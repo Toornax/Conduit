@@ -6,9 +6,33 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Conduit — conduit-backend-wasapi"
+description = "Conduit — backend Windows : énumération MMDevice, notifications, flux WASAPI"
 
 [dependencies]
+
+[target.'cfg(windows)'.dependencies]
+conduit-core.workspace = true
+conduit-backend.workspace = true
+# Le crate `windows` de Microsoft : liaisons COM sûres + macro `implement` pour
+# exposer un `IMMNotificationClient` écrit en Rust. Les features sont le strict
+# nécessaire de l'énumération MMDevice :
+# - `Win32_Media_Audio` : IMMDeviceEnumerator, IMMDevice, IAudioClient, WAVEFORMATEX ;
+# - `Win32_System_Com` : CoInitializeEx, CoCreateInstance, CoTaskMemFree ;
+# - `Win32_System_Com_StructuredStorage` + `Win32_System_Variant` : PROPVARIANT ;
+# - `Win32_UI_Shell_PropertiesSystem` : IPropertyStore ;
+# - `Win32_Devices_FunctionDiscovery` : PKEY_Device_FriendlyName.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_Devices_FunctionDiscovery",
+] }
+# Le code que génère `#[implement]` nomme `::windows_core` : le crate doit être une
+# dépendance directe (même version que celle qu'embarque `windows`).
+windows-core = "0.62"
 
 [lints]
 workspace = true

@@ -1,0 +1,226 @@
+//! Tests d'intégration du backend WASAPI contre les cartes son de la machine.
+//!
+//! Ils supposent au moins un endpoint de rendu actif (n'importe quel poste Windows
+//! avec une sortie audio). Le critère « Fait quand » de M1b-30 — branchement d'un
+//! casque USB → `DeviceEvent::Added` — demande une main humaine : c'est le test
+//! `#[ignore]` [`hotplug_produces_added_then_removed`].
+
+#![cfg(windows)]
+
+use std::time::{Duration, Instant};
+
+use conduit_backend::{Backend, BackendError, DeviceDirection, DeviceEvent};
+use conduit_backend_wasapi::WasapiBackend;
+use conduit_core::types::SampleRate;
+
+/// Un poste sans aucune sortie audio (session distante, VM sans carte son) ne peut
+/// pas exercer ces tests : on le dit plutôt que d'échouer.
+macro_rules! backend_or_skip {
+    () => {
+        match WasapiBackend::new() {
+            Ok(backend) if !backend.devices().unwrap_or_default().is_empty() => backend,
+            Ok(_) => {
+                eprintln!("test sauté : aucun endpoint audio actif sur cette machine");
+                return;
+            }
+            Err(e) => panic!("WasapiBackend::new : {e}"),
+        }
+    };
+}
+
+#[test]
+fn backend_starts_and_enumerates_plausible_devices() {
+    let backend = backend_or_skip!();
+    assert_eq!(backend.name(), "wasapi");
+    let devices = backend.devices().expect("énumération");
+    assert!(!devices.is_empty());
+    for device in &devices {
+        assert!(
+            !device.id.as_str().is_empty(),
+            "identifiant vide : {device:?}"
+        );
+        assert!(!device.name.trim().is_empty(), "nom vide : {device:?}");
+        assert!(device.channels >= 1, "aucun canal : {device:?}");
+        let hz = device.sample_rate.hz();
+        assert!(
+            (8_000..=384_000).contains(&hz),
+            "fréquence invraisemblable : {device:?}"
+        );
+        assert!(
+            device.supports_rate(device.sample_rate),
+            "la fréquence native est toujours acceptée : {device:?}"
+        );
+        for rate in &device.sample_rates {
+            assert!(
+                [
+                    SampleRate::HZ_44100,
+                    SampleRate::HZ_48000,
+                    SampleRate::HZ_96000
+                ]
+                .contains(rate),
+                "fréquence hors des valeurs sondées : {device:?}"
+            );
+        }
+        // 10 ms à 8 kHz font 80 trames ; 10 ms à 384 kHz, 3840. La période par
+        // défaut du moteur est entre 1 et 100 ms.
+        assert!(
+            (1..=38_400).contains(&device.default_block),
+            "bloc invraisemblable : {device:?}"
+        );
+        assert!(
+            device.cable.is_none() || device.name.starts_with("Conduit "),
+            "câble reconnu sur un nom qui n'en est pas un : {device:?}"
+        );
+    }
+    // Les identifiants d'endpoint sont uniques.
+    let mut ids: Vec<_> = devices.iter().map(|d| d.id.clone()).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        devices.len(),
+        "identifiants en double : {devices:?}"
+    );
+}
+
+#[test]
+fn default_render_device_is_listed_and_flagged() {
+    let backend = backend_or_skip!();
+    let devices = backend.devices().expect("énumération");
+    for direction in [DeviceDirection::Render, DeviceDirection::Capture] {
+        let default = backend.default_device(direction);
+        let flagged: Vec<_> = devices
+            .iter()
+            .filter(|d| d.direction == direction && d.is_default)
+            .collect();
+        match default {
+            Some(id) => {
+                assert_eq!(flagged.len(), 1, "un seul défaut par sens : {flagged:?}");
+                assert_eq!(flagged[0].id, id);
+            }
+            None => assert!(
+                flagged.is_empty(),
+                "défaut marqué sans défaut : {flagged:?}"
+            ),
+        }
+    }
+    // Le critère du brief : le rendu a un défaut sur toute machine qui a une sortie.
+    if devices
+        .iter()
+        .any(|d| d.direction == DeviceDirection::Render)
+    {
+        assert!(backend.default_device(DeviceDirection::Render).is_some());
+    }
+}
+
+#[test]
+fn enumeration_is_stable() {
+    let backend = backend_or_skip!();
+    let first = backend.devices().expect("première énumération");
+    let second = backend.devices().expect("seconde énumération");
+    assert_eq!(first, second);
+}
+
+#[test]
+fn open_is_not_implemented_yet() {
+    let mut backend = backend_or_skip!();
+    let id = backend
+        .default_device(DeviceDirection::Render)
+        .expect("périphérique de rendu par défaut");
+    let format = conduit_backend::StreamFormat {
+        sample_rate: SampleRate::HZ_48000,
+        channels: 2,
+        block_frames: 480,
+    };
+    let result = backend.open(&id, format, Box::new(|io, _| io.silence_output()));
+    assert!(matches!(result, Err(BackendError::Platform(ref m)) if m.contains("M1b-31")));
+    assert!(backend.cable_control().is_none());
+}
+
+#[test]
+fn subscribe_then_drop_does_not_block() {
+    let started = Instant::now();
+    let worker = std::thread::spawn(|| {
+        let mut backend = match WasapiBackend::new() {
+            Ok(backend) => backend,
+            Err(e) => panic!("WasapiBackend::new : {e}"),
+        };
+        let events = backend.subscribe();
+        drop(backend);
+        // Le fil est parti : le récepteur le voit sans attendre.
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(1)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ));
+    });
+    // Attente bornée : un `Drop` qui bloquerait ferait échouer le test au lieu de
+    // suspendre la suite.
+    while !worker.is_finished() {
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "la destruction du backend bloque"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    worker.join().expect("le fil de test a paniqué");
+}
+
+#[test]
+fn several_backends_coexist() {
+    // Deux fils MMDevice, deux appartements COM, deux clients de notification.
+    let a = backend_or_skip!();
+    let b = WasapiBackend::new().expect("second backend");
+    assert_eq!(a.devices().unwrap(), b.devices().unwrap());
+}
+
+/// Critère « Fait quand » de M1b-30 : brancher un casque USB (ou activer un
+/// périphérique dans le panneau Son) pendant les 30 s produit `Added`, le
+/// débrancher produit `Removed`.
+///
+/// ```sh
+/// cargo test -p conduit-backend-wasapi --test wasapi -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "demande de brancher puis débrancher un périphérique audio à la main"]
+fn hotplug_produces_added_then_removed() {
+    let mut backend = backend_or_skip!();
+    let events = backend.subscribe();
+    eprintln!("branchez un périphérique audio dans les 30 s…");
+    let added = wait_for(&events, Duration::from_secs(30), |e| match e {
+        DeviceEvent::Added(info) => Some(info.clone()),
+        _ => None,
+    })
+    .expect("aucun DeviceEvent::Added en 30 s");
+    eprintln!("ajouté : {} — débranchez-le dans les 30 s…", added.name);
+    assert!(backend.devices().unwrap().iter().any(|d| d.id == added.id));
+    let removed = wait_for(&events, Duration::from_secs(30), |e| match e {
+        DeviceEvent::Removed { id } if *id == added.id => Some(()),
+        _ => None,
+    });
+    assert!(
+        removed.is_some(),
+        "aucun DeviceEvent::Removed pour {}",
+        added.id
+    );
+    assert!(backend.devices().unwrap().iter().all(|d| d.id != added.id));
+}
+
+fn wait_for<T>(
+    events: &conduit_backend::EventReceiver,
+    timeout: Duration,
+    mut pick: impl FnMut(&DeviceEvent) -> Option<T>,
+) -> Option<T> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let left = deadline.checked_duration_since(Instant::now())?;
+        match events.recv_timeout(left) {
+            Ok(event) => {
+                eprintln!("événement : {event:?}");
+                if let Some(value) = pick(&event) {
+                    return Some(value);
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+}
