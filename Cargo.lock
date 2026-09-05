@@ -55,6 +55,7 @@ version = "0.1.0"
 name = "conduit-core"
 version = "0.1.0"
 dependencies = [
+ "conduit-testing",
  "proptest",
  "rtrb",
  "serde",
@@ -72,6 +73,10 @@ version = "0.1.0"
 
 [[package]]
 name = "conduit-protocol"
+version = "0.1.0"
+
+[[package]]
+name = "conduit-testing"
 version = "0.1.0"
 
 [[package]]

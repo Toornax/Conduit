@@ -11,6 +11,7 @@ members = [
     "crates/conduitd",
     "crates/conduitctl",
     "crates/conduit-gui",
+    "crates/conduit-testing",
 ]
 
 [workspace.package]
@@ -26,6 +27,7 @@ conduit-core = { path = "crates/conduit-core" }
 conduit-engine = { path = "crates/conduit-engine" }
 conduit-backend = { path = "crates/conduit-backend" }
 conduit-protocol = { path = "crates/conduit-protocol" }
+conduit-testing = { path = "crates/conduit-testing" }
 
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

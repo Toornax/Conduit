@@ -82,14 +82,14 @@ allocation dans le fil audio, CI verte partout, couverture ≥ 80 % sur `core` e
 
 ### M0.B — `conduit-core` : types et tampons
 
-- [ ] **M0-15** `feat(core): types de base SampleRate, Frames, ChannelCount, Db, Gain`
+- [x] **M0-15** `feat(core): types de base SampleRate, Frames, ChannelCount, Db, Gain`
   Newtypes, conversions dB ↔ linéaire, bornes, `Display`.
   *Fait quand* : tests unitaires des conversions, y compris −∞ dB et 0 dB.
-- [ ] **M0-16** `feat(core): tampon audio planaire pré-alloué AudioBuffer`
+- [x] **M0-16** `feat(core): tampon audio planaire pré-alloué AudioBuffer`
   Un `Vec<f32>` par canal, vues mutables par canal, `fill_silence`, `copy_from`, aucune
   allocation après construction.
   *Fait quand* : tests + test de non-allocation sur les opérations de vue.
-- [ ] **M0-17** `feat(core): tampon circulaire SPSC temps réel`
+- [x] **M0-17** `feat(core): tampon circulaire SPSC temps réel`
   Intégration de `rtrb` derrière une façade `RingBuffer` (producteur/consommateur séparés,
   lecture/écriture par blocs, niveau de remplissage atomique).
   *Fait quand* : tests de propriétés `proptest` (jamais de perte ni de duplication), test
@@ -97,30 +97,30 @@ allocation dans le fil audio, CI verte partout, couverture ≥ 80 % sur `core` e
 
 ### M0.C — `conduit-core` : graphe
 
-- [ ] **M0-20** `feat(core): modèle du graphe (NodeId, PortId, LinkId, Direction, PortSpec)`
+- [x] **M0-20** `feat(core): modèle du graphe (NodeId, PortId, LinkId, Direction, PortSpec)`
   Structures descriptives uniquement, sans traitement. Identifiants générationnels.
   *Fait quand* : tests de sérialisation `serde` des identifiants.
-- [ ] **M0-21** `feat(core): trait Node et ProcessContext`
+- [x] **M0-21** `feat(core): trait Node et ProcessContext`
   `Node::process(&mut self, ctx, inputs, outputs)`, `ProcessContext { frames, sample_rate,
   position }`, `Node::ports()`.
   *Fait quand* : un nœud de test passe-plat compile et s'exécute.
-- [ ] **M0-22** `feat(core): GraphBuilder avec détection de cycles`
+- [x] **M0-22** `feat(core): GraphBuilder avec détection de cycles`
   Ajout/retrait de nœuds et liens, type d'erreur explicite (`LinkError::WouldCycle` avec
   le chemin), validation des directions et types de ports.
   *Fait quand* : tests couvrant cycle direct, cycle indirect, auto-lien, port inexistant (F-12).
-- [ ] **M0-23** `feat(core): compilation du graphe en plan d'exécution`
+- [x] **M0-23** `feat(core): compilation du graphe en plan d'exécution`
   Ordre topologique, attribution des tampons par port, liste d'exécution plate,
   `CompiledGraph` immuable.
   *Fait quand* : tests d'ordre sur graphes en diamant et en chaîne ; aucun tampon partagé
   entre ports actifs simultanément.
-- [ ] **M0-24** `feat(core): sommation des liens avec gain et rampe`
+- [x] **M0-24** `feat(core): sommation des liens avec gain et rampe`
   Somme des liens entrants dans un port, gain par lien, rampe linéaire sur un quantum lors
   d'un changement.
   *Fait quand* : test vérifiant l'absence de discontinuité (dérivée bornée) lors d'un saut de gain (F-13).
-- [ ] **M0-25** `feat(core): Executor exécutant un cycle sur un CompiledGraph`
+- [x] **M0-25** `feat(core): Executor exécutant un cycle sur un CompiledGraph`
   Parcourt la liste d'exécution, remplit les entrées, appelle `process`, aucune allocation.
   *Fait quand* : test d'un graphe sinus → gain → moniteur produisant la sortie attendue.
-- [ ] **M0-26** `feat(core): échange atomique du graphe (GraphSlot)`
+- [x] **M0-26** `feat(core): échange atomique du graphe (GraphSlot)`
   Publication d'un nouveau `CompiledGraph` par échange de pointeur (`arc-swap`), l'ancien
   est renvoyé au fil de gestion pour libération hors temps réel.
   *Fait quand* : test de stress échange/exécution concurrents sans blocage ; test que le
