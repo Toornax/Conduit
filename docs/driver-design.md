@@ -14,8 +14,10 @@ Statut : brouillon 0.1 (2026-09-05), à ajuster par ADR à mesure que le spike a
   audio vers le démon, une seule surface de contrôle (activer, désactiver, canaux).
 - **Réserve fixe** (ADR-004) : 16 câbles enregistrés au démarrage, inactifs masqués par
   l'état de jack. Le spike M1a n'en enregistre qu'un ; la réserve arrive en M1b-02.
-- **Rust d'abord** (ADR-003) : `windows-drivers-rs`, vtables COM écrites à la main,
-  porte de décision M1a-12 avec repli C++ (SYSVAD).
+- **Rust d'abord** (ADR-003) : `windows-drivers-rs` (crates publiés `wdk-sys`/`wdk-build`
+  0.5.1, `wdk`/`wdk-alloc` 0.4.1, `cargo-wdk` 0.1.1, **Rust stable** 1.96.1 MSVC comme le
+  reste du dépôt, LLVM 17.0.6 pour bindgen : LLVM 22 casse les crates publiés), vtables
+  COM générées par bindgen (§2.2), porte de décision M1a-12 avec repli C++ (SYSVAD).
 - **Zéro panique en noyau** : une panique = `KeBugCheckEx` = écran bleu. Tout chemin
   faillible renvoie un `NTSTATUS`.
 - **Nix ne couvre pas Windows** (ADR-008) : mais tout ce qui peut être testé sans le
@@ -32,9 +34,9 @@ conduit/
 │   └── conduit-helper/              # service d'assistance (M1b-20), membre racine
 └── drivers/windows/
     ├── Cargo.toml                   # workspace NOYAU, indépendant, jamais ouvert par Nix
-    ├── rust-toolchain.toml          # toolchain exigée par windows-drivers-rs
-    ├── .cargo/config.toml           # cibles, flags d'édition de liens si nécessaires
-    ├── portcls-sys/                 # bindings PortCls/KS + vtables manuelles
+    ├── rust-toolchain.toml          # 1.96.1 MSVC (stable suffit à windows-drivers-rs)
+    ├── .cargo/config.toml           # rustflags -C target-feature=+crt-static (exigé par wdk-build)
+    ├── portcls-sys/                 # bindings PortCls/KS générés (structures, GUID, vtables)
     ├── conduit-kmd/                 # le pilote (.sys), cdylib no_std
     └── tools/                       # scripts PowerShell : build, install VM, verifier
 ```
@@ -74,29 +76,41 @@ Le crate compile aussi avec `std` (feature `std`, tests et fuzz seulement).
   `KSRTAUDIO_*`…), GUID (`KSCATEGORY_AUDIO`, `KSDATAFORMAT_*`, `KSNODETYPE_*`,
   `KSPROPSETID_*`), constantes. Liste d'autorisation explicite (`allowlist_*`) : pas de
   génération « tout `ntddk.h` ».
-- **Vtables à la main** (M1a-04/05) : `IUnknown`, `IAdapterPowerManagement`,
-  `IMiniportTopology`, `IMiniportWaveRT`, `IMiniportWaveRTStream`,
-  `IMiniportWaveRTStreamNotification`, `IPortWaveRT`, `IPortTopology`,
-  `IPortWaveRTStream`, `IResourceList`, `IUnknown` côté port. Chaque interface = une
-  `struct XxxVtbl` `#[repr(C)]` de pointeurs `unsafe extern "system" fn`, dans l'ordre
-  exact du `DECLARE_INTERFACE_` du header, plus les constantes `IID_*`.
-- **Oracle des dispositions** : bindgen en mode C++ (`vtable_generation`,
-  `enable_cxx_namespaces`) produit, une fois, des structs de vtable de référence
-  commitées dans `portcls-sys/tests/golden/` (script `tools/regen-golden.ps1`). Les
-  tests comparent `size_of` et `offset_of` de chaque slot entre vtable manuelle et
-  golden, pour chaque interface. Le golden n'est jamais utilisé par le pilote.
-- Compile en mode utilisateur pour ses tests (`cargo test -p portcls-sys` depuis
-  `drivers/windows`) : il ne dépend **pas** de `wdk-sys` pour ses types (bindgen les
-  génère de façon autonome) ; les conversions vers les types `wdk-sys` se font dans
-  `conduit-kmd` par transmutation de pointeurs documentée.
+- **Vtables générées, pas écrites** (révision 2026-09-05 après étude de `basetyps.h`) :
+  compilé en **mode C**, `portcls.h` déclare chaque interface avec
+  `DECLARE_INTERFACE_`/`STDMETHOD_` et recopie les méthodes héritées
+  (`DEFINE_ABSTRACT_UNKNOWN`, `DEFINE_ABSTRACT_MINIPORT`) : bindgen produit donc
+  directement `struct IMiniportWaveRT { lpVtbl: *const IMiniportWaveRTVtbl }` et une
+  vtable plate de pointeurs de fonction, dans l'ordre du header. C'est la disposition
+  COM exacte, garantie par l'ABI C. Piège : `THIS_` s'expanse en `INTERFACE *This` et
+  `portcls.h` ne définit jamais `INTERFACE` ; l'en-tête d'entrée de bindgen le définit
+  (`#define INTERFACE void`) après `punknown.h`/`ks.h`/`drmk.h` et avant `portcls.h`.
+  Les `DEFINE_GUID` deviennent des `const GUID` via `PUT_GUIDS_HERE`/`initguid.h`.
+  **Repli** si ce mode C échoue sur le WDK 26100 : vtables écrites à la main, avec pour
+  oracle un bindgen C++ (`vtable_generation`) commité en golden et comparé slot par slot.
+- Génération : `build.rs` avec `wdk_build::configure_wdk_library_build_and_then` et
+  `bindgen::Builder::wdk_default(&config)` (chemins d'include et défines du WDK),
+  `allowlist_file` limité aux en-têtes PortCls/KS. Le `#[link(name = "portcls")]`
+  n'est **pas** dans `portcls-sys` : c'est `conduit-kmd/build.rs` qui l'émet, pour que
+  `portcls-sys` reste testable en mode utilisateur.
+- Tests (`cargo test -p portcls-sys` depuis `drivers/windows`, mode utilisateur, sans
+  lier au noyau) : `size_of` des structures clés contre des valeurs de référence
+  obtenues par un programme C compilé une fois (`tools/sizeof-probe.c`, `cl.exe` avec
+  les en-têtes `km`), nombre de slots de chaque vtable contre le header, et
+  `size_of::<IMiniportWaveRTVtbl>()` = nombre de slots × 8.
 
 ### 2.3 `conduit-kmd` (workspace noyau)
 
-`cdylib` `#![no_std]`, `wdk-alloc` en allocateur global (pool non paginé, tag `Cndt`),
-`wdk-panic` en gestionnaire de panique, `wdk-sys` pour NT et PortCls (fonctions
-`PcInitializeAdapterDriver`, `PcAddAdapterDevice`, `PcNewPort`, `PcRegisterSubdevice`,
-`PcRegisterPhysicalConnection`, `PcNewResourceList`, déclarées dans `portcls-sys` avec
-`#[link(name = "portcls")]`).
+`cdylib` `#![no_std]`, `panic = "abort"`, `[package.metadata.wdk.driver-model]
+driver-type = "WDM"`, `build.rs` = `wdk_build::configure_wdk_binary_build()` plus
+`cargo::rustc-link-lib=portcls`. `wdk-alloc` en allocateur global (pool non paginé, tag
+`rust` imposé par le crate ; **n'honore pas les alignements supérieurs à 16**, donc les
+tampons cycliques passent par `AllocatePagesForMdl`, jamais par `Box`). Gestionnaire de
+panique **maison** (`panic.rs` : `KeBugCheckEx` avec un code privé, `DbgBreakPoint` avant
+en debug) : `wdk-panic` 0.4.1 publié se contente d'un `loop {}` qui gèle la machine. Les
+fonctions PortCls (`PcInitializeAdapterDriver`, `PcAddAdapterDevice`, `PcNewPort`,
+`PcRegisterSubdevice`, `PcRegisterPhysicalConnection`, `PcNewResourceList`) sont déclarées
+dans `portcls-sys` et liées ici.
 
 Modules :
 
@@ -164,12 +178,16 @@ Les nœuds de topologie sont réduits au minimum que le générateur d'endpoints
 `KSNODETYPE_LINE_CONNECTOR` (capture) et un jack. Référence de structure : SYSVAD
 `SimpleAudioSample` (MIT), jamais copié.
 
-INF `conduit.inf` : classe `MEDIA`, périphérique énuméré à la racine (`Root\ConduitCable`),
-`Include=ks.inf,wdmaudio.inf`, `Needs=KS.Registration,WDMAUDIO.Registration`,
-interfaces `KSCATEGORY_AUDIO`, `KSCATEGORY_RENDER`, `KSCATEGORY_CAPTURE`,
-`KSCATEGORY_REALTIME`, `FriendlyName` « Conduit *n* » (M1a-09). Installation d'un
-périphérique racine : `devcon install conduit.inf Root\ConduitCable` (WDK) ;
-`pnputil /add-driver` seul installe le paquet mais ne crée pas le nœud.
+INF : source `conduit.inx` (`cargo wdk build` le transforme en `.inf` par `stampinf`,
+génère le `.cat` par `inf2cat`, le vérifie par `infverif` et signe `.sys` et `.cat` avec le
+certificat de test `WDRLocalTestCert` qu'il crée au besoin). Classe `MEDIA`, périphérique
+énuméré à la racine (`Root\ConduitCable`), `Include=ks.inf,wdmaudio.inf`,
+`Needs=KS.Registration,WDMAUDIO.Registration`, interfaces `KSCATEGORY_AUDIO`,
+`KSCATEGORY_RENDER`, `KSCATEGORY_CAPTURE`, `KSCATEGORY_REALTIME`, `FriendlyName`
+« Conduit *n* » (M1a-09). Installation dans la VM : importer `WDRLocalTestCert.cer` dans
+*Trusted Root* et *Trusted Publishers*, `pnputil /add-driver conduit.inf /install`, puis
+créer le nœud racine avec `devgen /add /hardwareid "Root\ConduitCable"` (WDK 26100).
+Retrait : `devgen /remove <id>` puis `pnputil /delete-driver oem<N>.inf /uninstall /force`.
 
 ## 5. Horloge, positions, boucle locale
 

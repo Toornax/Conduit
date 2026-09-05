@@ -294,10 +294,12 @@ Objectif : prouver qu'un pilote PortCls/WaveRT en Rust est faisable. Délai born
 proposition : trois semaines de travail effectif). Porte de décision en M1a-12.
 
 - [ ] **M1a-01** `chore(driver): environnement de build WDK et windows-drivers-rs`
-  Hors Nix (SPEC §5.11). Extension de `packaging/windows/setup-env.ps1` avec le WDK et sa
-  version exacte ; `rust-toolchain.toml` du dossier `drivers/windows` (nightly épinglé) ;
-  scripts de build ; `docs/driver-dev.md` (installation, VM de test, mode test signing,
-  kernel debugger).
+  Hors Nix (SPEC §5.11). Extension de `packaging/windows/setup-env.ps1` (WDK 26100, LLVM
+  17.0.6, `cargo-wdk` 0.1.1, versions dans `versions.json`) ; workspace noyau
+  `drivers/windows` (ADR-012) avec `rust-toolchain.toml` **stable** 1.96.1 (nightly inutile),
+  `.cargo/config.toml` (`crt-static`), crates vides `portcls-sys` et `conduit-kmd` ;
+  `docs/driver-dev.md` (installation, VM de test, mode test signing, kernel debugger) qui
+  remplace `docs/windows-setup.md`.
   *Fait quand* : un développeur reproduit le build à partir de la doc ; le job CI Windows
   compile le crate vide du pilote.
 - [ ] **M1a-01b** `feat(driver): conduit-kmd-core, horloge virtuelle et copie cyclique testées sous Nix`
@@ -307,14 +309,19 @@ proposition : trois semaines de travail effectif). Porte de décision en M1a-12.
 - [ ] **M1a-02** `feat(driver): pilote WDM minimal chargé et déchargé en mode test`
   `DriverEntry`, `AddDevice`, `Unload`, INF, catalogue de test, installation `pnputil`.
   *Fait quand* : chargement/déchargement 100 fois sans erreur dans la VM.
-- [ ] **M1a-03** `feat(portcls): bindings des structures et constantes PortCls et KS`
-  `bindgen` sur `portcls.h`, `ksmedia.h` : structures, GUID, constantes ; pas de vtables.
-  *Fait quand* : compile, tailles de structures vérifiées par tests `size_of`.
-- [ ] **M1a-04** `feat(portcls): vtables IUnknown, IAdapterPowerManagement, IMiniportTopology`
-  Définition manuelle, macros de déclaration, gestion du comptage de références.
-  *Fait quand* : tests de disposition mémoire (offsets) contre les en-têtes C.
-- [ ] **M1a-05** `feat(portcls): vtables IMiniportWaveRT, IMiniportWaveRTStream, IPortWaveRT`
-  *Fait quand* : idem, plus les appels vers `IPortWaveRT` (`PcNewPort`, `RegisterSubdevice`) fonctionnent.
+- [ ] **M1a-03** `feat(portcls): bindings PortCls et KS générés en mode C (structures, GUID, vtables)`
+  `bindgen` via `wdk_build::BuilderExt::wdk_default` sur `ks.h`, `ksmedia.h`, `punknown.h`,
+  `drmk.h`, `portcls.h` avec `#define INTERFACE void` ; les vtables COM sortent plates du mode
+  C ([driver-design.md](docs/driver-design.md) §2.2). Repli documenté : vtables manuelles.
+  *Fait quand* : compile ; `size_of` des structures clés et nombre de slots de chaque vtable
+  vérifiés par tests en mode utilisateur.
+- [ ] **M1a-04** `feat(portcls): objets COM sûrs, IUnknown, IAdapterPowerManagement, IMiniportTopology`
+  `ComObject<V, T>`, `ComRef<V>`, macros `com_interface!`/`impl_unknown!` (driver-design §3),
+  comptage de références, `QueryInterface` par préfixe de vtable.
+  *Fait quand* : tests en mode utilisateur (AddRef/Release, QueryInterface, un faux « port »
+  appelant la vtable) ; Miri sur le modèle objet.
+- [ ] **M1a-05** `feat(portcls): enveloppes IMiniportWaveRT, IMiniportWaveRTStream, IPortWaveRT`
+  *Fait quand* : idem, plus les appels vers `IPortWaveRT` (`PcNewPort`, `RegisterSubdevice`) fonctionnent dans la VM.
 - [ ] **M1a-06** `feat(driver): adaptateur enregistrant une topologie rendu et capture`
   *Fait quand* : le gestionnaire de périphériques montre un endpoint rendu et un capture.
 - [ ] **M1a-07** `feat(driver): miniport WaveRT rendu avec tampon cyclique et horloge timer`
