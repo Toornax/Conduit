@@ -4,7 +4,10 @@
 //!
 //! - les types de base ([`types`]) : fréquence, nombre de trames, canaux, gains ;
 //! - les tampons audio planaires pré-alloués ([`buffer`]) ;
-//! - un tampon circulaire SPSC temps réel ([`ring`]).
+//! - un tampon circulaire SPSC temps réel ([`ring`]) ;
+//! - le modèle de graphe et sa construction validée ([`graph`]) ;
+//! - le trait [`Node`] et ses tampons d'entrée/sortie ([`node`]) ;
+//! - les gains partagés avec rampe ([`gain`]) ;
 //!
 //! # Contraintes temps réel
 //!
@@ -16,9 +19,17 @@
 #![warn(missing_docs)]
 
 pub mod buffer;
+pub mod gain;
+pub mod graph;
+pub mod node;
 pub mod ring;
 pub mod types;
 
 pub use buffer::AudioBuffer;
+pub use gain::GainParam;
+pub use graph::{
+    CompiledGraph, Direction, GraphBuilder, GraphError, LinkId, LinkInfo, NodeId, NodeInfo, PortId,
+};
+pub use node::{ChannelLabel, Node, NodeIo, PortSpec, ProcessContext};
 pub use ring::{RingBuffer, RingConsumer, RingProducer};
 pub use types::{ChannelCount, Db, Frames, Gain, Quantum, SampleRate};
