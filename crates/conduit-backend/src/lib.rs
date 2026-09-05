@@ -18,13 +18,14 @@
 //!   appel, `timestamp_ns` est monotone ;
 //! - plus aucun appel après [`DeviceHandle::stop`] ou la destruction du handle.
 
-#![forbid(unsafe_code)]
 #![warn(missing_docs)]
+// `unsafe` confiné au module `rt` (appels système de priorité), chaque bloc justifié.
 
 pub mod cable;
 pub mod device;
 pub mod event;
 pub mod null;
+pub mod rt;
 
 pub use cable::{CableControl, CableError, CableId, CableInfo, CableSpec};
 pub use device::{
@@ -32,3 +33,4 @@ pub use device::{
     DeviceInfo, StreamFormat, StreamIo,
 };
 pub use event::{DeviceEvent, EventReceiver};
+pub use rt::{promote_current_thread, RtOutcome};
