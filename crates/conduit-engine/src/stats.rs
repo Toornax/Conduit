@@ -3,8 +3,8 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use conduit_backend::DeviceId;
 use conduit_core::ring::{RingBuffer, RingConsumer, RingProducer};
+pub use conduit_protocol::api::{EngineEvent, TimingSnapshot};
 
 /// Agrégat des temps de cycle, mis à jour par le fil audio, lu par la gestion.
 #[derive(Debug, Default)]
@@ -17,26 +17,6 @@ pub struct CycleTiming {
     /// Cycles dont la durée a dépassé le budget (quantum).
     overruns: AtomicU64,
     budget_ns: AtomicU64,
-}
-
-/// Instantané des temps de cycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct TimingSnapshot {
-    /// Cycles mesurés.
-    pub count: u64,
-    /// Durée minimale (ns).
-    pub min_ns: u64,
-    /// Durée moyenne (ns).
-    pub avg_ns: u64,
-    /// Durée maximale (ns).
-    pub max_ns: u64,
-    /// Dernière durée (ns).
-    pub last_ns: u64,
-    /// Budget d'un cycle (ns).
-    pub budget_ns: u64,
-    /// Cycles au-delà du budget.
-    pub overruns: u64,
 }
 
 impl CycleTiming {
@@ -98,37 +78,6 @@ impl CycleTiming {
         self.last_ns.store(0, Ordering::Relaxed);
         self.overruns.store(0, Ordering::Relaxed);
     }
-}
-
-/// Événement émis par le fil audio.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Serialize, serde::Deserialize),
-    serde(tag = "type", rename_all = "snake_case")
-)]
-pub enum EngineEvent {
-    /// Le cycle a dépassé son budget.
-    CycleOverrun {
-        /// Numéro du cycle.
-        cycle: u64,
-        /// Durée mesurée (ns).
-        duration_ns: u64,
-    },
-    /// Xrun sur un périphérique asynchrone.
-    DeviceXrun {
-        /// Périphérique.
-        device: DeviceId,
-        /// Sous-alimentation (`true`) ou débordement.
-        underrun: bool,
-    },
-    /// Le pilote de graphe a exécuté son premier cycle.
-    DriverStarted {
-        /// Périphérique pilote (`None` = horloge interne).
-        device: Option<DeviceId>,
-    },
-    /// L'exécuteur était occupé (autre pilote en cours) : cycle sauté, silence.
-    ExecutorBusy,
 }
 
 /// File d'événements RT → gestion.
@@ -217,19 +166,5 @@ mod tests {
         assert_eq!(c.pop(), Some(EngineEvent::ExecutorBusy));
         assert_eq!(c.pop(), Some(EngineEvent::DriverStarted { device: None }));
         assert_eq!(c.pop(), None);
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn event_serde() {
-        let e = EngineEvent::DeviceXrun {
-            device: "d".into(),
-            underrun: true,
-        };
-        let json = serde_json::to_string(&e).unwrap();
-        assert_eq!(
-            json,
-            r#"{"type":"device_xrun","device":"d","underrun":true}"#
-        );
     }
 }

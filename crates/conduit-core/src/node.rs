@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
     derive(Serialize, Deserialize),
     serde(rename_all = "UPPERCASE")
 )]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum ChannelLabel {
     /// Mono ou sans position définie.
     #[default]
@@ -96,6 +97,7 @@ impl fmt::Display for ChannelLabel {
 /// Description d'un port mono d'un nœud.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PortSpec {
     /// Nom du port, unique parmi les ports de même direction d'un nœud.
     pub name: String,

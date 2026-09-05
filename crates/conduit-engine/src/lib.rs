@@ -16,9 +16,10 @@ pub mod engine;
 pub mod key;
 pub mod stats;
 
-pub use engine::{
-    Command, DeviceStatus, DriverChoice, DriverStatus, Engine, EngineConfig, EngineError,
-    EngineStatus, InternalKind, LinkDescriptor, NodeDescriptor, NodeState, Notification, Reply,
+pub use conduit_protocol::api::{
+    Command, DeviceStatus, DriverChoice, DriverStatus, EngineEvent, EngineStatus, InternalKind,
+    LinkDescriptor, NodeDescriptor, NodeKey, NodeState, Notification, Reply, TimingSnapshot,
 };
-pub use key::{NodeKey, Registry};
-pub use stats::{CycleTiming, EngineEvent, TimingSnapshot};
+pub use engine::{Engine, EngineConfig, EngineError};
+pub use key::Registry;
+pub use stats::CycleTiming;

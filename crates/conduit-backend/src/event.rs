@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
     derive(Serialize, Deserialize),
     serde(tag = "type", rename_all = "snake_case")
 )]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum DeviceEvent {
     /// Un périphérique est apparu.
     Added(DeviceInfo),

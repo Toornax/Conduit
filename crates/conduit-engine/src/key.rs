@@ -3,65 +3,8 @@
 
 use std::collections::HashMap;
 
-use conduit_backend::DeviceId;
 use conduit_core::graph::NodeId;
-
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
-
-/// Clé stable d'un nœud.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[cfg_attr(
-    feature = "serde",
-    derive(Serialize, Deserialize),
-    serde(tag = "kind", rename_all = "snake_case")
-)]
-pub enum NodeKey {
-    /// Périphérique d'un backend.
-    Device {
-        /// Nom du backend (`"null"`, `"wasapi"`, …).
-        backend: String,
-        /// Identifiant OS.
-        id: DeviceId,
-    },
-    /// Nœud interne nommé (générateur, mixeur, …).
-    Internal {
-        /// Nom unique choisi à la création.
-        name: String,
-    },
-}
-
-impl NodeKey {
-    /// Clé de périphérique.
-    pub fn device(backend: &str, id: DeviceId) -> Self {
-        NodeKey::Device {
-            backend: backend.to_string(),
-            id,
-        }
-    }
-
-    /// Clé interne.
-    pub fn internal(name: impl Into<String>) -> Self {
-        NodeKey::Internal { name: name.into() }
-    }
-
-    /// Identifiant de périphérique, si c'en est un.
-    pub fn device_id(&self) -> Option<&DeviceId> {
-        match self {
-            NodeKey::Device { id, .. } => Some(id),
-            NodeKey::Internal { .. } => None,
-        }
-    }
-}
-
-impl core::fmt::Display for NodeKey {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            NodeKey::Device { backend, id } => write!(f, "{backend}:{id}"),
-            NodeKey::Internal { name } => write!(f, "internal:{name}"),
-        }
-    }
-}
+pub use conduit_protocol::api::NodeKey;
 
 /// Table bidirectionnelle clé ↔ identifiant de graphe.
 #[derive(Debug, Default, Clone)]
@@ -171,17 +114,5 @@ mod tests {
         }
         assert_ne!(r1.id(&first[0]), r2.id(&first[0]));
         assert!(r2.id(&first[0]).is_some() && r2.id(&first[1]).is_some());
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn serde_tagged() {
-        let d = NodeKey::device("null", "x".into());
-        let json = serde_json::to_string(&d).unwrap();
-        assert_eq!(json, r#"{"kind":"device","backend":"null","id":"x"}"#);
-        let back: NodeKey = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, d);
-        let i: NodeKey = serde_json::from_str(r#"{"kind":"internal","name":"m"}"#).unwrap();
-        assert_eq!(i, NodeKey::internal("m"));
     }
 }

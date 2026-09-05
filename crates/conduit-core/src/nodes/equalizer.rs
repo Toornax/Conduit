@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 /// Réglage d'une bande.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct EqBand {
     /// Type de filtre.
     pub kind: FilterKind,

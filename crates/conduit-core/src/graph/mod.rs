@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
     derive(Serialize, Deserialize),
     serde(rename_all = "snake_case")
 )]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum Direction {
     /// Le port reçoit de l'audio.
     Input,
@@ -97,6 +98,7 @@ fn format_path(path: &[NodeId]) -> String {
 /// Description d'un nœud du graphe (hors état de traitement).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct NodeInfo {
     /// Identifiant.
     pub id: NodeId,
@@ -143,6 +145,7 @@ impl NodeInfo {
 /// Description d'un lien.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct LinkInfo {
     /// Identifiant.
     pub id: LinkId,

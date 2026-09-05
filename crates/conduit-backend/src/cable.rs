@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 /// Identifiant d'un câble (numéro stable, 1 = « Conduit 1 »).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CableId(pub u32);
 
 impl fmt::Display for CableId {
@@ -23,6 +24,7 @@ impl fmt::Display for CableId {
 /// Demande de création ou de modification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CableSpec {
     /// Nom OS souhaité (`None` = `Conduit N`).
     pub name: Option<String>,
@@ -42,6 +44,7 @@ impl Default for CableSpec {
 /// Description d'un câble existant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CableInfo {
     /// Identifiant.
     pub id: CableId,

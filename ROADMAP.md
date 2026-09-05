@@ -187,31 +187,31 @@ allocation dans le fil audio, CI verte partout, couverture ≥ 80 % sur `core` e
 
 ### M0.G — `conduit-engine`
 
-- [ ] **M0-60** `feat(engine): registre des nœuds et clés stables NodeKey`
+- [x] **M0-60** `feat(engine): registre des nœuds et clés stables NodeKey`
   Clé = identifiant OS + nom, indépendante de l'ordre d'énumération ; table clé → NodeId.
   *Fait quand* : test de stabilité après redémarrage simulé (F-30).
-- [ ] **M0-61** `feat(engine): fil audio et pilote de graphe`
+- [x] **M0-61** `feat(engine): fil audio et pilote de graphe`
   Le rappel du périphérique désigné pilote exécute `Executor::run` ; les autres nœuds
   matériels passent par `AsyncPort`.
   *Fait quand* : test null : sortie audible sur le pilote, entrée capturée depuis un second périphérique.
-- [ ] **M0-62** `feat(engine): priorité temps réel du fil audio`
+- [x] **M0-62** `feat(engine): priorité temps réel du fil audio`
   `audio_thread_priority` ou appels natifs, dégradation documentée si refusée.
   *Fait quand* : test que la promotion est tentée et l'échec journalisé, pas fatal.
-- [ ] **M0-63** `feat(engine): horloge interne comme pilote de secours`
+- [x] **M0-63** `feat(engine): horloge interne comme pilote de secours`
   Timer haute résolution cadençant le graphe quand aucun matériel n'est disponible.
   *Fait quand* : test de gigue de période < 10 % du quantum sur 60 s (F-22).
-- [ ] **M0-64** `feat(engine): suspension et réactivation à chaud des nœuds`
+- [x] **M0-64** `feat(engine): suspension et réactivation à chaud des nœuds`
   Périphérique retiré → nœud suspendu, liens conservés ; réapparu → réactivé.
   *Fait quand* : test null retrait/réapparition, graphe identique avant/après (F-20).
-- [ ] **M0-65** `feat(engine): changement du pilote de graphe à chaud`
+- [x] **M0-65** `feat(engine): changement du pilote de graphe à chaud`
   *Fait quand* : test null de basculement avec mesure du silence < 2 quanta (F-21).
-- [ ] **M0-66** `feat(engine): compteurs xrun, temps de cycle, file d'événements hors RT`
+- [x] **M0-66** `feat(engine): compteurs xrun, temps de cycle, file d'événements hors RT`
   File SPSC d'événements du fil audio vers le fil de gestion ; agrégation min/moy/max.
   *Fait quand* : test : xrun provoqué → compteur incrémenté et événement émis.
-- [ ] **M0-67** `feat(engine): API de commandes (enum Command, réponses typées)`
+- [x] **M0-67** `feat(engine): API de commandes (enum Command, réponses typées)`
   Commandes : lier, délier, gain, pilote, câbles, requêtes d'état ; exécutées sur le fil de gestion.
   *Fait quand* : chaque commande a un test.
-- [ ] **M0-68** `test(engine): scénarios d'intégration engine + null`
+- [x] **M0-68** `test(engine): scénarios d'intégration engine + null`
   Scénarios F-11 à F-16, F-20 à F-22 enchaînés.
   *Fait quand* : tous les scénarios passent en CI sur les trois OS.
 

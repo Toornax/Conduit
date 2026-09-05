@@ -8,14 +8,10 @@ repository.workspace = true
 authors.workspace = true
 description = "Conduit — fil temps réel, horloges, périphériques, commandes"
 
-[features]
-default = ["serde"]
-serde = ["dep:serde", "conduit-core/serde", "conduit-backend/serde"]
-
 [dependencies]
-conduit-core = { workspace = true }
-conduit-backend = { workspace = true }
-serde = { workspace = true, optional = true }
+conduit-core = { workspace = true, features = ["serde"] }
+conduit-backend = { workspace = true, features = ["serde"] }
+conduit-protocol = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

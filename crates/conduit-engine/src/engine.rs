@@ -5,51 +5,31 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use conduit_backend::{
-    Backend, BackendError, CableError, CableId, CableInfo, CableSpec, ClockInfo, DeviceDirection,
-    DeviceEvent, DeviceHandle, DeviceId, DeviceInfo, EventReceiver, StreamFormat, StreamIo,
+    Backend, BackendError, CableError, ClockInfo, DeviceDirection, DeviceEvent, DeviceHandle,
+    DeviceId, DeviceInfo, EventReceiver, StreamFormat, StreamIo,
 };
 use conduit_core::asyncport::{input_port, output_port, AsyncPortConfig, AsyncStats};
 use conduit_core::dsp::ResampleQuality;
 use conduit_core::executor::Executor;
-use conduit_core::graph::{Direction, GraphBuilder, GraphError, LinkId, LinkInfo, NodeId, PortId};
-use conduit_core::node::{Node, PortSpec};
+use conduit_core::graph::{Direction, GraphBuilder, GraphError, LinkId, NodeId, PortId};
+use conduit_core::node::Node;
 use conduit_core::nodes::{
-    ChannelAdapter, EqBand, EqBandControl, EqualizerNode, MeterNode, MeterReading, MeterShared,
-    MixerNode, NoiseColor, NoiseControl, NoiseNode, SilenceNode, SineControl, SineNode,
-    SplitterNode,
+    ChannelAdapter, EqBandControl, EqualizerNode, MeterNode, MeterReading, MeterShared, MixerNode,
+    NoiseColor, NoiseControl, NoiseNode, SilenceNode, SineControl, SineNode, SplitterNode,
 };
 use conduit_core::ring::{RingBuffer, RingConsumer};
 use conduit_core::slot::{GraphSlot, PublishError};
-use conduit_core::types::{ChannelCount, Db, Quantum, SampleRate};
+use conduit_core::types::{Quantum, SampleRate};
+
+use conduit_protocol::api::{
+    Command, DeviceStatus, DriverChoice, DriverStatus, EngineEvent, EngineStatus, ErrorCode,
+    InternalKind, LinkDescriptor, NodeDescriptor, NodeState, Notification, ProtocolError, Reply,
+};
 
 use crate::clock::InternalClock;
 use crate::device_node::{DeviceNode, DeviceNodeControl, Role};
 use crate::key::{NodeKey, Registry};
-use crate::stats::{CycleTiming, EngineEvent, EventQueue, TimingSnapshot};
-
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
-
-/// Choix du pilote de graphe.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-#[cfg_attr(
-    feature = "serde",
-    derive(Serialize, Deserialize),
-    serde(tag = "mode", rename_all = "snake_case")
-)]
-pub enum DriverChoice {
-    /// Périphérique de rendu par défaut s'il existe, sinon capture par défaut, sinon
-    /// horloge interne.
-    #[default]
-    Auto,
-    /// Horloge interne (timer).
-    Internal,
-    /// Un périphérique précis.
-    Device {
-        /// Identifiant.
-        id: DeviceId,
-    },
-}
+use crate::stats::{CycleTiming, EventQueue};
 
 /// Configuration du moteur.
 #[derive(Debug, Clone, PartialEq)]
@@ -125,404 +105,12 @@ pub enum EngineError {
     /// Cette plateforme ne gère pas les câbles.
     #[error("le backend {0} ne gère pas les câbles virtuels")]
     NoCableControl(&'static str),
+    /// Commande gérée par le démon, pas par le moteur.
+    #[error("commande « {0} » non supportée par le moteur seul")]
+    Unsupported(&'static str),
     /// Un nœud de périphérique ne peut pas être retiré tant que le périphérique est présent.
     #[error("le périphérique {0} est présent : débranchez-le ou désactivez-le avant de retirer son nœud")]
     DevicePresent(DeviceId),
-}
-
-/// État d'un nœud dans le moteur.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    feature = "serde",
-    derive(Serialize, Deserialize),
-    serde(rename_all = "snake_case")
-)]
-pub enum NodeState {
-    /// Nœud interne, toujours actif.
-    Internal,
-    /// Périphérique ouvert en asynchrone.
-    Active,
-    /// Périphérique pilote du graphe.
-    Driver,
-    /// Périphérique absent ou fermé ; liens conservés.
-    Suspended,
-}
-
-/// Description d'un nœud vu du moteur.
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct NodeDescriptor {
-    /// Identifiant de graphe (change si le nœud est recréé).
-    pub id: NodeId,
-    /// Clé stable.
-    pub key: NodeKey,
-    /// Nom d'affichage.
-    pub label: String,
-    /// Type.
-    pub type_name: String,
-    /// Entrées.
-    pub inputs: Vec<PortSpec>,
-    /// Sorties.
-    pub outputs: Vec<PortSpec>,
-    /// État.
-    pub state: NodeState,
-    /// Gain du nœud (dB).
-    pub gain_db: Db,
-    /// Muet.
-    pub muted: bool,
-    /// Périphérique associé.
-    pub device: Option<DeviceInfo>,
-}
-
-/// Description d'un lien vu du moteur.
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct LinkDescriptor {
-    /// Lien.
-    #[cfg_attr(feature = "serde", serde(flatten))]
-    pub link: LinkInfo,
-    /// Gain (dB).
-    pub gain_db: Db,
-    /// Muet.
-    pub muted: bool,
-}
-
-/// État d'un périphérique asynchrone.
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct DeviceStatus {
-    /// Périphérique.
-    pub id: DeviceId,
-    /// Nœud.
-    pub node: NodeId,
-    /// État.
-    pub state: NodeState,
-    /// Sous-alimentations.
-    pub underruns: u64,
-    /// Débordements.
-    pub overruns: u64,
-    /// Remplissage du tampon (trames périphérique).
-    pub fill: u32,
-    /// Ratio de rééchantillonnage.
-    pub ratio: f64,
-    /// DLL verrouillée.
-    pub locked: bool,
-}
-
-/// Pilote courant.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    feature = "serde",
-    derive(Serialize, Deserialize),
-    serde(tag = "kind", rename_all = "snake_case")
-)]
-pub enum DriverStatus {
-    /// Aucun (moteur arrêté).
-    None,
-    /// Horloge interne.
-    Internal,
-    /// Périphérique.
-    Device {
-        /// Identifiant.
-        id: DeviceId,
-    },
-}
-
-/// État global.
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct EngineStatus {
-    /// Backend.
-    pub backend: String,
-    /// Fréquence.
-    pub sample_rate: SampleRate,
-    /// Quantum.
-    pub quantum: Quantum,
-    /// Pilote.
-    pub driver: DriverStatus,
-    /// Choix configuré.
-    pub driver_choice: DriverChoice,
-    /// Nœuds.
-    pub nodes: usize,
-    /// Liens.
-    pub links: usize,
-    /// Temps de cycle.
-    pub timing: TimingSnapshot,
-    /// Xruns cumulés (périphériques + dépassements de cycle).
-    pub xruns: u64,
-    /// Périphériques.
-    pub devices: Vec<DeviceStatus>,
-    /// Position du graphe (trames).
-    pub position: u64,
-    /// Cycles exécutés.
-    pub cycles: u64,
-}
-
-/// Type de nœud interne à créer.
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(
-    feature = "serde",
-    derive(Serialize, Deserialize),
-    serde(tag = "kind", rename_all = "snake_case")
-)]
-pub enum InternalKind {
-    /// Silence.
-    Silence {
-        /// Canaux.
-        channels: usize,
-    },
-    /// Sinus.
-    Sine {
-        /// Fréquence.
-        frequency: f32,
-        /// Amplitude.
-        amplitude: f32,
-        /// Canaux.
-        channels: usize,
-    },
-    /// Bruit.
-    Noise {
-        /// Rose (`true`) ou blanc.
-        pink: bool,
-        /// Amplitude.
-        amplitude: f32,
-        /// Canaux.
-        channels: usize,
-    },
-    /// Mixeur.
-    Mixer {
-        /// Bus.
-        buses: usize,
-        /// Canaux par bus.
-        channels: usize,
-    },
-    /// Duplicateur.
-    Splitter {
-        /// Canaux.
-        channels: usize,
-        /// Copies.
-        copies: usize,
-    },
-    /// VU-mètre.
-    Meter {
-        /// Canaux.
-        channels: usize,
-    },
-    /// Égaliseur.
-    Equalizer {
-        /// Canaux.
-        channels: usize,
-        /// Bandes.
-        bands: Vec<EqBand>,
-    },
-    /// Adaptation de canaux automatique.
-    Adapter {
-        /// Entrées.
-        inputs: usize,
-        /// Sorties.
-        outputs: usize,
-    },
-}
-
-/// Commande adressée au moteur.
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(
-    feature = "serde",
-    derive(Serialize, Deserialize),
-    serde(tag = "cmd", rename_all = "snake_case")
-)]
-pub enum Command {
-    /// État global.
-    Status,
-    /// Liste des nœuds.
-    Nodes,
-    /// Ports d'un nœud.
-    Ports {
-        /// Nœud.
-        node: NodeId,
-    },
-    /// Liste des liens.
-    Links,
-    /// Crée un lien.
-    Link {
-        /// Source (sortie).
-        src: PortId,
-        /// Destination (entrée).
-        dst: PortId,
-    },
-    /// Crée un lien par noms de ports.
-    LinkByName {
-        /// Nœud source.
-        src_node: NodeId,
-        /// Port de sortie.
-        src_port: String,
-        /// Nœud destination.
-        dst_node: NodeId,
-        /// Port d'entrée.
-        dst_port: String,
-    },
-    /// Supprime un lien.
-    Unlink {
-        /// Lien.
-        link: LinkId,
-    },
-    /// Gain d'un nœud.
-    SetNodeGain {
-        /// Nœud.
-        node: NodeId,
-        /// Gain (dB), `None` = inchangé.
-        gain_db: Option<Db>,
-        /// Muet, `None` = inchangé.
-        muted: Option<bool>,
-    },
-    /// Gain d'un lien.
-    SetLinkGain {
-        /// Lien.
-        link: LinkId,
-        /// Gain (dB).
-        gain_db: Option<Db>,
-        /// Muet.
-        muted: Option<bool>,
-    },
-    /// Nom d'affichage d'un nœud.
-    SetLabel {
-        /// Nœud.
-        node: NodeId,
-        /// Nom.
-        label: String,
-    },
-    /// Change le pilote.
-    SetDriver {
-        /// Choix.
-        choice: DriverChoice,
-    },
-    /// Ajoute un nœud interne.
-    AddInternal {
-        /// Nom unique.
-        name: String,
-        /// Type.
-        kind: InternalKind,
-    },
-    /// Retire un nœud (interne, ou périphérique suspendu).
-    RemoveNode {
-        /// Nœud.
-        node: NodeId,
-    },
-    /// Règle un paramètre d'un nœud interne (`frequency`, `amplitude`,
-    /// `band.<i>.gain_db`, …).
-    SetParam {
-        /// Nœud.
-        node: NodeId,
-        /// Nom.
-        name: String,
-        /// Valeur.
-        value: f32,
-    },
-    /// Lit un VU-mètre.
-    ReadMeter {
-        /// Nœud.
-        node: NodeId,
-    },
-    /// Liste les câbles.
-    CableList,
-    /// Crée un câble.
-    CableAdd {
-        /// Spécification.
-        spec: CableSpec,
-    },
-    /// Supprime un câble.
-    CableRemove {
-        /// Câble.
-        id: CableId,
-    },
-    /// Renomme un câble.
-    CableRename {
-        /// Câble.
-        id: CableId,
-        /// Nom.
-        name: String,
-    },
-    /// Change les canaux d'un câble.
-    CableSetChannels {
-        /// Câble.
-        id: CableId,
-        /// Canaux.
-        channels: ChannelCount,
-    },
-    /// Remet les compteurs de xruns à zéro.
-    ResetXruns,
-}
-
-/// Réponse à une commande.
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(
-    feature = "serde",
-    derive(Serialize, Deserialize),
-    serde(tag = "reply", rename_all = "snake_case")
-)]
-pub enum Reply {
-    /// Succès sans donnée.
-    Ok,
-    /// État.
-    Status(EngineStatus),
-    /// Nœuds.
-    Nodes(Vec<NodeDescriptor>),
-    /// Un nœud.
-    Node(NodeDescriptor),
-    /// Liens.
-    Links(Vec<LinkDescriptor>),
-    /// Un lien.
-    Link(LinkDescriptor),
-    /// Mesures d'un VU-mètre.
-    Meter(Vec<MeterReading>),
-    /// Câbles.
-    Cables(Vec<CableInfo>),
-    /// Un câble.
-    Cable(CableInfo),
-}
-
-/// Notification de gestion (F-43), produite par [`Engine::tick`].
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(
-    feature = "serde",
-    derive(Serialize, Deserialize),
-    serde(tag = "event", rename_all = "snake_case")
-)]
-pub enum Notification {
-    /// Nœud ajouté (périphérique apparu ou nœud interne).
-    NodeAdded(NodeDescriptor),
-    /// Nœud retiré.
-    NodeRemoved {
-        /// Identifiant.
-        id: NodeId,
-        /// Clé.
-        key: NodeKey,
-    },
-    /// État d'un nœud changé (suspendu, réactivé, pilote).
-    NodeStateChanged {
-        /// Identifiant.
-        id: NodeId,
-        /// Nouvel état.
-        state: NodeState,
-    },
-    /// Lien ajouté.
-    LinkAdded(LinkDescriptor),
-    /// Lien retiré.
-    LinkRemoved {
-        /// Identifiant.
-        id: LinkId,
-    },
-    /// Pilote changé.
-    DriverChanged(DriverStatus),
-    /// Câble changé (`None` = supprimé).
-    CableChanged {
-        /// Identifiant.
-        id: CableId,
-        /// État.
-        info: Option<CableInfo>,
-    },
-    /// Événement du fil audio.
-    Rt(EngineEvent),
 }
 
 struct DeviceEntry {
@@ -635,9 +223,13 @@ impl Engine {
     pub fn execute(&mut self, cmd: Command) -> Result<Reply, EngineError> {
         match cmd {
             Command::Status => Ok(Reply::Status(self.status())),
-            Command::Nodes => Ok(Reply::Nodes(self.nodes())),
+            Command::Nodes => Ok(Reply::Nodes {
+                nodes: self.nodes(),
+            }),
             Command::Ports { node } => self.node_descriptor(node).map(Reply::Node),
-            Command::Links => Ok(Reply::Links(self.links())),
+            Command::Links => Ok(Reply::Links {
+                links: self.links(),
+            }),
             Command::Link { src, dst } => self.link(src, dst).map(Reply::Link),
             Command::LinkByName {
                 src_node,
@@ -691,11 +283,12 @@ impl Engine {
             Command::SetParam { node, name, value } => {
                 self.set_param(node, &name, value).map(|()| Reply::Ok)
             }
-            Command::ReadMeter { node } => self.read_meter(node).map(Reply::Meter),
-            Command::CableList => self
-                .cables()
-                .map(|c| c.list().map(Reply::Cables))?
-                .map_err(Into::into),
+            Command::ReadMeter { node } => self
+                .read_meter(node)
+                .map(|channels| Reply::Meter { channels }),
+            Command::CableList => Ok(Reply::Cables {
+                cables: self.cables()?.list()?,
+            }),
             Command::CableAdd { spec } => self.cable_op(|c| c.create(spec)).map(Reply::Cable),
             Command::CableRemove { id } => self.cable_op(|c| c.remove(id)).map(|()| Reply::Ok),
             Command::CableRename { id, name } => {
@@ -704,6 +297,10 @@ impl Engine {
             Command::CableSetChannels { id, channels } => self
                 .cable_op(|c| c.set_channels(id, channels))
                 .map(Reply::Cable),
+            Command::Dump => Ok(Reply::Dump { text: self.dump() }),
+            Command::Subscribe { .. } => Err(EngineError::Unsupported("subscribe")),
+            Command::Save => Err(EngineError::Unsupported("save")),
+            Command::Load => Err(EngineError::Unsupported("load")),
             Command::ResetXruns => {
                 self.timing.reset();
                 for d in self.devices.values() {
@@ -1567,6 +1164,97 @@ impl Engine {
             d.stats = None;
         }
         let _ = self.publish();
+    }
+}
+
+impl Engine {
+    /// Rapport de diagnostic textuel : versions, périphériques, graphe, compteurs.
+    /// Sans chemin utilisateur ni nom de machine.
+    pub fn dump(&self) -> String {
+        use core::fmt::Write;
+        let st = self.status();
+        let mut out = String::new();
+        let _ = writeln!(out, "conduit-engine {}", env!("CARGO_PKG_VERSION"));
+        let _ = writeln!(out, "backend: {}", st.backend);
+        let _ = writeln!(
+            out,
+            "fréquence: {}  quantum: {}",
+            st.sample_rate, st.quantum
+        );
+        let _ = writeln!(
+            out,
+            "pilote: {:?} (choix: {:?})",
+            st.driver, st.driver_choice
+        );
+        let _ = writeln!(
+            out,
+            "cycles: {}  position: {}  temps de cycle min/moy/max: {}/{}/{} µs  budget: {} µs  dépassements: {}",
+            st.cycles,
+            st.position,
+            st.timing.min_ns / 1000,
+            st.timing.avg_ns / 1000,
+            st.timing.max_ns / 1000,
+            st.timing.budget_ns / 1000,
+            st.timing.overruns
+        );
+        let _ = writeln!(out, "xruns: {}", st.xruns);
+        let _ = writeln!(out, "périphériques ({}):", st.devices.len());
+        for d in &st.devices {
+            let _ = writeln!(
+                out,
+                "  {} → {} {:?} sous-alim={} débord={} remplissage={} ratio={:.6} verrouillé={}",
+                d.id, d.node, d.state, d.underruns, d.overruns, d.fill, d.ratio, d.locked
+            );
+        }
+        let nodes = self.nodes();
+        let _ = writeln!(out, "nœuds ({}):", nodes.len());
+        for n in &nodes {
+            let _ = writeln!(
+                out,
+                "  {} [{}] {:?} \"{}\" in={} out={} gain={} muet={}",
+                n.id,
+                n.type_name,
+                n.state,
+                n.label,
+                n.inputs.len(),
+                n.outputs.len(),
+                n.gain_db,
+                n.muted
+            );
+        }
+        let links = self.links();
+        let _ = writeln!(out, "liens ({}):", links.len());
+        for l in &links {
+            let _ = writeln!(
+                out,
+                "  {} {} → {} gain={} muet={}",
+                l.link.id, l.link.src, l.link.dst, l.gain_db, l.muted
+            );
+        }
+        out
+    }
+}
+
+impl From<EngineError> for ProtocolError {
+    fn from(e: EngineError) -> Self {
+        let code = match &e {
+            EngineError::Graph(GraphError::WouldCycle { .. }) => ErrorCode::WouldCycle,
+            EngineError::Graph(GraphError::UnknownNode(_))
+            | EngineError::Graph(GraphError::UnknownPort(_))
+            | EngineError::Graph(GraphError::UnknownLink(_))
+            | EngineError::UnknownKey(_)
+            | EngineError::UnknownPortName { .. } => ErrorCode::NotFound,
+            EngineError::Graph(_)
+            | EngineError::DuplicateName(_)
+            | EngineError::InvalidParam { .. }
+            | EngineError::DevicePresent(_) => ErrorCode::Invalid,
+            EngineError::Backend(BackendError::NotFound(_)) => ErrorCode::NotFound,
+            EngineError::Backend(_) | EngineError::CannotDrive { .. } => ErrorCode::Device,
+            EngineError::Cable(_) | EngineError::NoCableControl(_) => ErrorCode::Cable,
+            EngineError::Publish(_) => ErrorCode::Busy,
+            EngineError::Unsupported(_) => ErrorCode::Unsupported,
+        };
+        ProtocolError::new(code, e.to_string())
     }
 }
 

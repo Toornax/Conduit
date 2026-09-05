@@ -11,10 +11,12 @@ description = "Conduit — moteur de graphe audio portable (types, tampons, grap
 [features]
 default = ["serde"]
 serde = ["dep:serde"]
+schema = ["serde", "dep:schemars"]
 
 [dependencies]
 rtrb = "0.3"
 serde = { workspace = true, optional = true }
+schemars = { version = "1", optional = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

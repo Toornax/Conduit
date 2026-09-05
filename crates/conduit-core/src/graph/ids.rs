@@ -18,6 +18,7 @@ macro_rules! gen_id {
         $(#[$meta])*
         #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
         #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+        #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
         pub struct $name {
             index: RawIndex,
             generation: u32,
@@ -78,6 +79,7 @@ gen_id!(
 /// Identifiant d'un port : nœud, direction et index dans cette direction.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PortId {
     /// Nœud propriétaire.
     pub node: NodeId,

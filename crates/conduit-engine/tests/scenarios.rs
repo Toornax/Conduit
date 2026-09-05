@@ -279,7 +279,7 @@ fn gains_mute_and_meter_via_commands() {
         })
         .unwrap();
     null.advance(Duration::from_secs(1));
-    let Reply::Meter(r) = engine
+    let Reply::Meter { channels: r } = engine
         .execute(Command::ReadMeter { node: meter.id })
         .unwrap()
     else {
@@ -296,18 +296,18 @@ fn gains_mute_and_meter_via_commands() {
         .unwrap();
     // Décroissance de crête 20 dB/s : après 4 s, −80 dB.
     null.advance(Duration::from_secs(4));
-    let Reply::Meter(r) = engine
+    let Reply::Meter { channels: r } = engine
         .execute(Command::ReadMeter { node: meter.id })
         .unwrap()
     else {
         panic!()
     };
     assert!(r[0].peak < 1e-3, "crête après muet {}", r[0].peak);
-    let Reply::Nodes(nodes) = engine.execute(Command::Nodes).unwrap() else {
+    let Reply::Nodes { nodes } = engine.execute(Command::Nodes).unwrap() else {
         panic!()
     };
     assert!(nodes.iter().find(|n| n.id == sine.id).unwrap().muted);
-    let Reply::Links(links) = engine.execute(Command::Links).unwrap() else {
+    let Reply::Links { links } = engine.execute(Command::Links).unwrap() else {
         panic!()
     };
     assert!(
@@ -577,7 +577,7 @@ fn internal_clock_drives_when_no_device() {
         })
         .unwrap();
     std::thread::sleep(Duration::from_millis(400));
-    let Reply::Meter(r) = engine
+    let Reply::Meter { channels: r } = engine
         .execute(Command::ReadMeter { node: meter.id })
         .unwrap()
     else {
@@ -674,7 +674,7 @@ fn cables_create_device_nodes() {
     assert!(nodes
         .iter()
         .any(|n| n.device.as_ref().map(|d| d.direction) == Some(DeviceDirection::Render)));
-    let Reply::Cables(list) = engine.execute(Command::CableList).unwrap() else {
+    let Reply::Cables { cables: list } = engine.execute(Command::CableList).unwrap() else {
         panic!()
     };
     assert_eq!(list.len(), 1);

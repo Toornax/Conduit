@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 /// d'énumération.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DeviceId(Arc<str>);
 
 impl DeviceId {
@@ -55,6 +56,7 @@ impl From<&str> for DeviceId {
     derive(Serialize, Deserialize),
     serde(rename_all = "snake_case")
 )]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum DeviceDirection {
     /// Le périphérique fournit de l'audio (micro, entrée de câble).
     Capture,
@@ -74,6 +76,7 @@ impl fmt::Display for DeviceDirection {
 /// Description d'un périphérique énuméré.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct DeviceInfo {
     /// Identifiant stable.
     pub id: DeviceId,
@@ -105,6 +108,7 @@ impl DeviceInfo {
 /// Format demandé ou obtenu pour un flux.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct StreamFormat {
     /// Fréquence.
     pub sample_rate: SampleRate,

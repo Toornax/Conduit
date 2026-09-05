@@ -11,10 +11,12 @@ description = "Conduit — traits Backend et CableControl, backend null simulé"
 [features]
 default = ["serde"]
 serde = ["dep:serde", "conduit-core/serde"]
+schema = ["serde", "dep:schemars", "conduit-core/schema"]
 
 [dependencies]
 conduit-core = { workspace = true }
 serde = { workspace = true, optional = true, features = ["rc"] }
+schemars = { version = "1", optional = true }
 thiserror = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

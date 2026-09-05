@@ -9,6 +9,7 @@ use crate::types::SampleRate;
 /// Mesure d'un canal.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MeterReading {
     /// Crête avec décroissance (linéaire, ≥ 0).
     pub peak: f32,

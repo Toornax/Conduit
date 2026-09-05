@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 /// Fréquence d'échantillonnage en hertz.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SampleRate(u32);
 
 impl SampleRate {
@@ -74,6 +75,7 @@ impl fmt::Display for SampleRate {
 /// Nombre de trames (échantillons par canal).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Frames(usize);
 
 impl Frames {
@@ -278,8 +280,42 @@ pub struct InvalidChannelCount(pub u8);
 /// `Db::NEG_INF` (`-inf`) représente le silence. Les valeurs sont bornées à
 /// [`MAX`](Self::MAX) lors de la construction.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
 pub struct Db(f32);
+
+#[cfg(feature = "serde")]
+impl Serialize for Db {
+    /// Nombre, ou la chaîne `"-inf"` pour le silence (JSON n'a pas d'infini).
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if self.is_silent() {
+            s.serialize_str("-inf")
+        } else {
+            s.serialize_f32(self.0)
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for Db {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Num(f32),
+            Str(String),
+        }
+        match Repr::deserialize(d)? {
+            Repr::Num(v) => Ok(Db::new(v)),
+            Repr::Str(s)
+                if s.eq_ignore_ascii_case("-inf") || s.eq_ignore_ascii_case("-infinity") =>
+            {
+                Ok(Db::NEG_INF)
+            }
+            Repr::Str(s) => s.parse::<f32>().map(Db::new).map_err(|_| {
+                serde::de::Error::custom(format!("gain invalide {s:?} : nombre en dB ou \"-inf\""))
+            }),
+        }
+    }
+}
 
 impl Db {
     /// 0 dB : gain unité.
@@ -345,6 +381,7 @@ impl fmt::Display for Db {
 /// Gain linéaire (facteur multiplicatif), toujours ≥ 0 et fini.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Gain(f32);
 
 impl Gain {
@@ -521,6 +558,13 @@ mod tests {
     }
 
     #[cfg(feature = "serde")]
+    fn rmp_serde_roundtrip(db: Db) -> Db {
+        // MessagePack via serde_json Value comme pivot neutre (pas de dépendance rmp ici).
+        let v = serde_json::to_value(db).unwrap();
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[cfg(feature = "serde")]
     #[test]
     fn serde_roundtrip_and_validation() {
         let q: Quantum = serde_json::from_str("512").unwrap();
@@ -534,5 +578,59 @@ mod tests {
             "48000"
         );
         assert_eq!(serde_json::to_string(&Db::new(-6.0)).unwrap(), "-6.0");
+        assert_eq!(serde_json::to_string(&Db::NEG_INF).unwrap(), "\"-inf\"");
+        assert_eq!(serde_json::from_str::<Db>("\"-inf\"").unwrap(), Db::NEG_INF);
+        assert_eq!(
+            serde_json::from_str::<Db>("\"-3.5\"").unwrap(),
+            Db::new(-3.5)
+        );
+        assert_eq!(serde_json::from_str::<Db>("-200").unwrap(), Db::NEG_INF);
+        assert!(serde_json::from_str::<Db>("\"fort\"").is_err());
+        let bin = rmp_serde_roundtrip(Db::NEG_INF);
+        assert_eq!(bin, Db::NEG_INF);
+    }
+}
+
+#[cfg(feature = "schema")]
+mod schema_impls {
+    use super::{ChannelCount, Db, Quantum};
+    use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
+    use std::borrow::Cow;
+
+    impl JsonSchema for Quantum {
+        fn schema_name() -> Cow<'static, str> {
+            "Quantum".into()
+        }
+        fn json_schema(_: &mut SchemaGenerator) -> Schema {
+            json_schema!({
+                "type": "integer",
+                "minimum": Quantum::MIN,
+                "maximum": Quantum::MAX,
+                "description": "Trames par cycle, puissance de deux"
+            })
+        }
+    }
+
+    impl JsonSchema for ChannelCount {
+        fn schema_name() -> Cow<'static, str> {
+            "ChannelCount".into()
+        }
+        fn json_schema(_: &mut SchemaGenerator) -> Schema {
+            json_schema!({ "type": "integer", "minimum": 1, "maximum": ChannelCount::MAX })
+        }
+    }
+
+    impl JsonSchema for Db {
+        fn schema_name() -> Cow<'static, str> {
+            "Db".into()
+        }
+        fn json_schema(_: &mut SchemaGenerator) -> Schema {
+            json_schema!({
+                "oneOf": [
+                    { "type": "number", "maximum": Db::MAX, "description": "Gain en dB" },
+                    { "type": "string", "enum": ["-inf"], "description": "Silence" }
+                ]
+            })
+        }
     }
 }
