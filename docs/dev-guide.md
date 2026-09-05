@@ -110,7 +110,10 @@ Niveaux : unitaires par module ; intégration `conduit-engine/tests/scenarios.rs
 `nix develop` donne l'environnement de référence ; `nix flake check` lance format,
 clippy, tests, cargo-deny, doc, vérification de `docs/protocol.md` et compilation
 croisée Windows. `nix build .#conduitd` produit le binaire Linux/macOS.
-`nix develop .#nightly` fournit Miri et cargo-fuzz.
+`nix develop .#nightly` fournit Miri et cargo-fuzz : `cargo miri test -p conduit-core --lib`.
+Miri n'est pas un check du flake : la construction de son sysroot télécharge des
+crates (impossible dans le bac à sable Nix) ; il tourne dans le devshell nightly et
+en CI hors Nix.
 
 Windows : `packaging/windows/setup-env.ps1` installe ou vérifie (`-Check`) les
 versions de `versions.json`.

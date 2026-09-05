@@ -1,6 +1,6 @@
 { inputs, ... }:
 {
-  perSystem = { pkgs, system, ... }:
+  perSystem = { pkgs, system, config, ... }:
     let
       tc = import ./toolchain.nix { inherit pkgs; rust-overlay = inputs.rust-overlay; };
       linuxOnly = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux (with pkgs; [
@@ -33,7 +33,9 @@
           nixfmt-rfc-style
         ] ++ linuxOnly ++ darwinOnly;
         LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
+        inputsFrom = [ config.pre-commit.devShell ];
         shellHook = ''
+          ${config.pre-commit.installationScript}
           echo "conduit devshell — $(cargo --version) — nix flake check pour valider"
         '';
       };

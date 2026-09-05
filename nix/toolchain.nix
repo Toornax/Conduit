@@ -7,10 +7,14 @@ let
   toolchainCross = toolchain.override {
     targets = [ "x86_64-pc-windows-gnu" ];
   };
+  # Toolchain avec llvm-tools pour la couverture (M0-96).
+  toolchainCov = toolchain.override {
+    extensions = [ "llvm-tools-preview" ];
+  };
   nightly = pkgsWithOverlay.rust-bin.nightly.latest.minimal.override {
     extensions = [ "miri" "rust-src" ];
   };
 in
 {
-  inherit pkgsWithOverlay toolchain toolchainCross nightly;
+  inherit pkgsWithOverlay toolchain toolchainCross toolchainCov nightly;
 }

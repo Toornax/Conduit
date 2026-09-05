@@ -41,13 +41,13 @@ allocation dans le fil audio, CI verte partout, couverture ≥ 80 % sur `core` e
   `clippy.toml`, `.gitignore`, `.editorconfig`, `LICENSE-MIT`, `LICENSE-APACHE`,
   `Cargo.lock` versionné.
   *Fait quand* : `cargo build --workspace` et `cargo clippy --workspace -- -D warnings` passent.
-- [ ] **M0-03** `chore(nix): flake.nix avec flake-parts, rust-overlay et devshell`
+- [x] **M0-03** `chore(nix): flake.nix avec flake-parts, rust-overlay et devshell`
   `flake.nix`, `flake.lock`, `nix/devshell.nix` : toolchain lue depuis `rust-toolchain.toml`,
   `cargo-nextest`, `cargo-deny`, `cargo-audit`, `cargo-llvm-cov`, `clang`/`bindgen`,
   `pkg-config`, PipeWire et ALSA sur Linux, `apple-sdk` sur macOS. `.envrc` pour direnv.
   *Fait quand* : `nix develop -c cargo build --workspace` passe sur Linux et macOS ;
   `nix flake show` liste le devshell.
-- [ ] **M0-04** `chore(nix): packages crane et checks (fmt, clippy, tests)`
+- [x] **M0-04** `chore(nix): packages crane et checks (fmt, clippy, tests)`
   `nix/packages.nix` : vendoring des dépendances, un package par binaire ; `nix/checks.nix` :
   `fmt`, `clippy`, `nextest`.
   *Fait quand* : `nix flake check` et `nix build .#conduitd` passent sur Linux et macOS.
@@ -161,7 +161,7 @@ allocation dans le fil audio, CI verte partout, couverture ≥ 80 % sur `core` e
   de phase d'un sinus vérifiée, xruns = 0.
 - [x] **M0-43** `bench(core): criterion sur le cycle de traitement et le rééchantillonneur`
   *Fait quand* : bench exécuté en CI (sans seuil bloquant), résultats dans le rapport.
-- [ ] **M0-44** `chore(nix): check Miri sur conduit-core (toolchain nightly séparée)`
+- [x] **M0-44** `chore(nix): check Miri sur conduit-core (toolchain nightly séparée)` — toolchain nightly dans `devShells.nightly` ; Miri tourne hors bac à sable (son sysroot télécharge des crates), 56 tests verts en local
   *Fait quand* : check Miri vert dans `nix flake check` sur les tests marqués compatibles.
 
 ### M0.F — `conduit-backend` : traits et backend `null`
