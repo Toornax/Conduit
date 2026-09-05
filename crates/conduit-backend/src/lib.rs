@@ -4,6 +4,8 @@
 //! flux avec un rappel audio temps réel et, s'il le peut, contrôle les câbles
 //! virtuels de sa plateforme ([`CableControl`]).
 //!
+//! Le backend [`null`] simule tout cela avec des horloges virtuelles, pour les tests.
+//!
 //! # Garanties du rappel audio
 //!
 //! Le rappel passé à [`Backend::open`] est appelé depuis le fil audio du backend :
@@ -22,6 +24,7 @@
 pub mod cable;
 pub mod device;
 pub mod event;
+pub mod null;
 
 pub use cable::{CableControl, CableError, CableId, CableInfo, CableSpec};
 pub use device::{
