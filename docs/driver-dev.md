@@ -51,14 +51,15 @@ En cas de succès il liste toutes les versions vérifiées.
 ## 2. Construire le pilote
 
 Le pilote vit dans le **workspace noyau** `drivers/windows` (ADR-012), indépendant du
-workspace racine : `portcls-sys` (bindings, testable en mode utilisateur) et
+workspace racine : `portcls-sys` (bindings, testable en mode utilisateur), `portcls`
+(enveloppes sûres traits ↔ vtables, testées en mode utilisateur avec un faux PortCls) et
 `conduit-kmd` (le `.sys`, `cdylib` `no_std`). Sa toolchain (`rust-toolchain.toml`,
 stable 1.96.1 MSVC), ses lints anti-panique (`Cargo.toml`) et `rustflags =
 ["-C", "target-feature=+crt-static"]` (`.cargo/config.toml`, exigé par `wdk-build`) lui
 sont propres.
 
 ```powershell
-.\drivers\windows\tools\check.ps1               # fmt, clippy -D warnings, test portcls-sys, build conduit-kmd, golden à jour
+.\drivers\windows\tools\check.ps1               # fmt, clippy -D warnings, tests portcls-sys (± com) et portcls, build conduit-kmd, golden à jour
 .\drivers\windows\tools\build.ps1               # cargo wdk build --profile dev
 .\drivers\windows\tools\build.ps1 -Profile release
 ```
@@ -69,6 +70,8 @@ ou, depuis `drivers/windows` :
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p portcls-sys
+cargo test -p portcls-sys --features com
+cargo test -p portcls
 cargo build -p conduit-kmd
 cargo wdk build [--profile release]
 ```
@@ -77,7 +80,8 @@ Le tout fonctionne depuis un PowerShell ordinaire : `rustc` localise `link.exe` 
 registre de Visual Studio (comme `vswhere`), aucun `vcvars` n'est nécessaire. Ne lancez **pas** `cargo test -p conduit-kmd` :
 `wdk-sys` 0.5.1 lie `ntoskrnl.lib` même en test (issue #502). `portcls-sys` ne dépend
 pas de `wdk-sys` (ses bindings régénèrent les types NT dont PortCls a besoin) :
-`cargo test -p portcls-sys` reste en mode utilisateur.
+`cargo test -p portcls-sys` reste en mode utilisateur, comme `cargo test -p portcls`
+(dont les seules dépendances sont `portcls-sys` et `conduit-com`).
 
 **Golden de disposition** (`portcls-sys\tests\layout.golden`) : `tests\layout.rs`
 compare les `size_of` et les GUID des bindings à ce fichier, produit par `cl.exe` sur

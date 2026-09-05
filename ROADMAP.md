@@ -316,13 +316,13 @@ proposition : trois semaines de travail effectif). Porte de décision en M1a-12.
   C ([driver-design.md](docs/driver-design.md) §2.2). Repli documenté : vtables manuelles.
   *Fait quand* : compile ; `size_of` des structures clés et nombre de slots de chaque vtable
   vérifiés par tests en mode utilisateur.
-- [ ] **M1a-04** `feat(portcls): objets COM sûrs, IUnknown, IAdapterPowerManagement, IMiniportTopology`
-  `ComObject<V, T>`, `ComRef<V>`, macros `com_interface!`/`impl_unknown!` (driver-design §3),
-  comptage de références, `QueryInterface` par préfixe de vtable.
+- [x] **M1a-04** `feat(portcls): objets COM sûrs, IUnknown, IAdapterPowerManagement, IMiniportTopology`
+  `ComObject<V, T>`, `ComPtr`, `ComRef<I>` (crate portable `conduit-com`, Miri), comptage de
+  références, `QueryInterface` par préfixe de vtable ; traits `AdapterPowerManagement` et
+  `MiniportTopology` reliés aux vtables générées par une constante associée par type
+  (`drivers/windows/portcls`, driver-design §3), enveloppes `ResourceList`/`PortTopology`.
   *Fait quand* : tests en mode utilisateur (AddRef/Release, QueryInterface, un faux « port »
   appelant la vtable) ; Miri sur le modèle objet.
-  *État* : modèle générique livré (crates/conduit-com) ; enveloppes IAdapterPowerManagement/IMiniportTopology
-  à suivre (drivers/windows/portcls).
 - [ ] **M1a-05** `feat(portcls): enveloppes IMiniportWaveRT, IMiniportWaveRTStream, IPortWaveRT`
   *Fait quand* : idem, plus les appels vers `IPortWaveRT` (`PcNewPort`, `RegisterSubdevice`) fonctionnent dans la VM.
 - [ ] **M1a-06** `feat(driver): adaptateur enregistrant une topologie rendu et capture`

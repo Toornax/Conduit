@@ -77,8 +77,12 @@ fn main() -> anyhow::Result<()> {
             // structure (`_DEVICE_OBJECT`, `_DRIVER_OBJECT`) : PortCls ne nomme que les
             // pointeurs (`PDEVICE_OBJECT`). Les alias `typedef` de `wdm.h` sont ajoutés
             // explicitement pour que `conduit-kmd` et les tests parlent le même nom que
-            // `wdk-sys`.
-            .allowlist_type("(DEVICE_OBJECT|DRIVER_OBJECT|IRP|UNICODE_STRING|IO_STACK_LOCATION)")
+            // `wdk-sys`. `DEVICE_CAPABILITIES` : paramètre de
+            // `IAdapterPowerManagement::QueryDeviceCapabilities`, nommé par le trait
+            // `portcls::AdapterPowerManagement`.
+            .allowlist_type(
+                "(DEVICE_OBJECT|DRIVER_OBJECT|IRP|UNICODE_STRING|IO_STACK_LOCATION|DEVICE_CAPABILITIES)",
+            )
             .default_enum_style(bindgen::EnumVariation::ModuleConsts)
             .layout_tests(true)
             .generate_comments(false)

@@ -1,0 +1,20 @@
+[package]
+name = "portcls"
+description = "Enveloppes sûres entre traits Rust et vtables PortCls (workspace noyau, testé en mode utilisateur)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+# `no_std` + `alloc` : l'allocateur global vient du binaire final (`wdk-alloc` dans
+# `conduit-kmd`, celui de `std` sous `cargo test`). Aucune dépendance à `wdk-sys` : le
+# crate se teste en mode utilisateur avec de faux ports (`tests/`).
+[dependencies]
+conduit-com = { path = "../../../crates/conduit-com" }
+portcls-sys = { path = "../portcls-sys", features = ["com"] }
+
+[lints]
+workspace = true

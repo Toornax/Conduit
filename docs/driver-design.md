@@ -173,6 +173,14 @@ Les **enveloppes PortCls** (`drivers/windows/portcls`) relient un trait Rust sû
 correspondante de `portcls-sys`, et enveloppent les interfaces reçues (`IPortWaveRT`,
 `IResourceList`…) ; elles se testent en mode utilisateur avec de faux ports qui appellent
 les vtables comme PortCls le ferait. `conduit-kmd` n'implémente que les traits.
+La vtable de chaque type implémenteur est une **constante associée** d'un trait
+compagnon (`impl<T: MiniportTopology> TopologyVtbl for T { const VTBL: IMiniportTopologyVtbl
+= … }`, slots = thunks génériques instanciés pour `T`), dont `&T::VTBL` est promu en
+`&'static` par le compilateur : ni `static` par type, ni macro. La feature **`com`** de
+`portcls-sys` (module `com`, désactivée par défaut) déclare les vtables et interfaces
+générées `ComVtable`/`ComInterface` avec leurs tables d'IID (bases par préfixe de
+vtable) ; c'est la seule dépendance de `portcls-sys` hors scripts de build, et elle reste
+optionnelle.
 
 PortCls dialogue avec le miniport par des interfaces COM (vtable C++ pure, convention
 `__stdcall`, `IUnknown` en tête). Représentation :

@@ -37,6 +37,11 @@
 //! par `cl.exe` sur les mêmes en-têtes (`tools/sizeof-probe.c`,
 //! `drivers/windows/tools/regen-layout.ps1`) ; bindgen émet en outre ses propres
 //! assertions de disposition (`const _: () = …`), vérifiées à la compilation.
+//!
+//! Feature **`com`** (désactivée par défaut) : le module [`com`] relie les vtables et
+//! interfaces générées au modèle objet `conduit-com` (`ComVtable`, `ComInterface`), pour
+//! le crate `portcls` ; `cargo test -p portcls-sys --features com` en vérifie la
+//! disposition et les IID.
 
 #![no_std]
 
@@ -44,6 +49,8 @@
 extern crate std;
 
 mod bindings;
+#[cfg(feature = "com")]
+pub mod com;
 pub mod fixups;
 
 pub use bindings::*;

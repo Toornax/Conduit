@@ -13,7 +13,15 @@ publish = false
 # sous `cargo test`). Les types NT référencés par PortCls (`DRIVER_OBJECT`, `IRP`…) sont
 # régénérés ici par bindgen ; `conduit-kmd` convertit entre les deux définitions par
 # `cast()` (même disposition, même en-tête source).
+[features]
+default = []
+# Relie les vtables et interfaces générées au modèle objet `conduit-com` (`ComVtable`,
+# `ComInterface`, module `com`). Activée par `portcls` ; hors feature, le crate reste
+# sans dépendance.
+com = ["dep:conduit-com"]
+
 [dependencies]
+conduit-com = { path = "../../../crates/conduit-com", optional = true }
 
 [build-dependencies]
 wdk-build.workspace = true

@@ -2,7 +2,7 @@
 # sous Windows avec le WDK (`cargo wdk build` ou `tools/build.ps1`). Jamais ouvert par Nix.
 [workspace]
 resolver = "2"
-members = ["portcls-sys", "conduit-kmd"]
+members = ["portcls-sys", "portcls", "conduit-kmd"]
 
 [workspace.package]
 version = "0.1.0"
