@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/conduit-core",
+    "crates/conduit-engine",
+    "crates/conduit-backend",
+    "crates/conduit-backend-wasapi",
+    "crates/conduit-backend-pipewire",
+    "crates/conduit-backend-coreaudio",
+    "crates/conduit-protocol",
+    "crates/conduitd",
+    "crates/conduitctl",
+    "crates/conduit-gui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ToorNax/conduit"
+authors = ["Conduit contributors"]
+
+[workspace.dependencies]
+conduit-core = { path = "crates/conduit-core" }
+conduit-engine = { path = "crates/conduit-engine" }
+conduit-backend = { path = "crates/conduit-backend" }
+conduit-protocol = { path = "crates/conduit-protocol" }
+
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+proptest = "1"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 4
+
+[profile.bench]
+inherits = "release"
