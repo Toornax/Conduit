@@ -12,6 +12,7 @@ use iced::{Element, Fill, Subscription, Task};
 
 use crate::i18n::{self, Text};
 use crate::ipc::{self, Requester};
+use crate::model::Mirror;
 
 /// État de la connexion au démon.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -83,6 +84,7 @@ pub struct App {
     socket: PathBuf,
     connection: Connection,
     requester: Option<Requester>,
+    mirror: Mirror,
 }
 
 impl App {
@@ -92,6 +94,7 @@ impl App {
             socket,
             connection: Connection::Starting,
             requester: None,
+            mirror: Mirror::default(),
         }
     }
 
@@ -103,6 +106,11 @@ impl App {
     /// État de la connexion.
     pub fn connection(&self) -> &Connection {
         &self.connection
+    }
+
+    /// Miroir de l'état du démon.
+    pub fn mirror(&self) -> &Mirror {
+        &self.mirror
     }
 
     /// Titre de la fenêtre.
@@ -124,11 +132,16 @@ impl App {
         match event {
             ipc::Event::Started(requester) => self.requester = Some(requester),
             ipc::Event::Connecting => self.connection = Connection::Connecting,
-            ipc::Event::Ready { server } => self.connection = Connection::Ready { server },
+            ipc::Event::Ready { server, snapshot } => {
+                self.mirror.reset(*snapshot);
+                self.connection = Connection::Ready { server };
+            }
             ipc::Event::Lost { reason, retry_in } => {
                 self.connection = Connection::Lost { reason, retry_in };
             }
-            ipc::Event::Notified(_) | ipc::Event::Failed(_) => {}
+            // L'état ne suit que les notifications : aucun optimisme local.
+            ipc::Event::Notified(notification) => self.mirror.apply(&notification),
+            ipc::Event::Failed(_) => {}
         }
     }
 
@@ -190,6 +203,8 @@ pub fn run(socket: PathBuf) -> iced::Result {
 mod tests {
     use super::*;
 
+    use crate::model::fixtures::snapshot;
+
     fn app() -> App {
         App::new(PathBuf::from("/tmp/conduitd.sock"))
     }
@@ -202,9 +217,12 @@ mod tests {
         assert_eq!(*a.connection(), Connection::Connecting);
         a.apply_ipc(ipc::Event::Ready {
             server: "conduitd 0.1.0".into(),
+            snapshot: Box::new(snapshot()),
         });
         assert!(a.connection().is_ready());
         assert!(a.connection().summary().contains("conduitd 0.1.0"));
+        assert!(a.mirror().is_loaded());
+        assert_eq!(a.mirror().cables.len(), 2);
         assert!(a.connection().hint().is_none());
         a.apply_ipc(ipc::Event::Lost {
             reason: "connexion perdue".into(),

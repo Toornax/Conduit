@@ -7,6 +7,8 @@
 //! Organisation :
 //!
 //! - [`i18n`] : table des textes affichés (une seule langue pour l'instant) ;
+//! - [`model`] : miroir de l'état du démon, alimenté par réduction pure des
+//!   notifications ;
 //! - [`ipc`] : connexion, chargement initial, boucle d'événements et
 //!   reconnexion — **indépendante d'`iced`**, donc testable sans fenêtre ;
 //! - [`app`] : architecture Elm d'`iced` (`Message`, `update`, `view`,
@@ -20,6 +22,7 @@
 pub mod app;
 pub mod i18n;
 pub mod ipc;
+pub mod model;
 
 pub use app::run;
 

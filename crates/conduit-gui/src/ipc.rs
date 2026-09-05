@@ -22,9 +22,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use conduit_protocol::client::{Client, ClientError};
-use conduit_protocol::Command;
-use conduit_protocol::Notification;
+use conduit_protocol::{Command, Notification, Reply};
 use tokio::sync::mpsc;
+
+use crate::model::Snapshot;
 
 /// Délai avant la première nouvelle tentative de connexion.
 pub const RETRY_MIN: Duration = Duration::from_secs(1);
@@ -93,10 +94,12 @@ pub enum Event {
     Started(Requester),
     /// Une tentative de connexion commence.
     Connecting,
-    /// Connexion établie et abonnement actif.
+    /// Connexion établie, abonnement actif et état initial chargé.
     Ready {
         /// Identification du démon (`HelloReply::server`).
         server: String,
+        /// État complet du démon au moment de la connexion.
+        snapshot: Box<Snapshot>,
     },
     /// Notification diffusée par le démon.
     Notified(Box<Notification>),
@@ -166,6 +169,39 @@ pub async fn run<S: EventSink>(socket: PathBuf, mut sink: S) {
     }
 }
 
+/// Charge l'état initial du démon : `Status`, `Nodes`, `Links`, `CableList`.
+///
+/// `CableList` est toléré en erreur : un backend sans câbles virtuels le
+/// refuse, ce qui n'empêche pas d'afficher le reste.
+pub async fn load(client: &mut Client) -> Result<Snapshot, ClientError> {
+    let status = match client.call(Command::Status).await? {
+        Reply::Status(status) => status,
+        _ => return Err(ClientError::Unexpected),
+    };
+    let nodes = match client.call(Command::Nodes).await? {
+        Reply::Nodes { nodes } => nodes,
+        _ => return Err(ClientError::Unexpected),
+    };
+    let links = match client.call(Command::Links).await? {
+        Reply::Links { links } => links,
+        _ => return Err(ClientError::Unexpected),
+    };
+    let cables = match client.request(Command::CableList).await? {
+        Ok(Reply::Cables { cables }) => cables,
+        Ok(_) => return Err(ClientError::Unexpected),
+        Err(error) => {
+            tracing::info!("câbles indisponibles sur ce démon : {}", error.message);
+            Vec::new()
+        }
+    };
+    Ok(Snapshot {
+        status,
+        nodes,
+        links,
+        cables,
+    })
+}
+
 /// Ce qui a réveillé la boucle d'une session.
 enum Step {
     /// Une commande à envoyer, ou `None` si la file est fermée.
@@ -187,10 +223,12 @@ async fn session<S: EventSink>(
     let mut client = Client::connect(socket, &client_name()).await?;
     let server = client.server().server.clone();
     // Abonnement avant le chargement : les notifications reçues pendant le
-    // chargement sont mises de côté par le client et appliquées ensuite.
+    // chargement sont mises de côté par le client et rejouées ensuite, donc
+    // aucun changement n'est perdu entre les deux.
     client.subscribe().await?;
+    let snapshot = Box::new(load(&mut client).await?);
     *connected = true;
-    if sink.send(Event::Ready { server }).await.is_err() {
+    if sink.send(Event::Ready { server, snapshot }).await.is_err() {
         return Ok(());
     }
     loop {
