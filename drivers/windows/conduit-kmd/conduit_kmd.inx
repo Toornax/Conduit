@@ -6,9 +6,12 @@
 ; avec `infverif /w` (exigences « Windows Driver » : fichiers dans le magasin des pilotes,
 ; DIRID 13). Le nom du fichier est imposé par cargo-wdk : nom du crate avec `_`.
 ;
-; M1a-01 : INF minimal pour un périphérique énuméré à la racine (Root\ConduitCable), classe
-; MEDIA. Les sections Kernel Streaming et PortCls (Include=ks.inf,wdmaudio.inf, interfaces
-; KSCATEGORY_*, noms des endpoints) arrivent en M1a-09 (docs/driver-design.md §4).
+; M1a-02 : adaptateur PortCls pour un périphérique énuméré à la racine (Root\ConduitCable),
+; classe MEDIA. Include/Needs de ks.inf et wdmaudio.inf enregistrent Kernel Streaming et
+; PortCls ; AssociatedFilters et Driver sont les valeurs que wdmaud attend d'un adaptateur
+; audio. Les interfaces KSCATEGORY_* et les noms des endpoints arrivent avec les
+; sous-périphériques (M1a-09, docs/driver-design.md §4). Structure de référence : SYSVAD
+; SimpleAudioSample, jamais copié.
 ;
 
 [Version]
@@ -36,10 +39,17 @@ conduit_kmd.sys = 1
 %ConduitCable.DeviceDesc% = ConduitCable_Install, Root\ConduitCable
 
 [ConduitCable_Install.NT]
+Include   = ks.inf, wdmaudio.inf
+Needs     = KS.Registration, WDMAUDIO.Registration
 CopyFiles = ConduitCable_CopyFiles
+AddReg    = ConduitCable_AddReg
 
 [ConduitCable_CopyFiles]
 conduit_kmd.sys
+
+[ConduitCable_AddReg]
+HKR,,AssociatedFilters,,"wdmaud,swmidi,redbook"
+HKR,,Driver,,conduit_kmd.sys
 
 [ConduitCable_Install.NT.Services]
 AddService = conduit_kmd, 0x00000002, ConduitCable_Service

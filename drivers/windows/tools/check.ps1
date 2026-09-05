@@ -28,6 +28,20 @@ try {
       exit $LASTEXITCODE
     }
   }
+
+  # Scripts de VM : analyse syntaxique seulement (ils exigent Hyper-V et l'élévation) ;
+  # les tests Pester des fonctions pures se lancent à part (Invoke-Pester tools\tests).
+  Write-Host "== analyse syntaxique des scripts tools\*.ps1, *.psm1"
+  $scripts = Get-ChildItem -Path $PSScriptRoot -Recurse -Include "*.ps1", "*.psm1"
+  foreach ($script in $scripts) {
+    $tokens = $null
+    $errors = $null
+    [System.Management.Automation.Language.Parser]::ParseFile($script.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+    if (@($errors).Count -gt 0) {
+      foreach ($e in $errors) { $Host.UI.WriteErrorLine("$($script.Name):$($e.Extent.StartLineNumber): $($e.Message)") }
+      exit 1
+    }
+  }
   Write-Host "workspace noyau : vérifications vertes"
 } finally {
   Pop-Location

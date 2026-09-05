@@ -23,7 +23,9 @@ wdk-build.workspace = true
 wdk.workspace = true
 wdk-alloc.workspace = true
 wdk-sys.workspace = true
-portcls-sys = { path = "../portcls-sys" }
+# Feature `kernel` : active `wdk-sys` dans portcls-sys (déclarations PortCls), que
+# `cargo test -p portcls-sys` n'active pas.
+portcls-sys = { path = "../portcls-sys", features = ["kernel"] }
 
 [lints]
 workspace = true
