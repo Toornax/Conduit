@@ -4,6 +4,7 @@
 //!
 //! - les types de base ([`types`]) : fréquence, nombre de trames, canaux, gains ;
 //! - les tampons audio planaires pré-alloués ([`buffer`]) ;
+//! - un tampon circulaire SPSC temps réel ([`ring`]).
 //!
 //! # Contraintes temps réel
 //!
@@ -15,7 +16,9 @@
 #![warn(missing_docs)]
 
 pub mod buffer;
+pub mod ring;
 pub mod types;
 
 pub use buffer::AudioBuffer;
+pub use ring::{RingBuffer, RingConsumer, RingProducer};
 pub use types::{ChannelCount, Db, Frames, Gain, Quantum, SampleRate};
