@@ -6,9 +6,25 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Conduit — conduitctl"
+description = "Conduit — CLI de contrôle et de diagnostic"
+
+[[bin]]
+name = "conduitctl"
+path = "src/main.rs"
 
 [dependencies]
+conduit-core = { workspace = true, features = ["serde"] }
+conduit-backend = { workspace = true, features = ["serde"] }
+conduit-protocol = { workspace = true, features = ["client"] }
+clap = { version = "4", features = ["derive"] }
+directories = "6"
+serde_json = "1"
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+
+[dev-dependencies]
+conduitd = { path = "../conduitd" }
+tempfile = "3"
 
 [lints]
 workspace = true

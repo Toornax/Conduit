@@ -217,15 +217,15 @@ allocation dans le fil audio, CI verte partout, couverture ≥ 80 % sur `core` e
 
 ### M0.H — `conduit-protocol`
 
-- [ ] **M0-70** `feat(protocol): types Request, Response, Event et serde`
+- [x] **M0-70** `feat(protocol): types Request, Response, Event et serde`
   Miroir des commandes de l'engine, erreurs avec code et message destiné à l'utilisateur.
   *Fait quand* : round-trip serde de chaque variante.
-- [ ] **M0-71** `feat(protocol): framing u32 + MessagePack avec limites de taille`
+- [x] **M0-71** `feat(protocol): framing u32 + MessagePack avec limites de taille`
   Encodeur/décodeur incrémental, taille maximale de trame, erreurs non paniquantes.
   *Fait quand* : tests de trames tronquées, trop grandes, corrompues.
-- [ ] **M0-72** `feat(protocol): négociation Hello et version`
+- [x] **M0-72** `feat(protocol): négociation Hello et version`
   *Fait quand* : test client trop ancien / trop récent → erreur claire.
-- [ ] **M0-73** `feat(protocol): export JSON Schema et docs/protocol.md généré`
+- [x] **M0-73** `feat(protocol): export JSON Schema et docs/protocol.md généré`
   *Fait quand* : job CI vérifie que la doc est à jour avec les types.
 - [ ] **M0-74** `test(protocol): fuzzing du décodeur avec cargo-fuzz`
   Cible dans le devshell nightly ; check Nix court (corpus seulement) ; job long en nocturne.
@@ -233,28 +233,28 @@ allocation dans le fil audio, CI verte partout, couverture ≥ 80 % sur `core` e
 
 ### M0.I — `conduitd`
 
-- [ ] **M0-80** `feat(daemon): squelette, configuration TOML, chemins par OS`
+- [x] **M0-80** `feat(daemon): squelette, configuration TOML, chemins par OS`
   Chargement/validation de la config de SPEC §5.7, valeurs par défaut, chemins via `directories`.
   *Fait quand* : tests de config valide/invalide avec messages exploitables.
-- [ ] **M0-81** `feat(daemon): journalisation tracing (fichier tournant + stderr)`
+- [x] **M0-81** `feat(daemon): journalisation tracing (fichier tournant + stderr)`
   *Fait quand* : niveau configurable, rotation testée.
-- [ ] **M0-82** `feat(daemon): serveur IPC multi-clients (socket Unix, named pipe)`
+- [x] **M0-82** `feat(daemon): serveur IPC multi-clients (socket Unix, named pipe)`
   `tokio`, permissions 0600 / ACL utilisateur, limite de clients.
   *Fait quand* : test de deux clients simultanés sur chaque OS en CI.
-- [ ] **M0-83** `feat(daemon): pont IPC ↔ engine`
+- [x] **M0-83** `feat(daemon): pont IPC ↔ engine`
   *Fait quand* : chaque requête du protocole a un test bout en bout avec le backend null.
-- [ ] **M0-84** `feat(daemon): abonnements et diffusion des événements`
+- [x] **M0-84** `feat(daemon): abonnements et diffusion des événements`
   *Fait quand* : test : événement engine → reçu par les abonnés seulement (F-43).
-- [ ] **M0-85** `feat(daemon): persistance et restauration de l'état du graphe`
+- [x] **M0-85** `feat(daemon): persistance et restauration de l'état du graphe`
   Sauvegarde atomique (fichier temporaire + renommage) à chaque changement, restauration au démarrage par clés stables.
   *Fait quand* : test redémarrage simulé, graphe identique (F-30).
-- [ ] **M0-86** `feat(daemon): règles d'auto-connexion`
+- [x] **M0-86** `feat(daemon): règles d'auto-connexion`
   *Fait quand* : test : nœud apparaissant correspondant à une règle → lié (F-32).
-- [ ] **M0-87** `feat(daemon): arrêt propre et watchdog du fil audio`
+- [x] **M0-87** `feat(daemon): arrêt propre et watchdog du fil audio`
   Signaux/événements de contrôle, fermeture des périphériques, détection d'un fil audio
   bloqué > 1 s avec journalisation et redémarrage du moteur.
   *Fait quand* : test de blocage simulé → moteur redémarré, clients notifiés.
-- [ ] **M0-88** `feat(daemon): rapport de diagnostic (dump)`
+- [x] **M0-88** `feat(daemon): rapport de diagnostic (dump)`
   *Fait quand* : le rapport ne contient aucun chemin utilisateur ni nom de machine.
 
 ### M0.J — `conduitctl`

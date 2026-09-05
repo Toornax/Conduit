@@ -213,9 +213,9 @@ impl Manager {
                 self.save();
             }
         }
-        if self.dirty {
-            self.save();
-        }
+        // Sauvegarde finale inconditionnelle : l'état sur disque reflète toujours le
+        // dernier arrêt propre.
+        self.save();
         let _ = self.events.send(Notification::Shutdown);
         self.engine.shutdown();
     }

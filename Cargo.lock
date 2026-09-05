@@ -261,6 +261,18 @@ version = "0.1.0"
 [[package]]
 name = "conduitctl"
 version = "0.1.0"
+dependencies = [
+ "clap",
+ "conduit-backend",
+ "conduit-core",
+ "conduit-protocol",
+ "conduitd",
+ "directories",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "conduitd"
