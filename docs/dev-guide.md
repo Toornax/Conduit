@@ -24,6 +24,7 @@ conduit-core ← conduit-backend ← conduit-protocol ← conduit-engine ← con
 |---|---|---|
 | `conduit-core` | graphe, exécution, tampons, DSP, nœuds, rééchantillonnage, DLL, ports asynchrones | aucune |
 | `conduit-backend` | traits `Backend`, `DeviceHandle`, `CableControl`, événements, backend `null`, priorité RT | `rt` seulement |
+| `conduit-backend-pipewire` | backend Linux : fil de boucle PipeWire, registre, `pw_stream` | Linux |
 | `conduit-protocol` | API (`Command`, `Reply`, `Notification`), enveloppe, framing, client, schéma | aucune |
 | `conduit-engine` | `Engine` : périphériques, rôles, pilote, horloge interne, commandes | aucune |
 | `conduitd` | configuration, IPC, service, persistance, règles, watchdog | socket / pipe |
@@ -76,10 +77,28 @@ Une poignée clonée (`null.clone()`) partage les périphériques : le test scri
 backend que le moteur possède (ajout/retrait à chaud, injection de signal avec
 `set_signal`, lecture de ce qui a été rendu avec `take_recorded`).
 
+## 4 bis. Backend PipeWire (Linux)
+
+`conduit-backend-pipewire` connecte Conduit au démon PipeWire. Un **fil dédié**
+(`loop_thread`) fait tourner la boucle : rien de `pipewire-rs` n'est `Send`, donc
+contexte, registre, métadonnées et `pw_stream` y vivent tous. Le reste du programme
+lui parle par `pw::channel` (ouvrir, activer, fermer, quitter) et lit l'état par
+`Arc<Mutex<Shared>>`. Le rappel `process` d'un flux tourne, lui, sur le fil temps
+réel de PipeWire : il respecte §2 et se coordonne avec `start`/`stop` par un
+automate atomique (`arrêté` / `actif` / `en cours`), si bien que `stop` ne rend la
+main qu'après le rappel en cours.
+
+Les tests d'intégration lancent un **démon headless** (`tests/common/mod.rs`,
+configuration `tests/pipewire-test.conf`) : `core.daemon = true` et
+`libpipewire-module-access` sont indispensables. Un flux client n'est relié et
+cadencé que par un gestionnaire de session : les tests qui veulent voir le rappel
+`process` lancent aussi `wireplumber`. Sans ces binaires dans le `PATH`, les tests
+se sautent avec un message.
+
 ## 5. Tests
 
 ```sh
-cargo test --workspace --all-features           # tout
+cargo test --workspace --all-features           # tout (Linux : libpipewire-0.3-dev)
 cargo test -p conduit-core --lib asyncport      # un module
 cargo test --release -p conduit-core -- --ignored input_port_one_hour
 cargo bench -p conduit-core                     # criterion

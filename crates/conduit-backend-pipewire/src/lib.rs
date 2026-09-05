@@ -9,10 +9,14 @@
 //!   disparition ;
 //! - suit les métadonnées `default` (`default.audio.sink` / `default.audio.source`)
 //!   pour renseigner `is_default` ;
-//! - reçoit par `pw::channel` les ordres du reste du programme : la bibliothèque
-//!   PipeWire n'est pas `Send`, tout ce qui la touche vit sur ce fil.
+//! - exécute toutes les opérations sur les flux (`pw_stream`), reçues par
+//!   `pw::channel` : la bibliothèque PipeWire n'est pas `Send`, tout ce qui la
+//!   touche vit sur ce fil.
 //!
-//! L'ouverture de flux arrive avec la tâche M3-03.
+//! Le rappel `process` d'un flux tourne, lui, sur le fil temps réel de PipeWire :
+//! il n'alloue pas, ne verrouille pas et ne journalise pas (voir `docs/dev-guide.md`
+//! §2). La coordination entre le fil de boucle et le fil temps réel passe par des
+//! atomiques.
 //!
 //! Ce crate ne compile de code que sur Linux ; ailleurs il n'expose rien, pour que
 //! `cargo check --workspace` reste vert sur toutes les cibles.
@@ -42,8 +46,10 @@ mod backend;
 mod devices;
 #[cfg(target_os = "linux")]
 mod loop_thread;
+#[cfg(target_os = "linux")]
+mod stream;
 
 #[cfg(target_os = "linux")]
-pub use backend::PipewireBackend;
+pub use backend::{PipewireBackend, PipewireHandle};
 #[cfg(target_os = "linux")]
 pub use devices::{DEFAULT_BLOCK_FRAMES, DEFAULT_SAMPLE_RATE};

@@ -445,11 +445,21 @@ testée d'abord avec le backend null, puis sur Windows.
 
 Objectif : câbles et routage fonctionnels sur PipeWire, endurance 24 h.
 
-- [ ] **M3-01** `feat(pipewire): connexion au démon PipeWire, suivi du registre`
+- [x] **M3-01** `feat(pipewire): connexion au démon PipeWire, suivi du registre`
   *Fait quand* : `DeviceEvent` émis à l'ajout/retrait d'un nœud PipeWire (F-10, F-20).
+  Fait : fil de boucle dédié, `Added` / `Removed` / `DefaultChanged`, test d'intégration
+  sur un démon headless. Réserve : le registre ne publie pas `audio.channels`, les
+  canaux retombent sur `audio.position` puis sur 2 ; la fréquence (48 kHz) et le
+  quantum (256) annoncés sont ceux du graphe, pas encore lus dans les métadonnées
+  `settings`.
 - [ ] **M3-02** `feat(pipewire): nœuds câbles (pw_stream Audio/Sink et Audio/Source)`
   *Fait quand* : Conduit 1 visible dans les réglages son ; test de boucle.
-- [ ] **M3-03** `feat(pipewire): entrée/sortie des périphériques réels via streams`
+- [x] **M3-03** `feat(pipewire): entrée/sortie des périphériques réels via streams`
+  Fait : `open()` crée un `pw_stream` f32 entrelacé ciblant le nœud, `start`/`stop`/
+  `clock` et destruction propre, rappel `process` sans allocation ni verrou. Test :
+  rendu sur le `Null-Sink` du banc headless (avec WirePlumber, sans lequel aucun flux
+  client n'est relié). Reste hors périmètre : la latence n'est pas encore remontée à
+  la DLL (M3-04).
 - [ ] **M3-04** `feat(pipewire): horloge et intégration DLL`
   *Fait quand* : xruns = 0 sur 1 h avec deux cartes.
 - [ ] **M3-05** `feat(pipewire): CableControl (création, destruction, noms)`

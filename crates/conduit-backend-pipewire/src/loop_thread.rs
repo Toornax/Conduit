@@ -5,22 +5,52 @@
 //! `pw::channel` (commandes) et lit l'état par `Arc<Mutex<…>>`.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use conduit_backend::event::EventBroadcaster;
-use conduit_backend::{DeviceDirection, DeviceEvent, DeviceId};
+use conduit_backend::{
+    AudioCallback, BackendError, DeviceDirection, DeviceEvent, DeviceId, StreamFormat,
+};
 use pipewire as pw;
 use pw::metadata::{Metadata, MetadataListener};
 use pw::types::ObjectType;
 
 use crate::devices::{device_from_props, metadata_name, Shared};
+use crate::stream::{OpenStream, StreamShared};
+
+/// Identifiant local d'un flux ouvert.
+pub(crate) type StreamKey = u64;
 
 /// Ordre envoyé au fil de boucle.
 pub(crate) enum Command {
+    /// Ouvrir un flux (boîte : la variante serait sinon bien plus grosse que les autres).
+    Open(Box<OpenRequest>),
+    /// Démarrer ou arrêter les rappels d'un flux.
+    SetActive {
+        key: StreamKey,
+        active: bool,
+        reply: mpsc::Sender<Result<(), BackendError>>,
+    },
+    /// Fermer un flux et confirmer qu'aucun rappel ne peut plus survenir.
+    Close {
+        key: StreamKey,
+        reply: mpsc::Sender<()>,
+    },
     /// Arrêter la boucle.
     Quit,
+}
+
+/// Demande d'ouverture, préparée hors du fil de boucle.
+pub(crate) struct OpenRequest {
+    pub(crate) key: StreamKey,
+    pub(crate) id: DeviceId,
+    pub(crate) format: StreamFormat,
+    pub(crate) callback: AudioCallback,
+    pub(crate) shared: Arc<StreamShared>,
+    pub(crate) reply: mpsc::Sender<Result<(), BackendError>>,
 }
 
 /// Nom du démon visé, pour les messages d'erreur.
@@ -91,6 +121,8 @@ pub(crate) fn run(
     };
 
     let ready = Rc::new(RefCell::new(Some(ready)));
+    let streams: Rc<RefCell<HashMap<StreamKey, OpenStream>>> =
+        Rc::new(RefCell::new(HashMap::new()));
     let metadata: Rc<RefCell<Option<(u32, Metadata, MetadataListener)>>> =
         Rc::new(RefCell::new(None));
 
@@ -126,6 +158,7 @@ pub(crate) fn run(
 
         let shared_rm = Arc::clone(&shared);
         let events_rm = Arc::clone(&events);
+        let streams_rm = Rc::clone(&streams);
         let metadata_rm = Rc::clone(&metadata);
 
         registry
@@ -185,6 +218,11 @@ pub(crate) fn run(
                 let Some((info, default_cleared)) = removed else {
                     return;
                 };
+                for stream in streams_rm.borrow().values() {
+                    if stream.device == info.id {
+                        stream.shared.mark_disconnected();
+                    }
+                }
                 let mut events = events_rm.lock().expect("abonnés");
                 events.send(DeviceEvent::Removed {
                     id: info.id.clone(),
@@ -200,9 +238,35 @@ pub(crate) fn run(
     };
 
     let _commands = {
+        let core = core.clone();
+        let shared = Arc::clone(&shared);
+        let streams = Rc::clone(&streams);
         let quit = main_loop.clone();
         receiver.attach(main_loop.loop_(), move |command| match command {
-            Command::Quit => quit.quit(),
+            Command::Open(request) => {
+                let (reply, result) = handle_open(&core, &shared, &streams, *request);
+                let _ = reply.send(result);
+            }
+            Command::SetActive { key, active, reply } => {
+                let result = match streams.borrow().get(&key) {
+                    Some(stream) => stream.set_active(active),
+                    None => Err(BackendError::Platform("flux déjà fermé".into())),
+                };
+                let _ = reply.send(result);
+            }
+            Command::Close { key, reply } => {
+                if let Some(stream) = streams.borrow_mut().remove(&key) {
+                    stream.close();
+                    shared.lock().expect("registre").mark_closed(&stream.device);
+                }
+                let _ = reply.send(());
+            }
+            Command::Quit => {
+                for (_, stream) in streams.borrow_mut().drain() {
+                    stream.close();
+                }
+                quit.quit();
+            }
         })
     };
 
@@ -210,6 +274,48 @@ pub(crate) fn run(
 }
 
 /// Applique une demande d'ouverture. Retourne l'émetteur de réponse et le résultat.
+type OpenOutcome = (
+    mpsc::Sender<Result<(), BackendError>>,
+    Result<(), BackendError>,
+);
+
+fn handle_open(
+    core: &pw::core::CoreRc,
+    shared: &Arc<Mutex<Shared>>,
+    streams: &Rc<RefCell<HashMap<StreamKey, OpenStream>>>,
+    request: OpenRequest,
+) -> OpenOutcome {
+    let OpenRequest {
+        key,
+        id,
+        format,
+        callback,
+        shared: stream_shared,
+        reply,
+    } = request;
+    let info = {
+        let mut guard = shared.lock().expect("registre");
+        match guard.get(&id).cloned() {
+            None => return (reply, Err(BackendError::NotFound(id))),
+            Some(_) if guard.is_open(&id) => return (reply, Err(BackendError::Busy(id))),
+            Some(info) => {
+                guard.mark_open(&id);
+                info
+            }
+        }
+    };
+    match crate::stream::open(core, &info, format, callback, stream_shared) {
+        Ok(stream) => {
+            streams.borrow_mut().insert(key, stream);
+            (reply, Ok(()))
+        }
+        Err(e) => {
+            shared.lock().expect("registre").mark_closed(&id);
+            (reply, Err(e))
+        }
+    }
+}
+
 /// Réagit à `default.audio.sink` / `default.audio.source`.
 fn on_default_metadata(
     shared: &Arc<Mutex<Shared>>,

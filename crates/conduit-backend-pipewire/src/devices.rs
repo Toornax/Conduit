@@ -3,7 +3,7 @@
 //! Le fil de boucle écrit ; les appels de [`Backend`](conduit_backend::Backend)
 //! lisent. Un `Mutex` std suffit : rien de tout cela n'est temps réel.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use conduit_backend::{CableId, DeviceDirection, DeviceId, DeviceInfo};
 use conduit_core::types::SampleRate;
@@ -30,6 +30,8 @@ pub(crate) struct Shared {
     by_global: HashMap<u32, DeviceId>,
     /// Périphérique par défaut, indexé par [`dir_index`].
     defaults: [Option<DeviceId>; 2],
+    /// Périphériques déjà ouverts (un flux à la fois par périphérique).
+    open: HashSet<DeviceId>,
 }
 
 pub(crate) fn dir_index(direction: DeviceDirection) -> usize {
@@ -54,7 +56,9 @@ impl Shared {
     /// Retire le périphérique correspondant à un global disparu.
     pub(crate) fn remove_global(&mut self, global: u32) -> Option<DeviceInfo> {
         let id = self.by_global.remove(&global)?;
-        self.devices.remove(&id)
+        let info = self.devices.remove(&id)?;
+        self.open.remove(&id);
+        Some(info)
     }
 
     /// Change le périphérique par défaut d'un sens. Retourne `true` si ça a changé.
@@ -87,6 +91,18 @@ impl Shared {
 
     pub(crate) fn get(&self, id: &DeviceId) -> Option<&DeviceInfo> {
         self.devices.get(id)
+    }
+
+    pub(crate) fn is_open(&self, id: &DeviceId) -> bool {
+        self.open.contains(id)
+    }
+
+    pub(crate) fn mark_open(&mut self, id: &DeviceId) {
+        self.open.insert(id.clone());
+    }
+
+    pub(crate) fn mark_closed(&mut self, id: &DeviceId) {
+        self.open.remove(id);
     }
 }
 
@@ -209,6 +225,17 @@ mod tests {
             Some("b".into())
         );
         assert_eq!(shared.default_device(DeviceDirection::Capture), None);
+    }
+
+    #[test]
+    fn open_marks_are_tracked() {
+        let mut shared = Shared::default();
+        shared.insert(1, info("a", DeviceDirection::Render));
+        assert!(!shared.is_open(&"a".into()));
+        shared.mark_open(&"a".into());
+        assert!(shared.is_open(&"a".into()));
+        shared.mark_closed(&"a".into());
+        assert!(!shared.is_open(&"a".into()));
     }
 
     #[test]

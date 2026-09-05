@@ -8,7 +8,9 @@
 
 mod common;
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use conduit_backend::{
     Backend, BackendError, DeviceDirection, DeviceEvent, DeviceId, StreamFormat,
@@ -108,6 +110,112 @@ fn reports_added_and_removed_nodes() {
 }
 
 #[test]
+fn render_stream_runs_between_start_and_stop() {
+    let daemon = daemon_or_skip!(
+        PwDaemon::start_with_session(),
+        "pipewire ou wireplumber (le cadencement d'un flux exige un gestionnaire de session)"
+    );
+    let mut backend = PipewireBackend::connect(Some(daemon.name())).expect("connexion");
+    let id = DeviceId::new(NULL_SINK);
+    assert!(common::wait_until(Duration::from_secs(5), || backend
+        .devices()
+        .map(|d| d.iter().any(|i| i.id == id))
+        .unwrap_or(false)));
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let faults = Arc::new(AtomicUsize::new(0));
+    let expected = Arc::new(AtomicU64::new(0));
+    let mut handle = {
+        let calls = Arc::clone(&calls);
+        let faults = Arc::clone(&faults);
+        let expected = Arc::clone(&expected);
+        backend
+            .open(
+                &id,
+                format(),
+                Box::new(move |io, clock| {
+                    // `position` avance exactement de `frames` d'un rappel à l'autre.
+                    if clock.position != expected.load(Ordering::Relaxed) {
+                        faults.fetch_add(1, Ordering::Relaxed);
+                    }
+                    expected.store(clock.position + clock.frames as u64, Ordering::Relaxed);
+                    match io.output.as_deref() {
+                        Some(out) if out.len() == clock.frames * 2 => {}
+                        _ => {
+                            faults.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    io.silence_output();
+                    calls.fetch_add(1, Ordering::Relaxed);
+                }),
+            )
+            .expect("ouverture du Null-Sink")
+    };
+
+    assert_eq!(handle.format(), format());
+    assert_eq!(handle.info().id, id);
+    assert!(!handle.is_running());
+    assert_eq!(handle.clock().position, 0);
+
+    handle.start().expect("démarrage");
+    assert!(handle.is_running());
+    assert!(
+        common::wait_until(Duration::from_secs(2), || calls.load(Ordering::Relaxed) > 0),
+        "aucun rappel dans les 2 s"
+    );
+
+    handle.stop().expect("arrêt");
+    assert!(!handle.is_running());
+    let after_stop = calls.load(Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        after_stop,
+        "des rappels ont eu lieu après stop"
+    );
+    assert_eq!(
+        faults.load(Ordering::Relaxed),
+        0,
+        "horloge ou tampon incohérent"
+    );
+
+    let clock = handle.clock();
+    assert!(clock.position > 0);
+    assert!(clock.frames > 0);
+    assert!(clock.timestamp_ns > 0);
+
+    // Un second flux sur le même périphérique est refusé tant que le premier vit.
+    assert!(matches!(
+        backend.open(&id, format(), Box::new(|_, _| {})),
+        Err(BackendError::Busy(_))
+    ));
+
+    drop(handle);
+    // Après fermeture, le périphérique est de nouveau ouvrable.
+    let again = backend.open(&id, format(), Box::new(|_, _| {}));
+    assert!(again.is_ok(), "réouverture refusée : {again:?}");
+}
+
+/// L'`Engine` détruit son backend avant ses poignées : la destruction ne doit pas
+/// attendre une réponse d'un fil de boucle déjà arrêté.
+#[test]
+fn dropping_the_backend_before_the_handle_does_not_hang() {
+    let daemon = daemon_or_skip!(PwDaemon::start(), "pipewire");
+    let mut backend = PipewireBackend::connect(Some(daemon.name())).expect("connexion");
+    let handle = backend
+        .open(&DeviceId::new(NULL_SINK), format(), Box::new(|_, _| {}))
+        .expect("ouverture du Null-Sink");
+    let start = Instant::now();
+    drop(backend);
+    drop(handle);
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "destruction trop lente : {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
 fn connecting_to_a_missing_daemon_says_what_to_check() {
     common::runtime_dir();
     let name = format!("pipewire-conduit-absent-{}", std::process::id());
@@ -137,8 +245,8 @@ fn wait_for<T>(
     timeout: Duration,
     mut pick: impl FnMut(&DeviceEvent) -> Option<T>,
 ) -> Option<T> {
-    let deadline = std::time::Instant::now() + timeout;
-    while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+    let deadline = Instant::now() + timeout;
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
         match events.recv_timeout(remaining) {
             Ok(event) => {
                 if let Some(value) = pick(&event) {
