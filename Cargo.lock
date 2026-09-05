@@ -321,6 +321,13 @@ name = "conduit-gui"
 version = "0.1.0"
 
 [[package]]
+name = "conduit-kmd-core"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "conduit-protocol"
 version = "0.1.0"
 dependencies = [

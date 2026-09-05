@@ -1,0 +1,23 @@
+[package]
+name = "conduit-kmd-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Conduit — logique portable du pilote noyau Windows (positions, copie cyclique, formats)"
+
+[features]
+default = []
+# Lie la bibliothèque standard : tests, fuzz et outils utilisateur seulement.
+# Le pilote noyau construit ce crate sans cette feature.
+std = []
+
+[dependencies]
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

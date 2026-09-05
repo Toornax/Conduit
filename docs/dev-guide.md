@@ -30,6 +30,7 @@ conduit-core ← conduit-backend ← conduit-protocol ← conduit-engine ← con
 | `conduitd` | configuration, IPC, service, persistance, règles, watchdog | socket / pipe |
 | `conduitctl` | CLI | — |
 | `conduit-testing` | allocateur de garde | — |
+| `conduit-kmd-core` | logique portable du pilote Windows : positions, copie cyclique, formats | aucune |
 
 ## 2. Le fil audio
 
@@ -95,6 +96,15 @@ cadencé que par un gestionnaire de session : les tests qui veulent voir le rapp
 `process` lancent aussi `wireplumber`. Sans ces binaires dans le `PATH`, les tests
 se sautent avec un message.
 
+## 4 ter. Logique du pilote Windows
+
+`conduit-kmd-core` est un crate `#![no_std]` sans `unsafe` ni dépendance, membre du
+workspace racine (ADR-012) : horloge virtuelle et positions (`position`), copie
+cyclique rendu → capture avec conversion F32 ↔ I16 (`ring`), validation des formats
+et taille de tampon (`format`). Son code tourne à `DISPATCH_LEVEL` dans le pilote :
+les lints anti-panique (`unwrap`, indexation, arithmétique débordante) sont en `deny`.
+Conception et invariants : [driver-design.md](driver-design.md) §2.1 et §5.
+
 ## 5. Tests
 
 ```sh
@@ -103,6 +113,7 @@ cargo test -p conduit-core --lib asyncport      # un module
 cargo test --release -p conduit-core -- --ignored input_port_one_hour
 cargo bench -p conduit-core                     # criterion
 cargo +nightly miri test -p conduit-core --lib -- ring:: graph:: executor::
+cargo +nightly miri test -p conduit-kmd-core --all-features --lib
 cargo +nightly fuzz run decoder                 # depuis crates/conduit-protocol
 cargo deny check
 cargo run -p conduit-protocol --features schema --example gen-docs   # docs/protocol.md

@@ -12,8 +12,10 @@ members = [
     "crates/conduitctl",
     "crates/conduit-gui",
     "crates/conduit-testing",
+    "crates/conduit-kmd-core",
 ]
-exclude = ["crates/conduit-protocol/fuzz"]
+# `drivers/windows` est le workspace noyau, indépendant (ADR-012).
+exclude = ["crates/conduit-protocol/fuzz", "drivers/windows"]
 
 [workspace.package]
 version = "0.1.0"
