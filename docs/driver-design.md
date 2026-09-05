@@ -244,6 +244,53 @@ certificat de test `WDRLocalTestCert` qu'il crée au besoin). Classe `MEDIA`, p�
 créer le nœud racine avec `devgen /add /hardwareid "Root\ConduitCable"` (WDK 26100).
 Retrait : `devgen /remove <id>` puis `pnputil /delete-driver oem<N>.inf /uninstall /force`.
 
+### 4.1 Descripteurs de filtres (M1a-06, minimum accepté par le générateur d'endpoints)
+
+Le spike enregistre le strict nécessaire pour qu'un endpoint rendu et un endpoint capture
+apparaissent ; volume, mute et jack (M1b-03) viendront après. Toutes les tables sont des
+`static` `#[repr(C)]` de `portcls-sys` construites en `const` dans `conduit-kmd::descriptors`.
+
+**Plages de formats** (`KSDATARANGE_AUDIO`, communes aux broches système) : type
+`KSDATAFORMAT_TYPE_AUDIO`, spécificateur `KSDATAFORMAT_SPECIFIER_WAVEFORMATEX`, 2 canaux,
+48 000 Hz min et max, une entrée par sous-type : `KSDATAFORMAT_SUBTYPE_IEEE_FLOAT` (32 bits)
+et `KSDATAFORMAT_SUBTYPE_PCM` (16 bits). Plage « analogique » des broches bridge : type audio,
+sous-type `KSDATAFORMAT_SUBTYPE_ANALOG`, spécificateur `KSDATAFORMAT_SPECIFIER_NONE`
+(`KSDATARANGE` simple).
+
+| Filtre | Broche | Flux | Communication | Catégorie / rôle |
+|---|---|---|---|---|
+| `WaveRender<n>` | 0 | `KSPIN_DATAFLOW_IN` | `KSPIN_COMMUNICATION_SINK` | `KSCATEGORY_AUDIO`, plages système : le lecteur écrit ici |
+| | 1 | `KSPIN_DATAFLOW_OUT` | `KSPIN_COMMUNICATION_NONE` | bridge, plage analogique |
+| `TopoRender<n>` | 0 | `KSPIN_DATAFLOW_IN` | `KSPIN_COMMUNICATION_NONE` | bridge, plage analogique |
+| | 1 | `KSPIN_DATAFLOW_OUT` | `KSPIN_COMMUNICATION_NONE` | catégorie `KSNODETYPE_SPEAKER` : c'est l'endpoint |
+| `WaveCapture<n>` | 0 | `KSPIN_DATAFLOW_IN` | `KSPIN_COMMUNICATION_NONE` | bridge, plage analogique |
+| | 1 | `KSPIN_DATAFLOW_OUT` | `KSPIN_COMMUNICATION_SINK` | `KSCATEGORY_AUDIO`, plages système : l'enregistreur lit ici |
+| `TopoCapture<n>` | 0 | `KSPIN_DATAFLOW_IN` | `KSPIN_COMMUNICATION_NONE` | catégorie `KSNODETYPE_LINE_CONNECTOR` : c'est l'endpoint |
+| | 1 | `KSPIN_DATAFLOW_OUT` | `KSPIN_COMMUNICATION_NONE` | bridge, plage analogique |
+
+Nœuds : aucun en M1a (connexion directe broche 0 → broche 1 via `PCFILTER_NODE` dans
+`PCCONNECTION_DESCRIPTOR`). Connexions physiques après enregistrement des quatre
+sous-périphériques : `WaveRender<n>` broche 1 → `TopoRender<n>` broche 0 ;
+`TopoCapture<n>` broche 1 → `WaveCapture<n>` broche 0. Chaque broche système déclare
+`KSPIN_DATAFLOW` correct et 1 instance possible (`MaxGlobalInstanceCount = 1`,
+`MaxFilterInstanceCount = 1`). Tables d'automatisation : vides pour le spike
+(`PCAUTOMATION_TABLE` sans propriétés ; PortCls gère `KSPROPSETID_Pin` et `KSPROPSETID_Topology`).
+
+**Séquence `StartDevice`** (adaptateur, IRQL `PASSIVE_LEVEL`), pour chaque câble *n* :
+
+1. `port = PcNewPort(CLSID_PortWaveRT)` ; `mini = new_wavert_object(WaveRender { n, cable })` ;
+   `port.Init(device, irp, mini.as_unknown(), None, resources)` ;
+   `PcRegisterSubdevice(device, "WaveRender<n>", port.as_unknown())`.
+2. Idem avec `CLSID_PortTopology` et `new_topology_object(TopoRender { n })`, nom `TopoRender<n>`.
+3. Idem pour `WaveCapture<n>` et `TopoCapture<n>`.
+4. `PcRegisterPhysicalConnection(device, wave_render_port, 1, topo_render_port, 0)` et
+   `PcRegisterPhysicalConnection(device, topo_capture_port, 1, wave_capture_port, 0)`.
+
+Tout `NTSTATUS` d'échec interrompt la séquence et est renvoyé : PortCls détruit ce qui a été
+enregistré. Les objets miniport sont possédés par leur port (PortCls prend ses références) ;
+l'adaptateur ne conserve que l'état partagé des câbles (`cable::Cable`, §5.3).
+`PcRegisterAdapterPowerManagement` n'est pas appelé avant M1b-06.
+
 ## 5. Horloge, positions, boucle locale
 
 ### 5.1 Horloge
