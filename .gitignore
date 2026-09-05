@@ -1,6 +1,6 @@
-/target
+*.profdata
+*.profraw
+.direnv/
 /result
 /result-*
-.direnv/
-*.profraw
-*.profdata
+/target
