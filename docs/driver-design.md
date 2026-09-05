@@ -383,8 +383,9 @@ libéré au `Drop` du flux (journalisé : ne doit pas arriver).
 
 ### 5.3 Boucle locale
 
-Un **timer noyau périodique par câble** (période 1 ms, `KeSetTimerEx` avec DPC ;
-`ExSetTimerResolution` n'est pas touché), armé quand au moins un flux du câble est en
+Un **timer noyau périodique par câble** (période 1 ms, timer `Ex*` haute résolution :
+`ExAllocateTimer` + `ExSetTimer(…, EX_TIMER_HIGH_RESOLUTION)`, rappel à `DISPATCH_LEVEL` ;
+`ExSetTimerResolution` n'est jamais touché, son effet est global), armé quand au moins un flux du câble est en
 `RUN`, désarmé sinon. À chaque DPC (`DISPATCH_LEVEL`, sous le spin lock du câble) :
 
 1. calculer la position courante du rendu et de la capture ;
@@ -417,11 +418,12 @@ bouclage n'est pas un cas particulier puisque le tampon est un multiple de la p�
 résiduel. **M1a-08 remonte ce timer au câble** (un seul timer, copie + notifications
 des deux flux) et y ajoute les étapes 1 à 4.
 
-Risque à trancher dans la VM : la période réelle d'un `KTIMER` de 1 ms est celle de
-l'horloge système (15,6 ms par défaut) tant que personne n'a élevé la résolution ; SYSVAD
-utilise `ExAllocateTimer`/`ExSetTimer` avec `EX_TIMER_HIGH_RESOLUTION`. Si les
-notifications arrivent trop tard pour un tampon de 10 ms, `PeriodicTimer` passera aux
-timers `Ex*` haute résolution (mêmes points d'appel).
+Décision (2026-09-06, sans attendre la VM) : un `KTIMER` de 1 ms n'a que la résolution de
+l'horloge système (15,6 ms par défaut) tant que personne ne l'élève, ce qui condamnerait
+les notifications d'un tampon de 10 ms ; `PeriodicTimer` utilise donc les timers `Ex*`
+haute résolution (`EX_TIMER_HIGH_RESOLUTION`, Windows 8.1+, ce que fait SYSVAD) dès
+M1a-08, avec `ExCancelTimer` puis `ExDeleteTimer` avant toute libération. `KeSetTimerEx`
+reste le repli si `ExAllocateTimer` échoue au démarrage (journalisé).
 
 ### 5.4 Formats
 
