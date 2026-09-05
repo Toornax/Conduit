@@ -33,9 +33,9 @@ allocation dans le fil audio, CI verte partout, couverture ≥ 80 % sur `core` e
 
 ### M0.A — Fondations du dépôt
 
-- [ ] **M0-01** `docs: ajoute SPEC.md et ROADMAP.md`
+- [x] **M0-01** `docs: ajoute SPEC.md et ROADMAP.md`
   *Fait quand* : les deux fichiers sont sur `main`.
-- [ ] **M0-02** `chore: initialise le workspace Cargo`
+- [x] **M0-02** `chore: initialise le workspace Cargo`
   Workspace vide avec les crates listés dans SPEC §7 (chacun avec un `lib.rs` vide),
   `rust-toolchain.toml` (stable épinglé, source de vérité pour le flake), `rustfmt.toml`,
   `clippy.toml`, `.gitignore`, `.editorconfig`, `LICENSE-MIT`, `LICENSE-APACHE`,
