@@ -16,5 +16,13 @@ publish = false
 conduit-com = { path = "../../../crates/conduit-com" }
 portcls-sys = { path = "../portcls-sys", features = ["com"] }
 
+# `kernel` : enveloppes des fonctions `Pc*` de `portcls.sys` (`adapter::new_port`,
+# `register_subdevice`, `register_physical_connection`), symboles que seul le pilote lie
+# (`conduit-kmd/build.rs`). Activée par `conduit-kmd` ; hors feature, le crate reste
+# testable en mode utilisateur sans symbole non résolu.
+[features]
+default = []
+kernel = []
+
 [lints]
 workspace = true

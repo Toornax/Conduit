@@ -5,24 +5,22 @@
 //! que `PcNewPort(IID_IPortTopology)` puis `IPort::Init` recevront (M1a-06). La vtable est
 //! la constante associée [`TopologyVtbl::VTBL`] (même technique que
 //! [`crate::power`]) : slots `IUnknown` génériques, puis `GetDescription`,
-//! `DataRangeIntersection` (hérités de `IMiniport`) et `Init`, dans l'ordre de
-//! `portcls.h`. `QueryInterface` répond à `IID_IUnknown`, `IID_IMiniport` et
-//! `IID_IMiniportTopology` (`IIDS` de `portcls_sys::com`).
+//! `DataRangeIntersection` (hérités de `IMiniport`, thunks de [`crate::miniport`]) et
+//! `Init`, dans l'ordre de `portcls.h`. `QueryInterface` répond à `IID_IUnknown`,
+//! `IID_IMiniport` et `IID_IMiniportTopology` (`IIDS` de `portcls_sys::com`).
 
 use core::ffi::c_void;
-use core::slice;
 
 use conduit_com::{
     ComObject, ComPtr, ComRef, NtStatus, STATUS_INVALID_PARAMETER, STATUS_NOT_IMPLEMENTED,
-    STATUS_SUCCESS,
 };
 use portcls_sys::{
-    IMiniportTopologyVtbl, IUnknown, KSDATARANGE, NTSTATUS, PCFILTER_DESCRIPTOR, PKSDATARANGE,
-    PPCFILTER_DESCRIPTOR, PPORTTOPOLOGY, PRESOURCELIST, PULONG, PUNKNOWN, PVOID, ULONG,
+    IMiniportTopologyVtbl, IUnknown, KSDATARANGE, NTSTATUS, PCFILTER_DESCRIPTOR, PPORTTOPOLOGY,
+    PRESOURCELIST, PUNKNOWN,
 };
 
+use crate::miniport::{self, MiniportSlots};
 use crate::received::{PortTopology, ResourceList};
-use crate::status::{STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL};
 use crate::unknown;
 
 /// Contrat de `IMiniportTopology` (`portcls.h`), vu du pilote.
@@ -77,6 +75,22 @@ pub trait MiniportTopology: Send + Sync + 'static {
     }
 }
 
+impl<T: MiniportTopology> MiniportSlots<T> for IMiniportTopologyVtbl {
+    fn description(me: &T) -> &'static PCFILTER_DESCRIPTOR {
+        me.description()
+    }
+
+    fn data_range_intersection(
+        me: &T,
+        pin_id: u32,
+        client: &KSDATARANGE,
+        my: &KSDATARANGE,
+        out: Option<&mut [u8]>,
+    ) -> Result<u32, NtStatus> {
+        me.data_range_intersection(pin_id, client, my, out)
+    }
+}
+
 /// Vtable `IMiniportTopology` d'un type implémenteur, constante associée (voir
 /// [`PowerVtbl`](crate::power::PowerVtbl)).
 pub trait TopologyVtbl {
@@ -89,8 +103,8 @@ impl<T: MiniportTopology> TopologyVtbl for T {
         QueryInterface: Some(unknown::query_interface::<IMiniportTopologyVtbl, T>),
         AddRef: Some(unknown::add_ref::<IMiniportTopologyVtbl, T>),
         Release: Some(unknown::release::<IMiniportTopologyVtbl, T>),
-        GetDescription: Some(get_description::<T>),
-        DataRangeIntersection: Some(data_range_intersection::<T>),
+        GetDescription: Some(miniport::get_description::<IMiniportTopologyVtbl, T>),
+        DataRangeIntersection: Some(miniport::data_range_intersection::<IMiniportTopologyVtbl, T>),
         Init: Some(init::<T>),
     };
 }
@@ -109,84 +123,6 @@ pub fn new_topology_object<T: MiniportTopology>(inner: T) -> TopologyObject<T> {
 /// Comme [`new_topology_object`], mais renvoie `None` si l'allocation échoue.
 pub fn try_new_topology_object<T: MiniportTopology>(inner: T) -> Option<TopologyObject<T>> {
     ComObject::try_new(&T::VTBL, inner)
-}
-
-/// `IMiniport::GetDescription`.
-///
-/// # Safety
-///
-/// `this` est un `*mut ComObject<IMiniportTopologyVtbl, T>` vivant pendant l'appel ;
-/// `description`, s'il n'est pas nul, pointe un emplacement de pointeur inscriptible.
-unsafe extern "C" fn get_description<T: MiniportTopology>(
-    this: *mut c_void,
-    description: *mut PPCFILTER_DESCRIPTOR,
-) -> NTSTATUS {
-    if description.is_null() {
-        return STATUS_INVALID_PARAMETER;
-    }
-    // SAFETY: `this` est un `ComObject<IMiniportTopologyVtbl, T>` vivant (contrat).
-    let me = unsafe { ComObject::<IMiniportTopologyVtbl, T>::inner(this) };
-    let desc: *const PCFILTER_DESCRIPTOR = me.description();
-    // SAFETY: `description` est non nul et inscriptible (contrat). Le prototype C veut un
-    // `PPCFILTER_DESCRIPTOR` (non `const`) mais PortCls ne fait que lire le descripteur :
-    // le `cast_mut` ne donne lieu à aucune écriture.
-    unsafe { *description = desc.cast_mut() };
-    STATUS_SUCCESS
-}
-
-/// `IMiniport::DataRangeIntersection`.
-///
-/// # Safety
-///
-/// `this` est un `*mut ComObject<IMiniportTopologyVtbl, T>` vivant pendant l'appel ;
-/// `data_range` et `matching` pointent des `KSDATARANGE` lisibles ; `out`, s'il n'est
-/// pas nul, pointe `out_len` octets inscriptibles ; `result_len` pointe un `ULONG`
-/// inscriptible.
-unsafe extern "C" fn data_range_intersection<T: MiniportTopology>(
-    this: *mut c_void,
-    pin_id: ULONG,
-    data_range: PKSDATARANGE,
-    matching: PKSDATARANGE,
-    out_len: ULONG,
-    out: PVOID,
-    result_len: PULONG,
-) -> NTSTATUS {
-    if data_range.is_null() || matching.is_null() || result_len.is_null() {
-        return STATUS_INVALID_PARAMETER;
-    }
-    let Ok(available) = usize::try_from(out_len) else {
-        return STATUS_INVALID_PARAMETER;
-    };
-    // SAFETY: `this` est un `ComObject<IMiniportTopologyVtbl, T>` vivant (contrat).
-    let me = unsafe { ComObject::<IMiniportTopologyVtbl, T>::inner(this) };
-    // SAFETY: `data_range` est non nul et pointe une `KSDATARANGE` lisible le temps de
-    // l'appel (contrat).
-    let client = unsafe { &*data_range };
-    // SAFETY: idem pour `matching`.
-    let my = unsafe { &*matching };
-    let buffer: Option<&mut [u8]> = if out.is_null() {
-        None
-    } else {
-        // SAFETY: `out` est non nul et pointe `out_len` octets inscriptibles, exclusifs
-        // le temps de l'appel (contrat) ; `u8` n'a pas de contrainte d'alignement.
-        Some(unsafe { slice::from_raw_parts_mut(out.cast::<u8>(), available) })
-    };
-    let has_buffer = buffer.is_some();
-
-    match me.data_range_intersection(pin_id, client, my, buffer) {
-        Ok(needed) => {
-            // SAFETY: `result_len` est non nul et inscriptible (contrat).
-            unsafe { *result_len = needed };
-            if has_buffer && needed <= out_len {
-                STATUS_SUCCESS
-            } else if out_len == 0 {
-                STATUS_BUFFER_OVERFLOW
-            } else {
-                STATUS_BUFFER_TOO_SMALL
-            }
-        }
-        Err(status) => status,
-    }
 }
 
 /// `IMiniportTopology::Init`.

@@ -25,9 +25,11 @@ wdk-alloc.workspace = true
 wdk-sys.workspace = true
 # Bindings PortCls/KS générés (mode C), crate autonome testable en mode utilisateur.
 portcls-sys = { path = "../portcls-sys" }
-# Enveloppes sûres traits Rust ↔ vtables PortCls (M1a-04) ; les objets seront
-# enregistrés auprès de PortCls en M1a-06.
-portcls = { path = "../portcls" }
+# Enveloppes sûres traits Rust ↔ vtables PortCls (M1a-04, M1a-05) ; la feature `kernel`
+# ajoute les enveloppes de `PcNewPort`/`PcRegisterSubdevice`/`PcRegisterPhysicalConnection`
+# (symboles de `portcls.lib`, lié par build.rs). Les objets seront enregistrés auprès de
+# PortCls en M1a-06.
+portcls = { path = "../portcls", features = ["kernel"] }
 
 [lints]
 workspace = true

@@ -324,7 +324,13 @@ proposition : trois semaines de travail effectif). Porte de décision en M1a-12.
   *Fait quand* : tests en mode utilisateur (AddRef/Release, QueryInterface, un faux « port »
   appelant la vtable) ; Miri sur le modèle objet.
 - [ ] **M1a-05** `feat(portcls): enveloppes IMiniportWaveRT, IMiniportWaveRTStream, IPortWaveRT`
+  Traits `MiniportWaveRT`, `MiniportWaveRTStream`, `MiniportWaveRTStreamNotification` et
+  leurs vtables (ordre du header 26100), `StreamObject` (flux à type effacé rendu par
+  `NewStream`), enveloppes reçues `PortWaveRT`/`PortWaveRTStream` (`AllocatePagesForMdl`…),
+  `adapter` (`PcNewPort`, `IPort::Init`, `PcRegisterSubdevice`, `PcRegisterPhysicalConnection`
+  sous la feature `kernel`, noms UTF-16 des sous-périphériques).
   *Fait quand* : idem, plus les appels vers `IPortWaveRT` (`PcNewPort`, `RegisterSubdevice`) fonctionnent dans la VM.
+  *État* : enveloppes livrées et testées avec un faux PortCls ; appels PcNewPort/RegisterSubdevice à valider dans la VM (M1a-06).
 - [ ] **M1a-06** `feat(driver): adaptateur enregistrant une topologie rendu et capture`
   *Fait quand* : le gestionnaire de périphériques montre un endpoint rendu et un capture.
 - [ ] **M1a-07** `feat(driver): miniport WaveRT rendu avec tampon cyclique et horloge timer`
