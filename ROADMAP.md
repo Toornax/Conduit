@@ -68,7 +68,7 @@ allocation dans le fil audio, CI verte partout, couverture ≥ 80 % sur `core` e
   `rust-toolchain.toml`), Visual Studio Build Tools, Windows SDK ; le script échoue si une
   version installée diffère. Workflow : setup, `cargo fmt --check`, clippy, `cargo nextest`.
   *Fait quand* : CI verte sur `windows-latest` ; versions listées dans un fichier versionné.
-- [ ] **M0-09** `chore(nix): vérification croisée mingwW64 des crates utilisateur`
+- [x] **M0-09** `chore(nix): vérification croisée mingwW64 des crates utilisateur`
   Check Nix compilant `conduitd`, `conduitctl`, `conduit-protocol` pour `x86_64-pc-windows-gnu`.
   *Fait quand* : le check tourne dans `nix flake check` sur Linux et attrape une erreur
   `cfg(windows)` volontaire.
@@ -272,7 +272,7 @@ allocation dans le fil audio, CI verte partout, couverture ≥ 80 % sur `core` e
 
 ### M0.K — Clôture
 
-- [ ] **M0-96** `chore(nix): check de couverture llvm-cov avec seuil 80 % sur core et protocol`
+- [x] **M0-96** `chore(nix): check de couverture llvm-cov avec seuil 80 % sur core et protocol`
 - [ ] **M0-97** `chore(nix): apps (démon, CLI, bancs de test) et packages testés hors devshell`
   `nix run .#conduitd` fonctionne ; les binaires packagés démarrent sur une machine sans devshell.
   *Fait quand* : test CI lançant le package dans un conteneur nu.

@@ -69,11 +69,17 @@ fn main() {
         .unwrap_or_else(|| config.log.level.clone());
     let _guard =
         conduitd::logging::init(&level, config.log.file.then_some(paths.log_dir.as_path()));
+    // Le backend null est cadencé en temps réel par son fil timer (mode manuel réservé aux tests).
+    let null_timer = || {
+        let mut null = NullBackend::new();
+        null.start_timer();
+        null
+    };
     let backend: Box<dyn Backend> = match args.backend.as_str() {
-        "null" => Box::new(NullBackend::new()),
+        "null" => Box::new(null_timer()),
         "auto" => {
             tracing::warn!("aucun backend natif disponible sur cette plateforme dans cette version : backend null (simulé)");
-            Box::new(NullBackend::new())
+            Box::new(null_timer())
         }
         other => {
             eprintln!("backend inconnu « {other} » : auto ou null");
