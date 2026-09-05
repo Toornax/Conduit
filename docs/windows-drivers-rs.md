@@ -93,34 +93,65 @@ Flags émis par `wdk-build` : `/DRIVER /NODEFAULTLIB /SUBSYSTEM:NATIVE /KERNEL /
   en Rust connu publiquement : Conduit essuie les plâtres, SYSVAD (C++) reste la
   référence de comportement.
 
-## Recette bindgen pour `portcls-sys` (non vérifiée)
+## Recette bindgen pour `portcls-sys` (vérifiée, M1a-03, WDK 10.0.26100.0)
+
+Source de vérité : `drivers/windows/portcls-sys/build.rs` et `wrapper.h`. Squelette :
 
 ```rust
 // build.rs
 use wdk_build::BuilderExt;
 fn main() -> anyhow::Result<()> {
     wdk_build::configure_wdk_library_build_and_then(|config| {
-        let out = std::path::PathBuf::from(std::env::var("OUT_DIR")?).join("portcls.rs");
+        let out = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
         bindgen::Builder::wdk_default(&config)?
-            .header_contents("portcls-input.h", concat!(
-                "#define PUT_GUIDS_HERE\n#include <initguid.h>\n",
-                "#include <ntddk.h>\n#include <ks.h>\n#include <ksmedia.h>\n",
-                "#include <punknown.h>\n#include <drmk.h>\n",
-                "#define INTERFACE void\n#include <portcls.h>\n"))
-            .allowlist_file(".*(portcls|ks|ksmedia|punknown|drmk)\\.h")
+            .header("wrapper.h") // ntddk, windef, mmreg (NOBITMAP), ks, ksmedia, punknown,
+                                 // drmk, `#define INTERFACE void`, portcls
+            .allowlist_file(r"(?i).*[\/](portcls|ks|ksmedia|punknown|drmk)\.h")
+            .allowlist_recursively(true)
+            .allowlist_type("(DEVICE_OBJECT|DRIVER_OBJECT|IRP|UNICODE_STRING)")
+            .default_enum_style(bindgen::EnumVariation::ModuleConsts)
+            .layout_tests(true)
+            .blocklist_var("DEVPKEY_.*")           // extern static sans définition
+            .blocklist_type("IPortClsVersionVtbl") // 1 slot au lieu de 4 : fixups.rs
+            .blocklist_item("IPortCls(Power|RuntimePower|EtwHelper)(Vtbl)?") // C++ seulement
+            // + blocklist_var de chaque GUID, émis à part en `pub const` (voir plus bas)
             .generate()?
-            .write_to_file(out)?;
+            .write_to_file(out.join("portcls.rs"))?;
         Ok::<_, anyhow::Error>(())
     })
 }
 ```
 
-En mode C, `DECLARE_INTERFACE_`/`STDMETHOD_` de `basetyps.h` donnent
-`struct IMiniportWaveRT { const IMiniportWaveRTVtbl *lpVtbl; }` avec une vtable plate
-incluant les méthodes héritées : disposition COM exacte sans support C++ de bindgen.
-`THIS_` s'expanse en `INTERFACE *This`, d'où le `#define INTERFACE void` juste avant
-`portcls.h` (après les autres en-têtes qui le définissent puis l'annulent eux-mêmes).
-Les fonctions `FORCEINLINE` ne sont pas générées (`generate_inline_functions` désactivé).
+Ce qui a été constaté (et diffère de la recette initiale) :
+
+- **Mode C confirmé** : `DECLARE_INTERFACE_`/`STDMETHOD_` de `basetyps.h` donnent
+  `struct IMiniportWaveRT { IMiniportWaveRTVtbl *lpVtbl; }` avec une vtable plate
+  incluant les méthodes héritées, dans l'ordre du header : disposition COM exacte, sans
+  support C++ de bindgen. `THIS_` s'expanse en `INTERFACE *This`, d'où le
+  `#define INTERFACE void` juste avant `portcls.h` (après les autres en-têtes, qui le
+  définissent puis l'annulent eux-mêmes). Les tailles de 14 vtables et 27 structures
+  et la valeur de 11 GUID concordent avec `cl.exe` (`tests/layout.golden`).
+- **Ordre des en-têtes** : `portcls.h` a besoin de `KSDATAFORMAT_WAVEFORMATEX`, que
+  `ksmedia.h` ne définit que si `WAVEFORMATEX` existe : `windef.h` puis `mmreg.h`
+  (`NOBITMAP`) **avant** `ks.h`/`ksmedia.h`, sinon `portcls.h` ne compile pas.
+- **GUID** : `PUT_GUIDS_HERE`/`initguid.h` est inutile, bindgen n'évalue pas les
+  initialiseurs de structure ; tous les `DEFINE_GUID`/`DEFINE_GUIDSTRUCT` sortent en
+  `extern static` (symboles à fournir par l'éditeur de liens). `build.rs` analyse les
+  en-têtes avec une regex, émet `pub const NOM: GUID = …` dans `OUT_DIR/guids.rs`,
+  bloque les `static` homonymes, et échoue si un `static … : GUID` subsiste.
+- `IPortClsVersion` ne recopie pas `DEFINE_ABSTRACT_UNKNOWN()` (vtable à un slot) ;
+  `IPortClsPower`, `IPortClsRuntimePower`, `IPortClsEtwHelper` n'ont ni `THIS_` ni
+  `IUnknown` en C : la première est réécrite dans `src/fixups.rs`, les trois autres
+  sont exclues.
+- Les macros à `sizeof` (`PORT_CLASS_DEVICE_EXTENSION_SIZE`) ne sont pas générées :
+  recopiées dans `fixups.rs`. Les fonctions `FORCEINLINE` ne le sont pas non plus
+  (`generate_inline_functions` désactivé).
+- Les `layout_tests` de bindgen indexent un tableau dans un bloc `const` : autoriser
+  `clippy::indexing_slicing` et `clippy::arithmetic_side_effects` dans le module qui
+  fait l'`include!`, pas ailleurs.
+- Sortie : ~41 000 lignes (1,5 Mo) plus 639 GUID ; une trentaine de secondes à la
+  première compilation, cache Cargo ensuite (`rerun-if-changed` sur `wrapper.h`,
+  `build.rs` et les cinq en-têtes).
 
 ## Test dans la VM
 

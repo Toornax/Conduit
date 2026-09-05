@@ -1,44 +1,55 @@
 //! Bindings PortCls et Kernel Streaming pour le pilote Conduit.
 //!
-//! Crate du workspace noyau (ADR-012), conçu pour rester **testable en mode utilisateur** :
-//! `wdk-sys` (qui lie les bibliothèques noyau même sous `cargo test`) n'est qu'une
-//! dépendance optionnelle derrière la feature `kernel`, activée par `conduit-kmd` seul ;
-//! `cargo test -p portcls-sys` tourne sans elle. Le crate n'émet aucun `#[link]` : c'est
-//! `conduit-kmd/build.rs` qui lie `portcls.lib`.
+//! Crate du workspace noyau (ADR-012), **autonome** (aucune dépendance à `wdk-sys`, qui
+//! lie les bibliothèques noyau même sous `cargo test`) et donc testable en mode
+//! utilisateur : `cargo test -p portcls-sys` depuis `drivers/windows`. Le crate n'émet
+//! aucun `#[link]` : c'est `conduit-kmd/build.rs` qui lie `portcls.lib`.
 //!
-//! État (M1a-02) : le module [`functions`] déclare **à la main, provisoirement**, les deux
-//! fonctions PortCls dont le pilote minimal a besoin (`PcInitializeAdapterDriver`,
-//! `PcAddAdapterDevice`) et les types qu'elles exigent. La tâche M1a-03 remplace ces
-//! déclarations par les bindings générés selon
-//! [driver-design.md §2.2](../../../docs/driver-design.md) :
+//! Contenu, généré à la compilation par `build.rs` (bindgen 0.71 sur les en-têtes du WDK
+//! [`WDK_VERSION`], **mode C**, driver-design.md §2.2) :
 //!
-//! - les bindings générés par `bindgen` (`wdk_build::BuilderExt::wdk_default`) sur
-//!   `ks.h`, `ksmedia.h`, `punknown.h`, `drmk.h` et `portcls.h` en mode C, avec une liste
-//!   d'autorisation explicite : structures (`KSDATAFORMAT`, `KSDATARANGE_AUDIO`,
-//!   `PCFILTER_DESCRIPTOR`, `PCPIN_DESCRIPTOR`, `PCNODE_DESCRIPTOR`, `PCPROPERTY_*`,
-//!   `KSJACK_DESCRIPTION`, `KSRTAUDIO_*`…), GUID (`KSCATEGORY_*`, `KSDATAFORMAT_*`,
-//!   `KSNODETYPE_*`, `KSPROPSETID_*`) et constantes ;
-//! - les vtables COM **plates** produites par bindgen depuis les macros
-//!   `DECLARE_INTERFACE_`/`STDMETHOD_` (`IMiniportWaveRT`, `IMiniportWaveRTStream`,
-//!   `IMiniportTopology`, `IPortWaveRT`, `IAdapterPowerManagement`…), grâce au
-//!   `#define INTERFACE void` placé avant `portcls.h` ;
-//! - les déclarations des autres fonctions PortCls (`PcNewPort`, `PcRegisterSubdevice`,
-//!   `PcRegisterPhysicalConnection`, `PcNewResourceList`…) ;
-//! - des tests de `size_of` et de nombre de slots de vtable contre des valeurs de
-//!   référence obtenues par un programme C (`tools/sizeof-probe.c`).
+//! - structures et constantes de `ks.h`, `ksmedia.h`, `punknown.h`, `drmk.h`, `portcls.h`
+//!   (`KSDATAFORMAT`, `KSDATARANGE_AUDIO`, `PCFILTER_DESCRIPTOR`, `PCPIN_DESCRIPTOR`,
+//!   `PCPROPERTY_*`, `KSJACK_DESCRIPTION`, `KSRTAUDIO_*`, `KSSTATE`…), et, par
+//!   récursivité, les types NT qu'elles référencent (`DRIVER_OBJECT`, `DEVICE_OBJECT`,
+//!   `IRP`, `UNICODE_STRING`…) : ce sont **d'autres définitions** que celles de `wdk-sys`,
+//!   de même disposition (mêmes en-têtes) ; `conduit-kmd` convertit par `cast()` ;
+//! - les **vtables COM plates** issues des macros `DECLARE_INTERFACE_`/`STDMETHOD_` de
+//!   `basetyps.h` : `struct IMiniportWaveRT { lpVtbl: *mut IMiniportWaveRTVtbl }` et une
+//!   vtable de pointeurs de fonction `extern "C"` (`__stdcall` = ABI C sur x64) dans
+//!   l'ordre du header, slots hérités compris (`IUnknown`, `IMiniport`, `IPort`…) ;
+//! - les fonctions `Pc*` (`PcInitializeAdapterDriver`, `PcAddAdapterDevice`, `PcNewPort`,
+//!   `PcRegisterSubdevice`…) et les types de rappel (`PCPFNSTARTDEVICE`…) ;
+//! - les GUID (`IID_*`, `KSCATEGORY_*`, `KSDATAFORMAT_SUBTYPE_*`, `KSNODETYPE_*`,
+//!   `KSPROPSETID_*`…) en `pub const GUID`, extraits des en-têtes par `build.rs`
+//!   (bindgen les sortirait en `extern static` sans définition) ;
+//! - les corrections manuelles de [`fixups`] pour les interfaces dont le mode C du WDK
+//!   26100 est incomplet (`IPortClsVersion`) et les macros à `sizeof` que bindgen
+//!   n'évalue pas (`PORT_CLASS_DEVICE_EXTENSION_SIZE`).
 //!
-//! `unsafe` n'est autorisé ici que pour les blocs `extern` (déclarations de fonctions
-//! externes) ; `unsafe_op_in_unsafe_fn` reste en `deny` (lints du workspace).
+//! Les énumérations C sont des modules de constantes (`KSSTATE::KSSTATE_RUN`,
+//! `KSSTATE::Type`). `STATUS_SUCCESS` et les autres `STATUS_*` ne sont **pas** redéfinis
+//! ici (`ntstatus.h` n'est pas dans la liste d'autorisation) : ils viennent de `wdk-sys`
+//! côté pilote.
+//!
+//! Vérification (tests en mode utilisateur, `tests/`) : `size_of` de chaque structure
+//! clé et de chaque vtable, et valeur des GUID, comparés à `tests/layout.golden` produit
+//! par `cl.exe` sur les mêmes en-têtes (`tools/sizeof-probe.c`,
+//! `drivers/windows/tools/regen-layout.ps1`) ; bindgen émet en outre ses propres
+//! assertions de disposition (`const _: () = …`), vérifiées à la compilation.
 
 #![no_std]
 
 #[cfg(test)]
 extern crate std;
 
-#[cfg(feature = "kernel")]
-pub mod functions;
+mod bindings;
+pub mod fixups;
 
-/// Version du WDK dont les en-têtes servent de source aux bindings (M1a-03).
+pub use bindings::*;
+pub use fixups::*;
+
+/// Version du WDK dont les en-têtes servent de source aux bindings.
 ///
 /// Épinglée dans `packaging/windows/versions.json` (`wdk`) ; exposée ici pour que
 /// `conduit-kmd` puisse la journaliser au chargement.
