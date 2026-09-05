@@ -407,9 +407,10 @@ signé par attestation, HLK audio passé, latence conforme à SPEC §5.6, endura
   `AUDCLNT_E_DEVICE_INVALIDATED`, `ClockInfo` par atomiques, `latency()` hors trait.
 - [ ] **M1b-32** `feat(wasapi): mode exclusif quand disponible`
   *Fait quand* : latence mesurée inférieure au mode partagé, repli automatique documenté.
-- [ ] **M1b-33** `feat(wasapi): position d'horloge IAudioClock et intégration DLL`
+- [x] **M1b-33** `feat(wasapi): position d'horloge IAudioClock et intégration DLL`
   *Fait quand* : deux cartes réelles en même temps, dérive absorbée, xruns = 0 sur 1 h.
-  *État* : IAudioClock intégrée, 60 s sur deux cartes OK, 1 h en cours/à confirmer.
+  *Vérifié* le 2026-09-05 : 1 h avec le moteur, G27QC A pilote et Realtek asynchrone, 720 006 cycles,
+  0 xrun, DLL verrouillée (dérive relative −18 ppm absorbée), `write_ahead` ≈ 20 ms.
   `ClockInfo` : position `IAudioClock::GetPosition` en trames du format livré
   (fréquence classée : octets/s du mixage sur les deux cartes du poste, octets/s du
   format client par le chemin conversion), horodatage QPC commun aux flux ; latence
