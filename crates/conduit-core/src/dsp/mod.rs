@@ -1,9 +1,11 @@
 //! Briques de traitement du signal, sans allocation à l'exécution.
 
 pub mod biquad;
+pub mod dll;
 pub mod resampler;
 
 pub use biquad::{Biquad, BiquadCoeffs, FilterKind};
+pub use dll::{Dll, DllConfig};
 pub use resampler::{ResampleQuality, Resampler};
 
 /// Générateur pseudo-aléatoire xorshift32, déterministe, sans allocation.
