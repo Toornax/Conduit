@@ -32,6 +32,7 @@ conduit-core ← conduit-backend ← conduit-protocol ← conduit-engine ← con
 | `conduitctl` | CLI | — |
 | `conduit-testing` | allocateur de garde | — |
 | `conduit-kmd-core` | logique portable du pilote Windows : positions, copie cyclique, formats | aucune |
+| `conduit-com` | modèle objet COM du pilote : `ComObject`, `ComPtr`, `ComRef` | aucune |
 | `portcls-sys` | bindings PortCls/KS générés, testables en mode utilisateur (`drivers/windows`, workspace noyau, ADR-012) | Windows |
 | `conduit-kmd` | le pilote noyau `.sys` : WDM, `no_std`, PortCls/WaveRT (`drivers/windows`, workspace noyau ; [driver-dev.md](driver-dev.md)) | Windows |
 
@@ -107,6 +108,14 @@ cyclique rendu → capture avec conversion F32 ↔ I16 (`ring`), validation des 
 et taille de tampon (`format`). Son code tourne à `DISPATCH_LEVEL` dans le pilote :
 les lints anti-panique (`unwrap`, indexation, arithmétique débordante) sont en `deny`.
 Conception et invariants : [driver-design.md](driver-design.md) §2.1 et §5.
+
+`conduit-com` est le modèle objet COM générique du pilote, lui aussi `#![no_std]`
+(+ `alloc`) sans dépendance et membre du workspace racine, mais avec de l'`unsafe`
+(chaque bloc porte un `// SAFETY:`) : `ComObject<V, T>` (vtable à l'offset 0, compteur
+atomique, `QueryInterface`/`AddRef`/`Release` génériques), `ComPtr` (possession Rust) et
+`ComRef` (interfaces reçues de PortCls), testés en mode utilisateur à travers les
+pointeurs de vtable et sous Miri. Les vtables PortCls concrètes et les traits Rust qui
+les implémentent sont dans `drivers/windows/portcls` ([driver-design.md](driver-design.md) §3).
 
 Le pilote lui-même (`portcls-sys`, `conduit-kmd`) est dans le workspace noyau
 `drivers/windows`, construit uniquement sous Windows avec le WDK : installation du
@@ -212,6 +221,7 @@ cargo test --release -p conduit-core -- --ignored input_port_one_hour
 cargo bench -p conduit-core                     # criterion
 cargo +nightly miri test -p conduit-core --lib -- ring:: graph:: executor::
 cargo +nightly miri test -p conduit-kmd-core --all-features --lib
+cargo +nightly miri test -p conduit-com --all-features
 cargo +nightly fuzz run decoder                 # depuis crates/conduit-protocol
 cargo deny check
 cargo run -p conduit-protocol --features schema --example gen-docs   # docs/protocol.md

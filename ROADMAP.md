@@ -321,6 +321,8 @@ proposition : trois semaines de travail effectif). Porte de décision en M1a-12.
   comptage de références, `QueryInterface` par préfixe de vtable.
   *Fait quand* : tests en mode utilisateur (AddRef/Release, QueryInterface, un faux « port »
   appelant la vtable) ; Miri sur le modèle objet.
+  *État* : modèle générique livré (crates/conduit-com) ; enveloppes IAdapterPowerManagement/IMiniportTopology
+  à suivre (drivers/windows/portcls).
 - [ ] **M1a-05** `feat(portcls): enveloppes IMiniportWaveRT, IMiniportWaveRTStream, IPortWaveRT`
   *Fait quand* : idem, plus les appels vers `IPortWaveRT` (`PcNewPort`, `RegisterSubdevice`) fonctionnent dans la VM.
 - [ ] **M1a-06** `feat(driver): adaptateur enregistrant une topologie rendu et capture`

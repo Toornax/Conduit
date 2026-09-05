@@ -1,0 +1,22 @@
+[package]
+name = "conduit-com"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Conduit — modèle objet COM générique du pilote noyau (ComObject, ComPtr, ComRef), no_std + alloc"
+
+[features]
+default = []
+# Lie la bibliothèque standard : tests et outils utilisateur seulement.
+# Le pilote noyau construit ce crate sans cette feature.
+std = []
+
+[dependencies]
+
+[dev-dependencies]
+
+[lints]
+workspace = true

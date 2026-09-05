@@ -299,6 +299,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "conduit-com"
+version = "0.1.0"
+
+[[package]]
 name = "conduit-core"
 version = "0.1.0"
 dependencies = [
