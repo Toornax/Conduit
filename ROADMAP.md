@@ -332,7 +332,14 @@ proposition : trois semaines de travail effectif). Porte de décision en M1a-12.
   *Fait quand* : idem, plus les appels vers `IPortWaveRT` (`PcNewPort`, `RegisterSubdevice`) fonctionnent dans la VM.
   *État* : enveloppes livrées et testées avec un faux PortCls ; appels PcNewPort/RegisterSubdevice à valider dans la VM (M1a-06).
 - [ ] **M1a-06** `feat(driver): adaptateur enregistrant une topologie rendu et capture`
+  `StartDevice` (`conduit-kmd::adapter`) : `PcNewPort`, `IPort::Init`, `PcRegisterSubdevice`
+  pour `WaveRender0`, `TopoRender0`, `WaveCapture0`, `TopoCapture0`, puis
+  `PcRegisterPhysicalConnection` entre broches bridge ; tables KS `static` en `const`
+  (`descriptors`), miniports `topo`/`wave` (`NewStream` valide le format puis refuse),
+  état de câble `static` (`cable`), INF avec les `AddInterface` `KSCATEGORY_*`
+  ([driver-design.md](docs/driver-design.md) §4.1).
   *Fait quand* : le gestionnaire de périphériques montre un endpoint rendu et un capture.
+  *État* : adaptateur, descripteurs et INF livrés ; endpoints à constater dans la VM.
 - [ ] **M1a-07** `feat(driver): miniport WaveRT rendu avec tampon cyclique et horloge timer`
   Allocation du tampon cyclique, position via timer noyau, formats 48 kHz float32 et PCM16.
   *Fait quand* : une application lit un fichier sur l'endpoint sans erreur, position cohérente.

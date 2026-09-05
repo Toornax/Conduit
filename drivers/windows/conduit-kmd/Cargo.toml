@@ -27,9 +27,12 @@ wdk-sys.workspace = true
 portcls-sys = { path = "../portcls-sys" }
 # Enveloppes sûres traits Rust ↔ vtables PortCls (M1a-04, M1a-05) ; la feature `kernel`
 # ajoute les enveloppes de `PcNewPort`/`PcRegisterSubdevice`/`PcRegisterPhysicalConnection`
-# (symboles de `portcls.lib`, lié par build.rs). Les objets seront enregistrés auprès de
-# PortCls en M1a-06.
+# (symboles de `portcls.lib`, lié par build.rs), utilisées par `adapter::start_device`
+# (M1a-06).
 portcls = { path = "../portcls", features = ["kernel"] }
+# Logique portable du pilote (workspace racine, `no_std`, sans `unsafe`) : validation des
+# formats (M1a-06), horloge virtuelle et copie cyclique (M1a-07, M1a-08).
+conduit-kmd-core = { path = "../../../crates/conduit-kmd-core" }
 
 [lints]
 workspace = true

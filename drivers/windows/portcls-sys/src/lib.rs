@@ -24,8 +24,9 @@
 //!   `KSPROPSETID_*`…) en `pub const GUID`, extraits des en-têtes par `build.rs`
 //!   (bindgen les sortirait en `extern static` sans définition) ;
 //! - les corrections manuelles de [`fixups`] pour les interfaces dont le mode C du WDK
-//!   26100 est incomplet (`IPortClsVersion`) et les macros à `sizeof` que bindgen
-//!   n'évalue pas (`PORT_CLASS_DEVICE_EXTENSION_SIZE`).
+//!   26100 est incomplet (`IPortClsVersion`), les macros à `sizeof` ou à transtypage que
+//!   bindgen n'émet pas (`PORT_CLASS_DEVICE_EXTENSION_SIZE`, `PCFILTER_NODE`) et les
+//!   `WAVE_FORMAT_*` de `mmreg.h`, hors de la liste d'autorisation.
 //!
 //! Les énumérations C sont des modules de constantes (`KSSTATE::KSSTATE_RUN`,
 //! `KSSTATE::Type`). `STATUS_SUCCESS` et les autres `STATUS_*` ne sont **pas** redéfinis

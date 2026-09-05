@@ -156,6 +156,7 @@ Modules :
 | `entry` | `DriverEntry`, `AddDevice`, `Unload` ; délègue à PortCls |
 | `adapter` | `StartDevice` : lit les paramètres (M1b-01), crée la table des câbles, enregistre les sous-périphériques ; objet `IAdapterPowerManagement` |
 | (hors crate) | le modèle objet COM générique est dans `crates/conduit-com`, les enveloppes PortCls dans `drivers/windows/portcls` (§3) |
+| `descriptors` | tables KS `static` des quatre filtres (§4.1), construites en `const`, invariants en assertions `const` |
 | `cable` | état partagé par câble : flux rendu et capture courants, spin lock, timer/DPC de copie |
 | `wave` | miniport `IMiniportWaveRT` (un par câble et par sens) et ses flux `IMiniportWaveRTStream` |
 | `topo` | miniport `IMiniportTopology` (un par câble et par sens) : nœuds volume/mute factices, jack |
@@ -287,8 +288,21 @@ Nœuds : aucun en M1a (connexion directe broche 0 → broche 1 via `PCFILTER_NOD
 sous-périphériques : `WaveRender<n>` broche 1 → `TopoRender<n>` broche 0 ;
 `TopoCapture<n>` broche 1 → `WaveCapture<n>` broche 0. Chaque broche système déclare
 `KSPIN_DATAFLOW` correct et 1 instance possible (`MaxGlobalInstanceCount = 1`,
-`MaxFilterInstanceCount = 1`). Tables d'automatisation : vides pour le spike
-(`PCAUTOMATION_TABLE` sans propriétés ; PortCls gère `KSPROPSETID_Pin` et `KSPROPSETID_Topology`).
+`MaxFilterInstanceCount = 1`) ; broches bridge et endpoint : 0 instance, catégorie
+`KSCATEGORY_AUDIO` pour les bridges (comme SYSVAD). Tables d'automatisation : vides pour
+le spike (`PCAUTOMATION_TABLE` sans propriétés ; PortCls gère `KSPROPSETID_Pin` et
+`KSPROPSETID_Topology`). Catégories du filtre : `CategoryCount = 0`, PortCls fournit les
+siennes (`KSCATEGORY_AUDIO`, `RENDER`/`CAPTURE`, `REALTIME` pour WaveRT ; `AUDIO`,
+`TOPOLOGY` pour la topologie) ; l'INF les publie par `AddInterface` (M1a-06).
+
+Réalité des bindings (M1a-06) : `PCFILTER_NODE` (`((ULONG)-1)`) et les `WAVE_FORMAT_*`
+de `mmreg.h` ne sortent pas de bindgen, ils sont recopiés dans `portcls-sys::fixups` ;
+`PCFILTER_DESCRIPTOR_VERSION` n'existe pas dans `portcls.h` 26100, `Version` vaut 0
+comme dans SYSVAD. Les numéros de broche sont nommés **par filtre**
+(`WAVE_RENDER_PIN_SYSTEM = 0`, `WAVE_RENDER_PIN_BRIDGE = 1`, `TOPO_RENDER_PIN_BRIDGE = 0`,
+`TOPO_RENDER_PIN_ENDPOINT = 1`, `WAVE_CAPTURE_PIN_BRIDGE = 0`, `WAVE_CAPTURE_PIN_SYSTEM = 1`,
+`TOPO_CAPTURE_PIN_ENDPOINT = 0`, `TOPO_CAPTURE_PIN_BRIDGE = 1`) : la broche 0 est toujours
+l'entrée, ce qui interdit une constante « bridge » commune aux deux sens.
 
 **Séquence `StartDevice`** (adaptateur, IRQL `PASSIVE_LEVEL`), pour chaque câble *n* :
 
@@ -302,8 +316,14 @@ sous-périphériques : `WaveRender<n>` broche 1 → `TopoRender<n>` broche 0 ;
 
 Tout `NTSTATUS` d'échec interrompt la séquence et est renvoyé : PortCls détruit ce qui a été
 enregistré. Les objets miniport sont possédés par leur port (PortCls prend ses références) ;
-l'adaptateur ne conserve que l'état partagé des câbles (`cable::Cable`, §5.3).
-`PcRegisterAdapterPowerManagement` n'est pas appelé avant M1b-06.
+l'adaptateur ne conserve que l'état partagé des câbles (`cable::Cable`, §5.3), qui est une
+**`static`** du pilote (construction `const`, section de données non paginée, vit jusqu'au
+déchargement : ni allocation, ni fuite de pool, ni `Drop` ; les cycles start/stop la
+réutilisent). Ses deux `Slot` (flux rendu et capture courants) sont des `AtomicPtr` ;
+M1a-08 fixera comment la DPC garantit la survie de l'état pointé.
+`PcRegisterAdapterPowerManagement` n'est pas appelé avant M1b-06. En M1a-06, `NewStream`
+valide le format (`kmd-core::format::validate`) puis répond `STATUS_NOT_IMPLEMENTED` :
+les endpoints existent, les flux arrivent en M1a-07.
 
 ## 5. Horloge, positions, boucle locale
 

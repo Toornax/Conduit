@@ -225,6 +225,7 @@ version = "0.1.0"
 name = "conduit-kmd"
 version = "0.1.0"
 dependencies = [
+ "conduit-kmd-core",
  "portcls",
  "portcls-sys",
  "wdk",
@@ -232,6 +233,10 @@ dependencies = [
  "wdk-build",
  "wdk-sys",
 ]
+
+[[package]]
+name = "conduit-kmd-core"
+version = "0.1.0"
 
 [[package]]
 name = "either"

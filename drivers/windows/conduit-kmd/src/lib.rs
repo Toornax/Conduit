@@ -5,19 +5,18 @@
 //! [windows-drivers-rs.md](../../../docs/windows-drivers-rs.md), installation et test dans
 //! [driver-dev.md](../../../docs/driver-dev.md).
 //!
-//! État (M1a-02) : pilote minimal **directement bâti sur PortCls**, sans gestion PnP WDM
+//! État (M1a-06) : pilote **directement bâti sur PortCls**, sans gestion PnP WDM
 //! maison : `DriverEntry` délègue à `PcInitializeAdapterDriver` (qui installe les dispatch
 //! PnP/Power/SystemControl/Create/Close via `PcDispatchIrp` et son propre `DriverUnload`),
-//! `AddDevice` à `PcAddAdapterDevice`, et `StartDevice` ne fait encore rien :
-//! l'enregistrement des sous-périphériques (driver-design.md §4) arrive en M1a-06. Le
-//! pilote se charge, crée son objet de périphérique fonctionnel au-dessus du nœud racine
-//! `Root\ConduitCable`, démarre, s'arrête et se décharge ; c'est ce cycle que
-//! `tools/vm-cycle.ps1` répète cent fois. Les fonctions et types PortCls viennent des
-//! bindings générés de `portcls-sys` (M1a-03) ; les objets COM (`IAdapterPowerManagement`,
-//! `IMiniportTopology`, `IMiniportWaveRT`, `IMiniportWaveRTStream`) s'écriront contre les
-//! traits de `portcls` (M1a-04, M1a-05), dépendance déjà liée (feature `kernel` : enveloppes
-//! de `PcNewPort`, `PcRegisterSubdevice`, `PcRegisterPhysicalConnection`) mais sans usage
-//! avant M1a-06.
+//! `AddDevice` à `PcAddAdapterDevice`, et `StartDevice` à [`adapter::start_device`], qui
+//! enregistre les quatre sous-périphériques du câble (driver-design.md §4.1) : ports
+//! WaveRT et topologie (`PcNewPort`, `IPort::Init`, `PcRegisterSubdevice`) avec les
+//! miniports de [`wave`] et [`topo`], puis les connexions physiques
+//! (`PcRegisterPhysicalConnection`). Les tables KS sont les `static` de [`descriptors`],
+//! l'état partagé du câble celui de [`cable`]. Les fonctions et types PortCls viennent
+//! des bindings générés de `portcls-sys` (M1a-03), les objets COM des traits de
+//! `portcls` (M1a-04, M1a-05). Les flux WaveRT (tampon cyclique, horloge, boucle locale)
+//! arrivent en M1a-07 et M1a-08 : `NewStream` répond encore `STATUS_NOT_IMPLEMENTED`.
 //!
 //! Le gestionnaire de panique est maison (`panic.rs`) : une panique en noyau se traduit
 //! par un bug check, jamais par une boucle infinie. La journalisation passe par
@@ -36,12 +35,14 @@ mod log;
 #[cfg(not(test))]
 mod panic;
 
+mod adapter;
+mod cable;
+mod descriptors;
+mod topo;
+mod wave;
+
 use core::cell::UnsafeCell;
 
-// Enveloppes COM (M1a-04, M1a-05) : liées dès maintenant pour que le pilote se construise
-// avec elles dans sa configuration noyau ; premier usage en M1a-06 (`adapter`, `topo`,
-// `wave`).
-use portcls as _;
 use portcls_sys::{PCPFNSTARTDEVICE, PRESOURCELIST, PcAddAdapterDevice, PcInitializeAdapterDriver};
 use wdk_sys::{
     DRIVER_OBJECT, DRIVER_UNLOAD, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, STATUS_SUCCESS, ULONG,
@@ -161,10 +162,10 @@ unsafe extern "C" fn add_device(
 
 /// `StartDevice` : PortCls a reçu `IRP_MN_START_DEVICE` pour l'adaptateur.
 ///
-/// Ne fait rien en M1a-02 ; M1a-06 y créera les ports et enregistrera les
-/// sous-périphériques (`PcNewPort`, `PcRegisterSubdevice`, `PcRegisterPhysicalConnection`).
-/// Renvoyer `STATUS_SUCCESS` sans sous-périphérique est accepté par PortCls : l'adaptateur
-/// démarre, sans exposer de filtre KS.
+/// Délègue à [`adapter::start_device`] : création des ports, enregistrement des
+/// sous-périphériques et des connexions physiques du câble (driver-design.md §4.1). Tout
+/// échec est renvoyé tel quel : PortCls libère ce qui a été enregistré et l'adaptateur ne
+/// démarre pas.
 ///
 /// IRQL : `PASSIVE_LEVEL`.
 ///
@@ -174,11 +175,16 @@ unsafe extern "C" fn add_device(
 /// `PcAddAdapterDevice`), un `irp` et une `resource_list` valides le temps de l'appel.
 unsafe extern "C" fn start_device(
     device: portcls_sys::PDEVICE_OBJECT,
-    _irp: portcls_sys::PIRP,
-    _resource_list: PRESOURCELIST,
+    irp: portcls_sys::PIRP,
+    resource_list: PRESOURCELIST,
 ) -> NTSTATUS {
     kmd_log!("StartDevice (fdo {device:p})");
-    STATUS_SUCCESS
+    // SAFETY: `device`, `irp` et `resource_list` sont ceux reçus de PortCls (contrat).
+    let status = unsafe { adapter::start_device(device, irp, resource_list) };
+    if status != STATUS_SUCCESS {
+        kmd_log!("StartDevice a échoué : {status:#010x}");
+    }
+    status
 }
 
 /// Déchargement du pilote : rien à libérer côté Conduit ; enchaîne le `DriverUnload` de

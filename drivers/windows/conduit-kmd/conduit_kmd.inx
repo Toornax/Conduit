@@ -9,9 +9,14 @@
 ; M1a-02 : adaptateur PortCls pour un périphérique énuméré à la racine (Root\ConduitCable),
 ; classe MEDIA. Include/Needs de ks.inf et wdmaudio.inf enregistrent Kernel Streaming et
 ; PortCls ; AssociatedFilters et Driver sont les valeurs que wdmaud attend d'un adaptateur
-; audio. Les interfaces KSCATEGORY_* et les noms des endpoints arrivent avec les
-; sous-périphériques (M1a-09, docs/driver-design.md §4). Structure de référence : SYSVAD
-; SimpleAudioSample, jamais copié.
+; audio.
+; M1a-06 : interfaces KS des quatre sous-périphériques que StartDevice enregistre
+; (docs/driver-design.md §4.1) : WaveRender0 (KSCATEGORY_AUDIO, RENDER, REALTIME),
+; WaveCapture0 (AUDIO, CAPTURE, REALTIME), TopoRender0 et TopoCapture0 (AUDIO, TOPOLOGY).
+; Le nom de référence de chaque AddInterface est le nom passé à PcRegisterSubdevice ;
+; CLSID est le proxy KS (ksproxy) et FriendlyName le nom que l'utilisateur voit
+; (« Conduit 1 », affiné en M1a-09). Structure de référence : SYSVAD SimpleAudioSample,
+; jamais copié.
 ;
 
 [Version]
@@ -61,8 +66,66 @@ StartType     = 3
 ErrorControl  = 1
 ServiceBinary = %13%\conduit_kmd.sys
 
+; Interfaces KS des sous-périphériques (câble 0). Le deuxième champ est le nom de
+; référence du sous-périphérique, tel que PcRegisterSubdevice le reçoit.
+[ConduitCable_Install.NT.Interfaces]
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveRender0%,  WaveRender0.Interface
+AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_WaveRender0%,  WaveRender0.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveRender0%,  WaveRender0.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoRender0%,  TopoRender0.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoRender0%,  TopoRender0.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveCapture0%, WaveCapture0.Interface
+AddInterface = %KSCATEGORY_CAPTURE%,  %KSNAME_WaveCapture0%, WaveCapture0.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveCapture0%, WaveCapture0.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoCapture0%, TopoCapture0.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoCapture0%, TopoCapture0.Interface
+
+[WaveRender0.Interface]
+AddReg = WaveRender0.Interface.AddReg
+
+[WaveRender0.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.Render0.FriendlyName%
+
+[TopoRender0.Interface]
+AddReg = TopoRender0.Interface.AddReg
+
+[TopoRender0.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.Render0.FriendlyName%
+
+[WaveCapture0.Interface]
+AddReg = WaveCapture0.Interface.AddReg
+
+[WaveCapture0.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.Capture0.FriendlyName%
+
+[TopoCapture0.Interface]
+AddReg = TopoCapture0.Interface.AddReg
+
+[TopoCapture0.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.Capture0.FriendlyName%
+
 [Strings]
 Conduit                  = "Conduit"
 DiskName                 = "Conduit Installation Disk"
 ConduitCable.DeviceDesc  = "Conduit Virtual Audio Cable"
 ConduitCable.ServiceDesc = "Conduit Virtual Audio Cable Driver"
+
+; Noms de sous-périphérique (portcls::adapter : WAVE_RENDER_0…) et noms affichés.
+KSNAME_WaveRender0          = "WaveRender0"
+KSNAME_TopoRender0          = "TopoRender0"
+KSNAME_WaveCapture0         = "WaveCapture0"
+KSNAME_TopoCapture0         = "TopoCapture0"
+Conduit.Render0.FriendlyName  = "Conduit 1"
+Conduit.Capture0.FriendlyName = "Conduit 1"
+
+; Catégories KS (ksmedia.h) et proxy KS (ksproxy.ax).
+KSCATEGORY_AUDIO    = "{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_RENDER   = "{65E8773E-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_CAPTURE  = "{65E8773D-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_REALTIME = "{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
+KSCATEGORY_TOPOLOGY = "{DDA54A40-1E4C-11D1-A050-405705C10000}"
+Proxy.CLSID         = "{17CCA71B-ECD7-11D0-B908-00A0C9223196}"
