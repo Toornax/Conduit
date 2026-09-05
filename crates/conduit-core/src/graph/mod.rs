@@ -101,7 +101,7 @@ pub struct NodeInfo {
     /// Identifiant.
     pub id: NodeId,
     /// Type de nœud (`"sine"`, `"mixer"`, …).
-    pub type_name: &'static str,
+    pub type_name: String,
     /// Nom d'affichage.
     pub label: String,
     /// Ports d'entrée.
@@ -234,7 +234,7 @@ impl GraphBuilder {
         let make_entry = |id: NodeId| NodeEntry {
             info: NodeInfo {
                 id,
-                type_name: node.type_name(),
+                type_name: node.type_name().to_string(),
                 label: label.into(),
                 inputs: node.inputs(),
                 outputs: node.outputs(),

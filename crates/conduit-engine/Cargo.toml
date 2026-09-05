@@ -6,9 +6,20 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Conduit — conduit-engine"
+description = "Conduit — fil temps réel, horloges, périphériques, commandes"
+
+[features]
+default = ["serde"]
+serde = ["dep:serde", "conduit-core/serde", "conduit-backend/serde"]
 
 [dependencies]
+conduit-core = { workspace = true }
+conduit-backend = { workspace = true }
+serde = { workspace = true, optional = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1"
 
 [lints]
 workspace = true

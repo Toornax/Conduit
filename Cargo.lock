@@ -154,6 +154,13 @@ dependencies = [
 [[package]]
 name = "conduit-engine"
 version = "0.1.0"
+dependencies = [
+ "conduit-backend",
+ "conduit-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "conduit-gui"

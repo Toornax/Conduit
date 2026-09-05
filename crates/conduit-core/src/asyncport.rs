@@ -270,6 +270,7 @@ pub fn input_port(cfg: &AsyncPortConfig) -> (DeviceWriter, GraphReader) {
     let stats = Arc::new(AsyncStats::default());
     let nominal = cfg.ratio_graph_per_device();
     let period = cfg.quantum as f64 / cfg.graph_rate.as_f64();
+    stats.ratio_bits.store(nominal.to_bits(), Ordering::Relaxed);
     let reader = GraphReader {
         ring: c,
         resampler: Resampler::new(ch, nominal, cfg.quality, cfg.quantum),
@@ -407,6 +408,7 @@ pub fn output_port(cfg: &AsyncPortConfig) -> (GraphWriter, DeviceReader) {
     let nominal = 1.0 / cfg.ratio_graph_per_device();
     let period = cfg.quantum as f64 / cfg.graph_rate.as_f64();
     let max_out = (cfg.quantum as f64 * nominal).ceil() as usize + 2;
+    stats.ratio_bits.store(nominal.to_bits(), Ordering::Relaxed);
     let writer = GraphWriter {
         ring: p,
         resampler: Resampler::new(ch, nominal, cfg.quality, cfg.quantum),
