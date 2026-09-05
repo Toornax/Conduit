@@ -10,5 +10,10 @@ description = "Conduit — conduit-backend-pipewire"
 
 [dependencies]
 
+[target.'cfg(target_os = "linux")'.dependencies]
+conduit-core.workspace = true
+conduit-backend.workspace = true
+pipewire = { version = "0.10", features = ["v0_3_49"] }
+
 [lints]
 workspace = true

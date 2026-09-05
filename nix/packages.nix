@@ -19,7 +19,8 @@
           path: type:
           (craneLib.filterCargoSources path type)
           || (
-            builtins.match ".*\\.(md|json|toml|ps1)$" path != null && builtins.match ".*/target/.*" path == null
+            builtins.match ".*\\.(md|json|toml|ps1|conf)$" path != null
+            && builtins.match ".*/target/.*" path == null
           );
       };
       commonArgs = {
@@ -27,8 +28,15 @@
         strictDeps = true;
         pname = "conduit";
         version = "0.1.0";
-        nativeBuildInputs = [ pkgs.pkg-config ];
-        buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.alsa-lib ];
+        # `bindgenHook` : pipewire-sys génère ses bindings avec bindgen (Linux).
+        nativeBuildInputs = [
+          pkgs.pkg-config
+        ]
+        ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.rustPlatform.bindgenHook ];
+        buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+          pkgs.alsa-lib
+          pkgs.pipewire
+        ];
       };
       # Dépendances vendorisées et compilées une fois, partagées par tous les dérivés.
       cargoArtifacts = craneLib.buildDepsOnly (

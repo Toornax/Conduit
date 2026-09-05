@@ -27,6 +27,8 @@
           }
         );
 
+        # Les tests PipeWire lancent un démon headless : le binaire `pipewire` et
+        # ses outils doivent être dans le PATH du bac à sable (Linux seulement).
         tests = craneLib.cargoNextest (
           commonArgs
           // {
@@ -34,6 +36,16 @@
             cargoNextestExtraArgs = "--workspace --all-features";
             partitions = 1;
             partitionType = "count";
+            nativeBuildInputs =
+              commonArgs.nativeBuildInputs
+              ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+                pkgs.pipewire
+                pkgs.wireplumber
+              ];
+            nativeCheckInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+              pkgs.pipewire
+              pkgs.wireplumber
+            ];
           }
         );
 

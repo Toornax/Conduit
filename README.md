@@ -20,7 +20,11 @@ sur le backend `null`.
 ## Construire et tester
 
 Sans Nix, avec la version Rust de `rust-toolchain.toml` (installée automatiquement
-par `rustup`) :
+par `rustup`). Sur Linux, le backend PipeWire a besoin des en-têtes de la
+bibliothèque et de `libclang` (bindgen) — par exemple
+`apt install libpipewire-0.3-dev libclang-dev` ; ses tests d'intégration lancent un
+démon headless et se sautent si `pipewire` et `wireplumber` ne sont pas dans le
+`PATH` :
 
 ```sh
 cargo build --workspace
@@ -58,6 +62,7 @@ cargo run -p conduitctl -- --socket /tmp/conduit/conduitd.sock nodes
 crates/
   conduit-core       graphe, tampons, DSP, nœuds, rééchantillonnage, DLL (sans plateforme)
   conduit-backend    traits Backend / CableControl, backend null simulé, priorité RT
+  conduit-backend-pipewire  backend Linux (PipeWire) : registre, périphériques, flux
   conduit-protocol   API (commandes, réponses, événements), framing, client
   conduit-engine     fil audio, périphériques, pilote, horloge interne, commandes
   conduitd           démon : configuration, IPC, persistance, règles, watchdog

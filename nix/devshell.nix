@@ -16,6 +16,10 @@
         with pkgs;
         [
           pipewire.dev
+          # Banc de test headless (M3) : le démon `pipewire` et ses outils, plus
+          # `wireplumber`, sans lequel aucun flux client n'est relié ni cadencé.
+          pipewire
+          wireplumber
           alsa-lib.dev
           wayland
           libxkbcommon
