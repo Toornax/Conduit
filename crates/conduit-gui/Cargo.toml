@@ -6,9 +6,27 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Conduit — conduit-gui"
+description = "Conduit — interface graphique iced : câbles, patchbay, diagnostic"
+
+[[bin]]
+name = "conduit"
+path = "src/main.rs"
 
 [dependencies]
+conduit-core = { workspace = true, features = ["serde"] }
+conduit-backend = { workspace = true, features = ["serde"] }
+conduit-protocol = { workspace = true, features = ["client"] }
+iced = { version = "0.14", features = ["tokio"] }
+directories = "6"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+conduitd = { path = "../conduitd", version = "0.1.0" }
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "time"] }
 
 [lints]
 workspace = true
