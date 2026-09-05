@@ -120,7 +120,7 @@ poste, build, VM de test et débogage dans [driver-dev.md](driver-dev.md), outil
 `ComApartment`), crée l'`IMMDeviceEnumerator`, enregistre un `IMMNotificationClient`
 écrit en Rust (`notify`, macro `#[implement]` du crate `windows`) et sert les
 commandes du `WasapiBackend` par `std::sync::mpsc` (`Enumerate`, `DefaultDevice`,
-`Subscribe`, `Shutdown`). Le backend lui-même ne détient que l'émetteur du canal et
+`Open`, `Subscribe`, `Shutdown`). Le backend lui-même ne détient que l'émetteur du canal et
 la poignée du fil : il est `Send`, et sa destruction envoie `Shutdown`, désenregistre
 le client puis joint le fil.
 
@@ -135,21 +135,61 @@ pour le rôle `eConsole` seulement ; `OnPropertyValueChanged` ignoré. Une table
 endpoints connus évite les doublons, quel que soit l'ordre des rappels.
 
 `devices` traduit un `IMMDevice` en `DeviceInfo` : identifiant d'endpoint (`GetId`),
-`PKEY_Device_FriendlyName`, `IMMEndpoint::GetDataFlow`, canaux et fréquence lus dans
-`PKEY_AudioEngine_DeviceFormat` (repli `IAudioClient::GetMixFormat`), fréquences de
-44,1/48/96 kHz acceptées telles quelles en mode partagé (`IsFormatSupported`,
-float32), bloc par défaut = période du moteur (`GetDevicePeriod`) en trames,
-`is_default` = `GetDefaultAudioEndpoint(flow, eConsole)`, `cable` si le nom est
-exactement `Conduit <n>`. Seuls les endpoints `DEVICE_STATE_ACTIVE` sont énumérés.
-Tout ce que COM alloue est rendu par une garde (`CoTaskString`, `CoTaskMem`,
-`PropVariant`) ; chaque bloc `unsafe` porte son `SAFETY:`.
+`PKEY_Device_FriendlyName`, `IMMEndpoint::GetDataFlow`, canaux et fréquence du
+**format de mixage** du moteur (`IAudioClient::GetMixFormat`, repli
+`PKEY_AudioEngine_DeviceFormat`) — c'est ce qu'un flux partagé délivre sans
+conversion —, `sample_rates` = 44,1/48/96 kHz dès que l'`IAudioClient` s'active
+(le mode partagé convertit automatiquement ce qui diffère du mixage), bloc par
+défaut = période du moteur (`GetDevicePeriod`) en trames, `is_default` =
+`GetDefaultAudioEndpoint(flow, eConsole)`, `cable` si le nom est exactement
+`Conduit <n>`. Seuls les endpoints `DEVICE_STATE_ACTIVE` sont énumérés. Tout ce que
+COM alloue est rendu par une garde (`CoTaskString`, `CoTaskMem`, `PropVariant`) ;
+chaque bloc `unsafe` porte son `SAFETY:`.
 
-Ce qui manque encore : les flux (`open` renvoie `Platform("flux WASAPI : M1b-31")`),
-le mode exclusif (M1b-32), l'horloge (M1b-33), `CableControl` par le helper
-(M1b-34) ; le démon ne charge pas ce backend avant M1b-31. Les tests d'intégration
-(`tests/wasapi.rs`) tournent sur les cartes son de la machine ; le critère « casque
-USB branché → `Added` » est un test `#[ignore]` à lancer à la main :
-`cargo test -p conduit-backend-wasapi --test wasapi -- --ignored --nocapture`.
+**Flux.** `open(id, format, rappel)` honore le format demandé : le rappel reçoit
+exactement `format.channels` canaux `f32` entrelacés à `format.sample_rate`. Le fil
+MMDevice (`open`) active l'`IAudioClient` et choisit un chemin : si (fréquence,
+canaux) est le format de mixage et que celui-ci est float32,
+`IAudioClient3::InitializeSharedAudioStream` avec la plus petite période prise en
+charge ≥ `block_frames` (`choose_period` : multiple de la fondamentale, bornée à
+`[min, max]` de `GetSharedModeEnginePeriod`) ; sinon `IAudioClient::Initialize`
+en partagé avec `EVENTCALLBACK | AUTOCONVERTPCM | SRC_DEFAULT_QUALITY`, un
+`WAVEFORMATEXTENSIBLE` float32 aux valeurs demandées et la période par défaut
+(`block_frames` effectif = cette période en trames à la fréquence demandée). Un
+refus du premier chemin retombe sur le second avec un client neuf. `format()` rend
+le format effectif ; `WasapiHandle::latency()` (hors trait) expose `GetBufferSize`,
+la période, `GetStreamLatency` (0 chez certains pilotes) et le chemin retenu.
+Les interfaces du crate `windows` ne sont pas `Send` : `IAudioClient` et le
+service de rendu ou de capture voyagent vers le fil du flux en `AgileReference`,
+résolue là-bas (MTA des deux côtés, objets WASAPI libres de fil).
+
+Chaque flux a **son fil** (`stream`), créé par `start()` et joint par `stop()` :
+`ComApartment` MTA, `rt::promote_current_thread()` (résultat lisible par
+`rt_outcome()`), puis boucle sur `WaitForMultipleObjects(arrêt, tampon, 2 s)`.
+Rendu : `GetCurrentPadding` → `GetBuffer(libre)` → rappel écrivant directement
+dans le tampon WASAPI vu comme `&mut [f32]` (`bytemuck::try_cast_slice_mut`,
+tampon intermédiaire pré-alloué si l'alignement manquait) → `ReleaseBuffer` ; un
+tampon de silence précède `Start`. Capture : tant que `GetNextPacketSize` > 0,
+`GetBuffer` → rappel avec `input` (zéros pré-alloués si `SILENT`) →
+`ReleaseBuffer`. Rien n'alloue ni ne verrouille dans la boucle (§2, prouvé par
+`tests/no_alloc.rs` avec un allocateur comptant par fil natif). `ClockInfo` :
+`position` = trames livrées depuis `start()`, `timestamp_ns` = `Instant` depuis
+l'ouverture, `frames` = trames du rappel ; `clock()` lit les atomiques. Une erreur
+`AUDCLNT_E_DEVICE_INVALIDATED` (ou `RESOURCES_INVALIDATED`) fait sortir de la
+boucle sans panique : `is_running()` devient faux, `stop()` rend `Disconnected`,
+`start()` le refuse. `stop()` signale l'événement d'arrêt, joint le fil (qui a fait
+`Stop` puis `Reset`) : aucun rappel n'est en cours au retour ; `Drop` appelle
+`stop()` puis libère les objets COM sous un appartement MTA temporaire.
+
+Ce qui manque encore : le mode exclusif (M1b-32), l'horloge `IAudioClock`
+(M1b-33), `CableControl` par le helper (M1b-34) ; le démon ne charge pas encore ce
+backend. Les tests d'intégration (`tests/wasapi.rs`, `tests/stream.rs`,
+`tests/no_alloc.rs`) tournent sur les cartes son de la machine, en silence ; ceux
+qui demandent un périphérique absent se sautent avec un message. À lancer à la
+main : le critère « casque USB branché → `Added` »
+(`cargo test -p conduit-backend-wasapi --test wasapi -- --ignored --nocapture`) et
+le sinus audible
+(`cargo test -p conduit-backend-wasapi --test stream sine_audible -- --ignored --nocapture`).
 
 ## 5. Tests
 

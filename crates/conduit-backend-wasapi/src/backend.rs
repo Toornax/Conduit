@@ -10,11 +10,13 @@ use conduit_backend::{
 };
 
 use crate::mmdevice_thread::{Command, Message};
+use crate::stream::WasapiHandle;
 
 /// Délai au-delà duquel on considère que le fil MMDevice ne répond plus.
 ///
-/// Une énumération sonde chaque endpoint (`IsFormatSupported` × 3, `GetDevicePeriod`) :
-/// quelques dizaines de millisecondes par périphérique, loin de cette borne.
+/// Une énumération interroge chaque endpoint (`GetMixFormat`, `GetDevicePeriod`) et
+/// une ouverture initialise un `IAudioClient` : quelques dizaines de millisecondes,
+/// loin de cette borne.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Backend Windows (MMDevice + WASAPI).
@@ -74,6 +76,22 @@ impl WasapiBackend {
         }
     }
 
+    /// Comme [`Backend::open`], mais rend le type concret : utile pour
+    /// [`WasapiHandle::latency`] et [`WasapiHandle::rt_outcome`], hors trait.
+    pub fn open_handle(
+        &mut self,
+        id: &DeviceId,
+        format: StreamFormat,
+        callback: AudioCallback,
+    ) -> Result<WasapiHandle, BackendError> {
+        let id = id.clone();
+        let opened = self.request(
+            move |reply| Command::Open { id, format, reply },
+            "ouverture",
+        )??;
+        WasapiHandle::new(opened, callback)
+    }
+
     /// Envoie une commande au fil MMDevice et attend sa réponse.
     fn request<T: Send + 'static>(
         &self,
@@ -122,14 +140,22 @@ impl Backend for WasapiBackend {
         .ok()?
     }
 
-    /// Les flux arrivent avec M1b-31.
+    /// Ouvre un flux en mode partagé, événementiel, au format demandé (voir
+    /// `open` et `stream`). La poignée rendue est un [`WasapiHandle`] ; le rappel
+    /// n'est appelé qu'après [`DeviceHandle::start`].
+    ///
+    /// # Erreurs
+    ///
+    /// [`BackendError::NotFound`] si l'endpoint n'existe pas ou n'est pas actif,
+    /// [`BackendError::UnsupportedFormat`] pour zéro canal ou un format que le
+    /// moteur refuse malgré la conversion, [`BackendError::Platform`] sinon.
     fn open(
         &mut self,
-        _id: &DeviceId,
-        _format: StreamFormat,
-        _callback: AudioCallback,
+        id: &DeviceId,
+        format: StreamFormat,
+        callback: AudioCallback,
     ) -> Result<Box<dyn DeviceHandle>, BackendError> {
-        Err(BackendError::Platform("flux WASAPI : M1b-31".into()))
+        Ok(Box::new(self.open_handle(id, format, callback)?))
     }
 
     fn subscribe(&mut self) -> EventReceiver {

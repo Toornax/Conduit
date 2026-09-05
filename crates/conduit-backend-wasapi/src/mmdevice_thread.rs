@@ -2,17 +2,19 @@
 //!
 //! COM est initialisé ici (MTA) et tout ce qui touche à MMDevice s'exécute ici :
 //! énumération, recherche du périphérique par défaut, description d'un endpoint
-//! signalé par une notification. Le reste du programme parle à ce fil par
-//! `std::sync::mpsc` ([`Command`]) ; le client de notification y poste ses rappels
-//! ([`Notification`]) par le même canal. Les [`DeviceEvent`] produits sont diffusés
-//! par un [`EventBroadcaster`] que ce fil possède aussi.
+//! signalé par une notification, ouverture d'un flux (création et initialisation
+//! des objets WASAPI, qui partent ensuite vers le fil du flux). Le reste du
+//! programme parle à ce fil par `std::sync::mpsc` ([`Command`]) ; le client de
+//! notification y poste ses rappels ([`Notification`]) par le même canal. Les
+//! [`DeviceEvent`] produits sont diffusés par un [`EventBroadcaster`] que ce fil
+//! possède aussi.
 
 use std::collections::BTreeSet;
 use std::sync::mpsc;
 
 use conduit_backend::event::EventBroadcaster;
 use conduit_backend::{
-    BackendError, DeviceDirection, DeviceEvent, DeviceId, DeviceInfo, EventReceiver,
+    BackendError, DeviceDirection, DeviceEvent, DeviceId, DeviceInfo, EventReceiver, StreamFormat,
 };
 use windows::Win32::Media::Audio::{
     eConsole, IMMDeviceEnumerator, IMMNotificationClient, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
@@ -22,6 +24,7 @@ use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 use crate::com::{platform_error, ComApartment};
 use crate::devices::{default_endpoint_id, describe_id, direction_from_flow, enumerate};
 use crate::notify::{Notification, NotificationClient};
+use crate::open::Opened;
 
 /// Ordre envoyé par le [`WasapiBackend`](crate::WasapiBackend).
 pub(crate) enum Command {
@@ -33,6 +36,12 @@ pub(crate) enum Command {
     DefaultDevice {
         direction: DeviceDirection,
         reply: mpsc::Sender<Result<Option<DeviceId>, BackendError>>,
+    },
+    /// Ouvrir un flux partagé (objets WASAPI créés ici, consommés par le fil du flux).
+    Open {
+        id: DeviceId,
+        format: StreamFormat,
+        reply: mpsc::Sender<Result<Opened, BackendError>>,
     },
     /// Créer un abonnement aux événements.
     Subscribe { reply: mpsc::Sender<EventReceiver> },
@@ -143,6 +152,9 @@ impl State {
                 let result = default_endpoint_id(&self.enumerator, direction)
                     .map(|id| id.map(DeviceId::new));
                 let _ = reply.send(result);
+            }
+            Command::Open { id, format, reply } => {
+                let _ = reply.send(crate::open::open(&self.enumerator, &id, format));
             }
             Command::Subscribe { reply } => {
                 let _ = reply.send(self.events.subscribe());
