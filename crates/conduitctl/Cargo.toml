@@ -23,7 +23,7 @@ thiserror = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 
 [dev-dependencies]
-conduitd = { path = "../conduitd" }
+conduitd = { path = "../conduitd", version = "0.1.0" }
 tempfile = "3"
 
 [lints]
