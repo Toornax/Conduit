@@ -1,9 +1,17 @@
 {
-  "comment": "Versions exactes de l'environnement Windows (SPEC §5.11). Le script setup-env.ps1 échoue si une version installée diffère.",
+  "comment": "Versions exactes de l'environnement Windows (SPEC §5.11, docs/windows-drivers-rs.md). Le script setup-env.ps1 échoue si une version installée diffère.",
   "rust": "1.96.1",
   "targets": ["x86_64-pc-windows-msvc"],
   "components": ["rustfmt", "clippy"],
   "visual_studio_build_tools": "17",
   "windows_sdk": "10.0.26100.0",
-  "wdk": "10.0.26100.0"
+  "wdk": "10.0.26100.0",
+  "llvm": "17.0.6",
+  "cargo_wdk": "0.1.1",
+  "wdk_crates": {
+    "wdk-sys": "0.5.1",
+    "wdk-build": "0.5.1",
+    "wdk": "0.4.1",
+    "wdk-alloc": "0.4.1"
+  }
 }

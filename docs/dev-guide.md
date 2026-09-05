@@ -31,6 +31,8 @@ conduit-core ← conduit-backend ← conduit-protocol ← conduit-engine ← con
 | `conduitctl` | CLI | — |
 | `conduit-testing` | allocateur de garde | — |
 | `conduit-kmd-core` | logique portable du pilote Windows : positions, copie cyclique, formats | aucune |
+| `portcls-sys` | bindings PortCls/KS générés, testables en mode utilisateur (`drivers/windows`, workspace noyau, ADR-012) | Windows |
+| `conduit-kmd` | le pilote noyau `.sys` : WDM, `no_std`, PortCls/WaveRT (`drivers/windows`, workspace noyau ; [driver-dev.md](driver-dev.md)) | Windows |
 
 ## 2. Le fil audio
 
@@ -104,6 +106,11 @@ cyclique rendu → capture avec conversion F32 ↔ I16 (`ring`), validation des 
 et taille de tampon (`format`). Son code tourne à `DISPATCH_LEVEL` dans le pilote :
 les lints anti-panique (`unwrap`, indexation, arithmétique débordante) sont en `deny`.
 Conception et invariants : [driver-design.md](driver-design.md) §2.1 et §5.
+
+Le pilote lui-même (`portcls-sys`, `conduit-kmd`) est dans le workspace noyau
+`drivers/windows`, construit uniquement sous Windows avec le WDK : installation du
+poste, build, VM de test et débogage dans [driver-dev.md](driver-dev.md), outillage
+`windows-drivers-rs` dans [windows-drivers-rs.md](windows-drivers-rs.md).
 
 ## 5. Tests
 

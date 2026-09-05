@@ -1,0 +1,6 @@
+# Toolchain du workspace noyau : stable MSVC, même version que la racine
+# (packaging/windows/versions.json). Le nightly n'est pas nécessaire à windows-drivers-rs.
+[toolchain]
+channel = "1.96.1"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-pc-windows-msvc"]

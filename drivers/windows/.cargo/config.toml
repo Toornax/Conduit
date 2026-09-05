@@ -1,0 +1,3 @@
+# CRT statique : exigé par wdk-build pour un pilote noyau (sinon `StaticCrtNotEnabled`).
+[build]
+rustflags = ["-C", "target-feature=+crt-static"]

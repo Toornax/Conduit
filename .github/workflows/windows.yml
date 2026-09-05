@@ -21,3 +21,52 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
+
+  # Workspace noyau (drivers/windows, ADR-012) : WDK, LLVM épinglé pour bindgen et
+  # cargo-wdk, puis les mêmes scripts que sur un poste développeur (docs/driver-dev.md).
+  driver:
+    name: pilote noyau (WDK)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Versions épinglées
+        shell: pwsh
+        run: |
+          $v = Get-Content packaging/windows/versions.json -Raw | ConvertFrom-Json
+          "LLVM_VERSION=$($v.llvm)" >> $env:GITHUB_ENV
+          "CARGO_WDK_VERSION=$($v.cargo_wdk)" >> $env:GITHUB_ENV
+      - name: WDK 26100 et LLVM (winget)
+        shell: pwsh
+        run: |
+          winget install --id Microsoft.WindowsWDK.10.0.26100 -e --accept-source-agreements --accept-package-agreements --disable-interactivity
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          winget install --id LLVM.LLVM -e --version $env:LLVM_VERSION --force --accept-source-agreements --accept-package-agreements --disable-interactivity
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+      - name: Cache cargo-wdk
+        id: cache-cargo-wdk
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-wdk.exe
+          key: cargo-wdk-${{ env.CARGO_WDK_VERSION }}-${{ runner.os }}
+      - name: Environnement épinglé (toolchain, cargo-wdk)
+        shell: pwsh
+        run: ./packaging/windows/setup-env.ps1
+      - name: Environnement épinglé (vérification)
+        shell: pwsh
+        run: ./packaging/windows/setup-env.ps1 -Check
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: drivers/windows
+      - name: Vérifications du workspace noyau
+        shell: pwsh
+        run: ./drivers/windows/tools/check.ps1
+      - name: Build et package du pilote
+        shell: pwsh
+        run: ./drivers/windows/tools/build.ps1
+      - name: Package du pilote (artefact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: conduit_kmd_package
+          path: drivers/windows/target/debug/conduit_kmd_package/
+          if-no-files-found: error

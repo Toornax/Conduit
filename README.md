@@ -9,6 +9,7 @@ avec une latence faible et maîtrisée.
 - [ROADMAP.md](ROADMAP.md) : découpage en tâches et suivi.
 - [docs/adr](docs/adr/README.md) : décisions d'architecture.
 - [docs/protocol.md](docs/protocol.md) : protocole de contrôle (généré).
+- [docs/driver-dev.md](docs/driver-dev.md) : pilote Windows (installation, build, VM de test).
 
 ## État
 

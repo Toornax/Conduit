@@ -1,0 +1,58 @@
+;
+; conduit_kmd.inx : source de l'INF du pilote Conduit (câbles audio virtuels).
+;
+; `cargo wdk build` copie ce fichier en conduit_kmd.inf, remplace DriverVer et $ARCH$
+; (stampinf), génère le catalogue (inf2cat), signe avec le certificat de test et vérifie
+; avec `infverif /w` (exigences « Windows Driver » : fichiers dans le magasin des pilotes,
+; DIRID 13). Le nom du fichier est imposé par cargo-wdk : nom du crate avec `_`.
+;
+; M1a-01 : INF minimal pour un périphérique énuméré à la racine (Root\ConduitCable), classe
+; MEDIA. Les sections Kernel Streaming et PortCls (Include=ks.inf,wdmaudio.inf, interfaces
+; KSCATEGORY_*, noms des endpoints) arrivent en M1a-09 (docs/driver-design.md §4).
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = MEDIA
+ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider    = %Conduit%
+CatalogFile = conduit_kmd.cat
+DriverVer   =
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+conduit_kmd.sys = 1
+
+[Manufacturer]
+%Conduit% = Conduit,NT$ARCH$.10.0...16299
+
+[Conduit.NT$ARCH$.10.0...16299]
+%ConduitCable.DeviceDesc% = ConduitCable_Install, Root\ConduitCable
+
+[ConduitCable_Install.NT]
+CopyFiles = ConduitCable_CopyFiles
+
+[ConduitCable_CopyFiles]
+conduit_kmd.sys
+
+[ConduitCable_Install.NT.Services]
+AddService = conduit_kmd, 0x00000002, ConduitCable_Service
+
+[ConduitCable_Service]
+DisplayName   = %ConduitCable.ServiceDesc%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %13%\conduit_kmd.sys
+
+[Strings]
+Conduit                  = "Conduit"
+DiskName                 = "Conduit Installation Disk"
+ConduitCable.DeviceDesc  = "Conduit Virtual Audio Cable"
+ConduitCable.ServiceDesc = "Conduit Virtual Audio Cable Driver"

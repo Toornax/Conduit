@@ -1,0 +1,29 @@
+[package]
+name = "conduit-kmd"
+description = "Pilote noyau Windows des câbles Conduit (PortCls/WaveRT, WDM)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+# Pilote WDM (pas de KMDF) : PortCls fournit lui-même le modèle de périphérique.
+[package.metadata.wdk.driver-model]
+driver-type = "WDM"
+
+[lib]
+crate-type = ["cdylib"]
+
+[build-dependencies]
+wdk-build.workspace = true
+
+[dependencies]
+wdk.workspace = true
+wdk-alloc.workspace = true
+wdk-sys.workspace = true
+portcls-sys = { path = "../portcls-sys" }
+
+[lints]
+workspace = true

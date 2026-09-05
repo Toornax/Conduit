@@ -293,7 +293,7 @@ allocation dans le fil audio, CI verte partout, couverture ≥ 80 % sur `core` e
 Objectif : prouver qu'un pilote PortCls/WaveRT en Rust est faisable. Délai borné (à fixer,
 proposition : trois semaines de travail effectif). Porte de décision en M1a-12.
 
-- [ ] **M1a-01** `chore(driver): environnement de build WDK et windows-drivers-rs`
+- [x] **M1a-01** `chore(driver): environnement de build WDK et windows-drivers-rs`
   Hors Nix (SPEC §5.11). Extension de `packaging/windows/setup-env.ps1` (WDK 26100, LLVM
   17.0.6, `cargo-wdk` 0.1.1, versions dans `versions.json`) ; workspace noyau
   `drivers/windows` (ADR-012) avec `rust-toolchain.toml` **stable** 1.96.1 (nightly inutile),

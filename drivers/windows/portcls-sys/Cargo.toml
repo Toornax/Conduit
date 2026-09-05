@@ -1,0 +1,17 @@
+[package]
+name = "portcls-sys"
+description = "Bindings PortCls et KS générés pour le pilote Conduit (workspace noyau)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+# Aucune dépendance (ni `wdk-sys`) : le crate reste testable en mode utilisateur.
+# M1a-03 ajoutera `bindgen` et `wdk-build` en build-dependencies.
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,45 @@
+# Workspace NOYAU (ADR-012) : indépendant du workspace racine, construit uniquement
+# sous Windows avec le WDK (`cargo wdk build` ou `tools/build.ps1`). Jamais ouvert par Nix.
+[workspace]
+resolver = "2"
+members = ["portcls-sys", "conduit-kmd"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ToorNax/conduit"
+authors = ["Conduit contributors"]
+
+# Versions épinglées : voir docs/windows-drivers-rs.md et packaging/windows/versions.json.
+# Pas de `wdk-panic` : sa version publiée gèle la machine (`loop {}`), le gestionnaire de
+# panique est maison (conduit-kmd/src/panic.rs).
+[workspace.dependencies]
+wdk-sys = "0.5.1"
+wdk-build = "0.5.1"
+wdk = "0.4.1"
+wdk-alloc = "0.4.1"
+bindgen = "0.71"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+# Zéro panique en noyau (driver-design.md §1) : tout chemin faillible renvoie un NTSTATUS.
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+panic = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+debug = 1
