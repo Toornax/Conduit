@@ -23,7 +23,7 @@ repository = "https://github.com/ToorNax/conduit"
 authors = ["Conduit contributors"]
 
 [workspace.dependencies]
-conduit-core = { path = "crates/conduit-core" }
+conduit-core = { path = "crates/conduit-core", default-features = false }
 conduit-engine = { path = "crates/conduit-engine" }
 conduit-backend = { path = "crates/conduit-backend" }
 conduit-protocol = { path = "crates/conduit-protocol" }

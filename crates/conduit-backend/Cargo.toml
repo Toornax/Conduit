@@ -6,9 +6,19 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Conduit — conduit-backend"
+description = "Conduit — traits Backend et CableControl, backend null simulé"
+
+[features]
+default = ["serde"]
+serde = ["dep:serde", "conduit-core/serde"]
 
 [dependencies]
+conduit-core = { workspace = true }
+serde = { workspace = true, optional = true, features = ["rc"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1"
 
 [lints]
 workspace = true
