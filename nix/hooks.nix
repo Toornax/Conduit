@@ -1,5 +1,6 @@
-# Hooks de pré-commit via git-hooks.nix (M0-06) : rustfmt, nixfmt, cargo-deny,
-# format des messages de commit (Conventional Commits, scopes de ROADMAP).
+# Hooks de pré-commit via git-hooks.nix (M0-06) : rustfmt, nixfmt, format des
+# messages de commit (Conventional Commits, scopes de ROADMAP). cargo-deny est un
+# check crane séparé (`deny`) : en hook il exigerait le réseau dans le bac à sable.
 { inputs, ... }:
 {
   imports = [ inputs.git-hooks.flakeModule ];
@@ -29,13 +30,6 @@
           packageOverrides.rustfmt = pkgs.rustfmt;
         };
         nixfmt-rfc-style.enable = true;
-        cargo-deny = {
-          enable = true;
-          name = "cargo-deny";
-          entry = "${pkgs.cargo-deny}/bin/cargo-deny check";
-          pass_filenames = false;
-          files = "(Cargo\\.(toml|lock)|deny\\.toml)$";
-        };
         commit-message = {
           enable = true;
           name = "format du message de commit";
