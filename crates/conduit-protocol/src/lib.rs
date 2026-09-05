@@ -4,7 +4,8 @@
 //!   de l'API, implémentée par `conduit-engine`) ;
 //! - [`wire`] : enveloppe [`Message`], négociation [`Hello`], version ;
 //! - [`framing`] : trames `u32` longueur + MessagePack, décodeur incrémental borné ;
-//! - [`schema`] (feature `schema`) : export JSON Schema et documentation.
+//! - [`schema`] (feature `schema`) : export JSON Schema et documentation ;
+//! - [`client`] (feature `client`) : client asynchrone `tokio`.
 //!
 //! Compatibilité : l'ajout de champs est toujours optionnel ; un changement
 //! incompatible incrémente [`PROTOCOL_VERSION`].
@@ -13,6 +14,8 @@
 #![warn(missing_docs)]
 
 pub mod api;
+#[cfg(feature = "client")]
+pub mod client;
 pub mod framing;
 #[cfg(feature = "schema")]
 pub mod schema;
@@ -24,4 +27,7 @@ pub use api::{
     TimingSnapshot,
 };
 pub use framing::{Decoder, FramingError, MAX_FRAME_LEN};
-pub use wire::{Event, Hello, HelloReply, Message, Request, Response, PROTOCOL_VERSION};
+pub use wire::{
+    negotiate, negotiate_client, Event, Hello, HelloReply, Message, Request, Response,
+    PROTOCOL_VERSION,
+};

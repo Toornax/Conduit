@@ -1,0 +1,197 @@
+//! `conduitd` — le démon : moteur, IPC, persistance, règles.
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
+pub mod autoconnect;
+pub mod config;
+pub mod ipc;
+pub mod logging;
+pub mod paths;
+pub mod persist;
+pub mod service;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use conduit_backend::{Backend, CableSpec};
+use conduit_core::types::ChannelCount;
+use conduit_engine::{Engine, EngineConfig};
+use tokio::sync::watch;
+
+use config::Config;
+use paths::Paths;
+use service::{Service, ServiceOptions};
+
+/// Nom annoncé aux clients.
+pub fn server_name() -> String {
+    format!("conduitd {}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Erreurs de démarrage.
+#[derive(Debug, thiserror::Error)]
+pub enum DaemonError {
+    /// Configuration.
+    #[error("{0}")]
+    Config(#[from] config::ConfigError),
+    /// Moteur.
+    #[error("moteur : {0}")]
+    Engine(#[from] conduit_engine::EngineError),
+    /// Entrée/sortie.
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Options du démon.
+#[derive(Debug, Clone)]
+pub struct DaemonOptions {
+    /// Chemins.
+    pub paths: Paths,
+    /// Configuration.
+    pub config: Config,
+    /// Watchdog du fil audio.
+    pub watchdog: bool,
+    /// Persistance de l'état.
+    pub persist: bool,
+}
+
+impl DaemonOptions {
+    /// Options sous un répertoire racine (tests).
+    pub fn under(root: &std::path::Path, config: Config) -> Self {
+        Self {
+            paths: Paths::under(root),
+            config,
+            watchdog: false,
+            persist: true,
+        }
+    }
+}
+
+/// Construit le moteur : fréquence, quantum, pilote et câbles de la configuration.
+pub fn build_engine(mut backend: Box<dyn Backend>, config: &Config) -> Result<Engine, DaemonError> {
+    ensure_cables(backend.as_mut(), config);
+    let engine_config = EngineConfig {
+        sample_rate: config.sample_rate(),
+        quantum: config.quantum(),
+        driver: config.driver_choice(),
+        ..Default::default()
+    };
+    Ok(Engine::new(backend, engine_config)?)
+}
+
+/// Crée les câbles manquants de la configuration et applique les alias (F-01).
+fn ensure_cables(backend: &mut dyn Backend, config: &Config) {
+    let Some(cc) = backend.cable_control() else {
+        if !config.cables.is_empty() {
+            tracing::warn!("ce backend ne gère pas les câbles : section [[cable]] ignorée");
+        }
+        return;
+    };
+    let existing = cc.list().unwrap_or_default();
+    for c in &config.cables {
+        let channels = ChannelCount::new(c.channels).unwrap_or_default();
+        match existing.iter().find(|e| e.id.0 == c.id) {
+            Some(e) => {
+                if e.channels != channels {
+                    let _ = cc.set_channels(e.id, channels);
+                }
+                if let Some(alias) = &c.alias {
+                    if &e.name != alias {
+                        let _ = cc.rename(e.id, alias);
+                    }
+                }
+            }
+            None => match cc.create(CableSpec {
+                name: c.alias.clone(),
+                channels,
+            }) {
+                Ok(info) => tracing::info!("câble créé : {} ({})", info.name, info.channels),
+                Err(e) => tracing::warn!("câble {} : {e}", c.id),
+            },
+        }
+    }
+}
+
+/// Démon en cours d'exécution.
+pub struct Daemon {
+    /// Chemin ou nom du socket.
+    pub socket: PathBuf,
+    /// Service (commandes directes, sans IPC).
+    pub service: Arc<Service>,
+    shutdown: watch::Sender<bool>,
+    server: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl core::fmt::Debug for Daemon {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Daemon")
+            .field("socket", &self.socket)
+            .finish()
+    }
+}
+
+impl Daemon {
+    /// Démarre le moteur, le service et le serveur IPC (dans le runtime courant).
+    pub fn spawn(backend: Box<dyn Backend>, options: DaemonOptions) -> Result<Self, DaemonError> {
+        options.paths.ensure_dirs()?;
+        let engine = build_engine(backend, &options.config)?;
+        let service = Arc::new(Service::start(
+            engine,
+            ServiceOptions {
+                state_file: options.persist.then(|| options.paths.state_file.clone()),
+                rules: options.config.autoconnect.clone(),
+                watchdog: options.watchdog,
+                ..Default::default()
+            },
+        ));
+        let listener = ipc::Listener::bind(&options.paths.socket)?;
+        let (shutdown, rx) = watch::channel(false);
+        let server = tokio::spawn(ipc::serve(
+            listener,
+            Arc::clone(&service),
+            rx,
+            server_name(),
+        ));
+        tracing::info!("démon prêt sur {}", options.paths.socket.display());
+        Ok(Self {
+            socket: options.paths.socket.clone(),
+            service,
+            shutdown,
+            server: Some(server),
+        })
+    }
+
+    /// Arrête le serveur IPC puis le service.
+    pub async fn shutdown(mut self) {
+        let _ = self.shutdown.send(true);
+        if let Some(s) = self.server.take() {
+            let _ = s.await;
+        }
+        if let Ok(mut service) = Arc::try_unwrap(self.service) {
+            service.shutdown();
+        }
+    }
+
+    /// Tourne jusqu'au signal d'arrêt (Ctrl-C / SIGTERM).
+    pub async fn run_until_signal(self) {
+        wait_for_signal().await;
+        tracing::info!("arrêt demandé");
+        self.shutdown().await;
+    }
+}
+
+async fn wait_for_signal() {
+    #[cfg(unix)]
+    {
+        let mut term =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = async { match term.as_mut() { Some(t) => { t.recv().await; } None => std::future::pending().await } } => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}

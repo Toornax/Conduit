@@ -6,9 +6,30 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Conduit — conduitd"
+description = "Conduit — démon : moteur, IPC, persistance"
+
+[[bin]]
+name = "conduitd"
+path = "src/main.rs"
 
 [dependencies]
+conduit-core = { workspace = true, features = ["serde"] }
+conduit-backend = { workspace = true, features = ["serde"] }
+conduit-engine = { workspace = true }
+conduit-protocol = { workspace = true, features = ["client"] }
+serde = { workspace = true }
+serde_json = "1"
+toml = "0.8"
+thiserror = { workspace = true }
+directories = "6"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "io-util", "signal", "time", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

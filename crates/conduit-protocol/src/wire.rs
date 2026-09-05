@@ -69,6 +69,23 @@ pub fn negotiate(hello: &Hello, server: &str) -> HelloReply {
     }
 }
 
+/// Vérifie côté client la réponse du démon.
+pub fn negotiate_client(reply: &HelloReply) -> Result<(), String> {
+    if !reply.accepted {
+        return Err(reply
+            .reason
+            .clone()
+            .unwrap_or_else(|| "connexion refusée par le démon".into()));
+    }
+    if reply.version != PROTOCOL_VERSION {
+        return Err(format!(
+            "le démon parle le protocole {} et ce client le protocole {PROTOCOL_VERSION} : mettez à jour Conduit",
+            reply.version
+        ));
+    }
+    Ok(())
+}
+
 /// Requête : identifiant + commande.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]

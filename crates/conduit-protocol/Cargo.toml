@@ -11,6 +11,7 @@ description = "Conduit — protocole de contrôle IPC : types, framing, versionn
 [features]
 default = []
 schema = ["dep:schemars", "dep:serde_json", "conduit-core/schema", "conduit-backend/schema"]
+client = ["dep:tokio"]
 
 [dependencies]
 conduit-core = { workspace = true, features = ["serde"] }
@@ -20,6 +21,7 @@ rmp-serde = "1"
 thiserror = { workspace = true }
 schemars = { version = "1", optional = true }
 serde_json = { version = "1", optional = true }
+tokio = { version = "1", features = ["net", "io-util", "time"], optional = true }
 
 [dev-dependencies]
 serde_json = "1"

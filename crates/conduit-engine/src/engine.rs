@@ -127,6 +127,8 @@ struct DeviceEntry {
 
 struct InternalEntry {
     kind: InternalKind,
+    /// Paramètres réglés à chaud (nom → valeur), pour la persistance.
+    params: BTreeMap<String, f32>,
     sine: Option<Arc<SineControl>>,
     noise: Option<Arc<NoiseControl>>,
     meter: Option<Arc<MeterShared>>,
@@ -537,6 +539,7 @@ impl Engine {
         }
         let mut entry = InternalEntry {
             kind: kind.clone(),
+            params: BTreeMap::new(),
             sine: None,
             noise: None,
             meter: None,
@@ -691,6 +694,9 @@ impl Engine {
                 }
             }
         }
+        if let Some(entry) = self.internals.get_mut(&node) {
+            entry.params.insert(name.to_string(), value);
+        }
         Ok(())
     }
 
@@ -713,6 +719,11 @@ impl Engine {
     /// Type d'un nœud interne.
     pub fn internal_kind(&self, node: NodeId) -> Option<&InternalKind> {
         self.internals.get(&node).map(|e| &e.kind)
+    }
+
+    /// Paramètres réglés à chaud d'un nœud interne.
+    pub fn internal_params(&self, node: NodeId) -> Option<&BTreeMap<String, f32>> {
+        self.internals.get(&node).map(|e| &e.params)
     }
 
     fn publish(&mut self) -> Result<(), EngineError> {
