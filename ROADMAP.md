@@ -55,7 +55,7 @@ allocation dans le fil audio, CI verte partout, couverture ≥ 80 % sur `core` e
   `deny.toml` (licences autorisées MIT/Apache/BSD/ISC/Zlib, refus copyleft, sources
   crates.io uniquement), check Nix `deny` et `audit`.
   *Fait quand* : `nix flake check` échoue si on ajoute une dépendance GPL en test local.
-- [ ] **M0-06** `chore(nix): hooks de pré-commit via git-hooks.nix`
+- [x] **M0-06** `chore(nix): hooks de pré-commit via git-hooks.nix`
   `rustfmt`, `nixfmt`, `cargo-deny`, format des messages de commit.
   *Fait quand* : un commit mal formaté est refusé dans le devshell.
 - [x] **M0-07** `ci: nix flake check sur Linux et macOS avec cache binaire`
