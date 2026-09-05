@@ -184,6 +184,37 @@ impl Client {
     }
 }
 
+/// Vrai si `path` est déjà un nom de named pipe (`\\.\pipe\…` ou `\\?\pipe\…`).
+#[cfg(windows)]
+pub fn is_pipe_name(path: &Path) -> bool {
+    let s = path.to_string_lossy().to_ascii_lowercase();
+    s.starts_with(r"\\.\pipe\") || s.starts_with(r"\\?\pipe\")
+}
+
+/// Nom de named pipe correspondant à un chemin de socket.
+///
+/// Un nom de pipe (`\\.\pipe\…`) est rendu tel quel. Tout autre chemin (par exemple
+/// `<racine>\conduitd.sock` produit par `--root` ou par les tests) est projeté sur
+/// `\\.\pipe\conduit-<empreinte>` où l'empreinte (FNV-1a 64 bits) est celle du chemin
+/// absolu en minuscules : le démon et ses clients obtiennent ainsi le même nom à partir du
+/// même chemin, et deux racines différentes donnent deux pipes différents (sans cela,
+/// deux démons lancés en parallèle se disputaient la même instance et le second échouait
+/// avec `ERROR_ACCESS_DENIED`).
+#[cfg(windows)]
+pub fn pipe_name(path: &Path) -> std::path::PathBuf {
+    if is_pipe_name(path) {
+        return path.to_path_buf();
+    }
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let key = absolute.to_string_lossy().to_lowercase();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in key.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    std::path::PathBuf::from(format!(r"\\.\pipe\conduit-{hash:016x}"))
+}
+
 async fn connect_stream(path: &Path) -> std::io::Result<Stream> {
     #[cfg(unix)]
     {
@@ -193,8 +224,9 @@ async fn connect_stream(path: &Path) -> std::io::Result<Stream> {
     #[cfg(windows)]
     {
         use tokio::net::windows::named_pipe::ClientOptions;
+        let name = pipe_name(path);
         for _ in 0..50 {
-            match ClientOptions::new().open(path) {
+            match ClientOptions::new().open(&name) {
                 Ok(s) => return Ok(Box::new(s)),
                 Err(e) if e.raw_os_error() == Some(231) => {
                     // ERROR_PIPE_BUSY : toutes les instances sont occupées, réessayer.
@@ -215,5 +247,26 @@ async fn connect_stream(path: &Path) -> std::io::Result<Stream> {
             std::io::ErrorKind::Unsupported,
             "plateforme sans IPC",
         ))
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pipe_names_are_kept_and_paths_are_projected_deterministically() {
+        let explicit = Path::new(r"\\.\pipe\conduit-moi");
+        assert!(is_pipe_name(explicit));
+        assert_eq!(pipe_name(explicit), explicit);
+        let a = pipe_name(Path::new(r"C:\tmp\a\conduitd.sock"));
+        let b = pipe_name(Path::new(r"C:\tmp\b\conduitd.sock"));
+        assert!(is_pipe_name(&a));
+        assert_ne!(a, b, "deux racines → deux pipes");
+        assert_eq!(
+            a,
+            pipe_name(Path::new(r"c:\TMP\a\conduitd.sock")),
+            "insensible à la casse"
+        );
     }
 }

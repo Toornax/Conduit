@@ -11,7 +11,7 @@ use conduit_protocol::wire::{Hello, Message};
 use conduit_protocol::{Command, DriverStatus, InternalKind, NodeState, Notification, Reply};
 use conduitd::config::Config;
 use conduitd::{Daemon, DaemonOptions};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 fn null_with_speakers() -> NullBackend {
     let null = NullBackend::new();
@@ -34,6 +34,31 @@ async fn client(d: &Daemon, name: &str) -> Client {
     Client::connect(&d.socket, name).await.expect("connexion")
 }
 
+/// Connexion brute (sans `Hello`) pour envoyer des trames arbitraires au démon :
+/// socket Unix ou named pipe selon la plateforme.
+#[cfg(unix)]
+async fn raw_connect(path: &std::path::Path) -> impl AsyncRead + AsyncWrite + Unpin {
+    tokio::net::UnixStream::connect(path).await.unwrap()
+}
+
+/// Même logique de nouvelle tentative sur `ERROR_PIPE_BUSY` (231) que `Client::connect`
+/// (copie minimale : `connect_stream` n'est pas exposée par `conduit_protocol::client`).
+#[cfg(windows)]
+async fn raw_connect(path: &std::path::Path) -> impl AsyncRead + AsyncWrite + Unpin {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    let name = conduit_protocol::client::pipe_name(path);
+    for _ in 0..50 {
+        match ClientOptions::new().open(&name) {
+            Ok(s) => return s,
+            Err(e) if e.raw_os_error() == Some(231) => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => panic!("connexion brute au pipe : {e}"),
+        }
+    }
+    panic!("named pipe occupé");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn two_clients_and_version_negotiation() {
     let dir = tempfile::tempdir().unwrap();
@@ -50,7 +75,7 @@ async fn two_clients_and_version_negotiation() {
     assert_eq!(sa.nodes, sb.nodes);
     assert!(matches!(sa.driver, DriverStatus::Device { .. }));
     // Client trop récent : refusé avec conseil.
-    let mut raw = tokio::net::UnixStream::connect(&d.socket).await.unwrap();
+    let mut raw = raw_connect(&d.socket).await;
     raw.write_all(
         &encode_message(&Message::Hello(Hello {
             version: 99,
@@ -76,7 +101,7 @@ async fn two_clients_and_version_negotiation() {
     assert!(!r.accepted);
     assert!(r.reason.unwrap().contains("mettez à jour"));
     // Trame corrompue : le démon déconnecte, sans paniquer.
-    let mut bad = tokio::net::UnixStream::connect(&d.socket).await.unwrap();
+    let mut bad = raw_connect(&d.socket).await;
     bad.write_all(&[0xff, 0xff, 0xff, 0x7f, 1, 2, 3])
         .await
         .unwrap();
