@@ -172,6 +172,28 @@ pub fn buffer_bytes(requested_bytes: u32, frame_bytes: u32, sample_rate: u32) ->
     u32::try_from(frames.checked_mul(frame_bytes)?).ok()
 }
 
+/// Taille du tampon cyclique pour `AllocateBufferWithNotification` : comme
+/// [`buffer_bytes`], puis arrondie **vers le haut** à un multiple de
+/// `notification_count` trames, pour que chaque période de notification
+/// (`bytes / notification_count`) soit un nombre entier de trames et que la fin du
+/// tampon soit une frontière de période ([`crate::notify`]). L'arrondi peut dépasser
+/// [`MAX_BUFFER_MS`] d'au plus `notification_count − 1` trames.
+///
+/// `None` dans les cas de [`buffer_bytes`], si `notification_count == 0`, ou si le
+/// résultat ne tient pas dans un `u32`.
+pub fn buffer_bytes_for_notifications(
+    requested_bytes: u32,
+    frame_bytes: u32,
+    sample_rate: u32,
+    notification_count: u32,
+) -> Option<u32> {
+    let bytes = buffer_bytes(requested_bytes, frame_bytes, sample_rate)?;
+    // `frame_bytes ≠ 0` (vérifié par `buffer_bytes`) et `bytes` en est un multiple.
+    let frames = bytes.checked_div(frame_bytes)?;
+    let aligned = crate::notify::align_frames(frames, notification_count)?;
+    aligned.checked_mul(frame_bytes)
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -313,7 +335,59 @@ mod tests {
         assert_eq!(buffer_bytes(1_000, 32, u32::MAX), Some(4_294_968 * 32));
     }
 
+    #[test]
+    fn buffer_bytes_for_notifications_table() {
+        // 48 kHz F32 stéréo, 10 ms : 480 trames, déjà pair.
+        assert_eq!(
+            buffer_bytes_for_notifications(3_840, 8, 48_000, 1),
+            Some(3_840)
+        );
+        assert_eq!(
+            buffer_bytes_for_notifications(3_840, 8, 48_000, 2),
+            Some(3_840)
+        );
+        // 481 trames demandées : 482 avec deux notifications.
+        assert_eq!(
+            buffer_bytes_for_notifications(3_848, 8, 48_000, 1),
+            Some(3_848)
+        );
+        assert_eq!(
+            buffer_bytes_for_notifications(3_848, 8, 48_000, 2),
+            Some(3_856)
+        );
+        // 44,1 kHz I16 : 1 ms = 45 trames → 46 avec deux notifications.
+        assert_eq!(buffer_bytes_for_notifications(0, 4, 44_100, 2), Some(184));
+        // Plafond 100 ms = 4 800 trames, pair : inchangé.
+        assert_eq!(
+            buffer_bytes_for_notifications(u32::MAX, 8, 48_000, 2),
+            Some(38_400)
+        );
+        // 44,1 kHz : 4 410 trames, pair.
+        assert_eq!(
+            buffer_bytes_for_notifications(u32::MAX, 4, 44_100, 2),
+            Some(17_640)
+        );
+        assert_eq!(buffer_bytes_for_notifications(3_840, 8, 48_000, 0), None);
+        assert_eq!(buffer_bytes_for_notifications(3_840, 0, 48_000, 1), None);
+    }
+
     proptest! {
+        /// Multiple de `frame_bytes × count`, au moins `buffer_bytes`, moins de `count`
+        /// trames au-dessus.
+        #[test]
+        fn buffer_bytes_for_notifications_aligned(
+            requested in any::<u32>(),
+            frame_bytes in 1u32..=32,
+            sample_rate in 8_000u32..=384_000,
+            count in 1u32..=2,
+        ) {
+            let base = buffer_bytes(requested, frame_bytes, sample_rate).unwrap();
+            let bytes = buffer_bytes_for_notifications(requested, frame_bytes, sample_rate, count).unwrap();
+            prop_assert_eq!(bytes % (frame_bytes * count), 0);
+            prop_assert!(bytes >= base);
+            prop_assert!(bytes - base < frame_bytes * count);
+        }
+
         /// Résultat multiple de `frame_bytes`, dans [1 ms ; 100 ms], et au moins la
         /// demande quand celle-ci est dans les bornes.
         #[test]

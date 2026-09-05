@@ -9,7 +9,10 @@
 //! - la copie cyclique rendu → capture ([`ring`]) : tampons de tailles différentes,
 //!   wrap-around des deux côtés, conversion F32 ↔ I16, silence ;
 //! - la validation des formats ([`format`]) : format demandé par le moteur audio
-//!   contre la liste supportée, taille de tampon bornée.
+//!   contre la liste supportée, taille de tampon bornée ;
+//! - les périodes de notification ([`notify`]) : quand signaler les événements
+//!   enregistrés par `IMiniportWaveRTStreamNotification`, à partir de la position
+//!   absolue, bouclage compris.
 //!
 //! Le pilote (workspace `drivers/windows`, jamais construit par Nix) dépend de ce
 //! crate par chemin ; le workspace racine le compile, le teste (proptest, Miri,
@@ -56,11 +59,14 @@
 extern crate std;
 
 pub mod format;
+pub mod notify;
 pub mod position;
 pub mod ring;
 
 pub use format::{
-    buffer_bytes, validate, FormatError, RequestedFormat, SampleKind, SupportedFormat, M1A_FORMATS,
+    buffer_bytes, buffer_bytes_for_notifications, validate, FormatError, RequestedFormat,
+    SampleKind, SupportedFormat, M1A_FORMATS,
 };
+pub use notify::{align_frames, boundaries_crossed, Notifier};
 pub use position::{byte_offset, StreamPosition, VirtualClock};
 pub use ring::{copy_frames, silence, FrameLayout, RingError, SampleFormat};

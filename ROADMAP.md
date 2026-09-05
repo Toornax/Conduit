@@ -343,6 +343,7 @@ proposition : trois semaines de travail effectif). Porte de décision en M1a-12.
 - [ ] **M1a-07** `feat(driver): miniport WaveRT rendu avec tampon cyclique et horloge timer`
   Allocation du tampon cyclique, position via timer noyau, formats 48 kHz float32 et PCM16.
   *Fait quand* : une application lit un fichier sur l'endpoint sans erreur, position cohérente.
+  *État* : flux rendu livré (tampon MDL, position QPC, notifications par timer) ; lecture réelle à vérifier dans la VM.
 - [ ] **M1a-08** `feat(driver): miniport WaveRT capture en boucle locale sur le rendu`
   *Fait quand* : un enregistreur capture ce que joue le lecteur.
 - [ ] **M1a-09** `feat(driver): INF complet, endpoints nommés Conduit 1`

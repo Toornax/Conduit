@@ -1,15 +1,17 @@
 //! Miniports WaveRT d'un câble (driver-design.md §4, §5) : [`WaveRender`] et
 //! [`WaveCapture`], un par sens, implémentent `portcls::MiniportWaveRT`.
 //!
-//! M1a-06 : ils exposent leur descripteur de filtre (`descriptors::WAVE_RENDER_FILTER`,
-//! `WAVE_CAPTURE_FILTER`), ce qui suffit à publier les endpoints, et **refusent encore
-//! les flux** : `NewStream` vérifie la broche et le sens, traduit le
-//! `KSDATAFORMAT_WAVEFORMATEX[TENSIBLE]` reçu en `conduit_kmd_core::RequestedFormat`
-//! ([`requested_format`]), le valide contre `M1A_FORMATS`, puis répond
-//! `STATUS_NOT_IMPLEMENTED`. M1a-07 y créera l'objet flux (`MiniportWaveRTStream` :
-//! tampon cyclique, horloge, position) et l'inscrira dans le [`Slot`](crate::cable::Slot)
-//! du câble ; M1a-08 y branchera la boucle locale. `DataRangeIntersection` et
-//! `GetDeviceDescription` restent aux défauts de `portcls`.
+//! Ils exposent leur descripteur de filtre (`descriptors::WAVE_RENDER_FILTER`,
+//! `WAVE_CAPTURE_FILTER`, M1a-06), ce qui publie les endpoints, et `NewStream` vérifie
+//! la broche et le sens, traduit le `KSDATAFORMAT_WAVEFORMATEX[TENSIBLE]` reçu en
+//! `conduit_kmd_core::RequestedFormat` ([`requested_format`]) et le valide contre
+//! `M1A_FORMATS`. Côté rendu (M1a-07), `NewStream` crée alors le flux
+//! ([`crate::stream::RenderStream`] : tampon cyclique, horloge, position,
+//! notifications), l'inscrit dans l'emplacement rendu du [`Cable`] (un seul flux à la
+//! fois : `STATUS_DEVICE_BUSY` sinon) et le rend à PortCls par `StreamObject`. Côté
+//! capture, `NewStream` répond encore `STATUS_NOT_IMPLEMENTED` : M1a-08 y branchera la
+//! boucle locale. `DataRangeIntersection` et `GetDeviceDescription` restent aux défauts
+//! de `portcls`.
 //!
 //! # Lecture du format
 //!
@@ -24,9 +26,13 @@ use core::mem::size_of;
 
 use conduit_kmd_core::{M1A_FORMATS, RequestedFormat, SampleKind, SupportedFormat, validate};
 use portcls::conduit_com::{
-    ComRef, NtStatus, STATUS_INVALID_PARAMETER, STATUS_NOT_IMPLEMENTED, STATUS_SUCCESS,
+    ComRef, NtStatus, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_PARAMETER,
+    STATUS_NOT_IMPLEMENTED, STATUS_SUCCESS,
 };
-use portcls::{MiniportWaveRT, PortWaveRT, PortWaveRTStream, ResourceList, StreamObject};
+use portcls::{
+    MiniportWaveRT, PortWaveRT, PortWaveRTStream, ResourceList, StreamObject,
+    try_new_stream_notification_object,
+};
 use portcls_sys::{
     GUID, IUnknown, KSDATAFORMAT, KSDATAFORMAT_SPECIFIER_WAVEFORMATEX,
     KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, KSDATAFORMAT_SUBTYPE_PCM, KSDATAFORMAT_TYPE_AUDIO,
@@ -38,6 +44,7 @@ use crate::cable::Cable;
 use crate::descriptors::{
     WAVE_CAPTURE_FILTER, WAVE_CAPTURE_PIN_SYSTEM, WAVE_RENDER_FILTER, WAVE_RENDER_PIN_SYSTEM,
 };
+use crate::stream::RenderStream;
 
 /// Taille minimale de `cbSize` pour qu'un `WAVEFORMATEX` étendu contienne les champs
 /// de `WAVEFORMATEXTENSIBLE` (`Samples`, `dwChannelMask`, `SubFormat` : 22 octets).
@@ -155,7 +162,7 @@ unsafe fn check_stream_request(
 pub struct WaveRender {
     /// Numéro du câble.
     pub n: u32,
-    /// État partagé du câble (le flux rendu courant y sera inscrit en M1a-07).
+    /// État partagé du câble : le flux rendu courant y est inscrit par `NewStream`.
     pub cable: &'static Cable,
 }
 
@@ -179,7 +186,7 @@ impl MiniportWaveRT for WaveRender {
     // IRQL: PASSIVE_LEVEL
     fn new_stream(
         &self,
-        _port_stream: PortWaveRTStream,
+        port_stream: PortWaveRTStream,
         pin: u32,
         capture: bool,
         format: &KSDATAFORMAT,
@@ -188,13 +195,31 @@ impl MiniportWaveRT for WaveRender {
         // `KSDATAFORMAT` suivie de son extension `FormatSize`.
         let supported =
             unsafe { check_stream_request(WAVE_RENDER_PIN_SYSTEM, false, pin, capture, format) }?;
+        let stream = RenderStream::new(self.n, self.cable, port_stream, supported)?;
+        let object = try_new_stream_notification_object(stream).ok_or_else(|| {
+            kmd_log!(
+                "WaveRender{}::NewStream : allocation du flux impossible",
+                self.n
+            );
+            STATUS_INSUFFICIENT_RESOURCES
+        })?;
+        // SAFETY: `object` possède l'objet COM alloué : le `RenderStream` est à son
+        // adresse définitive jusqu'au dernier `Release`, dont le `Drop` arrête le timer
+        // avant toute libération. En cas d'échec, `object` est lâché ici même : `Drop`
+        // annule le timer initialisé et ne trouve rien à retirer du câble.
+        if let Err(status) = unsafe { object.attach() } {
+            kmd_log!(
+                "WaveRender{}::NewStream broche {pin} refusé : {status:#010x} (flux rendu déjà ouvert)",
+                self.n
+            );
+            return Err(status);
+        }
         kmd_log!(
-            "WaveRender{}::NewStream broche {pin} format {supported:?} : flux non implémenté (M1a-07)",
-            self.n
+            "WaveRender{}::NewStream broche {pin} format {supported:?} : flux {:p}",
+            self.n,
+            object.as_raw()
         );
-        // M1a-07 : créer le flux (`MiniportWaveRTStream`), l'inscrire dans
-        // `self.cable.render` et le rendre par `StreamObject::from`.
-        Err(STATUS_NOT_IMPLEMENTED)
+        Ok(StreamObject::from(object))
     }
 }
 
@@ -203,7 +228,7 @@ impl MiniportWaveRT for WaveRender {
 pub struct WaveCapture {
     /// Numéro du câble.
     pub n: u32,
-    /// État partagé du câble (le flux capture courant y sera inscrit en M1a-07/08).
+    /// État partagé du câble (le flux capture courant y sera inscrit en M1a-08).
     pub cable: &'static Cable,
 }
 
@@ -236,10 +261,11 @@ impl MiniportWaveRT for WaveCapture {
         let supported =
             unsafe { check_stream_request(WAVE_CAPTURE_PIN_SYSTEM, true, pin, capture, format) }?;
         kmd_log!(
-            "WaveCapture{}::NewStream broche {pin} format {supported:?} : flux non implémenté (M1a-07)",
+            "WaveCapture{}::NewStream broche {pin} format {supported:?} : flux non implémenté (M1a-08)",
             self.n
         );
-        // M1a-07/08 : créer le flux capture, l'inscrire dans `self.cable.capture`.
+        // M1a-08 : créer le flux capture (boucle locale sur le rendu), l'inscrire dans
+        // l'emplacement capture du câble (`Cable::attach(Direction::Capture, …)`).
         Err(STATUS_NOT_IMPLEMENTED)
     }
 }

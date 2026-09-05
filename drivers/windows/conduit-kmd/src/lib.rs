@@ -5,7 +5,7 @@
 //! [windows-drivers-rs.md](../../../docs/windows-drivers-rs.md), installation et test dans
 //! [driver-dev.md](../../../docs/driver-dev.md).
 //!
-//! État (M1a-06) : pilote **directement bâti sur PortCls**, sans gestion PnP WDM
+//! État (M1a-07) : pilote **directement bâti sur PortCls**, sans gestion PnP WDM
 //! maison : `DriverEntry` délègue à `PcInitializeAdapterDriver` (qui installe les dispatch
 //! PnP/Power/SystemControl/Create/Close via `PcDispatchIrp` et son propre `DriverUnload`),
 //! `AddDevice` à `PcAddAdapterDevice`, et `StartDevice` à [`adapter::start_device`], qui
@@ -15,8 +15,11 @@
 //! (`PcRegisterPhysicalConnection`). Les tables KS sont les `static` de [`descriptors`],
 //! l'état partagé du câble celui de [`cable`]. Les fonctions et types PortCls viennent
 //! des bindings générés de `portcls-sys` (M1a-03), les objets COM des traits de
-//! `portcls` (M1a-04, M1a-05). Les flux WaveRT (tampon cyclique, horloge, boucle locale)
-//! arrivent en M1a-07 et M1a-08 : `NewStream` répond encore `STATUS_NOT_IMPLEMENTED`.
+//! `portcls` (M1a-04, M1a-05). Le flux **rendu** est livré ([`stream`], M1a-07) :
+//! tampon cyclique par `AllocatePagesForMdl`, position calculée par
+//! `KeQueryPerformanceCounter` ([`clock`]), état sous spin lock ([`sync`]),
+//! notifications par timer et DPC ([`timer`]). Le flux capture et la boucle locale
+//! arrivent en M1a-08 : `WaveCapture::NewStream` répond encore `STATUS_NOT_IMPLEMENTED`.
 //!
 //! Le gestionnaire de panique est maison (`panic.rs`) : une panique en noyau se traduit
 //! par un bug check, jamais par une boucle infinie. La journalisation passe par
@@ -37,7 +40,11 @@ mod panic;
 
 mod adapter;
 mod cable;
+mod clock;
 mod descriptors;
+mod stream;
+mod sync;
+mod timer;
 mod topo;
 mod wave;
 
