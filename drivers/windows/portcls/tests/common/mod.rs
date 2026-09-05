@@ -64,3 +64,84 @@ pub fn refcount(this: This) -> ULONG {
     add_ref(this);
     release(this)
 }
+
+// ---------------------------------------------------------------------------------
+// Faux `IPortWaveRTStream` : `AllocatePagesForMdl` rend un pointeur factice et compte
+// les appels, `FreePagesFromMdl` compte, `GetPhysicalPagesCount` rend le nombre de pages
+// de la dernière allocation ; les autres slots sont vides (→ `STATUS_NOT_IMPLEMENTED`
+// par l'enveloppe). Partagé par `wavert.rs` et `stream.rs`.
+// ---------------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+use conduit_com::{ComObject, ComPtr};
+use portcls::unknown;
+use portcls_sys::{IPortWaveRTStreamVtbl, PHYSICAL_ADDRESS, PMDL, SIZE_T};
+
+/// Valeur du pointeur factice de MDL rendu par le faux port (jamais déréférencé).
+pub const FAUX_MDL: usize = 0x4D44_4C00;
+
+pub struct FauxPortStream {
+    pub allocs: AtomicU32,
+    pub frees: AtomicU32,
+    /// `TotalBytes` de la dernière allocation.
+    pub last_total: AtomicU64,
+    /// `HighAddress.QuadPart` de la dernière allocation.
+    pub last_high: AtomicU64,
+    /// Si vrai, `AllocatePagesForMdl` échoue (rend nul).
+    pub fail: AtomicU32,
+}
+
+unsafe extern "C" fn faux_allocate_pages(
+    this: This,
+    high: PHYSICAL_ADDRESS,
+    total: SIZE_T,
+) -> PMDL {
+    let me = unsafe { ComObject::<IPortWaveRTStreamVtbl, FauxPortStream>::inner(this) };
+    me.allocs.fetch_add(1, Ordering::SeqCst);
+    me.last_total.store(total, Ordering::SeqCst);
+    me.last_high
+        .store(unsafe { high.QuadPart } as u64, Ordering::SeqCst);
+    if me.fail.load(Ordering::SeqCst) != 0 {
+        return ptr::null_mut();
+    }
+    FAUX_MDL as PMDL
+}
+
+unsafe extern "C" fn faux_free_pages(this: This, mdl: PMDL) {
+    let me = unsafe { ComObject::<IPortWaveRTStreamVtbl, FauxPortStream>::inner(this) };
+    assert_eq!(mdl as usize, FAUX_MDL, "la MDL rendue est celle allouée");
+    me.frees.fetch_add(1, Ordering::SeqCst);
+}
+
+unsafe extern "C" fn faux_pages_count(this: This, mdl: PMDL) -> ULONG {
+    let me = unsafe { ComObject::<IPortWaveRTStreamVtbl, FauxPortStream>::inner(this) };
+    assert_eq!(mdl as usize, FAUX_MDL);
+    (me.last_total.load(Ordering::SeqCst).div_ceil(4096)) as ULONG
+}
+
+pub static FAUX_PORT_STREAM_VTBL: IPortWaveRTStreamVtbl = IPortWaveRTStreamVtbl {
+    QueryInterface: Some(unknown::query_interface::<IPortWaveRTStreamVtbl, FauxPortStream>),
+    AddRef: Some(unknown::add_ref::<IPortWaveRTStreamVtbl, FauxPortStream>),
+    Release: Some(unknown::release::<IPortWaveRTStreamVtbl, FauxPortStream>),
+    AllocatePagesForMdl: Some(faux_allocate_pages),
+    AllocateContiguousPagesForMdl: None,
+    MapAllocatedPages: None,
+    UnmapAllocatedPages: None,
+    FreePagesFromMdl: Some(faux_free_pages),
+    GetPhysicalPagesCount: Some(faux_pages_count),
+    GetPhysicalPageAddress: None,
+};
+
+pub fn faux_port_stream() -> ComPtr<IPortWaveRTStreamVtbl, FauxPortStream> {
+    ComObject::new(
+        &FAUX_PORT_STREAM_VTBL,
+        FauxPortStream {
+            allocs: AtomicU32::new(0),
+            frees: AtomicU32::new(0),
+            last_total: AtomicU64::new(0),
+            last_high: AtomicU64::new(0),
+            fail: AtomicU32::new(0),
+        },
+    )
+}

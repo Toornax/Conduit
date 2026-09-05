@@ -14,8 +14,10 @@
 //! `Root\ConduitCable`, démarre, s'arrête et se décharge ; c'est ce cycle que
 //! `tools/vm-cycle.ps1` répète cent fois. Les fonctions et types PortCls viennent des
 //! bindings générés de `portcls-sys` (M1a-03) ; les objets COM (`IAdapterPowerManagement`,
-//! `IMiniportTopology`) s'écriront contre les traits de `portcls` (M1a-04), dépendance déjà
-//! liée mais sans usage avant M1a-06.
+//! `IMiniportTopology`, `IMiniportWaveRT`, `IMiniportWaveRTStream`) s'écriront contre les
+//! traits de `portcls` (M1a-04, M1a-05), dépendance déjà liée (feature `kernel` : enveloppes
+//! de `PcNewPort`, `PcRegisterSubdevice`, `PcRegisterPhysicalConnection`) mais sans usage
+//! avant M1a-06.
 //!
 //! Le gestionnaire de panique est maison (`panic.rs`) : une panique en noyau se traduit
 //! par un bug check, jamais par une boucle infinie. La journalisation passe par
@@ -36,8 +38,9 @@ mod panic;
 
 use core::cell::UnsafeCell;
 
-// Enveloppes COM (M1a-04) : liées dès maintenant pour que le pilote se construise avec
-// elles dans sa configuration noyau ; premier usage en M1a-06 (`adapter`, `topo`).
+// Enveloppes COM (M1a-04, M1a-05) : liées dès maintenant pour que le pilote se construise
+// avec elles dans sa configuration noyau ; premier usage en M1a-06 (`adapter`, `topo`,
+// `wave`).
 use portcls as _;
 use portcls_sys::{PCPFNSTARTDEVICE, PRESOURCELIST, PcAddAdapterDevice, PcInitializeAdapterDriver};
 use wdk_sys::{

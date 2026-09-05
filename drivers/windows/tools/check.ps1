@@ -4,8 +4,9 @@
 .DESCRIPTION
   Même séquence que le job CI `driver` (.github/workflows/windows.yml). Tests en mode
   utilisateur de portcls-sys (avec et sans la feature `com`) et de portcls (faux
-  PortCls) ; ne lance pas `cargo test` sur conduit-kmd : wdk-sys lie les bibliothèques
-  noyau même en test.
+  PortCls), build de portcls avec la feature `kernel` (enveloppes des fonctions Pc*) ;
+  ne lance pas `cargo test` sur conduit-kmd : wdk-sys lie les bibliothèques noyau même
+  en test.
   Vérifie aussi que portcls-sys\tests\layout.golden (oracle cl.exe des bindings) est à
   jour : régénération dans un dossier temporaire (regen-layout.ps1) et comparaison.
 #>
@@ -24,6 +25,7 @@ try {
     @("test", "-p", "portcls-sys"),
     @("test", "-p", "portcls-sys", "--features", "com"),
     @("test", "-p", "portcls"),
+    @("build", "-p", "portcls", "--features", "kernel"),
     @("build", "-p", "conduit-kmd")
   )
   foreach ($step in $steps) {

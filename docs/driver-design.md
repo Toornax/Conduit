@@ -181,6 +181,20 @@ compagnon (`impl<T: MiniportTopology> TopologyVtbl for T { const VTBL: IMiniport
 générées `ComVtable`/`ComInterface` avec leurs tables d'IID (bases par préfixe de
 vtable) ; c'est la seule dépendance de `portcls-sys` hors scripts de build, et elle reste
 optionnelle.
+M1a-05 (2026-09-06) : `MiniportWaveRT`, `MiniportWaveRTStream`,
+`MiniportWaveRTStreamNotification` et les enveloppes reçues `PortWaveRT`,
+`PortWaveRTStream` (`AllocatePagesForMdl`, `MapAllocatedPages`, `FreePagesFromMdl`…)
+suivent le même schéma ; les deux slots hérités de `IMiniport` ont des thunks communs
+(`portcls::miniport`, trait `MiniportSlots` implémenté par vtable). `NewStream` rend un
+**`StreamObject`**, pointeur COM possédé à type effacé (`ComRef<IMiniportWaveRTStream>`),
+construit par `From` depuis l'objet typé (`StreamPtr<T>` ou `StreamNotificationPtr<T>`,
+dont la vtable a celle du flux simple pour préfixe) : le thunk le transfère tel quel dans
+`*Stream`, nul en cas d'erreur, et PortCls découvre la notification par `QueryInterface`.
+Les enveloppes des fonctions `Pc*` (`portcls::adapter` : `new_port`,
+`register_subdevice`, `register_physical_connection`) appellent des symboles de
+`portcls.sys` que seul le pilote lie : elles n'existent que sous la feature **`kernel`**
+de `portcls`, activée par `conduit-kmd` ; `port_init` (`IPort::Init`), `as_unknown` et les
+noms UTF-16 des sous-périphériques (`WAVE_RENDER_0`…) restent testés en mode utilisateur.
 
 PortCls dialogue avec le miniport par des interfaces COM (vtable C++ pure, convention
 `__stdcall`, `IUnknown` en tête). Représentation :
