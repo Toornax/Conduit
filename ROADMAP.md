@@ -371,8 +371,19 @@ signé par attestation, HLK audio passé, latence conforme à SPEC §5.6, endura
 
 ### M1b.C — Backend WASAPI
 
-- [ ] **M1b-30** `feat(wasapi): énumération MMDevice et notifications`
+- [x] **M1b-30** `feat(wasapi): énumération MMDevice et notifications`
   *Fait quand* : branchement d'un casque USB → `DeviceEvent::Added` (F-10, F-20).
+  Fait : fil MMDevice dédié (COM MTA, `IMMDeviceEnumerator`, `IMMNotificationClient`
+  Rust), `DeviceInfo` complet (nom, sens, format du moteur, fréquences acceptées en
+  mode partagé, période, défaut `eConsole`, câble par le nom), `Added` / `Removed` /
+  `DefaultChanged`, tests d'intégration sur les cartes son de la machine, exemple
+  `list --watch`. Reste à faire à la main : le critère casque USB est le test
+  `#[ignore]` `hotplug_produces_added_then_removed` (brancher puis débrancher pendant
+  30 s), non exécuté par l'agent. `open` renvoie `Platform("flux WASAPI : M1b-31")`.
+  Réserve : `channels` vient du format du périphérique (`PKEY_AudioEngine_DeviceFormat`),
+  qui peut différer du format de mixage qu'imposera le mode partagé (micro mono → mix
+  stéréo) ; `sample_rates` ne liste que ce que `IsFormatSupported` accepte tel quel
+  (en pratique la fréquence de mixage, vide pour un tel micro). À revoir en M1b-31.
 - [ ] **M1b-31** `feat(wasapi): lecture et capture en mode partagé, événementiel`
   *Fait quand* : test de boucle à travers Conduit 1 via l'engine, xruns = 0 sur 10 min.
 - [ ] **M1b-32** `feat(wasapi): mode exclusif quand disponible`

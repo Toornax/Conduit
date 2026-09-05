@@ -25,6 +25,7 @@ conduit-core ← conduit-backend ← conduit-protocol ← conduit-engine ← con
 | `conduit-core` | graphe, exécution, tampons, DSP, nœuds, rééchantillonnage, DLL, ports asynchrones | aucune |
 | `conduit-backend` | traits `Backend`, `DeviceHandle`, `CableControl`, événements, backend `null`, priorité RT | `rt` seulement |
 | `conduit-backend-pipewire` | backend Linux : fil de boucle PipeWire, registre, `pw_stream` | Linux |
+| `conduit-backend-wasapi` | backend Windows : fil MMDevice, énumération, notifications | Windows |
 | `conduit-protocol` | API (`Command`, `Reply`, `Notification`), enveloppe, framing, client, schéma | aucune |
 | `conduit-engine` | `Engine` : périphériques, rôles, pilote, horloge interne, commandes | aucune |
 | `conduitd` | configuration, IPC, service, persistance, règles, watchdog | socket / pipe |
@@ -95,6 +96,44 @@ cadencé que par un gestionnaire de session : les tests qui veulent voir le rapp
 `process` lancent aussi `wireplumber`. Sans ces binaires dans le `PATH`, les tests
 se sautent avec un message.
 
+## 4 quater. Backend WASAPI (Windows)
+
+`conduit-backend-wasapi` parle à l'API MMDevice depuis un **fil dédié**
+(`mmdevice_thread`, calqué sur `loop_thread`) : il initialise COM en MTA (garde RAII
+`ComApartment`), crée l'`IMMDeviceEnumerator`, enregistre un `IMMNotificationClient`
+écrit en Rust (`notify`, macro `#[implement]` du crate `windows`) et sert les
+commandes du `WasapiBackend` par `std::sync::mpsc` (`Enumerate`, `DefaultDevice`,
+`Subscribe`, `Shutdown`). Le backend lui-même ne détient que l'émetteur du canal et
+la poignée du fil : il est `Send`, et sa destruction envoie `Shutdown`, désenregistre
+le client puis joint le fil.
+
+Les **rappels COM** (`OnDeviceStateChanged`, `OnDeviceAdded`, `OnDeviceRemoved`,
+`OnDefaultDeviceChanged`) arrivent sur un fil choisi par Windows, éventuellement
+pendant qu'une commande est en cours : ils **ne font que copier leurs arguments et
+poster** une `Notification` sur le même canal. C'est le fil MMDevice qui décide :
+passage à `DEVICE_STATE_ACTIVE` ou `OnDeviceAdded` → ré-énumération de ce seul
+endpoint (`GetDevice`) et `DeviceEvent::Added` s'il n'était pas connu ; autre état
+ou `OnDeviceRemoved` → `Removed` s'il l'était ; `OnDefaultDeviceChanged` → `DefaultChanged`
+pour le rôle `eConsole` seulement ; `OnPropertyValueChanged` ignoré. Une table des
+endpoints connus évite les doublons, quel que soit l'ordre des rappels.
+
+`devices` traduit un `IMMDevice` en `DeviceInfo` : identifiant d'endpoint (`GetId`),
+`PKEY_Device_FriendlyName`, `IMMEndpoint::GetDataFlow`, canaux et fréquence lus dans
+`PKEY_AudioEngine_DeviceFormat` (repli `IAudioClient::GetMixFormat`), fréquences de
+44,1/48/96 kHz acceptées telles quelles en mode partagé (`IsFormatSupported`,
+float32), bloc par défaut = période du moteur (`GetDevicePeriod`) en trames,
+`is_default` = `GetDefaultAudioEndpoint(flow, eConsole)`, `cable` si le nom est
+exactement `Conduit <n>`. Seuls les endpoints `DEVICE_STATE_ACTIVE` sont énumérés.
+Tout ce que COM alloue est rendu par une garde (`CoTaskString`, `CoTaskMem`,
+`PropVariant`) ; chaque bloc `unsafe` porte son `SAFETY:`.
+
+Ce qui manque encore : les flux (`open` renvoie `Platform("flux WASAPI : M1b-31")`),
+le mode exclusif (M1b-32), l'horloge (M1b-33), `CableControl` par le helper
+(M1b-34) ; le démon ne charge pas ce backend avant M1b-31. Les tests d'intégration
+(`tests/wasapi.rs`) tournent sur les cartes son de la machine ; le critère « casque
+USB branché → `Added` » est un test `#[ignore]` à lancer à la main :
+`cargo test -p conduit-backend-wasapi --test wasapi -- --ignored --nocapture`.
+
 ## 5. Tests
 
 ```sh
@@ -116,8 +155,9 @@ Niveaux : unitaires par module ; intégration `conduit-engine/tests/scenarios.rs
 
 - Commits : Conventional Commits, scopes de ROADMAP (`core`, `engine`, `backend`,
   `null`, `protocol`, `daemon`, `cli`, `nix`, …). Une tâche = un commit, CI verte.
-- `unsafe` : interdit (`#![forbid(unsafe_code)]`) sauf `conduit-testing` (allocateur)
-  et `conduit-backend::rt` (appels système), chaque bloc commenté `SAFETY:`.
+- `unsafe` : interdit (`#![forbid(unsafe_code)]`) sauf `conduit-testing` (allocateur),
+  `conduit-backend::rt` (appels système) et `conduit-backend-wasapi` (appels COM),
+  chaque bloc commenté `SAFETY:` (lint `undocumented_unsafe_blocks` du workspace).
 - Messages d'erreur : dire quoi faire (ADR-006). Codes stables dans
   `ProtocolError`.
 - Identifiants : `NodeId`/`LinkId` sont générationnels (jamais réutilisés) ; la
