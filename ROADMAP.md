@@ -125,36 +125,36 @@ allocation dans le fil audio, CI verte partout, couverture ≥ 80 % sur `core` e
   est renvoyé au fil de gestion pour libération hors temps réel.
   *Fait quand* : test de stress échange/exécution concurrents sans blocage ; test que le
   `drop` ne se produit jamais sur le fil d'exécution.
-- [ ] **M0-27** `test(core): allocateur de garde et test zéro allocation du cycle`
+- [x] **M0-27** `test(core): allocateur de garde et test zéro allocation du cycle`
   Allocateur global de test qui panique quand un drapeau est armé ; armé pendant `Executor::run`.
   *Fait quand* : le test passe, et échoue si on introduit volontairement un `Vec::new()` dans un `process`.
 
 ### M0.D — `conduit-core` : nœuds utilitaires
 
-- [ ] **M0-30** `feat(core): nœuds Silence, Sine, PinkNoise`
+- [x] **M0-30** `feat(core): nœuds Silence, Sine, PinkNoise`
   *Fait quand* : tests de fréquence (FFT ou comptage de passages par zéro) et d'amplitude.
-- [ ] **M0-31** `feat(core): nœuds Mixer N→M et Splitter`
+- [x] **M0-31** `feat(core): nœuds Mixer N→M et Splitter`
   *Fait quand* : tests de somme et de duplication canal par canal.
-- [ ] **M0-32** `feat(core): nœud Meter (crête et RMS, export atomique)`
+- [x] **M0-32** `feat(core): nœud Meter (crête et RMS, export atomique)`
   Valeurs publiées par atomiques lisibles hors temps réel, décroissance configurable.
   *Fait quand* : test sur sinus d'amplitude connue.
-- [ ] **M0-33** `feat(core): adaptation de canaux mono↔stéréo et mapping explicite`
+- [x] **M0-33** `feat(core): adaptation de canaux mono↔stéréo et mapping explicite`
   Duplication mono→stéréo, somme pondérée stéréo→mono, table de mapping arbitraire.
   *Fait quand* : tests des trois cas (F-15).
 
 ### M0.E — `conduit-core` : horloges et rééchantillonnage
 
-- [ ] **M0-40** `feat(core): rééchantillonneur sinc à ratio variable`
+- [x] **M0-40** `feat(core): rééchantillonneur sinc à ratio variable`
   Sinc fenêtré avec interpolation du ratio par échantillon (`rubato` en mode asynchrone ou
   implémentation interne si l'API ne convient pas), qualité configurable.
   *Fait quand* : mesure de rapport signal/bruit ≥ 90 dB sur sinus à ratio fixe, pas de
   discontinuité lors d'un changement de ratio de 100 ppm.
-- [ ] **M0-41** `feat(core): boucle à verrouillage de délai (DLL)`
+- [x] **M0-41** `feat(core): boucle à verrouillage de délai (DLL)`
   Filtre de second ordre estimant le ratio d'horloge à partir du remplissage d'un tampon,
   paramètres de bande passante, anti-emballement.
   *Fait quand* : simulation avec horloges dérivantes de ± 1000 ppm et gigue : convergence
   en < 2 s, remplissage stable à ± un quantum, zéro xrun sur 1 h simulée.
-- [ ] **M0-42** `feat(core): AsyncPort (tampon + rééchantillonneur + DLL)`
+- [x] **M0-42** `feat(core): AsyncPort (tampon + rééchantillonneur + DLL)`
   Composant reliant un flux à horloge étrangère au graphe, dans les deux sens, avec
   détection et comptage des xruns.
   *Fait quand* : test bout en bout avec deux horloges virtuelles dérivantes, continuité
