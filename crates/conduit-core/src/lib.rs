@@ -8,6 +8,7 @@
 //! - le modèle de graphe et sa construction validée ([`graph`]) ;
 //! - le trait [`Node`] et ses tampons d'entrée/sortie ([`node`]) ;
 //! - les gains partagés avec rampe ([`gain`]) ;
+//! - l'exécution d'un cycle ([`executor`]) et l'échange atomique de version ([`slot`]).
 //!
 //! # Contraintes temps réel
 //!
@@ -19,17 +20,21 @@
 #![warn(missing_docs)]
 
 pub mod buffer;
+pub mod executor;
 pub mod gain;
 pub mod graph;
 pub mod node;
 pub mod ring;
+pub mod slot;
 pub mod types;
 
 pub use buffer::AudioBuffer;
+pub use executor::{CycleReport, Executor};
 pub use gain::GainParam;
 pub use graph::{
     CompiledGraph, Direction, GraphBuilder, GraphError, LinkId, LinkInfo, NodeId, NodeInfo, PortId,
 };
 pub use node::{ChannelLabel, Node, NodeIo, PortSpec, ProcessContext};
 pub use ring::{RingBuffer, RingConsumer, RingProducer};
+pub use slot::{GraphSlot, PublishError};
 pub use types::{ChannelCount, Db, Frames, Gain, Quantum, SampleRate};
