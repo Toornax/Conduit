@@ -9,7 +9,7 @@
 
 use std::time::{Duration, Instant};
 
-use conduit_backend::{Backend, BackendError, DeviceDirection, DeviceEvent};
+use conduit_backend::{Backend, DeviceDirection, DeviceEvent};
 use conduit_backend_wasapi::WasapiBackend;
 use conduit_core::types::SampleRate;
 
@@ -122,19 +122,24 @@ fn enumeration_is_stable() {
 }
 
 #[test]
-fn open_is_not_implemented_yet() {
+fn cable_control_waits_for_the_helper() {
     let mut backend = backend_or_skip!();
-    let id = backend
-        .default_device(DeviceDirection::Render)
-        .expect("périphérique de rendu par défaut");
-    let format = conduit_backend::StreamFormat {
-        sample_rate: SampleRate::HZ_48000,
-        channels: 2,
-        block_frames: 480,
-    };
-    let result = backend.open(&id, format, Box::new(|io, _| io.silence_output()));
-    assert!(matches!(result, Err(BackendError::Platform(ref m)) if m.contains("M1b-31")));
     assert!(backend.cable_control().is_none());
+}
+
+/// `DeviceInfo` décrit le format de mixage : tout périphérique dont l'`IAudioClient`
+/// s'active annonce les trois fréquences (conversion automatique en mode partagé).
+#[test]
+fn devices_announce_the_shared_mode_rates() {
+    let backend = backend_or_skip!();
+    for device in backend.devices().expect("énumération") {
+        assert!(
+            device.sample_rates.is_empty()
+                || device.sample_rates == conduit_backend_wasapi::PROBED_RATES.to_vec(),
+            "fréquences inattendues : {device:?}"
+        );
+        assert!(device.channels >= 1);
+    }
 }
 
 #[test]

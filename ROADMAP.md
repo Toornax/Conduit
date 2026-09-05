@@ -391,13 +391,17 @@ signé par attestation, HLK audio passé, latence conforme à SPEC §5.6, endura
   `DefaultChanged`, tests d'intégration sur les cartes son de la machine, exemple
   `list --watch`. Reste à faire à la main : le critère casque USB est le test
   `#[ignore]` `hotplug_produces_added_then_removed` (brancher puis débrancher pendant
-  30 s), non exécuté par l'agent. `open` renvoie `Platform("flux WASAPI : M1b-31")`.
-  Réserve : `channels` vient du format du périphérique (`PKEY_AudioEngine_DeviceFormat`),
-  qui peut différer du format de mixage qu'imposera le mode partagé (micro mono → mix
-  stéréo) ; `sample_rates` ne liste que ce que `IsFormatSupported` accepte tel quel
-  (en pratique la fréquence de mixage, vide pour un tel micro). À revoir en M1b-31.
+  30 s), non exécuté par l'agent. Tranché en M1b-31 : `DeviceInfo` = format de
+  mixage (`GetMixFormat`, repli `PKEY_AudioEngine_DeviceFormat`) et `sample_rates` =
+  44,1/48/96 kHz, toutes acceptées en partagé par conversion automatique.
 - [ ] **M1b-31** `feat(wasapi): lecture et capture en mode partagé, événementiel`
   *Fait quand* : test de boucle à travers Conduit 1 via l'engine, xruns = 0 sur 10 min.
+  *État* : flux partagés livrés et testés sur cartes réelles ; la boucle via Conduit 1
+  attend le pilote (M1a). Fait : format demandé honoré (`IAudioClient3` au format de
+  mixage avec période choisie, sinon `Initialize` + `AUTOCONVERTPCM`), un fil temps
+  réel par flux (rendu direct dans le tampon WASAPI, capture par paquets, sans
+  allocation ni verrou — `tests/no_alloc.rs`), déconnexion propre sur
+  `AUDCLNT_E_DEVICE_INVALIDATED`, `ClockInfo` par atomiques, `latency()` hors trait.
 - [ ] **M1b-32** `feat(wasapi): mode exclusif quand disponible`
   *Fait quand* : latence mesurée inférieure au mode partagé, repli automatique documenté.
 - [ ] **M1b-33** `feat(wasapi): position d'horloge IAudioClock et intégration DLL`

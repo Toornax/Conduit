@@ -15,12 +15,15 @@ conduit-core.workspace = true
 conduit-backend.workspace = true
 # Le crate `windows` de Microsoft : liaisons COM sûres + macro `implement` pour
 # exposer un `IMMNotificationClient` écrit en Rust. Les features sont le strict
-# nécessaire de l'énumération MMDevice :
-# - `Win32_Media_Audio` : IMMDeviceEnumerator, IMMDevice, IAudioClient, WAVEFORMATEX ;
+# nécessaire de l'énumération MMDevice et des flux WASAPI :
+# - `Win32_Media_Audio` : IMMDeviceEnumerator, IMMDevice, IAudioClient(3),
+#   IAudioRenderClient, IAudioCaptureClient, WAVEFORMATEX ;
 # - `Win32_System_Com` : CoInitializeEx, CoCreateInstance, CoTaskMemFree ;
 # - `Win32_System_Com_StructuredStorage` + `Win32_System_Variant` : PROPVARIANT ;
 # - `Win32_UI_Shell_PropertiesSystem` : IPropertyStore ;
-# - `Win32_Devices_FunctionDiscovery` : PKEY_Device_FriendlyName.
+# - `Win32_Devices_FunctionDiscovery` : PKEY_Device_FriendlyName ;
+# - `Win32_System_Threading` + `Win32_Security` : CreateEventW, SetEvent,
+#   WaitForMultipleObjects (événement de tampon et événement d'arrêt d'un flux).
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Media_Audio",
@@ -29,10 +32,15 @@ windows = { version = "0.62", features = [
     "Win32_System_Variant",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_Devices_FunctionDiscovery",
+    "Win32_System_Threading",
+    "Win32_Security",
 ] }
 # Le code que génère `#[implement]` nomme `::windows_core` : le crate doit être une
 # dépendance directe (même version que celle qu'embarque `windows`).
 windows-core = "0.62"
+# Vue `&mut [f32]` du tampon WASAPI (`try_cast_slice_mut`, repli par copie si
+# l'alignement n'est pas celui attendu).
+bytemuck = "1"
 
 [lints]
 workspace = true

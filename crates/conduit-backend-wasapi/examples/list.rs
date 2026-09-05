@@ -69,7 +69,7 @@ fn describe(device: &conduit_backend::DeviceInfo) -> String {
         .map(|r| r.hz().to_string())
         .collect();
     format!(
-        "  [{}] {}{}\n      {} canaux, {} Hz natif (acceptées : {}), bloc {} trames{}\n      id {}",
+        "  [{}] {}{}\n      format de mixage {} canaux à {} Hz (acceptées : {}), bloc {} trames{}\n      id {}",
         device.direction,
         device.name,
         if device.is_default { " (défaut)" } else { "" },
