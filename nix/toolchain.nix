@@ -12,9 +12,18 @@ let
     extensions = [ "llvm-tools-preview" ];
   };
   nightly = pkgsWithOverlay.rust-bin.nightly.latest.minimal.override {
-    extensions = [ "miri" "rust-src" ];
+    extensions = [
+      "miri"
+      "rust-src"
+    ];
   };
 in
 {
-  inherit pkgsWithOverlay toolchain toolchainCross toolchainCov nightly;
+  inherit
+    pkgsWithOverlay
+    toolchain
+    toolchainCross
+    toolchainCov
+    nightly
+    ;
 }

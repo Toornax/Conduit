@@ -4,7 +4,8 @@
 {
   imports = [ inputs.git-hooks.flakeModule ];
 
-  perSystem = { pkgs, config, ... }:
+  perSystem =
+    { pkgs, config, ... }:
     let
       types = "feat|fix|test|docs|chore|ci|refactor|perf|bench";
       scopes = "core|engine|backend|null|wasapi|pipewire|coreaudio|protocol|daemon|cli|gui|driver|portcls|helper|hal|packaging|nix|testing";

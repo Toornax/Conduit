@@ -273,7 +273,7 @@ allocation dans le fil audio, CI verte partout, couverture ≥ 80 % sur `core` e
 ### M0.K — Clôture
 
 - [x] **M0-96** `chore(nix): check de couverture llvm-cov avec seuil 80 % sur core et protocol`
-- [ ] **M0-97** `chore(nix): apps (démon, CLI, bancs de test) et packages testés hors devshell`
+- [x] **M0-97** `chore(nix): apps (démon, CLI, bancs de test) et packages testés hors devshell`
   `nix run .#conduitd` fonctionne ; les binaires packagés démarrent sur une machine sans devshell.
   *Fait quand* : test CI lançant le package dans un conteneur nu.
 - [x] **M0-98** `docs: guide développeur (architecture, tests, conventions, Nix)`
