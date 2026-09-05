@@ -78,6 +78,15 @@ pub struct Closed;
 pub struct Requester(mpsc::Sender<Command>);
 
 impl Requester {
+    /// Crée une poignée et le récepteur des commandes qu'elle met en file.
+    ///
+    /// [`run`] s'en sert pour sa session ; les tests s'en servent pour
+    /// observer les commandes émises par l'interface sans démon.
+    pub fn channel(capacity: usize) -> (Requester, mpsc::Receiver<Command>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (Requester(tx), rx)
+    }
+
     /// Met une commande en file. Ignore silencieusement si la session est
     /// fermée ou la file pleine : la reconnexion rechargera l'état complet.
     pub fn send(&self, command: Command) {
@@ -138,8 +147,8 @@ impl EventSink for mpsc::UnboundedSender<Event> {
 /// Rend la main quand le puits (fenêtre fermée) ou la file de commandes est
 /// fermé ; sinon elle tourne indéfiniment.
 pub async fn run<S: EventSink>(socket: PathBuf, mut sink: S) {
-    let (tx, mut rx) = mpsc::channel(COMMAND_QUEUE);
-    if sink.send(Event::Started(Requester(tx))).await.is_err() {
+    let (requester, mut rx) = Requester::channel(COMMAND_QUEUE);
+    if sink.send(Event::Started(requester)).await.is_err() {
         return;
     }
     let mut delay = RETRY_MIN;

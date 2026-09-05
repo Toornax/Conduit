@@ -7,12 +7,17 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use iced::widget::{column, container, text};
+use conduit_backend::{CableId, CableSpec};
+use iced::widget::{column, container};
 use iced::{Element, Fill, Subscription, Task};
 
+use conduit_protocol::Command;
+
+use crate::cables::{self, Channels};
 use crate::i18n::{self, Text};
 use crate::ipc::{self, Requester};
 use crate::model::Mirror;
+use crate::view::{self, Tab};
 
 /// État de la connexion au démon.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -76,6 +81,30 @@ impl Connection {
 pub enum Message {
     /// Événement de la couche IPC.
     Ipc(ipc::Event),
+    /// Change d'onglet.
+    Tab(Tab),
+    /// Ferme la bannière d'erreur.
+    DismissError,
+    /// Nom saisi pour le câble à créer.
+    NewCableName(String),
+    /// Canaux choisis pour le câble à créer.
+    NewCableChannels(Channels),
+    /// Crée le câble décrit par le formulaire (`CableAdd`).
+    AddCable,
+    /// Demande confirmation avant de supprimer un câble.
+    AskRemove(CableId),
+    /// Referme la confirmation ou l'édition de nom en cours.
+    CancelDialog,
+    /// Supprime un câble, confirmation faite (`CableRemove`).
+    RemoveCable(CableId),
+    /// Passe un câble en édition de nom.
+    StartRename(CableId),
+    /// Nom saisi pendant le renommage.
+    RenameEdited(String),
+    /// Applique le renommage en cours (`CableRename`).
+    CommitRename,
+    /// Change les canaux d'un câble (`CableSetChannels`).
+    SetChannels(CableId, Channels),
 }
 
 /// État complet de l'application.
@@ -85,6 +114,9 @@ pub struct App {
     connection: Connection,
     requester: Option<Requester>,
     mirror: Mirror,
+    tab: Tab,
+    cables: cables::State,
+    error: Option<String>,
 }
 
 impl App {
@@ -95,6 +127,9 @@ impl App {
             connection: Connection::Starting,
             requester: None,
             mirror: Mirror::default(),
+            tab: Tab::default(),
+            cables: cables::State::default(),
+            error: None,
         }
     }
 
@@ -113,6 +148,30 @@ impl App {
         &self.mirror
     }
 
+    /// Onglet affiché.
+    pub fn tab(&self) -> Tab {
+        self.tab
+    }
+
+    /// État d'édition de la vue Câbles.
+    pub fn cables(&self) -> &cables::State {
+        &self.cables
+    }
+
+    /// Dernière erreur renvoyée par le démon, affichée en bannière.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// Met une commande en file et efface la bannière d'erreur : le résultat
+    /// arrivera par notification, ou par une nouvelle erreur.
+    fn request(&mut self, command: Command) {
+        self.error = None;
+        if let Some(requester) = &self.requester {
+            requester.send(command);
+        }
+    }
+
     /// Titre de la fenêtre.
     pub fn title(&self) -> String {
         i18n::t(Text::AppTitle).to_string()
@@ -123,6 +182,59 @@ impl App {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Ipc(event) => self.apply_ipc(event),
+            Message::Tab(tab) => {
+                self.tab = tab;
+                self.cables.close_dialogs();
+            }
+            Message::DismissError => self.error = None,
+            Message::NewCableName(name) => self.cables.new_name = name,
+            Message::NewCableChannels(channels) => self.cables.new_channels = channels,
+            Message::AddCable => {
+                let name = self.cables.new_name.trim();
+                let spec = CableSpec {
+                    name: (!name.is_empty()).then(|| name.to_string()),
+                    channels: self.cables.new_channels.into(),
+                };
+                self.cables.new_name.clear();
+                self.request(Command::CableAdd { spec });
+            }
+            Message::AskRemove(id) => {
+                self.cables.close_dialogs();
+                self.cables.removing = Some(id);
+            }
+            Message::CancelDialog => self.cables.close_dialogs(),
+            Message::RemoveCable(id) => {
+                self.cables.close_dialogs();
+                self.request(Command::CableRemove { id });
+            }
+            Message::StartRename(id) => {
+                let current = self
+                    .mirror
+                    .cable(id)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default();
+                self.cables.close_dialogs();
+                self.cables.renaming = Some((id, current));
+            }
+            Message::RenameEdited(value) => {
+                if let Some((_, name)) = &mut self.cables.renaming {
+                    *name = value;
+                }
+            }
+            Message::CommitRename => {
+                if let Some((id, name)) = self.cables.renaming.take() {
+                    let name = name.trim().to_string();
+                    // Un nom vide n'est pas une demande : on referme sans rien
+                    // envoyer.
+                    if !name.is_empty() {
+                        self.request(Command::CableRename { id, name });
+                    }
+                }
+            }
+            Message::SetChannels(id, channels) => self.request(Command::CableSetChannels {
+                id,
+                channels: channels.into(),
+            }),
         }
         Task::none()
     }
@@ -134,6 +246,8 @@ impl App {
             ipc::Event::Connecting => self.connection = Connection::Connecting,
             ipc::Event::Ready { server, snapshot } => {
                 self.mirror.reset(*snapshot);
+                self.cables.close_dialogs();
+                self.error = None;
                 self.connection = Connection::Ready { server };
             }
             ipc::Event::Lost { reason, retry_in } => {
@@ -141,7 +255,8 @@ impl App {
             }
             // L'état ne suit que les notifications : aucun optimisme local.
             ipc::Event::Notified(notification) => self.mirror.apply(&notification),
-            ipc::Event::Failed(_) => {}
+            // Le message du démon dit déjà quoi faire (ADR-006).
+            ipc::Event::Failed(message) => self.error = Some(message),
         }
     }
 
@@ -159,27 +274,25 @@ impl App {
         .map(Message::Ipc)
     }
 
-    /// Fenêtre.
+    /// Fenêtre : barre de navigation, état de la connexion, bannière
+    /// d'erreur éventuelle, puis la page de l'onglet courant.
     pub fn view(&self) -> Element<'_, Message> {
-        let mut chrome = column![
-            text(i18n::t(Text::AppTitle)).size(28),
-            text(self.connection.summary()).size(16),
-            text(format!(
-                "{} : {}",
-                i18n::t(Text::Socket),
-                self.socket.display()
-            ))
-            .size(12),
+        let mut page = column![
+            view::navigation(self.tab),
+            view::status_line(&self.connection, &self.socket),
         ]
-        .spacing(8);
-        if let Some(hint) = self.connection.hint() {
-            chrome = chrome.push(text(hint).size(14));
+        .spacing(10)
+        .width(Fill);
+        if let Some(error) = &self.error {
+            page = page.push(view::banner(error));
         }
-        container(chrome)
-            .padding(16)
-            .width(Fill)
-            .height(Fill)
-            .into()
+        let enabled = self.connection.is_ready();
+        page = page.push(match self.tab {
+            Tab::Cables => cables::view(&self.mirror, &self.cables, enabled),
+            Tab::Patchbay => view::placeholder(Text::PatchbaySoon),
+            Tab::Diagnostic => view::placeholder(Text::DiagnosticSoon),
+        });
+        container(page).padding(16).width(Fill).height(Fill).into()
     }
 }
 
@@ -203,10 +316,32 @@ pub fn run(socket: PathBuf) -> iced::Result {
 mod tests {
     use super::*;
 
-    use crate::model::fixtures::snapshot;
+    use conduit_core::types::ChannelCount;
+    use tokio::sync::mpsc;
+
+    use crate::model::fixtures::{cable, snapshot};
 
     fn app() -> App {
         App::new(PathBuf::from("/tmp/conduitd.sock"))
+    }
+
+    /// Application connectée, avec le récepteur des commandes émises.
+    fn connected() -> (App, mpsc::Receiver<Command>) {
+        let (requester, rx) = Requester::channel(8);
+        let mut a = app();
+        a.apply_ipc(ipc::Event::Started(requester));
+        a.apply_ipc(ipc::Event::Ready {
+            server: "conduitd 0.1.0".into(),
+            snapshot: Box::new(snapshot()),
+        });
+        (a, rx)
+    }
+
+    /// La commande émise, en échouant s'il n'y en a pas exactement une.
+    fn sent(rx: &mut mpsc::Receiver<Command>) -> Command {
+        let command = rx.try_recv().expect("aucune commande émise");
+        assert!(rx.try_recv().is_err(), "une seule commande attendue");
+        command
     }
 
     #[test]
@@ -231,5 +366,139 @@ mod tests {
         assert!(!a.connection().is_ready());
         assert!(a.connection().summary().contains("2 s"));
         assert!(a.connection().hint().is_some());
+    }
+
+    #[test]
+    fn tabs_switch_and_close_the_open_dialogs() {
+        let (mut a, _rx) = connected();
+        assert_eq!(a.tab(), Tab::Cables);
+        let _ = a.update(Message::AskRemove(CableId(1)));
+        assert_eq!(a.cables().removing, Some(CableId(1)));
+        let _ = a.update(Message::Tab(Tab::Diagnostic));
+        assert_eq!(a.tab(), Tab::Diagnostic);
+        assert!(a.cables().removing.is_none());
+    }
+
+    #[test]
+    fn adding_a_cable_sends_cable_add_and_clears_the_form() {
+        let (mut a, mut rx) = connected();
+        let _ = a.update(Message::NewCableName("  Musique  ".into()));
+        let _ = a.update(Message::NewCableChannels(Channels(4)));
+        let _ = a.update(Message::AddCable);
+        assert_eq!(
+            sent(&mut rx),
+            Command::CableAdd {
+                spec: CableSpec {
+                    name: Some("Musique".into()),
+                    channels: ChannelCount::new(4).unwrap(),
+                }
+            }
+        );
+        assert!(a.cables().new_name.is_empty());
+        // Aucun optimisme local : le miroir attend la notification.
+        assert_eq!(a.mirror().cables.len(), 2);
+    }
+
+    #[test]
+    fn an_unnamed_cable_lets_the_daemon_choose_the_name() {
+        let (mut a, mut rx) = connected();
+        let _ = a.update(Message::AddCable);
+        assert_eq!(
+            sent(&mut rx),
+            Command::CableAdd {
+                spec: CableSpec {
+                    name: None,
+                    channels: ChannelCount::STEREO,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn removing_a_cable_requires_a_confirmation() {
+        let (mut a, mut rx) = connected();
+        let _ = a.update(Message::AskRemove(CableId(2)));
+        assert!(
+            rx.try_recv().is_err(),
+            "rien n'est envoyé avant la confirmation"
+        );
+        let _ = a.update(Message::CancelDialog);
+        assert!(a.cables().removing.is_none());
+        assert!(rx.try_recv().is_err());
+        let _ = a.update(Message::AskRemove(CableId(2)));
+        let _ = a.update(Message::RemoveCable(CableId(2)));
+        assert_eq!(sent(&mut rx), Command::CableRemove { id: CableId(2) });
+        assert!(a.cables().removing.is_none());
+    }
+
+    #[test]
+    fn renaming_starts_from_the_current_name_and_ignores_an_empty_one() {
+        let (mut a, mut rx) = connected();
+        let _ = a.update(Message::StartRename(CableId(1)));
+        assert_eq!(
+            a.cables().renaming,
+            Some((CableId(1), "Conduit 1".to_string()))
+        );
+        let _ = a.update(Message::RenameEdited("  Jeu ".into()));
+        let _ = a.update(Message::CommitRename);
+        assert_eq!(
+            sent(&mut rx),
+            Command::CableRename {
+                id: CableId(1),
+                name: "Jeu".into(),
+            }
+        );
+        assert!(a.cables().renaming.is_none());
+
+        let _ = a.update(Message::StartRename(CableId(1)));
+        let _ = a.update(Message::RenameEdited("   ".into()));
+        let _ = a.update(Message::CommitRename);
+        assert!(rx.try_recv().is_err(), "un nom vide n'envoie rien");
+    }
+
+    #[test]
+    fn changing_the_channels_sends_cable_set_channels() {
+        let (mut a, mut rx) = connected();
+        let _ = a.update(Message::SetChannels(CableId(2), Channels(6)));
+        assert_eq!(
+            sent(&mut rx),
+            Command::CableSetChannels {
+                id: CableId(2),
+                channels: ChannelCount::new(6).unwrap(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_refused_command_shows_a_banner_until_the_next_action() {
+        let (mut a, mut rx) = connected();
+        assert!(a.error().is_none());
+        a.apply_ipc(ipc::Event::Failed(
+            "limite de 8 câbles atteinte : supprimez un câble".into(),
+        ));
+        assert!(a.error().unwrap().contains("supprimez un câble"));
+        let _ = a.update(Message::DismissError);
+        assert!(a.error().is_none());
+        a.apply_ipc(ipc::Event::Failed("câble inconnu".into()));
+        let _ = a.update(Message::AddCable);
+        assert!(
+            a.error().is_none(),
+            "une nouvelle action efface la bannière"
+        );
+        let _ = sent(&mut rx);
+    }
+
+    #[test]
+    fn the_mirror_only_follows_the_notifications() {
+        let (mut a, _rx) = connected();
+        assert_eq!(a.mirror().cables.len(), 2);
+        a.apply_ipc(ipc::Event::Notified(Box::new(
+            conduit_protocol::Notification::CableChanged {
+                id: CableId(3),
+                info: Some(cable(3, "Jeu")),
+            },
+        )));
+        assert_eq!(a.mirror().cables.len(), 3);
+        assert_eq!(a.mirror().cable(CableId(3)).unwrap().name, "Jeu");
     }
 }

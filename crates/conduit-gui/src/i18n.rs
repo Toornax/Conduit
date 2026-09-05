@@ -50,6 +50,31 @@ textes! {
         "Démarrez le démon avec « conduitd », puis attendez la reconnexion.";
     Socket => "conn.socket", "Socket";
     Server => "conn.server", "Démon";
+    Waiting => "conn.waiting", "En attente du démon…";
+
+    TabCables => "tab.cables", "Câbles";
+    TabPatchbay => "tab.patchbay", "Patchbay";
+    TabDiagnostic => "tab.diagnostic", "Diagnostic";
+    PatchbaySoon => "tab.patchbay.soon",
+        "Le patchbay arrive au prochain jalon : nœuds, ports et liens par glisser-déposer.";
+    DiagnosticSoon => "tab.diagnostic.soon",
+        "La page de diagnostic arrive plus tard : xruns, latence, pilote et export de rapport.";
+
+    CablesTitle => "cables.title", "Câbles virtuels";
+    CablesEmpty => "cables.empty",
+        "Aucun câble. Créez-en un ci-dessous : il apparaîtra aussitôt dans les réglages audio du système.";
+    CableName => "cables.name", "Nom du câble";
+    CableNamePlaceholder => "cables.name.placeholder", "Nom du câble (optionnel)";
+    CableActive => "cables.active", "actif";
+    CableInactive => "cables.inactive", "inactif";
+    CableRemoveConfirm => "cables.remove.confirm", "Supprimer ce câble ?";
+
+    Add => "action.add", "Ajouter";
+    Remove => "action.remove", "Supprimer";
+    Rename => "action.rename", "Renommer";
+    Validate => "action.validate", "Valider";
+    Cancel => "action.cancel", "Annuler";
+    Dismiss => "action.dismiss", "Fermer";
 }
 
 /// Résout un texte dans la langue courante.
@@ -61,6 +86,15 @@ pub const fn t(text: Text) -> &'static str {
 pub fn reconnecting_in(delay: Duration) -> String {
     let secs = delay.as_secs().max(1);
     format!("Reconnexion dans {secs} s…")
+}
+
+/// « 1 canal » ou « N canaux ».
+pub fn channels_label(channels: u8) -> String {
+    if channels <= 1 {
+        format!("{channels} canal")
+    } else {
+        format!("{channels} canaux")
+    }
 }
 
 #[cfg(test)]
@@ -87,6 +121,12 @@ mod tests {
                 .map(|(_, v)| *v),
             Some(t(Text::Connected))
         );
+    }
+
+    #[test]
+    fn channels_label_agrees_in_number() {
+        assert_eq!(channels_label(1), "1 canal");
+        assert_eq!(channels_label(8), "8 canaux");
     }
 
     #[test]

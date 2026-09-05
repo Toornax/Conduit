@@ -7,6 +7,7 @@
 //! Organisation :
 //!
 //! - [`i18n`] : table des textes affichés (une seule langue pour l'instant) ;
+//! - [`view`] et [`cables`] : décor de la fenêtre et vue « Câbles » ;
 //! - [`model`] : miroir de l'état du démon, alimenté par réduction pure des
 //!   notifications ;
 //! - [`ipc`] : connexion, chargement initial, boucle d'événements et
@@ -20,9 +21,11 @@
 #![warn(missing_docs)]
 
 pub mod app;
+pub mod cables;
 pub mod i18n;
 pub mod ipc;
 pub mod model;
+pub mod view;
 
 pub use app::run;
 

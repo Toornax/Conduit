@@ -531,11 +531,11 @@ signé par attestation, HLK audio passé, latence conforme à SPEC §5.6, endura
 Objectif : un utilisateur cible fait un routage complet sans documentation. Développée et
 testée d'abord avec le backend null, puis sur Windows.
 
-- [ ] **M2-01** `feat(gui): squelette iced, client IPC asynchrone, reconnexion`
+- [x] **M2-01** `feat(gui): squelette iced, client IPC asynchrone, reconnexion`
   *Fait quand* : la fenêtre affiche l'état de connexion et se reconnecte après redémarrage du démon.
-- [ ] **M2-02** `feat(gui): état miroir du démon alimenté par les événements`
+- [x] **M2-02** `feat(gui): état miroir du démon alimenté par les événements`
   *Fait quand* : tests de réduction d'état pour chaque événement.
-- [ ] **M2-03** `feat(gui): vue Câbles (liste, ajouter, supprimer, renommer, canaux)`
+- [x] **M2-03** `feat(gui): vue Câbles (liste, ajouter, supprimer, renommer, canaux)`
   *Fait quand* : chaque action passe par l'IPC et se reflète dans l'OS (F-01, F-02, F-03).
 - [ ] **M2-04** `feat(gui): patchbay, rendu des nœuds et ports`
   Canvas `iced`, disposition automatique, positions mémorisées.
