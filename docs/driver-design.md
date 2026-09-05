@@ -69,35 +69,70 @@ Le crate compile aussi avec `std` (feature `std`, tests et fuzz seulement).
 
 ### 2.2 `portcls-sys` (workspace noyau)
 
-- **Bindings par bindgen** (M1a-03) sur `portcls.h`, `ksmedia.h`, `ks.h` avec les
-  chemins d'include du WDK fournis par `wdk-build` : structures (`KSDATAFORMAT`,
-  `KSDATARANGE_AUDIO`, `PCFILTER_DESCRIPTOR`, `PCPIN_DESCRIPTOR`, `PCNODE_DESCRIPTOR`,
-  `PCCONNECTION_DESCRIPTOR`, `PCPROPERTY_ITEM`, `PCPROPERTY_REQUEST`, `KSJACK_DESCRIPTION`,
-  `KSRTAUDIO_*`…), GUID (`KSCATEGORY_AUDIO`, `KSDATAFORMAT_*`, `KSNODETYPE_*`,
-  `KSPROPSETID_*`), constantes. Liste d'autorisation explicite (`allowlist_*`) : pas de
-  génération « tout `ntddk.h` ».
-- **Vtables générées, pas écrites** (révision 2026-09-05 après étude de `basetyps.h`) :
-  compilé en **mode C**, `portcls.h` déclare chaque interface avec
-  `DECLARE_INTERFACE_`/`STDMETHOD_` et recopie les méthodes héritées
-  (`DEFINE_ABSTRACT_UNKNOWN`, `DEFINE_ABSTRACT_MINIPORT`) : bindgen produit donc
-  directement `struct IMiniportWaveRT { lpVtbl: *const IMiniportWaveRTVtbl }` et une
-  vtable plate de pointeurs de fonction, dans l'ordre du header. C'est la disposition
-  COM exacte, garantie par l'ABI C. Piège : `THIS_` s'expanse en `INTERFACE *This` et
-  `portcls.h` ne définit jamais `INTERFACE` ; l'en-tête d'entrée de bindgen le définit
-  (`#define INTERFACE void`) après `punknown.h`/`ks.h`/`drmk.h` et avant `portcls.h`.
-  Les `DEFINE_GUID` deviennent des `const GUID` via `PUT_GUIDS_HERE`/`initguid.h`.
-  **Repli** si ce mode C échoue sur le WDK 26100 : vtables écrites à la main, avec pour
-  oracle un bindgen C++ (`vtable_generation`) commité en golden et comparé slot par slot.
-- Génération : `build.rs` avec `wdk_build::configure_wdk_library_build_and_then` et
-  `bindgen::Builder::wdk_default(&config)` (chemins d'include et défines du WDK),
-  `allowlist_file` limité aux en-têtes PortCls/KS. Le `#[link(name = "portcls")]`
-  n'est **pas** dans `portcls-sys` : c'est `conduit-kmd/build.rs` qui l'émet, pour que
-  `portcls-sys` reste testable en mode utilisateur.
+État (M1a-03, 2026-09-05) : **mode C confirmé** sur le WDK 10.0.26100.0, aucun repli.
+
+- **Bindings par bindgen** (0.71, LLVM 17), générés **à la compilation** par `build.rs`
+  sur `wrapper.h` (commité) : `ntddk.h`, `windef.h`, `mmreg.h` (`NOBITMAP`), `ks.h`,
+  `ksmedia.h`, `punknown.h`, `drmk.h`, `#define INTERFACE void`, `portcls.h`, avec les
+  chemins d'include et les défines du WDK fournis par `wdk-build`
+  (`configure_wdk_library_build_and_then`, `bindgen::Builder::wdk_default`).
+  `allowlist_file` limité aux cinq en-têtes PortCls/KS, récursivité active : les
+  structures (`KSDATAFORMAT`, `KSDATARANGE_AUDIO`, `PCFILTER_DESCRIPTOR`,
+  `PCPIN_DESCRIPTOR`, `PCNODE_DESCRIPTOR`, `PCCONNECTION_DESCRIPTOR`, `PCPROPERTY_ITEM`,
+  `PCPROPERTY_REQUEST`, `PCAUTOMATION_TABLE`, `KSJACK_DESCRIPTION`, `KSRTAUDIO_*`…), les
+  constantes, les 38 fonctions `Pc*` et les types de rappel ; et, par récursivité, les
+  types NT qu'ils référencent (`DRIVER_OBJECT`, `DEVICE_OBJECT`, `IRP`,
+  `UNICODE_STRING`, dont les alias `typedef` sont ajoutés explicitement). Ce sont
+  d'**autres définitions** que celles de `wdk-sys`, de même disposition : le crate est
+  autonome (ni `wdk-sys` ni feature `kernel`), donc testable en mode utilisateur, et
+  `conduit-kmd` passe de l'une à l'autre par `cast()` de pointeur (commentaire en tête
+  de `conduit-kmd/src/lib.rs`). Sortie : `OUT_DIR/portcls.rs` (~41 000 lignes,
+  1,5 Mo) et `OUT_DIR/guids.rs` (639 GUID), inclus par `src/bindings.rs`.
+- **Vtables générées, pas écrites** : compilé en mode C, `portcls.h` déclare chaque
+  interface avec `DECLARE_INTERFACE_`/`STDMETHOD_` (`basetyps.h`) et recopie les
+  méthodes héritées (`DEFINE_ABSTRACT_UNKNOWN`, `DEFINE_ABSTRACT_MINIPORT`,
+  `DEFINE_ABSTRACT_MINIPORTWAVERTSTREAM`…) : bindgen produit
+  `struct IMiniportWaveRT { lpVtbl: *mut IMiniportWaveRTVtbl }` et une vtable plate de
+  pointeurs de fonction `extern "C"` dans l'ordre du header (54 vtables). Slots vérifiés
+  : `IUnknown` 3, `IMiniport` 5, `IMiniportWaveRT` 8, `IMiniportWaveRTStream` 11,
+  `IMiniportWaveRTStreamNotification` 15, `IMiniportTopology` 6,
+  `IAdapterPowerManagement` 6, `IPort` 6, `IPortWaveRT` 6, `IPortTopology` 6,
+  `IPortWaveRTStream` 10, `IResourceList` 11, `IRegistryKey` 11, `IPortClsVersion` 4.
+  Pièges rencontrés et leur solution :
+  - `THIS_` s'expanse en `INTERFACE *This` et `portcls.h` ne définit jamais `INTERFACE` :
+    `#define INTERFACE void` juste avant `portcls.h` (les autres en-têtes le définissent
+    puis l'annulent eux-mêmes) ;
+  - `portcls.h` exige `KSDATAFORMAT_WAVEFORMATEX`, donc `WAVEFORMATEX` : `windef.h` puis
+    `mmreg.h` avec `NOBITMAP` avant `ksmedia.h` ;
+  - **GUID** : bindgen n'évalue pas les initialiseurs de structure, `PUT_GUIDS_HERE` /
+    `initguid.h` ne sert à rien et chaque `DEFINE_GUID`/`DEFINE_GUIDSTRUCT` sortirait en
+    `extern static` sans définition (symbole à lier). `build.rs` analyse donc lui-même
+    les cinq en-têtes, émet chaque GUID en `pub const GUID` et bloque les `static`
+    homonymes ; un `static … : GUID` restant fait échouer le build (liste complète par
+    construction). Les valeurs sont contrôlées contre `cl.exe` par le golden ;
+  - `DEVPKEY_*` (`DEFINE_DEVPROPKEY`, `ksmedia.h`) : mêmes `extern static`, bloqués ;
+  - `IPortClsVersion` ne recopie pas `DEFINE_ABSTRACT_UNKNOWN()` : sa vtable C n'a qu'un
+    slot au lieu de quatre. Bloquée et **redéfinie à la main dans `src/fixups.rs`**
+    (`IUnknown` + `GetVersion`) ; c'est le seul rôle de ce module, avec la macro
+    `PORT_CLASS_DEVICE_EXTENSION_SIZE` (`sizeof`, que bindgen n'évalue pas) ;
+  - `IPortClsPower`, `IPortClsRuntimePower`, `IPortClsEtwHelper` : déclarées pour C++
+    seulement (ni `THIS_` ni `IUnknown`), slots et signatures faux en C : exclues des
+    bindings, à écrire à la main si M1b en a besoin ;
+  - les assertions de disposition de bindgen (`layout_tests`) indexent un tableau dans un
+    bloc `const` : `indexing_slicing` et `arithmetic_side_effects` sont autorisés dans
+    `bindings.rs` seul.
+  Le repli « vtables manuelles avec oracle bindgen C++ » n'a pas été nécessaire.
+- Le `#[link(name = "portcls")]` n'est **pas** dans `portcls-sys` : c'est
+  `conduit-kmd/build.rs` qui l'émet (`cargo::rustc-link-lib=portcls`).
 - Tests (`cargo test -p portcls-sys` depuis `drivers/windows`, mode utilisateur, sans
-  lier au noyau) : `size_of` des structures clés contre des valeurs de référence
-  obtenues par un programme C compilé une fois (`tools/sizeof-probe.c`, `cl.exe` avec
-  les en-têtes `km`), nombre de slots de chaque vtable contre le header, et
-  `size_of::<IMiniportWaveRTVtbl>()` = nombre de slots × 8.
+  lier au noyau) : `tests/layout.rs` compare `size_of` de 27 structures et 14 vtables
+  et la valeur de 11 GUID à `tests/layout.golden`, produit par `cl.exe` sur les mêmes
+  en-têtes (`tools/sizeof-probe.c`, `drivers/windows/tools/regen-layout.ps1`, golden
+  commité et contrôlé à jour par `tools/check.ps1`) ; `tests/vtables.rs` vérifie
+  `lpVtbl` à l'offset 0, les trois slots `IUnknown` en tête, l'ordre des slots de
+  `IMiniportWaveRT` et `IMiniportWaveRTStream[Notification]`, le nombre de slots de
+  chaque vtable, `KSSTATE_RUN == 3` et la signature des rappels ; bindgen émet en outre
+  ses propres assertions de disposition, vérifiées à la compilation.
 
 ### 2.3 `conduit-kmd` (workspace noyau)
 
@@ -284,7 +319,7 @@ câble marche sans le démon (F-05) après redémarrage.
 | Niveau | Où | Comment |
 |---|---|---|
 | Logique | `conduit-kmd-core` | `cargo test`, proptest, Miri, fuzz ; **tourne dans `nix flake check`** |
-| Dispositions | `portcls-sys` | `cargo test` en mode utilisateur, Windows + WDK, golden bindgen C++ |
+| Dispositions | `portcls-sys` | `cargo test` en mode utilisateur, Windows + WDK, golden `cl.exe` (`tests/layout.golden`, §2.2) |
 | Chargement | VM Hyper-V | `tools/vm-cycle.ps1` : install/désinstall × 100 (M1a-02), dumps collectés |
 | Fonctionnel | VM | outil `conduit-looptest` (WASAPI, workspace racine, `cfg(windows)`) : sinus → rendu → capture, vérifie fréquence, phase, trous (M1a-10) |
 | Robustesse | VM | Driver Verifier (standard + special pool + IRQL) 1 h (M1a-11), 48 h (M1b-09) |

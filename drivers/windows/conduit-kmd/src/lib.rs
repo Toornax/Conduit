@@ -12,7 +12,8 @@
 //! l'enregistrement des sous-périphériques (driver-design.md §4) arrive en M1a-06. Le
 //! pilote se charge, crée son objet de périphérique fonctionnel au-dessus du nœud racine
 //! `Root\ConduitCable`, démarre, s'arrête et se décharge ; c'est ce cycle que
-//! `tools/vm-cycle.ps1` répète cent fois.
+//! `tools/vm-cycle.ps1` répète cent fois. Les fonctions et types PortCls viennent des
+//! bindings générés de `portcls-sys` (M1a-03).
 //!
 //! Le gestionnaire de panique est maison (`panic.rs`) : une panique en noyau se traduit
 //! par un bug check, jamais par une boucle infinie. La journalisation passe par
@@ -33,11 +34,18 @@ mod panic;
 
 use core::cell::UnsafeCell;
 
-use portcls_sys::functions::{PRESOURCELIST, PcAddAdapterDevice, PcInitializeAdapterDriver};
+use portcls_sys::{PCPFNSTARTDEVICE, PRESOURCELIST, PcAddAdapterDevice, PcInitializeAdapterDriver};
 use wdk_sys::{
-    DRIVER_OBJECT, DRIVER_UNLOAD, NTSTATUS, PCUNICODE_STRING, PDEVICE_OBJECT, PDRIVER_OBJECT, PIRP,
-    STATUS_SUCCESS, ULONG,
+    DRIVER_OBJECT, DRIVER_UNLOAD, NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, STATUS_SUCCESS, ULONG,
 };
+
+// Deux jeux de types NT coexistent : ceux de `wdk-sys` (`DriverEntry`, `DriverUnload`, tout
+// ce que le noyau appelle directement) et ceux régénérés par `portcls-sys` depuis les mêmes
+// en-têtes (`DRIVER_OBJECT`, `DEVICE_OBJECT`, `IRP`, `UNICODE_STRING`, nommés par les
+// prototypes `Pc*` et les rappels PortCls). Même disposition, mêmes en-têtes du WDK
+// (`portcls-sys/tests/layout.rs` le vérifie contre `cl.exe`) : le passage de l'un à
+// l'autre est un `cast()` de pointeur, sans conversion. Les rappels que PortCls invoque
+// (`add_device`, `start_device`) sont déclarés avec les types `portcls_sys`.
 
 /// Allocateur global : pool non paginé, tag `rust` (imposé par `wdk-alloc`).
 ///
@@ -91,8 +99,13 @@ pub unsafe extern "system" fn driver_entry(
     // l'appel ; `add_device` est une fonction statique, valide toute la vie du pilote.
     // PortCls ne modifie pas `registry_path` (il en fait une copie) : le retrait du
     // `const` ne sert qu'à satisfaire le prototype `PUNICODE_STRING` de `portcls.h`.
-    let status =
-        unsafe { PcInitializeAdapterDriver(driver, registry_path.cast_mut(), Some(add_device)) };
+    let status = unsafe {
+        PcInitializeAdapterDriver(
+            driver.cast(),
+            registry_path.cast_mut().cast(),
+            Some(add_device),
+        )
+    };
     if status != STATUS_SUCCESS {
         kmd_log!("PcInitializeAdapterDriver a échoué : {status:#010x}");
         return status;
@@ -119,15 +132,19 @@ pub unsafe extern "system" fn driver_entry(
 ///
 /// Appelée uniquement par le gestionnaire PnP, avec le `driver` de `DriverEntry` et un
 /// `pdo` valide.
-// `extern "C"` : type `DRIVER_ADD_DEVICE` tel que généré par `wdk-sys` (même ABI que
-// `system` sur x64).
-unsafe extern "C" fn add_device(driver: PDRIVER_OBJECT, pdo: PDEVICE_OBJECT) -> NTSTATUS {
+// `extern "C"` : type `PDRIVER_ADD_DEVICE` tel que généré par `portcls-sys` (même ABI que
+// `system` sur x64) ; types `portcls_sys`, c'est PortCls qui l'appelle.
+unsafe extern "C" fn add_device(
+    driver: portcls_sys::PDRIVER_OBJECT,
+    pdo: portcls_sys::PDEVICE_OBJECT,
+) -> NTSTATUS {
     kmd_log!("AddDevice (pdo {pdo:p})");
 
+    const START_DEVICE: PCPFNSTARTDEVICE = Some(start_device);
     // SAFETY: `driver` et `pdo` sont ceux reçus du gestionnaire PnP ; `start_device` est
     // une fonction statique, valide toute la vie du pilote ; 0 demande à PortCls
     // l'extension de périphérique par défaut.
-    let status = unsafe { PcAddAdapterDevice(driver, pdo, Some(start_device), MAX_MINIPORTS, 0) };
+    let status = unsafe { PcAddAdapterDevice(driver, pdo, START_DEVICE, MAX_MINIPORTS, 0) };
     if status != STATUS_SUCCESS {
         kmd_log!("PcAddAdapterDevice a échoué : {status:#010x}");
     }
@@ -147,9 +164,9 @@ unsafe extern "C" fn add_device(driver: PDRIVER_OBJECT, pdo: PDEVICE_OBJECT) -> 
 ///
 /// Appelée uniquement par PortCls, avec un `device` (objet fonctionnel créé par
 /// `PcAddAdapterDevice`), un `irp` et une `resource_list` valides le temps de l'appel.
-unsafe extern "system" fn start_device(
-    device: PDEVICE_OBJECT,
-    _irp: PIRP,
+unsafe extern "C" fn start_device(
+    device: portcls_sys::PDEVICE_OBJECT,
+    _irp: portcls_sys::PIRP,
     _resource_list: PRESOURCELIST,
 ) -> NTSTATUS {
     kmd_log!("StartDevice (fdo {device:p})");

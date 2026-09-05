@@ -58,7 +58,7 @@ stable 1.96.1 MSVC), ses lints anti-panique (`Cargo.toml`) et `rustflags =
 sont propres.
 
 ```powershell
-.\drivers\windows\tools\check.ps1               # fmt, clippy -D warnings, test portcls-sys, build conduit-kmd
+.\drivers\windows\tools\check.ps1               # fmt, clippy -D warnings, test portcls-sys, build conduit-kmd, golden à jour
 .\drivers\windows\tools\build.ps1               # cargo wdk build --profile dev
 .\drivers\windows\tools\build.ps1 -Profile release
 ```
@@ -75,9 +75,24 @@ cargo wdk build [--profile release]
 
 Le tout fonctionne depuis un PowerShell ordinaire : `rustc` localise `link.exe` par le
 registre de Visual Studio (comme `vswhere`), aucun `vcvars` n'est nécessaire. Ne lancez **pas** `cargo test -p conduit-kmd` :
-`wdk-sys` 0.5.1 lie `ntoskrnl.lib` même en test (issue #502). `portcls-sys` ne le tire que
-derrière sa feature `kernel` (activée par `conduit-kmd`) : `cargo test -p portcls-sys`
-reste en mode utilisateur.
+`wdk-sys` 0.5.1 lie `ntoskrnl.lib` même en test (issue #502). `portcls-sys` ne dépend
+pas de `wdk-sys` (ses bindings régénèrent les types NT dont PortCls a besoin) :
+`cargo test -p portcls-sys` reste en mode utilisateur.
+
+**Golden de disposition** (`portcls-sys\tests\layout.golden`) : `tests\layout.rs`
+compare les `size_of` et les GUID des bindings à ce fichier, produit par `cl.exe` sur
+les mêmes en-têtes du WDK (`portcls-sys\tools\sizeof-probe.c`). Il est commité ;
+`check.ps1` le régénère dans un dossier temporaire et échoue s'il diffère. À régénérer
+(puis à commiter) après toute modification du probe, de `wrapper.h`, ou changement de
+version du WDK :
+
+```powershell
+.\drivers\windows\tools\regen-layout.ps1     # cl.exe via vswhere, WDK de versions.json
+```
+
+Pour ajouter une mesure : une ligne `TAILLE(...)`/`GUID_*(...)` dans le probe **et** une
+entrée dans les tables `tailles!`/`guids!` de `tests\layout.rs` (le test échoue si les
+deux listes de noms diffèrent), puis régénération.
 
 `cargo wdk build` enchaîne `cargo build -p conduit-kmd`, puis l'empaquetage :
 copie de l'INF depuis le `.inx`, `stampinf` (`DriverVer`, `$ARCH$`), `inf2cat`,

@@ -9,16 +9,17 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
-# `wdk-sys` lie les bibliothèques noyau même sous `cargo test` : il reste optionnel,
-# derrière la feature `kernel` (activée par `conduit-kmd`), pour que
-# `cargo test -p portcls-sys` continue de tourner en mode utilisateur sans lui.
-# M1a-03 ajoutera `bindgen` et `wdk-build` en build-dependencies.
-[features]
-default = []
-kernel = ["dep:wdk-sys"]
-
+# Crate autonome : aucune dépendance à `wdk-sys` (qui lie les bibliothèques noyau même
+# sous `cargo test`). Les types NT référencés par PortCls (`DRIVER_OBJECT`, `IRP`…) sont
+# régénérés ici par bindgen ; `conduit-kmd` convertit entre les deux définitions par
+# `cast()` (même disposition, même en-tête source).
 [dependencies]
-wdk-sys = { workspace = true, optional = true }
+
+[build-dependencies]
+wdk-build.workspace = true
+bindgen.workspace = true
+anyhow = "1"
+regex = "1"
 
 [lints]
 workspace = true
