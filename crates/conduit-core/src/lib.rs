@@ -8,7 +8,10 @@
 //! - le modèle de graphe et sa construction validée ([`graph`]) ;
 //! - le trait [`Node`] et ses tampons d'entrée/sortie ([`node`]) ;
 //! - les gains partagés avec rampe ([`gain`]) ;
-//! - l'exécution d'un cycle ([`executor`]) et l'échange atomique de version ([`slot`]).
+//! - l'exécution d'un cycle ([`executor`]) et l'échange atomique de version ([`slot`]) ;
+//! - des paramètres atomiques ([`param`]), des briques DSP ([`dsp`]) et des nœuds
+//!   utilitaires ([`nodes`]) : générateurs, mixeur, VU-mètre, adaptation de canaux,
+//!   égaliseur.
 //!
 //! # Contraintes temps réel
 //!
@@ -20,10 +23,13 @@
 #![warn(missing_docs)]
 
 pub mod buffer;
+pub mod dsp;
 pub mod executor;
 pub mod gain;
 pub mod graph;
 pub mod node;
+pub mod nodes;
+pub mod param;
 pub mod ring;
 pub mod slot;
 pub mod types;
