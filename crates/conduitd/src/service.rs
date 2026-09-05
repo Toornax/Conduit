@@ -71,10 +71,16 @@ impl Service {
     pub fn start(engine: Engine, options: ServiceOptions) -> Self {
         let (tx, rx) = mpsc::channel();
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
-        let events2 = events.clone();
+        // Le gestionnaire est construit ici, sur le fil appelant : restauration de l'état,
+        // règles et premier `drain_notifications` (qui jette les notifications de démarrage,
+        // sans abonné) sont terminés quand `start` rend la main. Construit dans le fil de
+        // gestion, ce premier drain courait contre les premiers clients IPC : un client
+        // abonné assez tôt (observé sous Windows, où le démarrage d'un fil est plus lent)
+        // recevait `NodeStateChanged`/`NodeAdded` des nœuds déjà présents.
+        let manager = Manager::new(engine, options, events.clone());
         let thread = std::thread::Builder::new()
             .name("conduitd-manager".into())
-            .spawn(move || Manager::new(engine, options, events2).run(rx))
+            .spawn(move || manager.run(rx))
             .expect("fil de gestion");
         Self {
             tx,

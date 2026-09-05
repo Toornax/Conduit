@@ -76,12 +76,24 @@ impl Listener {
         }
         #[cfg(windows)]
         {
+            // Le chemin reçu (`--socket`, `--root`, tests) est projeté sur un nom de pipe
+            // par la même fonction que le client : voir `conduit_protocol::client::pipe_name`.
+            let name = conduit_protocol::client::pipe_name(path);
             let server = tokio::net::windows::named_pipe::ServerOptions::new()
                 .first_pipe_instance(true)
-                .create(path)?;
+                .create(&name)
+                .map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "named pipe {} : {e} (un démon écoute déjà ? arrêtez-le ou utilisez --socket)",
+                            name.display()
+                        ),
+                    )
+                })?;
             Ok(Self {
                 inner: Inner::Pipe(Some(server)),
-                path: path.to_path_buf(),
+                path: name,
             })
         }
         #[cfg(not(any(unix, windows)))]
@@ -109,8 +121,13 @@ impl Listener {
             }
             #[cfg(windows)]
             Inner::Pipe(slot) => {
+                // L'instance en attente reste dans `slot` pendant `connect()` : `accept` est
+                // appelé dans un `select!` et peut être annulé ; la retirer avant l'attente
+                // laissait un `None` et faisait paniquer l'appel suivant.
+                slot.as_ref().expect("instance de pipe").connect().await?;
                 let server = slot.take().expect("instance de pipe");
-                server.connect().await?;
+                // Une instance par client : la suivante est créée avant de servir celle-ci,
+                // sinon un client qui se présente entre-temps reçoit ERROR_PIPE_BUSY.
                 *slot =
                     Some(tokio::net::windows::named_pipe::ServerOptions::new().create(&self.path)?);
                 Ok(Box::new(server))

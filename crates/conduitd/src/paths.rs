@@ -32,11 +32,16 @@ impl Paths {
     }
 
     /// Chemins sous un répertoire unique (tests, `--root`).
+    ///
+    /// Le socket est `<racine>/conduitd.sock` sur toutes les plateformes : sous Windows,
+    /// `conduitd::ipc` et `conduit_protocol::client` projettent ce chemin sur un named pipe
+    /// propre à la racine. (Auparavant la racine était ignorée sous Windows et tous les
+    /// démons de test se disputaient `\\.\pipe\conduit-<utilisateur>`.)
     pub fn under(root: &std::path::Path) -> Self {
         Self::in_dirs(
             root.join("config"),
             root.join("data"),
-            Self::default_socket(root.to_path_buf()),
+            root.join("conduitd.sock"),
         )
     }
 
@@ -67,12 +72,23 @@ impl Paths {
         }
         std::fs::create_dir_all(&self.data_dir)?;
         std::fs::create_dir_all(&self.log_dir)?;
-        if !cfg!(windows) {
+        // Un nom de pipe (`\\.\pipe\…`) n'a pas de répertoire parent à créer.
+        if !Self::is_pipe_name(&self.socket) {
             if let Some(p) = self.socket.parent() {
                 std::fs::create_dir_all(p)?;
             }
         }
         Ok(())
+    }
+
+    #[cfg(windows)]
+    fn is_pipe_name(socket: &std::path::Path) -> bool {
+        conduit_protocol::client::is_pipe_name(socket)
+    }
+
+    #[cfg(not(windows))]
+    fn is_pipe_name(_socket: &std::path::Path) -> bool {
+        false
     }
 }
 
@@ -88,9 +104,7 @@ mod tests {
         assert_eq!(p.state_file, dir.path().join("data/state.json"));
         p.ensure_dirs().unwrap();
         assert!(p.log_dir.is_dir());
-        if !cfg!(windows) {
-            assert_eq!(p.socket, dir.path().join("conduitd.sock"));
-        }
+        assert_eq!(p.socket, dir.path().join("conduitd.sock"));
     }
 
     #[test]

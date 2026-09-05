@@ -283,8 +283,22 @@ Ce que la session Linux avait validé pour Windows avant M1a-01 :
 - tous les crates utilisateur compilent en croisé `x86_64-pc-windows-gnu` (check Nix
   `cross-windows`) ; les chemins spécifiques (`named pipe` dans `conduitd::ipc` et
   `conduit_protocol::client`, `SetThreadPriority` dans `conduit_backend::rt`) n'avaient
-  **jamais été exécutés** sous Windows : premiers points à tester
-  (`cargo test -p conduitd -p conduitctl`) ;
+  jamais été exécutés sous Windows. **Première exécution du named pipe le 2026-09-05** :
+  `cargo test -p conduitd -p conduitctl -p conduit-protocol --all-features` passe
+  (46 tests : 23 conduitd, 8 conduitctl, 15 conduit-protocol), après trois correctifs :
+  1. `Paths::under(racine)` ignorait la racine sous Windows : tous les démons de test
+     se disputaient `\\.\pipe\conduit-<utilisateur>` (`ERROR_ACCESS_DENIED` sur
+     `first_pipe_instance`). Désormais le socket est `<racine>\conduitd.sock` partout et
+     `conduit_protocol::client::pipe_name` projette tout chemin qui n'est pas déjà un
+     nom de pipe sur `\\.\pipe\conduit-<empreinte FNV du chemin absolu>`, côté démon
+     (`Listener::bind`) comme côté client ; `--socket <fichier>` est donc portable.
+  2. `Listener::accept` (pipe) retirait l'instance en attente avant `connect()` : annulé
+     par le `select!` de `serve`, l'appel suivant paniquait.
+  3. Bug commun révélé par le timing Windows : `Service::start` construisait `Manager`
+     (restauration, règles, premier drain des notifications de démarrage) dans le fil de
+     gestion, en course avec les premiers clients IPC ; un abonné précoce recevait
+     `NodeStateChanged`/`NodeAdded` des nœuds initiaux. `Manager` est maintenant
+     construit avant le lancement du fil ;
 - `packaging/windows/versions.json` fixait Rust 1.96.1, Build Tools 17, SDK/WDK 26100 ;
   M1a-01 y a ajouté LLVM 17.0.6, `cargo-wdk` 0.1.1 et les crates `wdk-*`.
 
