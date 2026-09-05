@@ -1,3 +1,4 @@
+| [ADR-012](012-workspace-noyau-separe.md) | Workspace noyau séparé, logique du pilote dans un crate portable | acceptée |
 # Décisions d'architecture (ADR)
 
 Une décision structurante = un fichier numéroté, jamais modifié après acceptation
@@ -18,3 +19,4 @@ Gabarit : contexte, décision, conséquences, statut.
 | [ADR-009](009-dsp-dans-le-coeur-des-m0.md) | Briques DSP (EQ, filtres) dans le cœur dès M0 | acceptée |
 | [ADR-010](010-protocole-source-de-verite-api.md) | `conduit-protocol` source de vérité de l'API, consommé par l'engine | acceptée |
 | [ADR-011](011-noeud-de-peripherique-a-role.md) | Un nœud par périphérique, rôle changé à chaud sans recompiler | acceptée |
+| [ADR-012](012-workspace-noyau-separe.md) | Workspace noyau séparé, logique du pilote dans un crate portable | acceptée |

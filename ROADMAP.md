@@ -26,7 +26,8 @@ Ordre général : M0 et M1a en parallèle, puis M1b, M2, M3, M4, M5.
 **État au 2026-09-05** : M0 clos (tag `v0.1.0-core`, `nix flake check` vert, 211 tests).
 M1a (pilote Windows) exige un poste Windows avec WDK : en son absence, le travail se
 poursuit sur M3 (Linux/PipeWire) puis M2 (GUI), conformément à la consigne « si Windows
-bloque, parties Linux/macOS ».
+bloque, parties Linux/macOS ». **Reprise Windows le 2026-09-05** : conception du pilote
+dans [docs/driver-design.md](docs/driver-design.md), ADR-012 (workspace noyau séparé).
 
 ---
 
@@ -299,6 +300,10 @@ proposition : trois semaines de travail effectif). Porte de décision en M1a-12.
   kernel debugger).
   *Fait quand* : un développeur reproduit le build à partir de la doc ; le job CI Windows
   compile le crate vide du pilote.
+- [ ] **M1a-01b** `feat(driver): conduit-kmd-core, horloge virtuelle et copie cyclique testées sous Nix`
+  Crate `#![no_std]` sans `unsafe` du workspace racine (ADR-012, [driver-design.md](docs/driver-design.md) §2.1) :
+  modules `position`, `ring`, `format` ; lints anti-panique en `deny`.
+  *Fait quand* : proptest et Miri verts dans `nix flake check` et sous Windows.
 - [ ] **M1a-02** `feat(driver): pilote WDM minimal chargé et déchargé en mode test`
   `DriverEntry`, `AddDevice`, `Unload`, INF, catalogue de test, installation `pnputil`.
   *Fait quand* : chargement/déchargement 100 fois sans erreur dans la VM.

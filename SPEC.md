@@ -522,12 +522,13 @@ conduit/
 │   ├── conduit-protocol/      # messages IPC, serde, versionnage
 │   ├── conduitd/              # binaire du démon
 │   ├── conduitctl/            # binaire CLI
-│   └── conduit-gui/           # application iced
+│   ├── conduit-gui/           # application iced
+│   ├── conduit-kmd-core/      # logique portable du pilote Windows (no_std, testée sous Nix)
+│   └── conduit-helper/        # service d'assistance Windows (IOCTL, registre), ADR-012
 ├── drivers/
-│   ├── windows/
+│   ├── windows/               # workspace Cargo NOYAU, indépendant (ADR-012)
 │   │   ├── portcls-sys/       # vtables et types PortCls/WaveRT
-│   │   ├── conduit-kmd/       # pilote noyau
-│   │   └── conduit-helper/    # service d'assistance (IOCTL, registre)
+│   │   └── conduit-kmd/       # pilote noyau
 │   └── macos-hal/             # plugin AudioServerPlugIn (Rust cdylib + bundle)
 ├── packaging/
 │   ├── windows/               # MSI (WiX), script d'environnement épinglé
