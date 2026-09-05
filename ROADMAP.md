@@ -407,6 +407,12 @@ signé par attestation, HLK audio passé, latence conforme à SPEC §5.6, endura
   *Fait quand* : latence mesurée inférieure au mode partagé, repli automatique documenté.
 - [ ] **M1b-33** `feat(wasapi): position d'horloge IAudioClock et intégration DLL`
   *Fait quand* : deux cartes réelles en même temps, dérive absorbée, xruns = 0 sur 1 h.
+  *État* : IAudioClock intégrée, 60 s sur deux cartes OK, 1 h en cours/à confirmer.
+  `ClockInfo` : position `IAudioClock::GetPosition` en trames du format livré
+  (fréquence classée : octets/s du mixage sur les deux cartes du poste, octets/s du
+  format client par le chemin conversion), horodatage QPC commun aux flux ; latence
+  estimée `write_ahead_frames` ; `clock_now()` ; `tests/two_devices.rs` (60 s : base
+  commune à 43 µs, dérive Realtek − G27QC = −18 ppm ; `#[ignore]` 1 h avec le moteur).
 - [ ] **M1b-34** `feat(wasapi): CableControl via le helper`
   *Fait quand* : `conduitctl cable add` fonctionne de bout en bout (F-01, F-03).
 - [ ] **M1b-35** `feat(daemon): service Windows et démarrage automatique`

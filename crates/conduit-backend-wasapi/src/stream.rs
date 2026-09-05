@@ -25,9 +25,21 @@
 //! `Reset` avant de rendre la main) : aucun rappel n'est en cours au retour. `Drop`
 //! appelle `stop()`.
 //!
-//! `ClockInfo` (M1b-33 branchera `IAudioClock`) : `position` = trames livrées au
-//! rappel depuis `start()`, `timestamp_ns` = `Instant` depuis l'`epoch` de
-//! l'ouverture, `frames` = trames de ce rappel (un paquet en capture).
+//! **Horloge** (module `clock`). À chaque rappel, **avant** de toucher au tampon,
+//! `IAudioClock::GetPosition(&position, &qpc)` : `ClockInfo::position` est cette
+//! position convertie en trames du format livré (en rendu, c'est la position de
+//! **lecture** du matériel, en retard sur ce qu'on écrit ; en capture, sa position
+//! d'écriture), bornée à ne jamais reculer ; `timestamp_ns` = `qpc × 100`, base
+//! `QueryPerformanceCounter` commune à tous les flux du processus ; `frames` =
+//! trames de ce rappel (un paquet en capture). Si `GetPosition` échoue
+//! ponctuellement, la position est extrapolée (dernière position + trames du
+//! rappel précédent) et l'horodatage vient de `QueryPerformanceCounter` ; les
+//! échecs sont comptés ([`ClockStats::faults`]). Sans `IAudioClock`
+//! ([`ClockSource::Counter`]), `position` = trames livrées depuis `start()`,
+//! toujours horodatées QPC. La latence estimée `write_ahead_frames` (trames
+//! écrites − position lue) et le coût mesuré de `GetPosition` sont publiés par
+//! atomiques ([`WasapiHandle::latency`], [`WasapiHandle::clock_stats`]).
+//! [`WasapiHandle::clock_now`] interroge l'horloge depuis n'importe quel fil.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -39,11 +51,13 @@ use conduit_backend::{
     AudioCallback, BackendError, ClockInfo, DeviceHandle, DeviceId, DeviceInfo, StreamFormat,
     StreamIo,
 };
+use windows::core::AgileReference;
 use windows::Win32::Media::Audio::{
-    IAudioCaptureClient, IAudioClient, IAudioRenderClient, AUDCLNT_BUFFERFLAGS_SILENT,
+    IAudioCaptureClient, IAudioClient, IAudioClock, IAudioRenderClient, AUDCLNT_BUFFERFLAGS_SILENT,
     AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_E_RESOURCES_INVALIDATED,
 };
 
+use crate::clock::{hns_to_ns, read_position, ClockScale, ClockSource, Qpc};
 use crate::com::{platform_error, ComApartment, Event, Woken};
 use crate::open::{Opened, Service, StreamLatency, StreamObjects};
 
@@ -61,12 +75,19 @@ pub(crate) struct StreamShared {
     running: AtomicBool,
     /// Le périphérique a été invalidé : plus aucun démarrage possible.
     disconnected: AtomicBool,
-    /// Trames livrées depuis `start()`, au début du prochain rappel.
+    /// Position d'horloge du dernier rappel, en trames du format livré.
     position: AtomicU64,
-    /// Horodatage du dernier rappel, nanosecondes depuis l'ouverture.
+    /// Horodatage du dernier rappel, nanosecondes QPC.
     timestamp_ns: AtomicU64,
     /// Trames du dernier rappel.
     frames: AtomicUsize,
+    /// Latence estimée au dernier rappel (voir [`StreamLatency::write_ahead_frames`]).
+    write_ahead: AtomicU64,
+    /// Appels à `GetPosition`, échecs, durée cumulée et maximale (ns).
+    clock_calls: AtomicU64,
+    clock_faults: AtomicU64,
+    clock_ns_total: AtomicU64,
+    clock_ns_max: AtomicU64,
     /// Résultat de la promotion temps réel du fil (écrit une fois, avant la boucle).
     rt: Mutex<Option<RtOutcome>>,
 }
@@ -79,6 +100,22 @@ impl StreamShared {
             frames: self.frames.load(Ordering::Acquire),
         }
     }
+}
+
+/// Ce que l'horloge d'un flux a coûté et rapporté depuis le dernier `start()`
+/// (hors trait `DeviceHandle`, [`WasapiHandle::clock_stats`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockStats {
+    /// D'où viennent les positions.
+    pub source: ClockSource,
+    /// Appels à `IAudioClock::GetPosition` faits par le fil du flux.
+    pub calls: u64,
+    /// Appels qui ont échoué (position extrapolée, horodatage QPC direct).
+    pub faults: u64,
+    /// Durée moyenne d'un appel, en nanosecondes (0 sans appel).
+    pub mean_ns: u64,
+    /// Durée maximale d'un appel, en nanosecondes.
+    pub max_ns: u64,
 }
 
 /// Tout ce que le fil du flux possède pendant qu'il tourne, et qui revient à la
@@ -95,10 +132,14 @@ struct Worker {
     /// Tampon intermédiaire (`buffer_frames × channels`), pré-alloué : repli
     /// d'alignement en rendu, silence ou repli d'alignement en capture.
     scratch: Vec<f32>,
-    /// Base des horodatages, fixée à l'ouverture.
-    epoch: Instant,
-    /// Position courante, propriété exclusive du fil du flux.
+    /// Compteur de performance : horodatages du repli et des échecs de `GetPosition`.
+    qpc: Qpc,
+    /// Dernière position publiée (trames du format livré), jamais décroissante.
     position: u64,
+    /// Trames du dernier rappel (extrapolation si `GetPosition` échoue).
+    last_frames: usize,
+    /// Trames livrées au rappel depuis `start()` (position du repli, latence).
+    delivered: u64,
 }
 
 /// Ce que le fil rend en s'arrêtant.
@@ -131,6 +172,11 @@ pub struct WasapiHandle {
     thread: Thread,
     /// Dernière erreur d'un fil perdu, rendue par `start()`.
     lost_reason: Option<BackendError>,
+    /// Seconde référence agile vers l'horloge du flux, pour [`Self::clock_now`]
+    /// depuis n'importe quel fil ; libérée sous un appartement COM dans `Drop`.
+    clock: Option<AgileReference<IAudioClock>>,
+    clock_scale: ClockScale,
+    clock_source: ClockSource,
 }
 
 impl WasapiHandle {
@@ -145,6 +191,10 @@ impl WasapiHandle {
         let stop = Arc::new(Event::new(true)?);
         let buffer_frames = objects.latency.buffer_frames.max(1);
         let channels = format.channels.max(1);
+        let qpc = Qpc::query()?;
+        let clock = objects.clock.clone();
+        let clock_scale = objects.clock_scale;
+        let clock_source = objects.clock_source;
         let worker = Worker {
             device: info.id.clone(),
             objects,
@@ -154,8 +204,10 @@ impl WasapiHandle {
             channels,
             buffer_frames,
             scratch: vec![0.0; buffer_frames * channels],
-            epoch: Instant::now(),
+            qpc,
             position: 0,
+            last_frames: 0,
+            delivered: 0,
         };
         Ok(Self {
             latency: worker.objects.latency,
@@ -165,14 +217,85 @@ impl WasapiHandle {
             stop,
             thread: Thread::Idle(Box::new(worker)),
             lost_reason: None,
+            clock,
+            clock_scale,
+            clock_source,
         })
     }
 
     /// Latence et tailles de tampon telles que WASAPI les rapporte à l'ouverture
     /// (hors trait `DeviceHandle`) : tampon partagé, période effective,
-    /// `GetStreamLatency`, chemin d'initialisation.
+    /// `GetStreamLatency`, chemin d'initialisation ; plus la latence estimée par
+    /// l'horloge au dernier rappel ([`StreamLatency::write_ahead_frames`]).
     pub fn latency(&self) -> StreamLatency {
-        self.latency
+        StreamLatency {
+            write_ahead_frames: self.write_ahead_frames(),
+            ..self.latency
+        }
+    }
+
+    /// Latence estimée au dernier rappel, en trames du format livré : trames
+    /// écrites − position de lecture du matériel (rendu), position d'écriture du
+    /// matériel − trames livrées (capture). Atomique, lisible à tout moment.
+    pub fn write_ahead_frames(&self) -> u64 {
+        self.shared.write_ahead.load(Ordering::Acquire)
+    }
+
+    /// D'où viennent les positions d'horloge de ce flux, fixé à l'ouverture.
+    pub fn clock_source(&self) -> ClockSource {
+        self.clock_source
+    }
+
+    /// Appels, échecs et coût de `IAudioClock::GetPosition` sur le fil du flux
+    /// depuis le dernier `start()`.
+    pub fn clock_stats(&self) -> ClockStats {
+        let calls = self.shared.clock_calls.load(Ordering::Acquire);
+        let total = self.shared.clock_ns_total.load(Ordering::Acquire);
+        ClockStats {
+            source: self.clock_source,
+            calls,
+            faults: self.shared.clock_faults.load(Ordering::Acquire),
+            mean_ns: total.checked_div(calls).unwrap_or(0),
+            max_ns: self.shared.clock_ns_max.load(Ordering::Acquire),
+        }
+    }
+
+    /// Interroge l'horloge **maintenant**, depuis le fil appelant, au lieu de
+    /// rendre la valeur publiée par le dernier rappel ([`DeviceHandle::clock`]) :
+    /// `position` en trames du format livré, `timestamp_ns` QPC de la lecture,
+    /// `frames` du dernier rappel. Utile pour comparer deux cartes au même instant.
+    /// Alloue (résolution d'une référence agile) : pas pour le fil audio.
+    ///
+    /// Avec [`ClockSource::Counter`], rend [`DeviceHandle::clock`] tel quel.
+    ///
+    /// # Erreurs
+    ///
+    /// [`BackendError::Disconnected`] si le périphérique a été invalidé,
+    /// [`BackendError::Platform`] si `GetPosition` échoue autrement.
+    pub fn clock_now(&self) -> Result<ClockInfo, BackendError> {
+        let Some(clock) = &self.clock else {
+            return Ok(self.clock());
+        };
+        // Le fil appelant n'a peut-être jamais initialisé COM : un appartement le
+        // temps de l'appel (voir `Drop`). Déclaré avant `resolved` pour lui survivre.
+        let _apartment = ComApartment::initialize_mta();
+        let resolved = clock
+            .resolve()
+            .map_err(|e| platform_error("AgileReference::Resolve(IAudioClock)", &e))?;
+        let (raw, qpc) = read_position(&resolved).map_err(|e| {
+            if e.code() == AUDCLNT_E_DEVICE_INVALIDATED
+                || e.code() == AUDCLNT_E_RESOURCES_INVALIDATED
+            {
+                self.disconnected_error()
+            } else {
+                platform_error("IAudioClock::GetPosition", &e)
+            }
+        })?;
+        Ok(ClockInfo {
+            position: self.clock_scale.frames(raw),
+            timestamp_ns: hns_to_ns(qpc),
+            frames: self.shared.frames.load(Ordering::Acquire),
+        })
     }
 
     /// Résultat de la promotion temps réel du fil du flux, connu dès que le fil
@@ -192,6 +315,7 @@ impl core::fmt::Debug for WasapiHandle {
             .field("device", &self.info.id)
             .field("format", &self.format)
             .field("latency", &self.latency)
+            .field("clock", &self.clock_source)
             .field("running", &self.is_running())
             .field(
                 "disconnected",
@@ -301,11 +425,12 @@ impl Drop for WasapiHandle {
         // appartement le temps de la libération. Si l'appel échoue (fil déjà en
         // STA, par exemple), COM y est initialisé de toute façon et la libération
         // reste valide.
+        let apartment = ComApartment::initialize_mta();
+        drop(self.clock.take());
         if let Thread::Idle(worker) = core::mem::replace(&mut self.thread, Thread::Lost) {
-            let apartment = ComApartment::initialize_mta();
             drop(worker);
-            drop(apartment);
         }
+        drop(apartment);
     }
 }
 
@@ -352,9 +477,28 @@ fn run_inner(worker: &mut Worker) -> Result<(), BackendError> {
         ),
     };
 
+    let clock = match &worker.objects.clock {
+        Some(clock) => Some(
+            clock
+                .resolve()
+                .map_err(|e| platform_error("AgileReference::Resolve(IAudioClock)", &e))?,
+        ),
+        None => None,
+    };
+
+    // `Reset` (fin du fil précédent) a remis la position du flux à zéro : les
+    // compteurs repartent avec elle.
     worker.position = 0;
-    worker.shared.position.store(0, Ordering::Release);
-    worker.shared.frames.store(0, Ordering::Release);
+    worker.last_frames = 0;
+    worker.delivered = 0;
+    let shared = &worker.shared;
+    shared.position.store(0, Ordering::Release);
+    shared.frames.store(0, Ordering::Release);
+    shared.write_ahead.store(0, Ordering::Release);
+    shared.clock_calls.store(0, Ordering::Release);
+    shared.clock_faults.store(0, Ordering::Release);
+    shared.clock_ns_total.store(0, Ordering::Release);
+    shared.clock_ns_max.store(0, Ordering::Release);
 
     // Un tampon de silence avant `Start` : le moteur ne lit jamais de données
     // indéterminées, et le premier réveil arrive une période plus tard.
@@ -365,7 +509,7 @@ fn run_inner(worker: &mut Worker) -> Result<(), BackendError> {
     // SAFETY: client initialisé, événement enregistré.
     unsafe { client.Start() }.map_err(|e| classify(worker, "IAudioClient::Start", &e))?;
 
-    let outcome = audio_loop(worker, &client, &service);
+    let outcome = audio_loop(worker, &client, &service, clock.as_ref());
 
     // Ignorés : après une invalidation ils échouent aussi, et il n'y a rien de
     // mieux à faire.
@@ -388,6 +532,7 @@ fn audio_loop(
     worker: &mut Worker,
     client: &IAudioClient,
     service: &Resolved,
+    clock: Option<&IAudioClock>,
 ) -> Result<(), BackendError> {
     loop {
         let woken = Event::wait_either(&worker.stop, &worker.objects.event, WAKE_TIMEOUT)?;
@@ -399,11 +544,44 @@ fn audio_loop(
             Woken::Second | Woken::Timeout => {}
         }
         let result = match service {
-            Resolved::Render(render) => render_once(worker, client, render),
-            Resolved::Capture(capture) => capture_all(worker, capture),
+            Resolved::Render(render) => render_once(worker, client, render, clock),
+            Resolved::Capture(capture) => capture_all(worker, capture, clock),
         };
         if let Err((call, e)) = result {
             return Err(classify(worker, call, &e));
+        }
+    }
+}
+
+/// Lit l'horloge du flux pour le rappel qui commence : position (trames du format
+/// livré, jamais décroissante) et horodatage QPC en nanosecondes. Sans allocation.
+///
+/// - `IAudioClock` : `GetPosition`, durée mesurée (`Instant`, autorisé sur le fil
+///   audio) ; en cas d'échec, dernière position + trames du rappel précédent, et
+///   `QueryPerformanceCounter` pour l'horodatage ;
+/// - repli compteur : trames livrées depuis `start()`, horodatage QPC.
+fn sample_clock(worker: &mut Worker, clock: Option<&IAudioClock>) -> (u64, u64) {
+    let Some(clock) = clock else {
+        return (worker.delivered, worker.qpc.now_ns());
+    };
+    let shared = &worker.shared;
+    let started = Instant::now();
+    let read = read_position(clock);
+    let cost = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    shared.clock_calls.fetch_add(1, Ordering::Relaxed);
+    shared.clock_ns_total.fetch_add(cost, Ordering::Relaxed);
+    shared.clock_ns_max.fetch_max(cost, Ordering::Relaxed);
+    match read {
+        Ok((raw, qpc)) => {
+            let position = worker.objects.clock_scale.frames(raw).max(worker.position);
+            (position, hns_to_ns(qpc))
+        }
+        Err(_) => {
+            shared.clock_faults.fetch_add(1, Ordering::Relaxed);
+            (
+                worker.position + worker.last_frames as u64,
+                worker.qpc.now_ns(),
+            )
         }
     }
 }
@@ -413,6 +591,7 @@ fn render_once(
     worker: &mut Worker,
     client: &IAudioClient,
     render: &IAudioRenderClient,
+    audio_clock: Option<&IAudioClock>,
 ) -> Result<(), (&'static str, windows::core::Error)> {
     // SAFETY: client démarré.
     let padding = unsafe { client.GetCurrentPadding() }
@@ -424,13 +603,15 @@ fn render_once(
     if frames == 0 {
         return Ok(());
     }
+    // L'horloge d'abord : la position se rapporte au début du rappel, avant que
+    // ce rappel n'ajoute ses trames.
+    let (position, timestamp_ns) = sample_clock(worker, audio_clock);
     // SAFETY: `frames ≤ tampon − padding`, condition de `GetBuffer`.
     let ptr = unsafe { render.GetBuffer(frames as u32) }
         .map_err(|e| ("IAudioRenderClient::GetBuffer", e))?;
     let samples = frames * worker.channels;
-    let timestamp_ns = elapsed_ns(worker.epoch);
     let clock = ClockInfo {
-        position: worker.position,
+        position,
         timestamp_ns,
         frames,
     };
@@ -461,7 +642,7 @@ fn render_once(
     // SAFETY: apparié au `GetBuffer` réussi ci-dessus, même nombre de trames.
     unsafe { render.ReleaseBuffer(frames as u32, 0) }
         .map_err(|e| ("IAudioRenderClient::ReleaseBuffer", e))?;
-    publish(worker, frames, timestamp_ns);
+    publish(worker, &clock, true);
     Ok(())
 }
 
@@ -469,6 +650,7 @@ fn render_once(
 fn capture_all(
     worker: &mut Worker,
     capture: &IAudioCaptureClient,
+    audio_clock: Option<&IAudioClock>,
 ) -> Result<(), (&'static str, windows::core::Error)> {
     loop {
         // SAFETY: client démarré.
@@ -486,13 +668,13 @@ fn capture_all(
         // Un paquet ne dépasse jamais le tampon ; la borne protège `scratch`.
         let frames = (packet_frames as usize).min(worker.buffer_frames);
         let samples = frames * worker.channels;
-        let timestamp_ns = elapsed_ns(worker.epoch);
+        let (position, timestamp_ns) = sample_clock(worker, audio_clock);
+        let clock = ClockInfo {
+            position,
+            timestamp_ns,
+            frames,
+        };
         if frames > 0 {
-            let clock = ClockInfo {
-                position: worker.position,
-                timestamp_ns,
-                frames,
-            };
             let silent = flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0;
             let Worker {
                 callback, scratch, ..
@@ -522,7 +704,7 @@ fn capture_all(
         // SAFETY: apparié au `GetBuffer` réussi, avec le nombre de trames rendu.
         unsafe { capture.ReleaseBuffer(packet_frames) }
             .map_err(|e| ("IAudioCaptureClient::ReleaseBuffer", e))?;
-        publish(worker, frames, timestamp_ns);
+        publish(worker, &clock, false);
     }
 }
 
@@ -544,23 +726,27 @@ fn prefill_silence(
     unsafe { render.ReleaseBuffer(frames as u32, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) }
 }
 
-/// Publie l'horloge après un rappel.
-fn publish(worker: &mut Worker, frames: usize, timestamp_ns: u64) {
-    worker.position += frames as u64;
-    worker
-        .shared
-        .position
-        .store(worker.position, Ordering::Release);
-    worker.shared.frames.store(frames, Ordering::Release);
-    worker
-        .shared
+/// Publie l'horloge après un rappel et met à jour la latence estimée : trames
+/// livrées − position (rendu, `write_ahead`) ou position − trames livrées
+/// (capture). Sans allocation.
+fn publish(worker: &mut Worker, clock: &ClockInfo, render: bool) {
+    worker.position = clock.position;
+    worker.last_frames = clock.frames;
+    worker.delivered += clock.frames as u64;
+    let write_ahead = if worker.objects.clock.is_none() {
+        0
+    } else if render {
+        worker.delivered.saturating_sub(clock.position)
+    } else {
+        clock.position.saturating_sub(worker.delivered)
+    };
+    let shared = &worker.shared;
+    shared.position.store(clock.position, Ordering::Release);
+    shared.frames.store(clock.frames, Ordering::Release);
+    shared
         .timestamp_ns
-        .store(timestamp_ns, Ordering::Release);
-}
-
-/// Nanosecondes écoulées depuis l'ouverture (monotone : `Instant`).
-fn elapsed_ns(epoch: Instant) -> u64 {
-    u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
+        .store(clock.timestamp_ns, Ordering::Release);
+    shared.write_ahead.store(write_ahead, Ordering::Release);
 }
 
 /// Une invalidation du périphérique devient [`BackendError::Disconnected`], le

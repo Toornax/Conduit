@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use conduit_backend::{
     Backend, BackendError, DeviceDirection, DeviceHandle, DeviceId, StreamFormat,
 };
-use conduit_backend_wasapi::{InitPath, WasapiBackend, WasapiHandle};
+use conduit_backend_wasapi::{ClockSource, InitPath, WasapiBackend, WasapiHandle};
 use conduit_core::types::SampleRate;
 
 /// Un poste sans le périphérique demandé ne peut pas exercer le test : on le dit
@@ -52,8 +52,10 @@ fn format(rate: SampleRate, channels: usize, block_frames: usize) -> StreamForma
 #[derive(Default)]
 struct Probe {
     calls: AtomicUsize,
-    /// Position attendue au prochain rappel (position + trames du précédent).
-    expected_position: AtomicU64,
+    /// Dernière position vue : la suivante ne doit pas être plus petite (la
+    /// position vient de l'horloge matérielle, elle n'avance pas de `frames`
+    /// exactement à chaque rappel).
+    last_position: AtomicU64,
     last_timestamp: AtomicU64,
     /// Tampon de la mauvaise taille, position ou horodatage incohérents.
     faults: AtomicUsize,
@@ -78,12 +80,10 @@ impl Probe {
             if clock.frames == 0 {
                 probe.faults.fetch_add(1, Ordering::Relaxed);
             }
-            if clock.position != probe.expected_position.load(Ordering::Relaxed) {
+            if clock.position < probe.last_position.load(Ordering::Relaxed) {
                 probe.faults.fetch_add(1, Ordering::Relaxed);
             }
-            probe
-                .expected_position
-                .store(clock.position + clock.frames as u64, Ordering::Relaxed);
+            probe.last_position.store(clock.position, Ordering::Relaxed);
             if clock.timestamp_ns < probe.last_timestamp.load(Ordering::Relaxed) {
                 probe.faults.fetch_add(1, Ordering::Relaxed);
             }
@@ -133,18 +133,33 @@ fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
     condition()
 }
 
-/// Affiche périodes, tampon et latence (visible avec `--nocapture`).
+/// Affiche périodes, tampon, latence et horloge (visible avec `--nocapture`).
 fn report(handle: &WasapiHandle, what: &str) {
     let latency = handle.latency();
     eprintln!(
         "{what} : format {:?}, tampon {} trames, période {} trames, latence WASAPI {:?}, \
-         chemin {:?}, temps réel {:?}",
+         chemin {:?}, horloge {}, temps réel {:?}",
         handle.format(),
         latency.buffer_frames,
         latency.period_frames,
         latency.stream_latency,
         latency.path,
+        handle.clock_source(),
         handle.rt_outcome().map(|o| o.to_string()),
+    );
+}
+
+/// Affiche ce que l'horloge a coûté et la latence estimée, après un `start()`.
+fn report_clock(handle: &WasapiHandle) {
+    let stats = handle.clock_stats();
+    eprintln!(
+        "  horloge : {} appels GetPosition, {} échecs, {} ns en moyenne, {} ns au pire ; \
+         latence estimée {} trames",
+        stats.calls,
+        stats.faults,
+        stats.mean_ns,
+        stats.max_ns,
+        handle.write_ahead_frames()
     );
 }
 
@@ -194,7 +209,7 @@ fn exercise(handle: &mut dyn DeviceHandle, probe: &Arc<Probe>, min_calls: usize)
     );
 
     // Redémarrage : la position repart de zéro, les rappels reprennent.
-    probe.expected_position.store(0, Ordering::Relaxed);
+    probe.last_position.store(0, Ordering::Relaxed);
     handle.start().expect("second démarrage");
     assert!(handle.is_running());
     assert!(
@@ -248,7 +263,109 @@ fn render_default_at_48k_stereo() {
     );
     let rt = handle.rt_outcome().expect("promotion tentée");
     eprintln!("fil du flux : {rt}");
+    report_clock(&handle);
     drop(handle);
+}
+
+/// M1b-33 : sur le rendu par défaut, 2 s, la position avance de ≈ 48 000 trames/s
+/// et l'horodatage de ≈ 1 s/s (±2 %), la position ne recule jamais,
+/// Δposition / Δhorodatage ≈ 48 kHz, et `clock_now()` (lecture immédiate) est
+/// cohérent avec `clock()` (dernier rappel) à une période près.
+#[test]
+fn clock_follows_the_hardware_at_48k() {
+    let mut backend = backend();
+    let id = default_or_skip!(backend, DeviceDirection::Render);
+    let probe = Probe::new();
+    let mut handle = backend
+        .open_handle(&id, format(SampleRate::HZ_48000, 2, 480), probe.callback(2))
+        .expect("ouverture du rendu par défaut");
+    report(&handle, "horloge du rendu par défaut");
+    let source = handle.clock_source();
+    assert!(
+        matches!(source, ClockSource::AudioClock { .. }),
+        "IAudioClock attendue sur une carte réelle, obtenu {source}"
+    );
+    // Avant `start()` : rien n'a bougé, et l'horloge immédiate dit pareil.
+    assert_eq!(handle.clock().position, 0);
+    assert_eq!(handle.clock_now().expect("clock_now").position, 0);
+
+    handle.start().expect("démarrage");
+    // Le matériel démarre sa lecture avec un peu de retard : on laisse passer
+    // le préremplissage avant de mesurer.
+    std::thread::sleep(Duration::from_millis(300));
+    let first = handle.clock_now().expect("clock_now");
+    let wall = Instant::now();
+    std::thread::sleep(Duration::from_secs(2));
+    let last = handle.clock_now().expect("clock_now");
+    let elapsed = wall.elapsed();
+    let published = handle.clock();
+
+    let d_position = last.position.saturating_sub(first.position) as f64;
+    let d_timestamp = last.timestamp_ns.saturating_sub(first.timestamp_ns) as f64;
+    let elapsed_ns = elapsed.as_nanos() as f64;
+    let rate = d_position / (d_timestamp / 1e9);
+    let period = handle.format().block_frames as u64;
+    eprintln!(
+        "  {elapsed:?} : Δposition {d_position} trames ({:.1} trames/s selon l'horloge murale), \
+         Δhorodatage {:.3} s, Δposition/Δhorodatage = {rate:.1} Hz",
+        d_position / elapsed.as_secs_f64(),
+        d_timestamp / 1e9
+    );
+    report_clock(&handle);
+
+    assert!(
+        (d_position / (48_000.0 * elapsed.as_secs_f64()) - 1.0).abs() < 0.02,
+        "la position n'avance pas à 48 000 trames/s : {d_position} en {elapsed:?}"
+    );
+    assert!(
+        (d_timestamp / elapsed_ns - 1.0).abs() < 0.02,
+        "l'horodatage n'avance pas à 1 s/s : {d_timestamp} ns en {elapsed:?}"
+    );
+    assert!(
+        (rate / 48_000.0 - 1.0).abs() < 0.02,
+        "Δposition / Δhorodatage = {rate} Hz, attendu ≈ 48 000"
+    );
+    assert!(last.position > first.position, "position figée");
+    assert!(last.timestamp_ns > first.timestamp_ns, "horodatage figé");
+
+    // `clock()` date du dernier rappel, `clock_now()` de maintenant : moins d'une
+    // période d'écart, dans un sens ou dans l'autre.
+    let gap_frames = last.position.abs_diff(published.position);
+    let gap_ns = last.timestamp_ns.abs_diff(published.timestamp_ns);
+    eprintln!("  clock_now − clock : {gap_frames} trames, {gap_ns} ns");
+    assert!(
+        gap_frames <= period,
+        "clock_now et clock diffèrent de {gap_frames} trames (période {period})"
+    );
+    assert!(
+        gap_ns <= period * 1_000_000_000 / 48_000,
+        "clock_now et clock diffèrent de {gap_ns} ns"
+    );
+
+    // Latence estimée : ce qu'on a écrit d'avance tient dans le tampon partagé.
+    let latency = handle.latency();
+    assert!(latency.write_ahead_frames > 0, "aucune avance d'écriture");
+    assert!(
+        latency.write_ahead_frames <= (latency.buffer_frames + latency.period_frames) as u64,
+        "avance d'écriture {} > tampon {} + période {}",
+        latency.write_ahead_frames,
+        latency.buffer_frames,
+        latency.period_frames
+    );
+
+    let stats = handle.clock_stats();
+    assert_eq!(
+        stats.faults, 0,
+        "GetPosition a échoué {} fois",
+        stats.faults
+    );
+    assert!(
+        stats.calls >= 150,
+        "seulement {} appels en 2,3 s",
+        stats.calls
+    );
+    handle.stop().expect("arrêt");
+    assert_eq!(probe.faults(), 0, "position ou horodatage non monotones");
 }
 
 #[test]
