@@ -375,6 +375,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "conduit-backend",
+ "conduit-backend-wasapi",
  "conduit-core",
  "conduit-engine",
  "conduit-protocol",

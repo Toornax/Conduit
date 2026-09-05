@@ -181,12 +181,24 @@ boucle sans panique : `is_running()` devient faux, `stop()` rend `Disconnected`,
 `Stop` puis `Reset`) : aucun rappel n'est en cours au retour ; `Drop` appelle
 `stop()` puis libère les objets COM sous un appartement MTA temporaire.
 
+**Démon.** `conduitd` charge ce backend par défaut sous Windows depuis M1b-31 :
+`--backend auto` (la valeur par défaut) appelle `WasapiBackend::new()` sous
+`cfg(windows)` ; `--backend wasapi` le demande explicitement. Si le fil MMDevice ne
+démarre pas (COM, service audio arrêté), l'erreur est journalisée et le démon se
+replie sur le backend `null` plutôt que de refuser de démarrer (F-51) — `conduitctl
+status` montre alors `backend null`. Le pilote de graphe suit la logique habituelle
+(`engine.driver` de la configuration ; en `auto`, le périphérique de rendu par
+défaut `eConsole`, sinon une capture, sinon l'horloge interne). Le
+test `conduitd_binary_auto_backend_is_wasapi_on_windows` (`crates/conduitd/tests/binary.rs`)
+lance le binaire et vérifie que le graphe contient chaque endpoint énuméré ; il se
+saute si WASAPI est indisponible ou qu'aucune carte n'est active.
+
 Ce qui manque encore : le mode exclusif (M1b-32), l'horloge `IAudioClock`
-(M1b-33), `CableControl` par le helper (M1b-34) ; le démon ne charge pas encore ce
-backend. Les tests d'intégration (`tests/wasapi.rs`, `tests/stream.rs`,
-`tests/no_alloc.rs`) tournent sur les cartes son de la machine, en silence ; ceux
-qui demandent un périphérique absent se sautent avec un message. À lancer à la
-main : le critère « casque USB branché → `Added` »
+(M1b-33), `CableControl` par le helper (M1b-34 — d'ici là le démon ignore la
+section `[[cable]]` avec un avertissement). Les tests d'intégration
+(`tests/wasapi.rs`, `tests/stream.rs`, `tests/no_alloc.rs`) tournent sur les cartes
+son de la machine, en silence ; ceux qui demandent un périphérique absent se sautent
+avec un message. À lancer à la main : le critère « casque USB branché → `Added` »
 (`cargo test -p conduit-backend-wasapi --test wasapi -- --ignored --nocapture`) et
 le sinus audible
 (`cargo test -p conduit-backend-wasapi --test stream sine_audible -- --ignored --nocapture`).

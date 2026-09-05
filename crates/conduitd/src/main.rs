@@ -24,7 +24,10 @@ struct Args {
     /// Chemin du socket Unix ou nom du named pipe.
     #[arg(long)]
     socket: Option<PathBuf>,
-    /// Backend audio : `auto` ou `null` (simulé).
+    /// Backend audio : `auto`, `null` (simulé) ou `wasapi` (Windows).
+    ///
+    /// `auto` choisit le backend natif de la plateforme (WASAPI sous Windows) et se
+    /// replie sur `null` s'il manque ou ne démarre pas.
     #[arg(long, default_value = "auto")]
     backend: String,
     /// Niveau de journalisation (remplace [log] level).
@@ -36,6 +39,40 @@ struct Args {
     /// Désactive la persistance de l'état.
     #[arg(long)]
     no_persist: bool,
+}
+
+/// Valeurs acceptées par `--backend`, pour le message d'erreur.
+#[cfg(windows)]
+const BACKEND_CHOICES: &str = "auto, null ou wasapi";
+#[cfg(not(windows))]
+const BACKEND_CHOICES: &str = "auto ou null";
+
+/// Backend natif de la plateforme : WASAPI sous Windows.
+///
+/// `None` si la plateforme n'en a pas dans cette version, ou si son démarrage
+/// échoue — l'erreur est alors journalisée et l'appelant se replie sur le backend
+/// null : le démon doit démarrer quand même (F-51), quitte à ne servir aucun
+/// périphérique réel.
+#[cfg(windows)]
+fn native_backend() -> Option<Box<dyn Backend>> {
+    match conduit_backend_wasapi::WasapiBackend::new() {
+        Ok(wasapi) => {
+            tracing::info!("backend wasapi (MMDevice + WASAPI, mode partagé)");
+            Some(Box::new(wasapi))
+        }
+        Err(e) => {
+            tracing::error!(
+                "le backend wasapi n'a pas démarré : {e} — le service audio Windows \
+                 (AudioSrv) tourne-t-il ? Aucun périphérique réel ne sera disponible"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn native_backend() -> Option<Box<dyn Backend>> {
+    None
 }
 
 fn main() {
@@ -77,12 +114,24 @@ fn main() {
     };
     let backend: Box<dyn Backend> = match args.backend.as_str() {
         "null" => Box::new(null_timer()),
-        "auto" => {
-            tracing::warn!("aucun backend natif disponible sur cette plateforme dans cette version : backend null (simulé)");
+        "auto" => match native_backend() {
+            Some(native) => native,
+            None => {
+                if cfg!(windows) {
+                    tracing::warn!("repli sur le backend null (simulé)");
+                } else {
+                    tracing::warn!("aucun backend natif disponible sur cette plateforme dans cette version : backend null (simulé)");
+                }
+                Box::new(null_timer())
+            }
+        },
+        #[cfg(windows)]
+        "wasapi" => native_backend().unwrap_or_else(|| {
+            tracing::warn!("repli sur le backend null (simulé)");
             Box::new(null_timer())
-        }
+        }),
         other => {
-            eprintln!("backend inconnu « {other} » : auto ou null");
+            eprintln!("backend inconnu « {other} » : {}", BACKEND_CHOICES);
             std::process::exit(2);
         }
     };

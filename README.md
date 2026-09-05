@@ -14,9 +14,10 @@ avec une latence faible et maîtrisée.
 ## État
 
 Jalon M0 (cœur portable) : moteur, backend simulé `null`, protocole, démon
-`conduitd` et CLI `conduitctl` fonctionnent et sont testés sans matériel. Aucun
-backend natif (WASAPI, PipeWire, CoreAudio) n'est encore livré : `conduitd` tourne
-sur le backend `null`.
+`conduitd` et CLI `conduitctl` fonctionnent et sont testés sans matériel. Sous
+Windows, `conduitd` charge par défaut le backend WASAPI (mode partagé) et expose
+les cartes son réelles ; les backends PipeWire et CoreAudio ne sont pas encore
+branchés au démon, qui y tourne sur le backend `null`.
 
 ## Construire et tester
 
@@ -56,6 +57,10 @@ cargo run -p conduitctl -- --socket /tmp/conduit/conduitd.sock status
 cargo run -p conduitctl -- --socket /tmp/conduit/conduitd.sock add sine gen --frequency 440
 cargo run -p conduitctl -- --socket /tmp/conduit/conduitd.sock nodes
 ```
+
+`--backend` vaut `auto` par défaut : WASAPI sous Windows (`--backend wasapi` le
+force ; en cas d'échec le démon se replie sur `null` et le signale), `null` ailleurs
+(simulé, sans matériel).
 
 ## Structure
 

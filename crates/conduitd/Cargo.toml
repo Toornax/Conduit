@@ -28,6 +28,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 clap = { version = "4", features = ["derive"] }
 
+# Backend natif Windows (MMDevice + WASAPI) : `--backend auto` le choisit sous Windows.
+[target.'cfg(windows)'.dependencies]
+conduit-backend-wasapi = { workspace = true }
+
 [dev-dependencies]
 tempfile = "3"
 
