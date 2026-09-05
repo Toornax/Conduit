@@ -31,12 +31,14 @@ conduit/
 │   exclude = ["drivers/windows", "crates/conduit-protocol/fuzz"]
 ├── crates/
 │   ├── conduit-kmd-core/            # logique portable du pilote, no_std, membre racine
+│   ├── conduit-com/                 # modèle objet COM générique, no_std, testé sous Miri (M1a-04)
 │   └── conduit-helper/              # service d'assistance (M1b-20), membre racine
 └── drivers/windows/
     ├── Cargo.toml                   # workspace NOYAU, indépendant, jamais ouvert par Nix
     ├── rust-toolchain.toml          # 1.96.1 MSVC (stable suffit à windows-drivers-rs)
     ├── .cargo/config.toml           # rustflags -C target-feature=+crt-static (exigé par wdk-build)
     ├── portcls-sys/                 # bindings PortCls/KS générés (structures, GUID, vtables)
+    ├── portcls/                     # enveloppes sûres : traits Rust ↔ vtables PortCls, testées en mode utilisateur
     ├── conduit-kmd/                 # le pilote (.sys), cdylib no_std
     └── tools/                       # scripts PowerShell : build, install VM, verifier
 ```
@@ -153,7 +155,7 @@ Modules :
 |---|---|
 | `entry` | `DriverEntry`, `AddDevice`, `Unload` ; délègue à PortCls |
 | `adapter` | `StartDevice` : lit les paramètres (M1b-01), crée la table des câbles, enregistre les sous-périphériques ; objet `IAdapterPowerManagement` |
-| `com` | modèle objet COM générique (§3) |
+| (hors crate) | le modèle objet COM générique est dans `crates/conduit-com`, les enveloppes PortCls dans `drivers/windows/portcls` (§3) |
 | `cable` | état partagé par câble : flux rendu et capture courants, spin lock, timer/DPC de copie |
 | `wave` | miniport `IMiniportWaveRT` (un par câble et par sens) et ses flux `IMiniportWaveRTStream` |
 | `topo` | miniport `IMiniportTopology` (un par câble et par sens) : nœuds volume/mute factices, jack |
@@ -161,6 +163,16 @@ Modules :
 | `clock` | lecture QPC (`KeQueryPerformanceCounter`) et enveloppe des timers noyau |
 
 ## 3. Modèle objet COM en Rust
+
+Répartition (révision 2026-09-05) : le **modèle générique** (`ComObject`, `ComRef`,
+`IUnknown`, macros, comptage de références) est le crate portable `crates/conduit-com`
+(`no_std` + `alloc`, aucune dépendance, `Guid` et vtable `IUnknown` définis localement avec
+la même disposition que ceux du WDK) : il est testé, passé à Miri et couvert depuis Nix.
+Les **enveloppes PortCls** (`drivers/windows/portcls`) relient un trait Rust sûr
+(`MiniportTopology`, `AdapterPowerManagement`, puis `MiniportWaveRT`…) à la vtable générée
+correspondante de `portcls-sys`, et enveloppent les interfaces reçues (`IPortWaveRT`,
+`IResourceList`…) ; elles se testent en mode utilisateur avec de faux ports qui appellent
+les vtables comme PortCls le ferait. `conduit-kmd` n'implémente que les traits.
 
 PortCls dialogue avec le miniport par des interfaces COM (vtable C++ pure, convention
 `__stdcall`, `IUnknown` en tête). Représentation :
