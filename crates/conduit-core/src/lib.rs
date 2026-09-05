@@ -11,7 +11,9 @@
 //! - l'exécution d'un cycle ([`executor`]) et l'échange atomique de version ([`slot`]) ;
 //! - des paramètres atomiques ([`param`]), des briques DSP ([`dsp`]) et des nœuds
 //!   utilitaires ([`nodes`]) : générateurs, mixeur, VU-mètre, adaptation de canaux,
-//!   égaliseur.
+//!   égaliseur ;
+//! - le port asynchrone ([`asyncport`]) : tampon + rééchantillonneur + DLL pour les
+//!   flux à horloge étrangère.
 //!
 //! # Contraintes temps réel
 //!
@@ -22,6 +24,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod asyncport;
 pub mod buffer;
 pub mod dsp;
 pub mod executor;
