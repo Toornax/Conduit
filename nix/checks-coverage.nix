@@ -1,4 +1,5 @@
-# Couverture llvm-cov avec seuil 80 % sur conduit-core et conduit-protocol (M0-96).
+# Couverture llvm-cov avec seuil 80 % sur conduit-core, conduit-protocol (M0-96)
+# et conduit-kmd-core (M1a-01b).
 { inputs, ... }:
 {
   perSystem =
@@ -20,7 +21,7 @@
         // {
           inherit cargoArtifacts;
           preBuild = "mkdir -p $out";
-          cargoLlvmCovExtraArgs = "--all-features -p conduit-core -p conduit-protocol --fail-under-lines 80 --lcov --output-path $out/lcov.info";
+          cargoLlvmCovExtraArgs = "--all-features -p conduit-core -p conduit-protocol -p conduit-kmd-core --fail-under-lines 80 --lcov --output-path $out/lcov.info";
         }
       );
     };

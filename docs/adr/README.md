@@ -1,4 +1,3 @@
-| [ADR-012](012-workspace-noyau-separe.md) | Workspace noyau séparé, logique du pilote dans un crate portable | acceptée |
 # Décisions d'architecture (ADR)
 
 Une décision structurante = un fichier numéroté, jamais modifié après acceptation

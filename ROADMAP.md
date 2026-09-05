@@ -302,7 +302,7 @@ proposition : trois semaines de travail effectif). Porte de décision en M1a-12.
   remplace `docs/windows-setup.md`.
   *Fait quand* : un développeur reproduit le build à partir de la doc ; le job CI Windows
   compile le crate vide du pilote.
-- [ ] **M1a-01b** `feat(driver): conduit-kmd-core, horloge virtuelle et copie cyclique testées sous Nix`
+- [x] **M1a-01b** `feat(driver): conduit-kmd-core, horloge virtuelle et copie cyclique testées sous Nix`
   Crate `#![no_std]` sans `unsafe` du workspace racine (ADR-012, [driver-design.md](docs/driver-design.md) §2.1) :
   modules `position`, `ring`, `format` ; lints anti-panique en `deny`.
   *Fait quand* : proptest et Miri verts dans `nix flake check` et sous Windows.
