@@ -308,6 +308,19 @@ impl Drop for NullBackend {
     }
 }
 
+impl Clone for NullBackend {
+    /// Une poignée partageant les mêmes périphériques, câbles et horloge (le fil
+    /// timer n'est pas partagé). Permet à un test de scripter le backend que le moteur
+    /// possède.
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            clock: Arc::clone(&self.clock),
+            timer: None,
+        }
+    }
+}
+
 fn dir_index(d: DeviceDirection) -> usize {
     match d {
         DeviceDirection::Capture => 0,

@@ -159,29 +159,29 @@ allocation dans le fil audio, CI verte partout, couverture ≥ 80 % sur `core` e
   détection et comptage des xruns.
   *Fait quand* : test bout en bout avec deux horloges virtuelles dérivantes, continuité
   de phase d'un sinus vérifiée, xruns = 0.
-- [ ] **M0-43** `bench(core): criterion sur le cycle de traitement et le rééchantillonneur`
+- [x] **M0-43** `bench(core): criterion sur le cycle de traitement et le rééchantillonneur`
   *Fait quand* : bench exécuté en CI (sans seuil bloquant), résultats dans le rapport.
 - [ ] **M0-44** `chore(nix): check Miri sur conduit-core (toolchain nightly séparée)`
   *Fait quand* : check Miri vert dans `nix flake check` sur les tests marqués compatibles.
 
 ### M0.F — `conduit-backend` : traits et backend `null`
 
-- [ ] **M0-50** `feat(backend): trait Backend, DeviceInfo, DeviceHandle, rappel audio`
+- [x] **M0-50** `feat(backend): trait Backend, DeviceInfo, DeviceHandle, rappel audio`
   Énumération, ouverture avec format demandé, rappel `FnMut(&mut AudioBuffer, ClockInfo)`,
   position d'horloge, fermeture. Documentation des garanties temps réel du rappel.
   *Fait quand* : doc-tests compilent, trait objet-safe.
-- [ ] **M0-51** `feat(backend): trait CableControl`
+- [x] **M0-51** `feat(backend): trait CableControl`
   Lister, créer, supprimer, configurer canaux, renommer ; erreurs typées (limite atteinte,
   droits insuffisants, non supporté).
   *Fait quand* : doc + erreurs testées avec une implémentation factice.
-- [ ] **M0-52** `feat(backend): événements de périphériques via canal`
+- [x] **M0-52** `feat(backend): événements de périphériques via canal`
   `DeviceEvent::{Added, Removed, DefaultChanged}` émis par le backend.
   *Fait quand* : test de réception avec le backend null.
-- [ ] **M0-53** `feat(null): périphériques simulés à horloge virtuelle`
+- [x] **M0-53** `feat(null): périphériques simulés à horloge virtuelle`
   Périphériques d'entrée/sortie avec horloge avançable manuellement ou par fil timer, dérive
   et gigue configurables, injection de signal, capture de sortie pour assertions.
   *Fait quand* : tests déterministes en mode manuel ; mode timer fonctionne.
-- [ ] **M0-54** `feat(null): câbles simulés et branchement à chaud scriptable`
+- [x] **M0-54** `feat(null): câbles simulés et branchement à chaud scriptable`
   `CableControl` factice, méthodes de test pour faire apparaître/disparaître un périphérique.
   *Fait quand* : tests de scénario ajout/retrait.
 

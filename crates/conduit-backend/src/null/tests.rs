@@ -430,6 +430,21 @@ fn cable_remove_rename_channels_and_limit() {
 }
 
 #[test]
+fn clone_shares_devices_and_clock() {
+    let mut a = NullBackend::new();
+    let b = a.clone();
+    let id = b.add_device(NullDeviceSpec::render("Partagé").layout(1, 48));
+    assert_eq!(a.devices().unwrap().len(), 1);
+    let (cb, count) = counting_callback();
+    let mut h = a.open(&id, fmt(1, 48), cb).unwrap();
+    h.start().unwrap();
+    b.advance(Duration::from_millis(10));
+    assert_eq!(count.load(Ordering::Relaxed), 11);
+    assert_eq!(a.now_ns(), b.now_ns());
+    assert!(!b.timer_running());
+}
+
+#[test]
 fn timer_mode_runs_callbacks_in_real_time() {
     let mut b = NullBackend::new();
     let id = b.add_device(NullDeviceSpec::render("T").layout(1, 48));
