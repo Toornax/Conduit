@@ -19,6 +19,7 @@
         ./nix/packages.nix
         ./nix/checks.nix
         ./nix/checks-miri.nix
+        ./nix/checks-coverage.nix
       ];
     };
 }

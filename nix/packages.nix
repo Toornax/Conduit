@@ -16,7 +16,7 @@
         pname = "conduit";
         version = "0.1.0";
         nativeBuildInputs = [ pkgs.pkg-config ];
-        buildInputs = lib.optionals pkgs.stdenv.isLinux [ pkgs.alsa-lib ];
+        buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.alsa-lib ];
       };
       # Dépendances vendorisées et compilées une fois, partagées par tous les dérivés.
       cargoArtifacts = craneLib.buildDepsOnly (commonArgs // { cargoExtraArgs = "--workspace --all-features"; });

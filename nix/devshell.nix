@@ -3,7 +3,7 @@
   perSystem = { pkgs, system, ... }:
     let
       tc = import ./toolchain.nix { inherit pkgs; rust-overlay = inputs.rust-overlay; };
-      linuxOnly = pkgs.lib.optionals pkgs.stdenv.isLinux (with pkgs; [
+      linuxOnly = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux (with pkgs; [
         pipewire.dev
         alsa-lib.dev
         wayland
@@ -15,7 +15,7 @@
         xorg.libXi
         xorg.libXrandr
       ]);
-      darwinOnly = pkgs.lib.optionals pkgs.stdenv.isDarwin (with pkgs; [
+      darwinOnly = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin (with pkgs; [
         apple-sdk
       ]);
     in

@@ -51,19 +51,19 @@ allocation dans le fil audio, CI verte partout, couverture ≥ 80 % sur `core` e
   `nix/packages.nix` : vendoring des dépendances, un package par binaire ; `nix/checks.nix` :
   `fmt`, `clippy`, `nextest`.
   *Fait quand* : `nix flake check` et `nix build .#conduitd` passent sur Linux et macOS.
-- [ ] **M0-05** `chore: cargo-deny et cargo-audit intégrés aux checks`
+- [x] **M0-05** `chore: cargo-deny et cargo-audit intégrés aux checks`
   `deny.toml` (licences autorisées MIT/Apache/BSD/ISC/Zlib, refus copyleft, sources
   crates.io uniquement), check Nix `deny` et `audit`.
   *Fait quand* : `nix flake check` échoue si on ajoute une dépendance GPL en test local.
 - [ ] **M0-06** `chore(nix): hooks de pré-commit via git-hooks.nix`
   `rustfmt`, `nixfmt`, `cargo-deny`, format des messages de commit.
   *Fait quand* : un commit mal formaté est refusé dans le devshell.
-- [ ] **M0-07** `ci: nix flake check sur Linux et macOS avec cache binaire`
+- [x] **M0-07** `ci: nix flake check sur Linux et macOS avec cache binaire`
   Workflow GitHub Actions : installation de Nix, cache (Cachix ou équivalent), `nix flake check`,
   `nix build` des packages, publication vers le cache.
   *Fait quand* : CI verte sur `ubuntu-latest` et `macos-latest` ; second run nettement plus
   rapide grâce au cache.
-- [ ] **M0-08** `ci: workflow Windows sans Nix, environnement scripté et épinglé`
+- [x] **M0-08** `ci: workflow Windows sans Nix, environnement scripté et épinglé`
   `packaging/windows/setup-env.ps1` : versions exactes de Rust (via `rustup` et
   `rust-toolchain.toml`), Visual Studio Build Tools, Windows SDK ; le script échoue si une
   version installée diffère. Workflow : setup, `cargo fmt --check`, clippy, `cargo nextest`.
@@ -72,10 +72,10 @@ allocation dans le fil audio, CI verte partout, couverture ≥ 80 % sur `core` e
   Check Nix compilant `conduitd`, `conduitctl`, `conduit-protocol` pour `x86_64-pc-windows-gnu`.
   *Fait quand* : le check tourne dans `nix flake check` sur Linux et attrape une erreur
   `cfg(windows)` volontaire.
-- [ ] **M0-10** `docs: ADR-001 à ADR-008 (décisions de SPEC §11)`
+- [x] **M0-10** `docs: ADR-001 à ADR-008 (décisions de SPEC §11)`
   Un fichier par décision, gabarit ADR (contexte, décision, conséquences), index.
   *Fait quand* : les huit ADR sont relus et cohérents avec SPEC.
-- [ ] **M0-11** `docs: README développeur minimal`
+- [x] **M0-11** `docs: README développeur minimal`
   Objectif en trois lignes, `nix develop` puis `cargo build`, chemin sans Nix, lien vers
   SPEC et ROADMAP.
   *Fait quand* : un nouveau contributeur peut builder en suivant le README, avec et sans Nix.
@@ -227,7 +227,7 @@ allocation dans le fil audio, CI verte partout, couverture ≥ 80 % sur `core` e
   *Fait quand* : test client trop ancien / trop récent → erreur claire.
 - [x] **M0-73** `feat(protocol): export JSON Schema et docs/protocol.md généré`
   *Fait quand* : job CI vérifie que la doc est à jour avec les types.
-- [ ] **M0-74** `test(protocol): fuzzing du décodeur avec cargo-fuzz`
+- [x] **M0-74** `test(protocol): fuzzing du décodeur avec cargo-fuzz`
   Cible dans le devshell nightly ; check Nix court (corpus seulement) ; job long en nocturne.
   *Fait quand* : 1 h de fuzzing sans crash, corpus versionné, check court vert.
 
@@ -259,14 +259,14 @@ allocation dans le fil audio, CI verte partout, couverture ≥ 80 % sur `core` e
 
 ### M0.J — `conduitctl`
 
-- [ ] **M0-90** `feat(cli): squelette clap, client IPC, sortie table et JSON`
+- [x] **M0-90** `feat(cli): squelette clap, client IPC, sortie table et JSON`
   *Fait quand* : `conduitctl --help` documente chaque commande ; `--json` sur toutes.
-- [ ] **M0-91** `feat(cli): status, nodes, ports, links`
-- [ ] **M0-92** `feat(cli): link, unlink, volume, driver`
-- [ ] **M0-93** `feat(cli): cable add, remove, rename, list`
-- [ ] **M0-94** `feat(cli): monitor, xruns, dump, load`
+- [x] **M0-91** `feat(cli): status, nodes, ports, links`
+- [x] **M0-92** `feat(cli): link, unlink, volume, driver`
+- [x] **M0-93** `feat(cli): cable add, remove, rename, list`
+- [x] **M0-94** `feat(cli): monitor, xruns, dump, load`
   *Fait quand (91 à 94)* : test bout en bout par commande contre un démon null (F-41).
-- [ ] **M0-95** `test: scénario bout en bout démon null + cli`
+- [x] **M0-95** `test: scénario bout en bout démon null + cli`
   Script de test : démarrer le démon, créer un câble, lier, retirer un périphérique, restaurer.
   *Fait quand* : passe en CI sur les trois OS.
 
@@ -276,7 +276,7 @@ allocation dans le fil audio, CI verte partout, couverture ≥ 80 % sur `core` e
 - [ ] **M0-97** `chore(nix): apps (démon, CLI, bancs de test) et packages testés hors devshell`
   `nix run .#conduitd` fonctionne ; les binaires packagés démarrent sur une machine sans devshell.
   *Fait quand* : test CI lançant le package dans un conteneur nu.
-- [ ] **M0-98** `docs: guide développeur (architecture, tests, conventions, Nix)`
+- [x] **M0-98** `docs: guide développeur (architecture, tests, conventions, Nix)`
 - [ ] **M0-99** `chore: tag v0.1.0-core`
   *Fait quand* : tous les critères de sortie M0 sont cochés dans ce fichier.
 

@@ -2,7 +2,7 @@
 
 Câble audio virtuel et graphe de routage multiplateforme, en Rust.
 
-Version 0.3 — 2026-09-05 — document de cadrage, à faire évoluer.
+Version 0.4 — 2026-09-05 — document de cadrage, à faire évoluer (0.4 : périmètre DSP de M0, ADR-009).
 
 ---
 
@@ -40,8 +40,10 @@ Conséquences :
 
 - Remplacer PipeWire, PulseAudio ou JACK sur Linux. On s'appuie dessus.
 - Vidéo, MIDI, audio réseau, Bluetooth, mobile (iOS/Android).
-- Traitements DSP avancés (EQ, effets). Seuls le gain, le mixage et le rééchantillonnage
-  sont dans le cœur. Un système de filtres viendra en v2 si le cœur est stable.
+- Système de filtres extensible (plugins, effets temporels, dynamique). Le cœur inclut
+  dès M0 le gain, le mixage, le rééchantillonnage, l'adaptation de canaux et une base DSP
+  bornée (biquads, égaliseur paramétrique, générateurs, VU-mètre) — voir ADR-009. Un
+  système de filtres ouvert viendra en v2 si le cœur est stable.
 - Nombre de câbles illimité sur Windows : la v1 a une réserve fixe (voir §5.4).
 
 ### 1.4 Principes directeurs
