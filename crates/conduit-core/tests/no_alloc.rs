@@ -173,3 +173,53 @@ fn allocating_node_panics_in_forbid_mode() {
     let mut ex = Executor::standalone(b.compile());
     assert_no_alloc(|| ex.run(64));
 }
+
+#[test]
+fn utility_nodes_do_not_allocate() {
+    use conduit_core::nodes::{
+        ChannelAdapter, EqBand, EqualizerNode, MeterNode, MixerNode, NoiseColor, NoiseNode,
+        SineNode, SplitterNode,
+    };
+    let mut b = GraphBuilder::new(SampleRate::HZ_48000, Quantum::new(256).unwrap());
+    let sine = b.add_node(Box::new(SineNode::new(440.0, 0.5, 2)), "sine");
+    let noise = b.add_node(Box::new(NoiseNode::new(NoiseColor::Pink, 0.1, 2)), "noise");
+    let mix = b.add_node(Box::new(MixerNode::new(2, 2)), "mix");
+    let eq = b.add_node(
+        Box::new(EqualizerNode::new(
+            2,
+            &[
+                EqBand::low_shelf(100.0, 3.0),
+                EqBand::peaking(1000.0, 1.0, -6.0),
+                EqBand::high_pass(40.0, 0.7),
+            ],
+        )),
+        "eq",
+    );
+    let meter = b.add_node(Box::new(MeterNode::new(2)), "meter");
+    let split = b.add_node(Box::new(SplitterNode::new(2, 2)), "split");
+    let mono = b.add_node(Box::new(ChannelAdapter::auto(2, 1)), "mono");
+    let info = |b: &GraphBuilder, id| b.node(id).unwrap().clone();
+    for ch in 0..2 {
+        b.add_link(info(&b, sine).output(ch), info(&b, mix).input(ch))
+            .unwrap();
+        b.add_link(info(&b, noise).output(ch), info(&b, mix).input(2 + ch))
+            .unwrap();
+        b.add_link(info(&b, mix).output(ch), info(&b, eq).input(ch))
+            .unwrap();
+        b.add_link(info(&b, eq).output(ch), info(&b, meter).input(ch))
+            .unwrap();
+        b.add_link(info(&b, meter).output(ch), info(&b, split).input(ch))
+            .unwrap();
+        b.add_link(info(&b, split).output(2 + ch), info(&b, mono).input(ch))
+            .unwrap();
+    }
+    let eq_ctrl = b.node_gain(eq).unwrap();
+    let mut ex = Executor::standalone(b.compile());
+    for i in 0..50 {
+        if i == 10 {
+            eq_ctrl.set_db(Db::new(-3.0));
+        }
+        let r = assert_no_alloc(|| ex.run(256));
+        assert_eq!(r.nodes_run, 7);
+    }
+}
