@@ -181,14 +181,45 @@ tampon intermédiaire pré-alloué si l'alignement manquait) → `ReleaseBuffer`
 tampon de silence précède `Start`. Capture : tant que `GetNextPacketSize` > 0,
 `GetBuffer` → rappel avec `input` (zéros pré-alloués si `SILENT`) →
 `ReleaseBuffer`. Rien n'alloue ni ne verrouille dans la boucle (§2, prouvé par
-`tests/no_alloc.rs` avec un allocateur comptant par fil natif). `ClockInfo` :
-`position` = trames livrées depuis `start()`, `timestamp_ns` = `Instant` depuis
-l'ouverture, `frames` = trames du rappel ; `clock()` lit les atomiques. Une erreur
+`tests/no_alloc.rs` avec un allocateur comptant par fil natif). Une erreur
 `AUDCLNT_E_DEVICE_INVALIDATED` (ou `RESOURCES_INVALIDATED`) fait sortir de la
 boucle sans panique : `is_running()` devient faux, `stop()` rend `Disconnected`,
 `start()` le refuse. `stop()` signale l'événement d'arrêt, joint le fil (qui a fait
 `Stop` puis `Reset`) : aucun rappel n'est en cours au retour ; `Drop` appelle
 `stop()` puis libère les objets COM sous un appartement MTA temporaire.
+
+**Horloge** (`clock`, M1b-33). À l'ouverture, `IAudioClient::GetService(IAudioClock)`
+et `GetFrequency`. Microsoft ne fixe pas l'unité de cette fréquence, seulement
+qu'elle est celle de la position : `ClockScale::new` la classe (`ClockUnits`) —
+`freq == mix_rate` ou `== sample_rate` → trames/s ; `freq == mix_rate × nBlockAlign`
+du mixage → octets/s du mixage (**observé** sur les deux cartes du poste par le
+chemin `IAudioClient3` : 384 000 pour 48 kHz stéréo float32) ; `freq == sample_rate
+× channels × 4` → octets/s du format livré (**observé** par le chemin conversion :
+176 400 en 44,1 kHz mono) ; sinon « autre » — et convertit toujours par le rapport
+générique `position × sample_rate / freq` (128 bits), exact dans tous les cas :
+`ClockInfo::position` est en **trames du format livré** au rappel. À chaque rappel,
+**avant** de toucher au tampon, `IAudioClock::GetPosition(&pos, &qpc)` :
+`position` = `pos` converti, jamais décroissante ; `timestamp_ns` = `qpc × 100`
+(le compteur de performance en unités de 100 ns : base **QPC commune** à tous les
+flux du processus, ce qui permet de comparer deux cartes — mesuré : 43 µs d'écart
+entre deux lectures immédiates sur deux cartes) ; `frames` = trames du rappel. En
+rendu, `pos` est la position de **lecture** du matériel, en retard sur ce qu'on
+écrit : la latence estimée `write_ahead_frames` = trames écrites − position lue
+(≈ 958 trames pour un tampon de 1 056 sur ce poste) est exposée par
+`WasapiHandle::latency()` et `write_ahead_frames()` (atomique) ; en capture, c'est
+position d'écriture − trames livrées. Microsoft ne documente pas `GetPosition`
+comme sûr en temps réel ; en mode partagé il lit une section partagée avec le
+moteur audio, et on le mesure sur le fil (`Instant`, autorisé §2) : ≈ 1 µs en
+moyenne, 6 µs au pire sur 6 000 appels (`WasapiHandle::clock_stats()`). Si
+`GetPosition` échoue ponctuellement, la position est extrapolée (dernière + trames
+du rappel précédent), l'horodatage vient de `QueryPerformanceCounter`, et l'échec
+est compté. Sans `IAudioClock` (`ClockSource::Counter`, visible par
+`clock_source()`), `position` = trames livrées depuis `start()`, toujours
+horodatées QPC. `clock()` (trait) rend la dernière `ClockInfo` publiée par le
+rappel ; `clock_now()` (hors trait, alloue) interroge `IAudioClock` immédiatement
+depuis le fil appelant. Le moteur, lui, n'exploite pas encore `ClockInfo` : sa DLL
+est asservie au remplissage du port asynchrone (§3), et c'est ainsi qu'il absorbe
+la dérive mesurée entre les deux cartes (−18 ppm, `tests/two_devices.rs`).
 
 **Démon.** `conduitd` charge ce backend par défaut sous Windows depuis M1b-31 :
 `--backend auto` (la valeur par défaut) appelle `WasapiBackend::new()` sous
@@ -202,15 +233,19 @@ test `conduitd_binary_auto_backend_is_wasapi_on_windows` (`crates/conduitd/tests
 lance le binaire et vérifie que le graphe contient chaque endpoint énuméré ; il se
 saute si WASAPI est indisponible ou qu'aucune carte n'est active.
 
-Ce qui manque encore : le mode exclusif (M1b-32), l'horloge `IAudioClock`
-(M1b-33), `CableControl` par le helper (M1b-34 — d'ici là le démon ignore la
-section `[[cable]]` avec un avertissement). Les tests d'intégration
-(`tests/wasapi.rs`, `tests/stream.rs`, `tests/no_alloc.rs`) tournent sur les cartes
-son de la machine, en silence ; ceux qui demandent un périphérique absent se sautent
-avec un message. À lancer à la main : le critère « casque USB branché → `Added` »
-(`cargo test -p conduit-backend-wasapi --test wasapi -- --ignored --nocapture`) et
-le sinus audible
-(`cargo test -p conduit-backend-wasapi --test stream sine_audible -- --ignored --nocapture`).
+Ce qui manque encore : le mode exclusif (M1b-32), `CableControl` par le helper
+(M1b-34 — d'ici là le démon ignore la section `[[cable]]` avec un avertissement).
+Les tests d'intégration (`tests/wasapi.rs`, `tests/stream.rs`, `tests/no_alloc.rs`,
+`tests/two_devices.rs` — 60 s sur deux cartes de rendu, dérive imprimée) tournent
+sur les cartes son de la machine, en silence ; ceux qui demandent un périphérique
+absent se sautent avec un message. À lancer à la main : le critère « casque USB
+branché → `Added` »
+(`cargo test -p conduit-backend-wasapi --test wasapi -- --ignored --nocapture`), le
+sinus audible
+(`cargo test -p conduit-backend-wasapi --test stream sine_audible -- --ignored --nocapture`)
+et l'heure d'endurance avec le moteur (une carte pilote, l'autre asynchrone,
+xruns = 0 ; `CONDUIT_ENDURANCE_SECS` pour raccourcir)
+(`cargo test -p conduit-backend-wasapi --test two_devices -- --ignored --nocapture`).
 
 ## 5. Tests
 

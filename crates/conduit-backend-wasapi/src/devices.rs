@@ -76,6 +76,9 @@ const WAVEFORMATEXTENSIBLE_SIZE: usize = 40;
 pub(crate) struct WaveFormat {
     pub(crate) channels: u16,
     pub(crate) sample_rate: u32,
+    /// Octets d'une trame (`nBlockAlign`) : sert à lire les positions que
+    /// `IAudioClock` exprime en octets (module `clock`).
+    pub(crate) block_align: u16,
     /// `dwChannelMask` si le format est extensible.
     pub(crate) channel_mask: Option<u32>,
     /// Échantillons `f32` (tag `WAVE_FORMAT_IEEE_FLOAT` ou sous-format IEEE float,
@@ -122,6 +125,7 @@ pub(crate) fn wave_format_from_bytes(bytes: &[u8]) -> Option<WaveFormat> {
     let tag = u16_at(0);
     let channels = u16_at(2);
     let sample_rate = u32_at(4);
+    let block_align = u16_at(12);
     let bits = u16_at(14);
     if channels == 0 || sample_rate == 0 {
         return None;
@@ -144,6 +148,7 @@ pub(crate) fn wave_format_from_bytes(bytes: &[u8]) -> Option<WaveFormat> {
     Some(WaveFormat {
         channels,
         sample_rate,
+        block_align,
         channel_mask,
         float32,
     })
@@ -590,6 +595,7 @@ mod tests {
             Some(WaveFormat {
                 channels: 2,
                 sample_rate: 48_000,
+                block_align: 8,
                 channel_mask: Some(MASK_STEREO),
                 float32: true,
             })
@@ -600,6 +606,7 @@ mod tests {
             Some(WaveFormat {
                 channels: 6,
                 sample_rate: 96_000,
+                block_align: 24,
                 channel_mask: Some(0x3F),
                 float32: true,
             })
@@ -622,6 +629,7 @@ mod tests {
             Some(WaveFormat {
                 channels: 1,
                 sample_rate: 44_100,
+                block_align: 2,
                 channel_mask: None,
                 float32: false,
             })

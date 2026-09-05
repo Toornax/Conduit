@@ -18,22 +18,29 @@
 //!    demandée. On y retombe aussi si le chemin 1 échoue (période verrouillée par
 //!    un autre client, pilote sans `IAudioClient3`).
 //!
+//! L'horloge du flux (`IAudioClock`, module `clock`) est obtenue ici aussi :
+//! `GetService(IAudioClock)` puis `GetFrequency`, classée par rapport au format de
+//! mixage. Son absence n'empêche pas l'ouverture : le flux se replie sur le
+//! compteur de trames ([`ClockSource::Counter`]).
+//!
 //! Les objets COM créés ici (`IAudioClient`, `IAudioRenderClient` ou
-//! `IAudioCaptureClient`) partent ensuite vers le fil du flux (`stream`) sous forme
-//! d'[`AgileReference`] : les interfaces du crate `windows` ne sont pas `Send`, la
-//! référence agile l'est, et sa résolution depuis un autre fil de l'appartement
-//! multi-fil rend le pointeur direct (les objets WASAPI sont libres de fil).
+//! `IAudioCaptureClient`, `IAudioClock`) partent ensuite vers le fil du flux
+//! (`stream`) sous forme d'[`AgileReference`] : les interfaces du crate `windows`
+//! ne sont pas `Send`, la référence agile l'est, et sa résolution depuis un autre
+//! fil de l'appartement multi-fil rend le pointeur direct (les objets WASAPI sont
+//! libres de fil).
 
 use std::time::Duration;
 
 use conduit_backend::{BackendError, DeviceDirection, DeviceId, DeviceInfo, StreamFormat};
 use windows::core::{AgileReference, Interface};
 use windows::Win32::Media::Audio::{
-    IAudioCaptureClient, IAudioClient, IAudioClient3, IAudioRenderClient, IMMDeviceEnumerator,
-    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+    IAudioCaptureClient, IAudioClient, IAudioClient3, IAudioClock, IAudioRenderClient,
+    IMMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
     AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, WAVEFORMATEX,
 };
 
+use crate::clock::{ClockScale, ClockSource};
 use crate::com::{platform_error, Event};
 use crate::devices::{
     activate_client, describe, device_period, find_active, float32_format, frames_from_period,
@@ -95,6 +102,12 @@ pub struct StreamLatency {
     pub stream_latency: Duration,
     /// Chemin d'initialisation.
     pub path: InitPath,
+    /// Latence estimée par l'horloge du flux, en trames du format livré, mise à
+    /// jour à chaque rappel : en rendu, trames écrites depuis `start()` moins la
+    /// position de lecture du matériel (`IAudioClock::GetPosition`) ; en capture,
+    /// position d'écriture du matériel moins trames livrées. Zéro avant le premier
+    /// rappel et avec la source [`ClockSource::Counter`].
+    pub write_ahead_frames: u64,
 }
 
 /// Service WASAPI selon le sens.
@@ -110,6 +123,12 @@ pub(crate) struct StreamObjects {
     /// Signalé par le moteur à chaque période (`SetEventHandle`).
     pub(crate) event: Event,
     pub(crate) latency: StreamLatency,
+    /// Horloge du flux, si le pilote en fournit une.
+    pub(crate) clock: Option<AgileReference<IAudioClock>>,
+    /// Conversion des positions de `clock` en trames du format livré.
+    pub(crate) clock_scale: ClockScale,
+    /// Ce que `clock` est, pour le diagnostic.
+    pub(crate) clock_source: ClockSource,
 }
 
 /// Résultat d'une ouverture.
@@ -218,11 +237,20 @@ pub(crate) fn open(
         }
     };
 
+    let (clock, clock_scale, clock_source) = audio_clock(
+        &client,
+        format.sample_rate.hz(),
+        channels,
+        mix.parsed.sample_rate,
+        mix.parsed.block_align,
+    )?;
+
     let latency = StreamLatency {
         buffer_frames: buffer_frames as usize,
         period_frames: block_frames.max(1),
         stream_latency: Duration::from_nanos(u64::try_from(latency_hns.max(0) * 100).unwrap_or(0)),
         path,
+        write_ahead_frames: 0,
     };
     Ok(Opened {
         info,
@@ -236,8 +264,50 @@ pub(crate) fn open(
             service,
             event,
             latency,
+            clock,
+            clock_scale,
+            clock_source,
         },
     })
+}
+
+/// `IAudioClock` du flux et sa fréquence, classée par rapport au format de mixage
+/// et au format livré (voir le module `clock`). Un pilote sans horloge, ou dont
+/// `GetFrequency` échoue ou rend zéro, donne le repli [`ClockSource::Counter`] :
+/// ce n'est pas une erreur d'ouverture, l'appelant le voit dans
+/// [`WasapiHandle::clock_source`].
+///
+/// [`WasapiHandle::clock_source`]: crate::WasapiHandle::clock_source
+fn audio_clock(
+    client: &IAudioClient,
+    sample_rate: u32,
+    channels: u16,
+    mix_rate: u32,
+    mix_block_align: u16,
+) -> Result<(Option<AgileReference<IAudioClock>>, ClockScale, ClockSource), BackendError> {
+    // SAFETY: client initialisé.
+    let clock: Option<IAudioClock> = unsafe { client.GetService() }.ok();
+    // SAFETY: horloge rendue par le client initialisé.
+    let frequency = clock
+        .as_ref()
+        .and_then(|c| unsafe { c.GetFrequency() }.ok())
+        .filter(|&f| f > 0);
+    match (clock, frequency) {
+        (Some(clock), Some(frequency)) => {
+            let (scale, units) =
+                ClockScale::new(frequency, sample_rate, channels, mix_rate, mix_block_align);
+            Ok((
+                Some(agile(&clock, "IAudioClock")?),
+                scale,
+                ClockSource::AudioClock { frequency, units },
+            ))
+        }
+        _ => Ok((
+            None,
+            ClockScale::identity(sample_rate),
+            ClockSource::Counter,
+        )),
+    }
 }
 
 /// Chemin 1 : `IAudioClient3` au format de mixage, période choisie. `Err` signifie

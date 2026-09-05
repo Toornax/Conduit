@@ -23,7 +23,9 @@ conduit-backend.workspace = true
 # - `Win32_UI_Shell_PropertiesSystem` : IPropertyStore ;
 # - `Win32_Devices_FunctionDiscovery` : PKEY_Device_FriendlyName ;
 # - `Win32_System_Threading` + `Win32_Security` : CreateEventW, SetEvent,
-#   WaitForMultipleObjects (événement de tampon et événement d'arrêt d'un flux).
+#   WaitForMultipleObjects (événement de tampon et événement d'arrêt d'un flux) ;
+# - `Win32_System_Performance` : QueryPerformanceCounter/Frequency, la base de
+#   temps des horodatages d'`IAudioClock` (module `clock`).
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Media_Audio",
@@ -33,6 +35,7 @@ windows = { version = "0.62", features = [
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_Devices_FunctionDiscovery",
     "Win32_System_Threading",
+    "Win32_System_Performance",
     "Win32_Security",
 ] }
 # Le code que génère `#[implement]` nomme `::windows_core` : le crate doit être une
@@ -41,6 +44,11 @@ windows-core = "0.62"
 # Vue `&mut [f32]` du tampon WASAPI (`try_cast_slice_mut`, repli par copie si
 # l'alignement n'est pas celui attendu).
 bytemuck = "1"
+
+[target.'cfg(windows)'.dev-dependencies]
+# Test d'endurance `two_devices` : le moteur pilote une carte et absorbe la
+# dérive de l'autre par son port asynchrone (critère M1b-33).
+conduit-engine.workspace = true
 
 [lints]
 workspace = true

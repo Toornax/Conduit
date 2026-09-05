@@ -294,6 +294,7 @@ dependencies = [
  "bytemuck",
  "conduit-backend",
  "conduit-core",
+ "conduit-engine",
  "windows",
  "windows-core",
 ]

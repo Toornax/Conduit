@@ -25,12 +25,14 @@
 //! `stream`) : créé par `start()`, promu temps réel, réveillé par l'événement du
 //! tampon, joint par `stop()`. Le rappel reçoit exactement le format demandé :
 //! sans conversion quand il coïncide avec le format de mixage
-//! (`IAudioClient3`, période au choix), converti par Windows sinon.
+//! (`IAudioClient3`, période au choix), converti par Windows sinon. Sa position
+//! d'horloge vient d'`IAudioClock` (module `clock`) : position matérielle en
+//! trames du format livré, horodatage `QueryPerformanceCounter` commun à tous les
+//! flux du processus ([`ClockSource`]).
 //!
 //! Ce crate ne compile de code que sous Windows ; ailleurs il n'expose rien, pour
 //! que `cargo check --workspace` reste vert sur toutes les cibles. Le mode exclusif
-//! (M1b-32), l'horloge `IAudioClock` (M1b-33) et le contrôle des câbles (M1b-34)
-//! viendront ensuite.
+//! (M1b-32) et le contrôle des câbles (M1b-34) viendront ensuite.
 //!
 //! ```no_run
 //! # #[cfg(windows)]
@@ -58,6 +60,8 @@
 #[cfg(windows)]
 mod backend;
 #[cfg(windows)]
+mod clock;
+#[cfg(windows)]
 mod com;
 #[cfg(windows)]
 mod devices;
@@ -73,8 +77,10 @@ mod stream;
 #[cfg(windows)]
 pub use backend::WasapiBackend;
 #[cfg(windows)]
+pub use clock::{ClockSource, ClockUnits};
+#[cfg(windows)]
 pub use devices::{cable_id_from_name, PROBED_RATES};
 #[cfg(windows)]
 pub use open::{choose_period, EnginePeriods, InitPath, StreamLatency};
 #[cfg(windows)]
-pub use stream::WasapiHandle;
+pub use stream::{ClockStats, WasapiHandle};
