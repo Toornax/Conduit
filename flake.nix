@@ -18,6 +18,7 @@
         ./nix/devshell.nix
         ./nix/packages.nix
         ./nix/checks.nix
+        ./nix/checks-miri.nix
       ];
     };
 }
