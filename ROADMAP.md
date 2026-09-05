@@ -309,6 +309,7 @@ proposition : trois semaines de travail effectif). Porte de décision en M1a-12.
 - [ ] **M1a-02** `feat(driver): pilote WDM minimal chargé et déchargé en mode test`
   `DriverEntry`, `AddDevice`, `Unload`, INF, catalogue de test, installation `pnputil`.
   *Fait quand* : chargement/déchargement 100 fois sans erreur dans la VM.
+  *État* : code et scripts prêts (commit), validation VM en attente d'une ISO Windows 11.
 - [ ] **M1a-03** `feat(portcls): bindings PortCls et KS générés en mode C (structures, GUID, vtables)`
   `bindgen` via `wdk_build::BuilderExt::wdk_default` sur `ks.h`, `ksmedia.h`, `punknown.h`,
   `drmk.h`, `portcls.h` avec `#define INTERFACE void` ; les vtables COM sortent plates du mode

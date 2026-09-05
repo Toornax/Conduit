@@ -1,11 +1,15 @@
 //! Bindings PortCls et Kernel Streaming pour le pilote Conduit.
 //!
 //! Crate du workspace noyau (ADR-012), conçu pour rester **testable en mode utilisateur** :
-//! il ne dépend pas de `wdk-sys` (qui lie les bibliothèques noyau même sous `cargo test`)
-//! et n'émet aucun `#[link]` ; c'est `conduit-kmd/build.rs` qui lie `portcls.lib`.
+//! `wdk-sys` (qui lie les bibliothèques noyau même sous `cargo test`) n'est qu'une
+//! dépendance optionnelle derrière la feature `kernel`, activée par `conduit-kmd` seul ;
+//! `cargo test -p portcls-sys` tourne sans elle. Le crate n'émet aucun `#[link]` : c'est
+//! `conduit-kmd/build.rs` qui lie `portcls.lib`.
 //!
-//! État (M1a-01) : crate vide qui prouve que le workspace compile et que
-//! `cargo test -p portcls-sys` fonctionne. La tâche M1a-03 y ajoutera, selon
+//! État (M1a-02) : le module [`functions`] déclare **à la main, provisoirement**, les deux
+//! fonctions PortCls dont le pilote minimal a besoin (`PcInitializeAdapterDriver`,
+//! `PcAddAdapterDevice`) et les types qu'elles exigent. La tâche M1a-03 remplace ces
+//! déclarations par les bindings générés selon
 //! [driver-design.md §2.2](../../../docs/driver-design.md) :
 //!
 //! - les bindings générés par `bindgen` (`wdk_build::BuilderExt::wdk_default`) sur
@@ -18,19 +22,21 @@
 //!   `DECLARE_INTERFACE_`/`STDMETHOD_` (`IMiniportWaveRT`, `IMiniportWaveRTStream`,
 //!   `IMiniportTopology`, `IPortWaveRT`, `IAdapterPowerManagement`…), grâce au
 //!   `#define INTERFACE void` placé avant `portcls.h` ;
-//! - les déclarations des fonctions PortCls (`PcInitializeAdapterDriver`,
-//!   `PcAddAdapterDevice`, `PcNewPort`, `PcRegisterSubdevice`…) ;
+//! - les déclarations des autres fonctions PortCls (`PcNewPort`, `PcRegisterSubdevice`,
+//!   `PcRegisterPhysicalConnection`, `PcNewResourceList`…) ;
 //! - des tests de `size_of` et de nombre de slots de vtable contre des valeurs de
 //!   référence obtenues par un programme C (`tools/sizeof-probe.c`).
 //!
-//! Tant que ces bindings n'existent pas, `#![forbid(unsafe_code)]` reste en place ; il
-//! sera relâché en M1a-03 pour les déclarations `extern "system"` générées.
+//! `unsafe` n'est autorisé ici que pour les blocs `extern` (déclarations de fonctions
+//! externes) ; `unsafe_op_in_unsafe_fn` reste en `deny` (lints du workspace).
 
 #![no_std]
-#![forbid(unsafe_code)]
 
 #[cfg(test)]
 extern crate std;
+
+#[cfg(feature = "kernel")]
+pub mod functions;
 
 /// Version du WDK dont les en-têtes servent de source aux bindings (M1a-03).
 ///

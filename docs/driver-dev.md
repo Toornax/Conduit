@@ -75,7 +75,9 @@ cargo wdk build [--profile release]
 
 Le tout fonctionne depuis un PowerShell ordinaire : `rustc` localise `link.exe` par le
 registre de Visual Studio (comme `vswhere`), aucun `vcvars` n'est nécessaire. Ne lancez **pas** `cargo test -p conduit-kmd` :
-`wdk-sys` 0.5.1 lie `ntoskrnl.lib` même en test (issue #502).
+`wdk-sys` 0.5.1 lie `ntoskrnl.lib` même en test (issue #502). `portcls-sys` ne le tire que
+derrière sa feature `kernel` (activée par `conduit-kmd`) : `cargo test -p portcls-sys`
+reste en mode utilisateur.
 
 `cargo wdk build` enchaîne `cargo build -p conduit-kmd`, puis l'empaquetage :
 copie de l'INF depuis le `.inx`, `stampinf` (`DriverVer`, `$ARCH$`), `inf2cat`,
@@ -105,58 +107,110 @@ minute environ la première fois ; ensuite le cache Cargo suffit.
 
 Jamais de pilote de test sur la machine de développement : un bug = écran bleu, et le
 mode `testsigning` affaiblit la machine. Les scripts du dépôt ne lancent jamais
-`pnputil`, `devgen` ni `bcdedit` : ces commandes se tapent dans la VM.
+`pnputil`, `devgen` ni `bcdedit` **sur l'hôte** : `vm-prepare.ps1` et `vm-cycle.ps1` les
+exécutent dans l'invité par PowerShell Direct (`Invoke-Command -VMName`).
 
-### 3.1 Création (Hyper-V, Windows 11 Pro sur l'hôte)
+Trois scripts dans `drivers\windows\tools\`, à lancer dans l'ordre depuis un PowerShell
+**administrateur** de l'hôte (Hyper-V exige l'élévation ; chacun le vérifie et s'arrête
+avec un message clair sinon). Prérequis : Hyper-V activé (Windows 11 Pro), le
+commutateur `Default Switch` (créé par Hyper-V, NAT vers l'hôte), une **ISO officielle
+de Windows 11** (microsoft.com, « Télécharger l'image de disque »), le WDK 26100 sur
+l'hôte (pour `devgen.exe`) et le paquet produit par `build.ps1`.
 
-VM de génération 2, Windows 11, 4 Go, 2 vCPU, **Secure Boot désactivé** (sinon
-`testsigning` est refusé), un commutateur virtuel avec accès à l'hôte. Prendre un
-point de contrôle « propre » après l'installation et y revenir après chaque plantage
-inexpliqué. Partager le dossier de package par un partage SMB de l'hôte ou par
-`Copy-VMFile`.
+| Script | Rôle | Une fois / à chaque fois |
+|---|---|---|
+| `vm-new.ps1 -IsoPath <iso>` | crée et démarre la VM | une fois |
+| `vm-prepare.ps1 -Credential <cred>` | `testsigning`, débogueur réseau, vidages, point de contrôle `propre` | une fois (ou après réinstallation) |
+| `vm-cycle.ps1 -Credential <cred> [-Count 100]` | copie le paquet, l'installe et le retire N fois | à chaque build à valider |
 
-### 3.2 Préparation (dans la VM, PowerShell administrateur)
+Les fonctions d'analyse partagées (`vm-common.psm1` : identifiant d'instance de `devgen`,
+`oemN.inf` de `pnputil /enum-drivers`, clé kdnet, résumé des durées) ont des tests Pester
+dans `tools\tests\` (`Invoke-Pester drivers\windows\tools\tests`, syntaxe Pester 3/4 livrée
+avec Windows).
+
+### 3.1 Création : `vm-new.ps1`
 
 ```powershell
-bcdedit /set testsigning on
-bcdedit /debug on
-bcdedit /dbgsettings net hostip:<ip de l'hôte> port:50000 key:<clé>   # débogage noyau réseau
-reg add HKLM\SYSTEM\CurrentControlSet\Control\CrashControl /v CrashDumpEnabled /t REG_DWORD /d 2 /f   # kernel dump
-Restart-Computer
+.\drivers\windows\tools\vm-new.ps1 -IsoPath C:\iso\Win11_x64.iso   # [-Name ConduitTest] [-MemoryGB 4] [-Cpu 2] [-DiskGB 64] [-Path <dossier>]
 ```
 
-Puis importer le certificat de test dans *Trusted Root* et *Trusted Publishers* :
+VM de **génération 2**, 4 Go, 2 vCPU (minimums de Windows 11), VHDX dynamique de 64 Go,
+`Default Switch`, ISO en premier périphérique de démarrage, vTPM (l'installeur de
+Windows 11 l'exige), **Secure Boot désactivé** (sinon `bcdedit /set testsigning on` est
+refusé), points de contrôle automatiques désactivés, interface de services invité
+activée. Le script démarre la VM, ouvre `vmconnect` et affiche la marche à suivre :
+appuyer sur une touche pour démarrer sur l'ISO, installer Windows 11 (Pro), créer un
+**compte local** `test` administrateur sans compte Microsoft (Maj+F10 puis
+`OOBE\BYPASSNRO` si l'installeur l'impose), puis passer à `vm-prepare.ps1`.
+
+### 3.2 Préparation : `vm-prepare.ps1`
 
 ```powershell
-certutil -addstore Root WDRLocalTestCert.cer
-certutil -addstore TrustedPublisher WDRLocalTestCert.cer
+$cred = Get-Credential test
+.\drivers\windows\tools\vm-prepare.ps1 -Name ConduitTest -Credential $cred   # [-HostIp <ip>] [-DebugPort 50000] [-DebugKey <clé>]
 ```
 
-### 3.3 Installation, création du nœud, retrait
+Dans l'invité, par PowerShell Direct : `bcdedit /set testsigning on`, `bcdedit /debug on`,
+`bcdedit /dbgsettings net hostip:<hôte> port:50000 key:<clé>` (hôte = adresse de
+`vEthernet (Default Switch)` par défaut ; clé générée et **affichée à la fin**, à
+conserver pour WinDbg), `CrashDumpEnabled = 2` (vidage noyau complet) et `AutoReboot = 1`
+dans `HKLM\SYSTEM\CurrentControlSet\Control\CrashControl`, veille, écran et hibernation
+désactivés. Puis redémarrage de l'invité, vérification que `testsigning` est bien actif
+(`bcdedit /enum`) et point de contrôle **`propre`** (`Checkpoint-VM`). Après un plantage
+inexpliqué : `Restore-VMCheckpoint -VMName ConduitTest -Name propre -Confirm:$false`.
+
+### 3.3 Cycle de chargement (M1a-02) : `vm-cycle.ps1`
 
 ```powershell
-pnputil /add-driver conduit_kmd.inf /install
-& "C:\Program Files (x86)\Windows Kits\10\Tools\10.0.26100.0\x64\devgen.exe" /add /hardwareid "Root\ConduitCable"
+.\drivers\windows\tools\build.ps1                                            # paquet target\debug\conduit_kmd_package
+.\drivers\windows\tools\vm-cycle.ps1 -Name ConduitTest -Credential $cred -Count 100   # [-Package <dossier>] [-Profile dev|release]
 ```
 
-`devgen` (WDK 26100, à copier dans la VM avec le package) crée le périphérique racine
-que l'INF cible ; le gestionnaire de périphériques doit montrer *Conduit Virtual Audio
-Cable* sous *Contrôleurs audio, vidéo et jeu*. Retrait :
+Le script copie le paquet et `devgen.exe` (WDK de l'hôte, version de `versions.json`)
+dans `C:\ConduitTest` de l'invité, importe `WDRLocalTestCert.cer` dans *Root* et
+*TrustedPublisher* de la machine invitée, retire les restes d'une exécution interrompue
+(périphériques `Root\ConduitCable`, paquets `oemN.inf` de `conduit_kmd.inf`), puis répète
+`Count` fois, en affichant `i/Count OK` et la durée :
+
+1. `pnputil /add-driver conduit_kmd.inf /install` ;
+2. `devgen /add /hardwareid "Root\ConduitCable"` (identifiant d'instance lu dans la
+   sortie) : PnP appelle `AddDevice` puis `IRP_MN_START_DEVICE` → `StartDevice` ;
+3. attente de `Get-PnpDevice -InstanceId <id>` en état `OK` (30 s au plus, sinon échec
+   avec le code de problème) ;
+4. `devgen /remove <id>` : `IRP_MN_REMOVE_DEVICE`, l'objet de périphérique disparaît ;
+5. `pnputil /delete-driver oemN.inf /uninstall /force` (`oemN.inf` retrouvé par
+   `pnputil /enum-drivers`) : le service est supprimé et le `.sys` déchargé ;
+6. vérification qu'aucun événement `Kernel-PnP` de niveau erreur ni `BugCheck`
+   (1001, 6008) n'est apparu dans l'invité depuis le début.
+
+Tout `devgen`/`pnputil` dont le code de retour n'est pas 0 arrête le script avec sa
+sortie. À la fin (même après un plantage : l'invité redémarre seul et le script se
+reconnecte), un `C:\Windows\MEMORY.DMP` ou un `C:\Windows\Minidump\*.dmp` plus récent que
+le début est rapatrié dans `drivers\windows\target\dumps\` et le script **échoue**.
+Sortie : cycles réussis et durée moyenne, minimale et maximale d'un cycle. Le critère de
+M1a-02 est `vm-cycle : 100 cycles sans erreur.`
+
+À la main, dans la VM, les mêmes commandes se tapent depuis `C:\ConduitTest` :
 
 ```powershell
-devgen /remove <id renvoyé par /add>
-pnputil /enum-drivers                      # repérer oemN.inf du fournisseur Conduit
+pnputil /add-driver package\conduit_kmd.inf /install
+.\devgen.exe /add /hardwareid "Root\ConduitCable"      # imprime l'identifiant d'instance
+.\devgen.exe /remove <id>
+pnputil /enum-drivers                                  # repérer oemN.inf du fournisseur Conduit
 pnputil /delete-driver oemN.inf /uninstall /force
 ```
 
-Un cycle de charge/décharge se boucle avec `devgen /add` puis `devgen /remove`
-(critère de M1a-02 : 100 cycles sans erreur).
+Le gestionnaire de périphériques doit montrer *Conduit Virtual Audio Cable* sous
+*Contrôleurs audio, vidéo et jeu* entre `/add` et `/remove` (sans endpoint audio avant
+M1a-06).
 
 ### 3.4 Driver Verifier et journal
 
 `verifier /standard /driver conduit_kmd.sys` puis redémarrage (retour : `verifier /reset`).
-Les messages `wdk::println!` passent par `DbgPrint` : DebugView (« Capture Kernel ») ou la
-fenêtre de commande WinDbg.
+Les messages `kmd_log!` (`conduit-kmd/src/log.rs`, `wdk::println!` → `DbgPrint`, profil
+`dev` seulement) passent par le débogueur : fenêtre de commande WinDbg ou DebugView
+(« Capture Kernel ») dans l'invité. Attendu à chaque cycle : `DriverEntry`, `AddDevice`,
+`StartDevice`, `DriverUnload`.
 
 ## 4. Débogage noyau et plantages
 
@@ -169,8 +223,9 @@ Verifier, `lm m conduit*` pour vérifier que le module et son `.pdb` sont charg�
 Une panique Rust se traduit par le bug check **`0xE0000001`** (`conduit-kmd/src/panic.rs`,
 `KeBugCheckEx`) : `!analyze -v` l'affiche avec ses quatre paramètres.
 
-Après chaque plantage, copier `C:\Windows\MEMORY.DMP` (ou `C:\Windows\Minidump\*.dmp`)
-de la VM vers l'hôte et l'ouvrir dans WinDbg (`.sympath` sur le dossier du package).
+Après un plantage pendant `vm-cycle.ps1`, le script rapatrie `C:\Windows\MEMORY.DMP` (ou
+`C:\Windows\Minidump\*.dmp`) dans `drivers\windows\target\dumps\` ; sinon, copier le
+fichier de la VM vers l'hôte. L'ouvrir dans WinDbg (`.sympath` sur le dossier du package).
 
 ## 5. Dépannage
 
@@ -185,7 +240,10 @@ de la VM vers l'hôte et l'ouvrir dans WinDbg (`.sympath` sur le dossier du pack
 | `infverif` : ERROR 1322 « not isolated to DIRID 13 » | L'INF copie vers `%12%` : rester sur `%13%` (§2). |
 | `Une stratégie de contrôle d'application a bloqué ce fichier (os error 4551)` à l'exécution d'un `build-script-build` ou d'un test | **Smart App Control** (Windows 11) bloque les binaires fraîchement compilés qu'il ne connaît pas. Journal : *Microsoft-Windows-CodeIntegrity/Operational*, événements 3077/3118. Aucune exclusion possible : le désactiver (*Sécurité Windows → Contrôle des applications et du navigateur → Smart App Control*, irréversible) ou développer dans une VM. |
 | Windows PowerShell 5.1 affiche `NativeCommandError` sur des lignes `Finished …` | Bruit : cargo écrit sa progression sur stderr et `2>&1` la transforme en erreur. Ne pas rediriger, ou utiliser `pwsh` 7. |
-| `signtool verify` : « terminated in a root certificate which is not trusted » | Normal sur l'hôte : `WDRLocalTestCert` est auto-signé. Importer le `.cer` dans la VM (§3.2). |
+| `signtool verify` : « terminated in a root certificate which is not trusted » | Normal sur l'hôte : `WDRLocalTestCert` est auto-signé. `vm-cycle.ps1` importe le `.cer` dans la VM (§3.3). |
+| Un script `tools\*.ps1` échoue avec « Jeton inattendu » ou « Le terminateur " est manquant » sur une ligne contenant `—`, `œ` ou `…` | Fichier UTF-8 **sans BOM** : Windows PowerShell 5.1 le lit en ANSI et prend des octets pour des guillemets typographiques. Tous les scripts du dépôt sont en UTF-8 avec BOM ; conserver ce BOM en éditant. |
+| `vm-prepare.ps1` : « testsigning n'est pas actif après redémarrage » | Secure Boot encore actif sur la VM : `Set-VMFirmware -VMName ConduitTest -EnableSecureBoot Off` (VM arrêtée), puis relancer le script. |
+| `vm-cycle.ps1` : « Le périphérique … n'est pas passé en état OK », problème 10 ou 28 | 10 : `StartDevice` ou PortCls a échoué (journal `kmd_log!`, événement Kernel-PnP 411). 28 : l'INF ne correspond pas (`pnputil /enum-drivers` dans la VM, certificat importé ?). |
 
 ## 6. Dépôt
 
@@ -220,8 +278,9 @@ sans version : abandonnés (VSIX inutile, version épinglée).
 
 ### 7.2 Tâches à enchaîner (ROADMAP, M1a)
 
-1. **M1a-02** pilote WDM minimal (`AddDevice`, INF, catalogue de test) chargé et
-   déchargé 100 fois dans la VM (§3.3).
+1. **M1a-02** pilote minimal via PortCls (`DriverEntry`, `AddDevice`, `StartDevice` vide, INF,
+   catalogue de test) : code et scripts de VM prêts, à charger et décharger 100 fois
+   dans la VM dès qu'une ISO Windows 11 est disponible (§3.3).
 2. **M1a-03** à **M1a-05** `portcls-sys` : bindgen en mode C sur `portcls.h`/`ks.h`/
    `ksmedia.h` (vtables plates, driver-design §2.2), objets COM sûrs, enveloppes
    `IMiniportWaveRT`/`IMiniportWaveRTStream`/`IPortWaveRT` avec tests en mode utilisateur.

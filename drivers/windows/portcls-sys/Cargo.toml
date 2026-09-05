@@ -9,9 +9,16 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
-# Aucune dépendance (ni `wdk-sys`) : le crate reste testable en mode utilisateur.
+# `wdk-sys` lie les bibliothèques noyau même sous `cargo test` : il reste optionnel,
+# derrière la feature `kernel` (activée par `conduit-kmd`), pour que
+# `cargo test -p portcls-sys` continue de tourner en mode utilisateur sans lui.
 # M1a-03 ajoutera `bindgen` et `wdk-build` en build-dependencies.
+[features]
+default = []
+kernel = ["dep:wdk-sys"]
+
 [dependencies]
+wdk-sys = { workspace = true, optional = true }
 
 [lints]
 workspace = true

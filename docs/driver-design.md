@@ -272,8 +272,10 @@ câble marche sans le démon (F-05) après redémarrage.
   (PortCls libère ce qui a été enregistré) plutôt que de charger un adaptateur
   incomplet.
 - Journalisation : `WPP` n'est pas disponible côté Rust ; le spike utilise
-  `DbgPrintEx` (composant `DPFLTR_IHVAUDIO_ID`) derrière une macro `kmd_log!` inactive
-  en release. M1b évalue `EtwWrite` via `wdk-sys`.
+  `wdk::println!` (`DbgPrint`, préfixe `conduit_kmd:`) derrière une macro `kmd_log!`
+  (`conduit-kmd/src/log.rs`) vide en release ; `DbgPrintEx` avec `DPFLTR_IHVAUDIO_ID`
+  reste une option si le filtrage devient nécessaire. M1b évalue `EtwWrite` via
+  `wdk-sys`.
 - Tags de pool distincts par famille d'objets (`CnKm`, `CnSt`, `CnBf`) pour suivre les
   fuites avec `!poolused` et Driver Verifier.
 
