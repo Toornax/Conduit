@@ -23,6 +23,11 @@ Version 0.1 — 2026-09-05. Découpage de chaque jalon de `SPEC.md` §9 en tâch
 
 Ordre général : M0 et M1a en parallèle, puis M1b, M2, M3, M4, M5.
 
+**État au 2026-09-05** : M0 clos (tag `v0.1.0-core`, `nix flake check` vert, 211 tests).
+M1a (pilote Windows) exige un poste Windows avec WDK : en son absence, le travail se
+poursuit sur M3 (Linux/PipeWire) puis M2 (GUI), conformément à la consigne « si Windows
+bloque, parties Linux/macOS ».
+
 ---
 
 ## M0 — Cœur portable
@@ -277,7 +282,7 @@ allocation dans le fil audio, CI verte partout, couverture ≥ 80 % sur `core` e
   `nix run .#conduitd` fonctionne ; les binaires packagés démarrent sur une machine sans devshell.
   *Fait quand* : test CI lançant le package dans un conteneur nu.
 - [x] **M0-98** `docs: guide développeur (architecture, tests, conventions, Nix)`
-- [ ] **M0-99** `chore: tag v0.1.0-core`
+- [x] **M0-99** `chore: tag v0.1.0-core`
   *Fait quand* : tous les critères de sortie M0 sont cochés dans ce fichier.
 
 ---
