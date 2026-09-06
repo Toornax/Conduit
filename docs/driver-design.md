@@ -685,11 +685,12 @@ câble marche sans le démon (F-05) après redémarrage.
 - Tout `NTSTATUS` d'échec de PortCls est propagé ; `StartDevice` échoue proprement
   (PortCls libère ce qui a été enregistré) plutôt que de charger un adaptateur
   incomplet.
-- Journalisation : `WPP` n'est pas disponible côté Rust ; le spike utilise
-  `wdk::println!` (`DbgPrint`, préfixe `conduit_kmd:`) derrière une macro `kmd_log!`
-  (`conduit-kmd/src/log.rs`) vide en release ; `DbgPrintEx` avec `DPFLTR_IHVAUDIO_ID`
-  reste une option si le filtrage devient nécessaire. M1b évalue `EtwWrite` via
-  `wdk-sys`.
+- Journalisation : `WPP` n'est pas disponible côté Rust ; la macro `kmd_log!`
+  (`conduit-kmd/src/log.rs`, vide en release, préfixe `conduit_kmd:`) émet par
+  `DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_ERROR_LEVEL, …)` — le niveau *erreur* est le seul
+  armé par défaut, donc les traces arrivent sans configuration du masque (driver-dev.md
+  §4). Formatage dans un tampon de pile, sans allocation, avec `c"%s"` comme chaîne de
+  format. M1b évalue `EtwWrite` via `wdk-sys`.
 - Tags de pool distincts par famille d'objets (`CnKm`, `CnSt`, `CnBf`) pour suivre les
   fuites avec `!poolused` et Driver Verifier.
 

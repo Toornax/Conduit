@@ -6,7 +6,7 @@
   dans la VM (compte local administrateur). Par PowerShell Direct, dans l'invité :
   `bcdedit /set testsigning on`, `bcdedit /debug on`, le transport du débogueur
   (`bcdedit /dbgsettings serial` par défaut, `net` sur demande), le filtre de traces du
-  noyau (Debug Print Filter, sans lequel les DbgPrint du pilote sont invisibles), vidage
+  noyau (Debug Print Filter, qui ouvre les traces des composants du système), vidage
   noyau complet (CrashDumpEnabled = 2), veille et hibernation désactivées ; puis, en
   série, attache le canal nommé au port COM de la VM (Set-VMComPort, VM arrêtée) ;
   redémarre l'invité, vérifie que testsigning est actif et prend le point de contrôle
@@ -102,23 +102,24 @@ try {
     }
 
     # Filtre de traces du noyau. Depuis Windows Vista, DbgPrint et DbgPrintEx sont filtrés
-    # par défaut : SEULES les lignes de niveau erreur passent, et les traces kmd_log! du
-    # pilote restent invisibles — un silence qui ressemble trait pour trait à un pilote qui
-    # ne démarre pas, et qui a déjà coûté cher. DEFAULT = 0xF ouvre les quatre niveaux
-    # (erreur, avertissement, trace, information) dès l'amorçage — donc pour DriverEntry —
-    # et pour tous les démarrages suivants. DEFAULT et non IHVDRIVER : kmd_log! passe par
-    # `wdk::println!`, donc par DbgPrint, donc par le composant DPFLTR_DEFAULT_ID (voir
-    # conduit-kmd\src\log.rs, et le paramètre -InitialCommands de vm-debug.ps1).
+    # par défaut : SEUL le niveau erreur (bit 0) est armé, les autres niveaux sont perdus.
+    # DEFAULT = 0xF ouvre les quatre niveaux (erreur, avertissement, trace, information)
+    # dès l'amorçage — donc pour DriverEntry — et pour tous les démarrages suivants.
     #
-    # CETTE VALEUR NE SUFFIT PAS À ELLE SEULE, et n'est pas non plus remplaçable par la
-    # commande du débogueur : mesuré le 2026-09-06, une séance complète est restée muette
-    # alors que la valeur valait DÉJÀ 0xFFFFFFFF dans l'invité, et c'est le
-    # `ed nt!Kd_DEFAULT_Mask 0xf` joué à la connexion par vm-debug.ps1 qui a débloqué les
-    # traces. Les DEUX sont nécessaires : le registre vaut dès l'amorçage, avant que le
-    # débogueur puisse agir ; le `ed` vaut pour la séance en cours. Constat de mesure, pas
-    # théorie : ne retirer ni l'un ni l'autre sans le remesurer.
+    # LES TRACES DU PILOTE N'EN DÉPENDENT PLUS : kmd_log! (conduit-kmd\src\log.rs) émet
+    # par DbgPrintEx au niveau DPFLTR_ERROR_LEVEL, justement parce que c'est le seul armé
+    # par défaut ; les kmd_log! arrivent donc sans cette valeur ni la commande `ed` de
+    # vm-debug.ps1. La pose est conservée parce qu'elle reste utile aux traces des AUTRES
+    # composants du système, qui, elles, sortent aux niveaux filtrés.
+    #
+    # Question ouverte, à ne pas transformer en explication : avec l'implémentation
+    # précédente (DbgPrint, composant DPFLTR_DEFAULT_ID, niveau information), la livraison
+    # des traces s'est révélée INTERMITTENTE À CONFIGURATION IDENTIQUE — deux séances de
+    # 100 cycles muettes encadrant une séance de dix traces, cette valeur de registre
+    # valant 0xFFFFFFFF dans les trois cas (détail dans conduit-kmd\src\log.rs et au
+    # paramètre -InitialCommands de vm-debug.ps1). La cause n'a pas été identifiée.
     # La clé n'existe pas sur une installation neuve : la créer.
-    Write-Host "  Debug Print Filter : DEFAULT = 0xF (les DbgPrint du pilote passent)"
+    Write-Host "  Debug Print Filter : DEFAULT = 0xF (traces des composants du système)"
     $filter = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Debug Print Filter"
     if (-not (Test-Path -LiteralPath $filter)) { New-Item -Path $filter -Force | Out-Null }
     Set-ItemProperty -LiteralPath $filter -Name DEFAULT -Value 0xF -Type DWord
@@ -200,9 +201,9 @@ if ($serial) {
   Write-Host "  Clé : $DebugKey   (à conserver ; WinDbg → Attach to kernel → Net)"
   Write-Host "  Équivalent : windbg -k net:port=$DebugPort,key=$DebugKey"
 }
-Write-Host "  Traces du pilote : Debug Print Filter DEFAULT = 0xF (dès l'amorçage) ; il faut"
-Write-Host "  AUSSI le « ed nt!Kd_DEFAULT_Mask 0xf » que vm-debug.ps1 joue à la connexion —"
-Write-Host "  mesuré : le registre seul ne suffit pas, aucun des deux ne remplace l'autre."
+Write-Host "  Traces du pilote : elles arrivent SANS CONFIGURATION (niveau « erreur », le seul"
+Write-Host "  armé par défaut). Debug Print Filter DEFAULT = 0xF est posé quand même, pour les"
+Write-Host "  traces des autres composants du système ; vm-debug.ps1 ouvre les mêmes masques."
 Write-Host "  Retour à l'état propre : Restore-VMCheckpoint -VMName $Name -Name $checkpoint -Confirm:`$false"
 Write-Host ""
 Write-Host "SUITE — attacher le débogueur noyau :"

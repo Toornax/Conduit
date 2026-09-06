@@ -158,5 +158,6 @@ Ce qui a été constaté (et diffère de la recette initiale) :
 `bcdedit /set testsigning on` (Secure Boot désactivé si refus), importer le `.cer` dans
 *Trusted Root* et *Trusted Publishers*, `pnputil /add-driver conduit.inf /install`,
 `devgen /add /hardwareid "Root\ConduitCable"`. Driver Verifier : « Create Standard
-Settings » sur `conduit-kmd.sys`, WinDbg `!analyze -v`, `!verifier 3`. Journal :
-`wdk::println!` → `DbgPrint` (DebugView « Capture Kernel »).
+Settings » sur `conduit-kmd.sys`, WinDbg `!analyze -v`, `!verifier 3`. Journal : `kmd_log!`
+→ `DbgPrintEx` au niveau *erreur* (DebugView « Capture Kernel »), visible sans réglage de
+masque.

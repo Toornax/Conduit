@@ -60,8 +60,9 @@ $cred = Get-Credential nathan
 
 Active `testsigning`, le **débogage noyau par canal nommé série** (`\\.\pipe\conduitdbg`
 sur le port COM 1 : le transport réseau, lui, ne s'est jamais connecté sur ce poste), le
-**filtre de traces du noyau** (`Debug Print Filter\DEFAULT = 0xF`, sans lequel les
-`kmd_log!` du pilote sont invisibles), la collecte des vidages, désactive la veille,
+**filtre de traces du noyau** (`Debug Print Filter\DEFAULT = 0xF`, qui ouvre les traces des
+autres composants ; les `kmd_log!` du pilote, eux, sortent au niveau *erreur* et arrivent
+sans configuration), la collecte des vidages, désactive la veille,
 arrête l'invité le temps d'attacher le canal (`Set-VMComPort` exige la VM éteinte),
 rallume et crée le point de contrôle « propre ». **Revenir à ce point de contrôle** avant
 chaque reprise à froid.
@@ -94,7 +95,7 @@ moyenne. Aucun vidage rapatrié dans `drivers\windows\target\dumps\`.
    revérifier), et que `bcdedit` montre `testsigning Yes`.
 2. *`ExAllocateTimer` échoue au démarrage* → `STATUS_INSUFFICIENT_RESOURCES`, le
    périphérique ne démarre pas (M1a-08, décision assumée : pas de repli). Regarder le
-   journal `DbgPrint`.
+   journal du débogueur (`kmd_log!`).
 3. *La course du retrait, `Kernel-PnP 411` avec l'état `0xC00000E5`* : **son signe
    distinctif est que l'événement désigne l'appareil du cycle PRÉCÉDENT**, à l'instant de
    son retrait, alors que le cycle en cours n'a jamais chargé le pilote. C'est PnP qui

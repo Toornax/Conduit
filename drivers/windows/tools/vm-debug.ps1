@@ -21,9 +21,9 @@
   kd.exe est lancé dans sa propre fenêtre (c'est une console interactive : on y tape
   `!analyze -v`, `lm m conduit*`, Ctrl+Inter pour interrompre l'invité) et journalise tout
   dans -LogPath. Les commandes initiales lèvent les masques de traces puis relâchent
-  l'invité, pour que les kmd_log! du pilote apparaissent tout de suite ; le masque DEFAULT
-  est aussi posé en registre par vm-prepare.ps1, qui lui vaut dès l'amorçage. LES DEUX SONT
-  NÉCESSAIRES, l'un n'est pas un substitut de l'autre (voir -InitialCommands).
+  l'invité. Les kmd_log! du pilote, eux, N'EN DÉPENDENT PLUS : ils sortent au niveau
+  « erreur », le seul armé par défaut, et arrivent donc sans configuration. Les masques
+  restent ouverts pour les traces des AUTRES composants (voir -InitialCommands).
 
   Ce script ne touche jamais au débogage de l'hôte : il ne lance ni bcdedit, ni verifier.
 .PARAMETER Name
@@ -38,8 +38,9 @@
   Suit le journal dans cette fenêtre, en mettant en évidence les lignes du pilote.
 .PARAMETER InitialCommands
   Commandes jouées par kd à la connexion. Par défaut : ouverture des masques de traces
-  Kd_DEFAULT_Mask PUIS Kd_IHVDRIVER_Mask, puis `g`, qui relâche l'invité. C'est le masque
-  DEFAULT qui porte nos traces — voir le commentaire du paramètre plus bas.
+  Kd_DEFAULT_Mask puis Kd_IHVDRIVER_Mask, puis `g`, qui relâche l'invité. Ces masques
+  servent aux traces des autres composants ; les nôtres arrivent sans eux — voir le
+  commentaire du paramètre plus bas.
 .PARAMETER HoldTimeoutSeconds
   Délai maximal d'attente que le débogueur tienne le canal (30 s).
 .EXAMPLE
@@ -54,26 +55,26 @@ param(
   [string]$LogPath,
   [switch]$StartVM,
   [switch]$Follow,
-  # Kd_DEFAULT_Mask D'ABORD, et c'est lui qui compte : kmd_log!
-  # (drivers\windows\conduit-kmd\src\log.rs) passe par `wdk::println!`, qui appelle
-  # **DbgPrint** — donc le composant DPFLTR_DEFAULT_ID, jamais DPFLTR_IHVDRIVER_ID, qui
-  # exigerait un DbgPrintEx explicite. Kd_IHVDRIVER_Mask est conservé derrière, sans coût,
-  # pour un éventuel DbgPrintEx futur.
+  # NOS TRACES NE DÉPENDENT PLUS DE CES MASQUES. kmd_log!
+  # (drivers\windows\conduit-kmd\src\log.rs) émet par DbgPrintEx sur le composant
+  # DPFLTR_IHVAUDIO_ID au niveau DPFLTR_ERROR_LEVEL — le niveau 0, bit 0, le SEUL armé
+  # par défaut pour tous les composants. Les kmd_log! arrivent donc sans configuration :
+  # ni ces commandes, ni la valeur de registre posée par vm-prepare.ps1.
   #
-  # MESURÉ le 2026-09-06, pas déduit : avec les seules commandes d'origine
-  # (`ed nt!Kd_IHVDRIVER_Mask 0xf`), une séance complète — débogueur connecté dès
-  # l'amorçage, 100 cycles de chargement — n'a rendu AUCUNE trace du pilote, alors que les
-  # DbgPrint d'autres composants passaient. Avec `ed nt!Kd_DEFAULT_Mask 0xf` en plus, la
-  # séance suivante a immédiatement rendu les dix traces attendues (DriverEntry, AddDevice,
-  # StartDevice, les quatre Init, DriverUnload…).
+  # Les deux masques restent ouverts parce qu'ils gardent leur utilité pour les traces des
+  # AUTRES composants (PortCls, ks, PnP…) pendant une séance, et qu'ils ne coûtent rien.
   #
-  # Autre constat de la même séance : la valeur de registre « Debug Print Filter\DEFAULT »
-  # valait DÉJÀ 0xFFFFFFFF dans l'invité pendant que la séance restait muette. Elle n'a
-  # donc pas suffi à elle seule ; c'est le `ed` joué à la connexion qui a débloqué les
-  # traces. Les DEUX sont nécessaires et aucun ne remplace l'autre : la valeur de registre
-  # (posée par vm-prepare.ps1) vaut dès l'amorçage, avant que le débogueur puisse agir ;
-  # le `ed` vaut pour la séance en cours. Constat de mesure, pas théorie : ne pas retirer
-  # l'un des deux sans le remesurer.
+  # CE QUI RESTE UNE QUESTION OUVERTE : avec l'implémentation précédente (wdk::println!,
+  # donc DbgPrint, donc le composant DPFLTR_DEFAULT_ID au niveau information), la
+  # livraison s'est révélée INTERMITTENTE À CONFIGURATION IDENTIQUE, cause non
+  # identifiée. Trois séances des 2026-09-06/07, débogueur série connecté dès l'amorçage,
+  # registre « Debug Print Filter » DEFAULT et IHVAUDIO à 0xFFFFFFFF chaque fois :
+  #   1. `ed nt!Kd_IHVDRIVER_Mask 0xf` seul       -> AUCUNE trace sur 100 cycles
+  #   2. + `ed nt!Kd_DEFAULT_Mask 0xf`            -> 10 traces, dès le cycle 1
+  #   3. commandes identiques à la séance 2       -> AUCUNE trace sur 100 cycles
+  # La séance 3 interdit de conclure que le masque DEFAULT était le facteur : ce n'est pas
+  # une explication, c'est une question sans réponse. Le passage au niveau « erreur » la
+  # rend sans objet, ce qui vaut mieux que de continuer à la poser.
   [string[]]$InitialCommands = @("ed nt!Kd_DEFAULT_Mask 0xf", "ed nt!Kd_IHVDRIVER_Mask 0xf", "g"),
   [ValidateRange(5, 600)][int]$HoldTimeoutSeconds = 30
 )

@@ -249,16 +249,14 @@ plus long qu'un simple redémarrage. Le transport réseau (`-DebugTransport net`
 
 **Filtre de traces** : `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Debug Print
 Filter`, valeur `DEFAULT` (DWord) à `0xF`, **créée si la clé n'existe pas** — c'est le cas
-sur une installation neuve. `DEFAULT` et non `IHVDRIVER` : `kmd_log!` passe par `DbgPrint`,
-donc par le composant `DPFLTR_DEFAULT_ID` (§4). Sans ce filtre, seules les lignes de niveau
-*erreur* traversent : les traces `kmd_log!` restent invisibles, et ce silence ressemble
-trait pour trait à un pilote qui ne démarre pas. Posée en registre, la valeur vaut dès
-l'amorçage, donc pour `DriverEntry`, avant même que le débogueur puisse agir.
+sur une installation neuve. Sans ce filtre, seules les lignes de niveau *erreur*
+traversent ; `0xF` ouvre aussi avertissement, trace et information, dès l'amorçage, donc
+pour `DriverEntry`.
 
-Elle **ne suffit pourtant pas** : mesuré le 2026-09-06, une séance est restée muette alors
-que la valeur valait déjà `0xFFFFFFFF` dans l'invité, et seul le `ed nt!Kd_DEFAULT_Mask 0xf`
-joué à la connexion a débloqué les traces. Les deux sont nécessaires, aucun ne remplace
-l'autre — le détail de la mesure est en §4.
+**Les traces du pilote n'en dépendent pas.** `kmd_log!` émet au niveau *erreur*, le seul
+armé par défaut : les `conduit_kmd:` arrivent sans cette valeur, et sans commande dans le
+débogueur (§4). La pose est conservée parce qu'elle reste utile aux traces des **autres**
+composants du système, qui sortent, elles, aux niveaux filtrés.
 
 ### 3.3 Cycle de chargement (M1a-02) : `vm-cycle.ps1`
 
@@ -459,11 +457,10 @@ minute. La sortie complète reste dans l'invité, sous `C:\ConduitTest\console-<
 ### 3.5 Driver Verifier et journal
 
 `verifier /standard /driver conduit_kmd.sys` puis redémarrage (retour : `verifier /reset`).
-Les messages `kmd_log!` (`conduit-kmd/src/log.rs`, `wdk::println!` → `DbgPrint`, profil
+Les messages `kmd_log!` (`conduit-kmd/src/log.rs`, `DbgPrintEx` au niveau *erreur*, profil
 `dev` seulement) passent par le débogueur : fenêtre de `kd.exe` ouverte par `vm-debug.ps1`
-(§4) ou DebugView (« Capture Kernel ») dans l'invité — à condition que le filtre de traces
-soit posé (§3.2). Attendu à chaque cycle : `DriverEntry`, `AddDevice`, `StartDevice`,
-`DriverUnload`.
+(§4) ou DebugView (« Capture Kernel ») dans l'invité — **sans configuration préalable**
+(§4). Attendu à chaque cycle : `DriverEntry`, `AddDevice`, `StartDevice`, `DriverUnload`.
 
 La charge d'une heure sous Driver Verifier (M1a-11) tourne sans surveillance avec
 `vm-run-console.ps1 -TimeoutSeconds 4000` : elle doit s'exécuter dans la session console,
@@ -511,27 +508,40 @@ de l'invité — mais pas à une machine partie avant lui. `vm-debug.ps1` journa
 `ed nt!Kd_IHVDRIVER_Mask 0xf` puis `g` à la connexion, et avec `-Follow` suit le journal
 en mettant en évidence les lignes du pilote.
 
-#### Le masque de traces : `DEFAULT`, et il en faut **deux** (mesuré le 2026-09-06)
+#### Les traces du pilote arrivent sans configuration
 
-Avec les seules commandes d'origine (`ed nt!Kd_IHVDRIVER_Mask 0xf`), une séance complète —
-débogueur connecté dès l'amorçage, 100 cycles de chargement — n'a rendu **aucune** trace
-du pilote, alors que les `DbgPrint` d'autres composants passaient. En ajoutant
-`ed nt!Kd_DEFAULT_Mask 0xf`, la séance suivante a immédiatement rendu les dix traces
-attendues (`DriverEntry`, `AddDevice`, `StartDevice`, les quatre `Init`, `DriverUnload`…).
+`kmd_log!` ([`conduit-kmd/src/log.rs`](../drivers/windows/conduit-kmd/src/log.rs)) émet par
+**`DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_ERROR_LEVEL, …)`**. Le masque d'un composant est
+un champ de bits, et le niveau *erreur* (niveau 0, bit 0) est **le seul armé par défaut**,
+pour tous les composants : une ligne émise à ce niveau traverse sans valeur de registre ni
+commande dans le débogueur. C'est ce que font les exemples du WDK, SYSVAD compris — et
+c'est pourquoi nos traces d'avancement s'annoncent comme des erreurs : mieux vaut une trace
+qui arrive toujours qu'une sévérité juste et un journal vide.
 
-La raison est dans le code : `kmd_log!` ([`conduit-kmd/src/log.rs`](../drivers/windows/conduit-kmd/src/log.rs))
-passe par `wdk::println!`, qui appelle **`DbgPrint`** — donc le composant
-`DPFLTR_DEFAULT_ID`, jamais `DPFLTR_IHVDRIVER_ID`, qui exigerait un `DbgPrintEx` explicite.
-Le masque à ouvrir est `Kd_DEFAULT_Mask` ; `Kd_IHVDRIVER_Mask` est conservé derrière, sans
-coût, pour un éventuel `DbgPrintEx` futur.
+L'élargissement des masques est **conservé des deux côtés** — `Debug Print Filter\DEFAULT`
+en registre (§3.2), `ed nt!Kd_DEFAULT_Mask 0xf` puis `ed nt!Kd_IHVDRIVER_Mask 0xf` à la
+connexion — parce qu'il reste utile aux traces des **autres** composants (PortCls, `ks`,
+PnP…), qui sortent, elles, aux niveaux filtrés. Il n'est simplement plus ce dont nos traces
+dépendent.
 
-Second constat de la même séance : la valeur de registre `Debug Print Filter\DEFAULT`
-valait **déjà `0xFFFFFFFF`** dans l'invité pendant que la séance restait muette. Elle n'a
-donc **pas suffi à elle seule** ; c'est le `ed` joué au moment de la connexion qui a
-débloqué les traces. **Les deux sont nécessaires et aucun ne remplace l'autre** : la valeur
-de registre (§3.2) vaut dès l'amorçage, avant que le débogueur puisse agir ; le `ed` vaut
-pour la séance en cours. C'est un constat de mesure, pas une théorie : ne retirer ni l'un
-ni l'autre sans le remesurer.
+#### Ce qui reste une question ouverte
+
+Avec l'implémentation précédente (`wdk::println!` → `DbgPrint`, donc le composant
+`DPFLTR_DEFAULT_ID` au niveau *information*), la livraison s'est révélée **intermittente à
+configuration identique**. Trois séances des 2026-09-06/07, débogueur série connecté dès
+l'amorçage à chaque fois, registre `DEFAULT` et `IHVAUDIO` à `0xFFFFFFFF` dans les trois
+cas :
+
+| Séance | Commandes initiales de kd | Traces du pilote |
+|---|---|---|
+| 1 | `ed nt!Kd_IHVDRIVER_Mask 0xf` | **aucune** sur 100 cycles |
+| 2 | + `ed nt!Kd_DEFAULT_Mask 0xf` | 10 traces, dès le cycle 1 |
+| 3 | identiques à la séance 2 | **aucune** sur 100 cycles |
+
+La séance 3 interdit de conclure que le masque `DEFAULT` était le facteur : la cause n'a
+pas été identifiée, et rien de ce qui précède n'est une explication. Le passage au niveau
+*erreur* rend la question sans objet pour nos traces ; elle resterait entière pour qui
+voudrait journaliser à un autre niveau.
 
 Commandes utiles dans la fenêtre de `kd.exe` : `!analyze -v` après un bug check,
 `!verifier 3` pour l'état de Driver Verifier, `lm m conduit*` pour vérifier que le module
@@ -570,7 +580,7 @@ fichier de la VM vers l'hôte. L'ouvrir dans WinDbg (`.sympath` sur le dossier d
 | `vm-run-console.ps1` : « Aucune session console interactive » | Voulu. Ouvrir `vmconnect` **en mode session de base** (pas étendue, qui redirige l'audio vers l'hôte), ouvrir une session Windows à l'écran avec le compte du `-Credential`, attendre le bureau, relancer. Sans cela la mesure tournerait dans la session 0 et serait silencieuse sans erreur (§3.4 bis). |
 | `vm-run-console.ps1` : « Le compte ouvert à la console est … mais -Credential désigne … » | La tâche `/it` ne se déclenche que pour l'utilisateur ouvert à la console. Le compte réel de la VM est `nathan`, pas `test` : passer le bon `-Credential`. |
 | `kd` reste sur `Waiting to reconnect...` après `Opened \\.\pipe\…` | La VM a démarré **avant** le débogueur — y compris quand `vm-debug.ps1` a été lancé sans `-StartVM` sur une VM déjà en marche, cas mesuré comme sans issue (§4). Arrêter la VM, relancer `vm-debug.ps1 -StartVM`, qui impose l'ordre. Vérifier aussi le port COM : `Get-VMComPort -VMName ConduitTest` doit montrer `\\.\pipe\conduitdbg` (attaché par `vm-prepare.ps1`, VM arrêtée). |
-| Aucune trace `kmd_log!` alors que le pilote démarre | Masque de traces **`DEFAULT`**, pas `IHVDRIVER` (§4) : `ed nt!Kd_DEFAULT_Mask 0xf` dans le débogueur, **et** `Debug Print Filter\DEFAULT = 0xF` en registre (§3.2) — les deux, l'un ne remplace pas l'autre. Vérifier aussi le profil : `kmd_log!` n'existe qu'en `dev`. |
+| Aucune trace `kmd_log!` alors que le pilote démarre | Ce n'est **pas** un problème de masque : `kmd_log!` sort au niveau *erreur*, armé par défaut (§4). Vérifier d'abord le profil — `kmd_log!` n'existe qu'en `dev` — puis que le débogueur est bien connecté (`vm-debug.ps1 -StartVM`) et que le module est chargé (`lm m conduit*`). |
 | `vm-cycle.ps1` : `Kernel-PnP 411`, état `0xC00000E5` sur l'appareil du cycle **précédent** | La course du retrait (§3.3), pas le pilote. Attendue et corrigée depuis ; si elle réapparaît, augmenter `-RemoveTimeoutSeconds`. Le journal `<horodatage>_setupapi.dev.log` rapatrié avec les vidages dit ce que PnP a tenté. |
 | `vm-prepare.ps1` : « Set-VMComPort exige une VM ARRÊTÉE » | L'invité ne s'est pas éteint (mise à jour en cours, invité figé). `Stop-VM -Name ConduitTest`, puis relancer le script. |
 | `vm-cycle.ps1` : « Le périphérique … n'est pas passé en état OK », problème 10 ou 28 | 10 : `StartDevice` ou PortCls a échoué (journal `kmd_log!`, événement Kernel-PnP 411). 28 : l'INF ne correspond pas (`pnputil /enum-drivers` dans la VM, certificat importé ?). |
