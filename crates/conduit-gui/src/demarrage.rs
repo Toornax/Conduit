@@ -164,6 +164,19 @@ pub fn lancer(socket: &Path) -> Result<(), Echec> {
     }
 }
 
+/// Le répertoire où le démon écrit son journal.
+///
+/// C'est `<répertoire de données de Conduit>/logs`, la règle de
+/// `conduitd::paths::Paths`. La GUI la **recalcule** au lieu d'importer le
+/// crate du démon : ADR-010 lui interdit de dépendre de l'engine, et
+/// `conduitd` en dépend — la fenêtre embarquerait le moteur et ses backends
+/// pour un chemin. Les deux ne peuvent pas diverger en silence pour autant :
+/// `tests/chemins.rs` les compare, `conduitd` y étant dépendance de
+/// développement.
+pub fn repertoire_du_journal() -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", "conduit").map(|dirs| dirs.data_dir().join("logs"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

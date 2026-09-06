@@ -12,7 +12,7 @@
 //!   simplement repartir sur la disposition automatique, sans notice ;
 //! - **on n'écrit qu'au relâchement** d'une carte, jamais pendant le
 //!   déplacement, et jamais depuis `update` — l'écriture passe par une
-//!   `Task` ([`ecrire`]) ;
+//!   `Task` ([`ecrire`], [`ecrire_accueil_vu`]) ;
 //! - **on ne perd rien** : les clés que le fichier contient et que la session
 //!   ne connaît pas — un périphérique débranché — sont conservées à
 //!   l'écriture (voir [`Positions::fusion`]).
@@ -32,6 +32,12 @@ pub const FICHIER: &str = "interface.json";
 pub struct Preferences {
     /// Positions des cartes du patchbay, par clé stable de nœud.
     pub patchbay: Positions,
+    /// Vrai une fois l'écran de bienvenue acquitté (M2-13).
+    ///
+    /// Absent du fichier — première installation, ou fichier écrit par une
+    /// version antérieure —, il vaut faux : l'accueil s'affiche une fois, ce
+    /// qui est exactement ce qu'on veut d'un écran de premier lancement.
+    pub accueil_vu: bool,
 }
 
 /// Chemin du fichier de préférences, si le système en désigne un.
@@ -53,18 +59,36 @@ pub fn lire() -> Preferences {
 ///
 /// Le fichier est relu juste avant d'être réécrit : une clé qu'une autre
 /// session — ou une autre journée — y a laissée n'est pas effacée par
-/// celle-ci. Une écriture qui échoue est sans conséquence : la disposition
-/// repartira automatiquement.
+/// celle-ci, non plus que les réglages que cette écriture-ci ne touche pas.
+/// Une écriture qui échoue est sans conséquence : la disposition repartira
+/// automatiquement.
 ///
 /// Bloquante : à n'appeler que depuis une tâche, jamais depuis `update`.
 pub fn ecrire(patchbay: &Positions) -> std::io::Result<()> {
+    let mut preferences = lire();
+    preferences.patchbay = preferences.patchbay.fusion(patchbay);
+    ecrire_tout(&preferences)
+}
+
+/// Retient que l'écran de bienvenue a été vu (M2-13).
+///
+/// Le reste du fichier est conservé, comme pour [`ecrire`]. Une écriture qui
+/// échoue fait revoir l'accueil à la session suivante : c'est désagréable,
+/// jamais grave.
+///
+/// Bloquante : à n'appeler que depuis une tâche, jamais depuis `update`.
+pub fn ecrire_accueil_vu() -> std::io::Result<()> {
+    let mut preferences = lire();
+    preferences.accueil_vu = true;
+    ecrire_tout(&preferences)
+}
+
+/// Écrit le fichier entier.
+fn ecrire_tout(preferences: &Preferences) -> std::io::Result<()> {
     let Some(chemin) = chemin() else {
         return Ok(());
     };
-    let preferences = Preferences {
-        patchbay: lire().patchbay.fusion(patchbay),
-    };
-    let json = serde_json::to_string_pretty(&preferences)
+    let json = serde_json::to_string_pretty(preferences)
         .map_err(|erreur| std::io::Error::new(std::io::ErrorKind::InvalidData, erreur))?;
     if let Some(parent) = chemin.parent() {
         std::fs::create_dir_all(parent)?;
@@ -83,9 +107,15 @@ mod tests {
     fn les_preferences_font_l_aller_retour_json() {
         let mut patchbay = Positions::default();
         patchbay.set("internal:mix", Point::new(24.0, 48.0));
-        let preferences = Preferences { patchbay };
+        let preferences = Preferences {
+            patchbay,
+            accueil_vu: true,
+        };
         let json = serde_json::to_string(&preferences).expect("sérialisation");
-        assert_eq!(json, r#"{"patchbay":{"internal:mix":[24.0,48.0]}}"#);
+        assert_eq!(
+            json,
+            r#"{"patchbay":{"internal:mix":[24.0,48.0]},"accueil_vu":true}"#
+        );
         assert_eq!(
             serde_json::from_str::<Preferences>(&json).expect("désérialisation"),
             preferences
@@ -110,6 +140,10 @@ mod tests {
         assert_eq!(lues.patchbay.get("internal:a"), Some(Point::new(1.0, 2.0)));
         let sans: Preferences = serde_json::from_str("{}").expect("désérialisation");
         assert!(sans.patchbay.is_empty());
+        // Un fichier écrit par une version antérieure n'a pas le drapeau : il
+        // vaut faux, et l'accueil s'affiche une fois.
+        assert!(!sans.accueil_vu);
+        assert!(!lues.accueil_vu);
     }
 
     /// Le chemin est celui de la configuration de Conduit.

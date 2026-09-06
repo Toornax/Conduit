@@ -573,8 +573,13 @@ testée d'abord avec le backend null, puis sur Windows.
   Wayland, X11, `libxkbcommon`, Vulkan, OpenGL fournis par `RPATH`/wrapper.
   *Fait quand* : `nix run .#conduit-gui` démarre sur NixOS et sur une distribution classique
   avec Nix installé.
-- [ ] **M2-13** `feat(gui): messages d'erreur orientés action`
-  Chaque erreur du protocole a un texte utilisateur avec la marche à suivre.
+- [x] **M2-13** `feat(gui): écrans d'état et messages d'erreur orientés action`
+  Chacun des huit `ErrorCode` a son conseil, ajouté après le message du démon, qui reste
+  affiché tel quel et en premier (ADR-006) ; les erreurs locales de la fenêtre — refus de
+  boucle, démon non lancé, rapport non écrit — prennent le même format. Deux écrans d'état
+  remplacent la vue : « démon absent » quand le démon n'a jamais répondu (le texte suit la
+  plateforme : boucle locale sous Windows et macOS, câbles disparus sous Linux, où F-05
+  n'est pas garanti), et l'accueil de premier lancement, affiché une seule fois.
 - [ ] **M2-14** `test(gui): tests hors écran et captures de référence`
 - [ ] **M2-15** `feat(packaging): GUI dans le MSI, raccourci, lancement à la session`
 - [ ] **M2-16** `test: session de test utilisateur`

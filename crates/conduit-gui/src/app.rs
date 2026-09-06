@@ -21,7 +21,7 @@ use crate::ipc::{self, Requester};
 use crate::model::Mirror;
 use crate::preferences::Preferences;
 use crate::shell::{self, Tab};
-use crate::{cables, demarrage, diagnostic, format, patchbay, theme, typo};
+use crate::{cables, demarrage, diagnostic, erreurs, etats, format, patchbay, theme, typo};
 
 /// État de la connexion au démon.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -82,8 +82,8 @@ impl Connection {
 
 /// Notice éphémère affichée sous l'en-tête.
 ///
-/// Le message du démon dit déjà quoi faire (ADR-006) : il est affiché tel
-/// quel, sans reformulation.
+/// Le message du démon est affiché **tel quel et en premier**, complété du
+/// conseil que son code d'erreur mérite (ADR-006, voir [`crate::erreurs`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
     /// Texte affiché.
@@ -160,6 +160,10 @@ pub enum Message {
     /// Fin du délai d'attente du démarrage demandé de ce numéro ; une demande
     /// plus récente n'est pas libérée.
     DemarrageExpire(u32),
+    /// Affiche le chemin du journal du démon dans une notice.
+    Journal,
+    /// L'accueil est acquitté : la fenêtre va sur cet onglet et le retient.
+    AccueilVu(Tab),
     /// Crée un câble stéréo sans nom (`CableAdd`) : le démon le nomme, et
     /// l'utilisateur lui donne ensuite un alias dans sa ligne.
     AddCable,
@@ -214,6 +218,7 @@ pub struct App {
     attente: Option<Attente>,
     rapport: Option<String>,
     generation: u32,
+    accueil_vu: Option<bool>,
     demarrage: bool,
     tentative: u32,
     mode: iced::theme::Mode,
@@ -234,6 +239,7 @@ impl App {
             attente: None,
             rapport: None,
             generation: 0,
+            accueil_vu: None,
             demarrage: false,
             tentative: 0,
             mode: iced::theme::Mode::default(),
@@ -290,6 +296,12 @@ impl App {
     /// Notice affichée sous l'en-tête, s'il y en a une.
     pub fn notice(&self) -> Option<&Notice> {
         self.notice.as_ref()
+    }
+
+    /// Ce que les préférences disent de l'accueil, ou `None` tant qu'elles
+    /// n'ont pas été lues.
+    pub fn accueil_vu(&self) -> Option<bool> {
+        self.accueil_vu
     }
 
     /// Vrai tant qu'un démarrage du démon a été demandé sans qu'on sache
@@ -396,6 +408,28 @@ impl App {
                     self.demarrage = false;
                 }
             }
+            Message::Journal => {
+                // Afficher le chemin, et non ouvrir l'explorateur du système :
+                // voir `i18n::journal_du_demon`.
+                let notice = match demarrage::repertoire_du_journal() {
+                    Some(chemin) => {
+                        Notice::info(i18n::journal_du_demon(&chemin.display().to_string()))
+                    }
+                    None => Notice::erreur(erreurs::locale(
+                        i18n::t(Text::DaemonNoLog),
+                        Text::AdviceDaemonMissing,
+                    )),
+                };
+                self.poser_notice(notice);
+                return self.minuteur();
+            }
+            Message::AccueilVu(tab) => {
+                self.accueil_vu = Some(true);
+                self.tab = tab;
+                // Le drapeau part au disque dans une tâche, comme les
+                // positions du patchbay : `update` ne touche jamais au fichier.
+                return Task::perform(retenir_l_accueil(), |()| Message::PreferencesEcrites);
+            }
             Message::AddCable => {
                 // Le câble naît stéréo et sans nom : le démon le nomme, et
                 // l'alias se saisit ensuite dans la ligne.
@@ -472,7 +506,10 @@ impl App {
             Message::RapportEcrit(resultat) => {
                 let notice = match resultat {
                     Ok(chemin) => Notice::info(i18n::rapport_ecrit(&chemin.display().to_string())),
-                    Err(erreur) => Notice::erreur(i18n::rapport_non_ecrit(&erreur)),
+                    Err(erreur) => Notice::erreur(erreurs::locale(
+                        &i18n::rapport_non_ecrit(&erreur),
+                        Text::AdviceReport,
+                    )),
                 };
                 self.poser_notice(notice);
                 return self.minuteur();
@@ -484,6 +521,9 @@ impl App {
                 if self.patchbay.positions.is_empty() {
                     self.patchbay.positions = preferences.patchbay;
                 }
+                // La première lecture fait foi : un accueil déjà acquitté dans
+                // cette session ne se rouvre pas.
+                self.accueil_vu.get_or_insert(preferences.accueil_vu);
             }
             Message::PreferencesEcrites => {}
             Message::ThemeSysteme(mode) => self.mode = mode,
@@ -500,9 +540,14 @@ impl App {
             patchbay::Effet::Rien => {}
             patchbay::Effet::Enregistrer => return self.enregistrer_preferences(),
             patchbay::Effet::Boucle { depuis, vers } => {
-                self.poser_notice(Notice::erreur(i18n::lien_refuse_boucle(
-                    &self.libelle_noeud(depuis),
-                    &self.libelle_noeud(vers),
+                // Le refus est local (F-12), mais il se lit comme un refus du
+                // démon : même format, même conseil que `ErrorCode::WouldCycle`.
+                self.poser_notice(Notice::erreur(erreurs::locale(
+                    &i18n::lien_refuse_boucle(
+                        &self.libelle_noeud(depuis),
+                        &self.libelle_noeud(vers),
+                    ),
+                    erreurs::conseil(conduit_protocol::ErrorCode::WouldCycle),
                 )));
                 return self.minuteur();
             }
@@ -671,11 +716,12 @@ impl App {
                 ipc::Reponse::Statut(status) => self.mirror.remplace_status(*status),
                 ipc::Reponse::Rapport(texte) => self.rapport = Some(texte),
             },
-            // Le message du démon dit déjà quoi faire (ADR-006).
-            ipc::Event::Failed(message) => {
+            // Le message du démon dit ce qui a échoué ; son code dit quel
+            // conseil l'accompagne (ADR-006, `crate::erreurs`).
+            ipc::Event::Failed(erreur) => {
                 // La commande n'a pas abouti : plus rien n'est attendu.
                 self.attente = None;
-                self.poser_notice(Notice::erreur(message));
+                self.poser_notice(Notice::erreur(erreurs::du_demon(&erreur)));
             }
         }
     }
@@ -756,8 +802,25 @@ impl App {
     /// Fenêtre : la coquille (barre latérale, en-tête, notice) et, dedans, la
     /// vue de l'onglet courant.
     pub fn view(&self) -> Element<'_, Message> {
-        let enabled = self.connection.is_ready();
         let graisse = theme::jetons(&self.theme()).graisse_texte;
+        // Les deux écrans d'état remplacent la vue **et** son en-tête ; la
+        // barre latérale, elle, reste (`crate::etats`).
+        let ecran = etats::ecran(&self.connection, &self.mirror, self.accueil_vu);
+        if let Some(contenu) = match ecran {
+            etats::Ecran::DemonAbsent => Some(etats::demon_absent(graisse, self.demarrage)),
+            etats::Ecran::Accueil => Some(etats::accueil(&self.mirror, graisse)),
+            etats::Ecran::Vue => None,
+        } {
+            return shell::fenetre_d_etat(
+                self.tab,
+                &self.connection,
+                &self.mirror,
+                self.notice.as_ref(),
+                graisse,
+                contenu,
+            );
+        }
+        let enabled = self.connection.is_ready();
         let (mut actions, contenu) = match self.tab {
             Tab::Cables => (
                 vec![shell::action_primaire(
@@ -854,6 +917,17 @@ async fn lire_les_preferences() -> Preferences {
     tokio::task::spawn_blocking(crate::preferences::lire)
         .await
         .unwrap_or_default()
+}
+
+/// Retient que l'accueil a été vu, hors du fil de l'interface.
+///
+/// L'échec n'est pas une erreur d'interface : il fait revoir l'accueil à la
+/// session suivante, ce qui est désagréable et sans gravité.
+async fn retenir_l_accueil() {
+    let ecriture = tokio::task::spawn_blocking(crate::preferences::ecrire_accueil_vu).await;
+    if let Ok(Err(erreur)) = ecriture {
+        tracing::warn!(%erreur, "accueil non retenu");
+    }
 }
 
 /// Écrit le fichier de préférences hors du fil de l'interface.
@@ -1188,19 +1262,41 @@ mod tests {
         );
     }
 
+    /// Une erreur du démon, telle que la couche IPC la transmet.
+    fn refus(code: conduit_protocol::ErrorCode, message: &str) -> ipc::Event {
+        ipc::Event::Failed(conduit_protocol::ProtocolError::new(code, message))
+    }
+
     #[test]
     fn a_refused_command_shows_a_notice_until_the_next_action() {
+        use conduit_protocol::ErrorCode;
+
         let (mut a, mut rx) = connected();
         assert!(a.notice().is_none());
-        a.apply_ipc(ipc::Event::Failed(
-            "limite de 8 câbles atteinte : supprimez un câble".into(),
+        a.apply_ipc(refus(
+            ErrorCode::Cable,
+            "limite de 8 câbles atteinte : supprimez un câble",
         ));
         let notice = a.notice().expect("une commande refusée pose une notice");
         assert!(notice.texte.contains("supprimez un câble"));
+        // Le message du démon vient en premier, le conseil de son code ensuite
+        // (M2-13).
+        assert!(
+            notice
+                .texte
+                .starts_with("limite de 8 câbles atteinte : supprimez un câble"),
+            "{}",
+            notice.texte
+        );
+        assert!(
+            notice.texte.ends_with(i18n::t(Text::AdviceCable)),
+            "{}",
+            notice.texte
+        );
         assert!(notice.erreur, "une commande refusée est une erreur");
         let _ = a.update(Message::NoticeExpiree(a.generation));
         assert!(a.notice().is_none());
-        a.apply_ipc(ipc::Event::Failed("câble inconnu".into()));
+        a.apply_ipc(refus(ErrorCode::NotFound, "câble inconnu"));
         let _ = a.update(Message::AddCable);
         assert!(a.notice().is_none(), "une nouvelle action efface la notice");
         let _ = sent(&mut rx);
@@ -1211,7 +1307,7 @@ mod tests {
     #[test]
     fn a_new_notice_survives_the_previous_timer() {
         let (mut a, _rx) = connected();
-        a.apply_ipc(ipc::Event::Failed("première".into()));
+        a.apply_ipc(refus(conduit_protocol::ErrorCode::Internal, "première"));
         let ancienne = a.generation;
         let _ = a.update(Message::Notice(Notice::info("seconde")));
         assert_eq!(a.notice().unwrap().texte, "seconde");
@@ -1288,6 +1384,7 @@ mod tests {
         positions.set("internal:a", iced::Point::new(12.0, 34.0));
         let _ = a.update(Message::Preferences(Box::new(Preferences {
             patchbay: positions,
+            accueil_vu: true,
         })));
         assert_eq!(
             a.patchbay().positions.get("internal:a"),
@@ -1299,6 +1396,7 @@ mod tests {
         tardives.set("internal:a", iced::Point::new(0.0, 0.0));
         let _ = a.update(Message::Preferences(Box::new(Preferences {
             patchbay: tardives,
+            accueil_vu: true,
         })));
         assert_eq!(
             a.patchbay().positions.get("internal:a"),
@@ -1340,9 +1438,19 @@ mod tests {
         let _ = a.update(Message::Patchbay(patchbay::Geste::FinLien));
         assert!(rx.try_recv().is_err(), "le refus n'atteint pas le démon");
         let notice = a.notice().expect("le refus se dit");
-        assert_eq!(
-            notice.texte,
-            "Lien refusé : il créerait une boucle (« a » alimente déjà « b »)."
+        assert!(
+            notice
+                .texte
+                .starts_with("Lien refusé : il créerait une boucle (« a » alimente déjà « b »)."),
+            "{}",
+            notice.texte
+        );
+        // Le conseil de `ErrorCode::WouldCycle` suit, comme pour un refus du
+        // démon (M2-13).
+        assert!(
+            notice.texte.ends_with(i18n::t(Text::AdviceWouldCycle)),
+            "{}",
+            notice.texte
         );
         assert!(notice.erreur, "un refus prend le filet garance");
     }
@@ -1604,11 +1712,20 @@ mod tests {
         );
         assert!(!a.notice().unwrap().erreur);
         let _ = a.update(Message::RapportEcrit(Err("permission refusée".into())));
-        assert_eq!(
-            a.notice().map(|n| n.texte.as_str()),
-            Some("Rapport non écrit : permission refusée")
+        let notice = a.notice().expect("l'échec se dit");
+        assert!(
+            notice
+                .texte
+                .starts_with("Rapport non écrit : permission refusée"),
+            "{}",
+            notice.texte
         );
-        assert!(a.notice().unwrap().erreur);
+        assert!(
+            notice.texte.ends_with(i18n::t(Text::AdviceReport)),
+            "{}",
+            notice.texte
+        );
+        assert!(notice.erreur);
     }
 
     /// Demander le démarrage arme le drapeau, qui grise le bouton ; la
@@ -1677,6 +1794,77 @@ mod tests {
         let _ = a.update(Message::DemonLance(Ok(())));
         assert!(a.demarrage(), "le bouton reste en « Démarrage… »");
         assert!(a.notice().is_none());
+    }
+
+    /// L'accueil ne s'affiche qu'une fois : le bouton et le lien l'acquittent
+    /// tous deux, et emmènent chacun sur sa vue.
+    #[test]
+    fn l_accueil_s_acquitte_une_fois_et_emmene_sur_sa_vue() {
+        let (mut a, _rx) = connected();
+        assert_eq!(a.accueil_vu(), None, "les préférences n'ont rien dit");
+        let _ = a.update(Message::Preferences(Box::default()));
+        assert_eq!(a.accueil_vu(), Some(false));
+        assert_eq!(
+            etats::ecran(a.connection(), a.mirror(), a.accueil_vu()),
+            etats::Ecran::Accueil
+        );
+        let _ = a.update(Message::AccueilVu(Tab::Patchbay));
+        assert_eq!(a.tab(), Tab::Patchbay);
+        assert_eq!(a.accueil_vu(), Some(true));
+        assert_eq!(
+            etats::ecran(a.connection(), a.mirror(), a.accueil_vu()),
+            etats::Ecran::Vue
+        );
+        // Une relecture tardive des préférences ne rouvre pas l'accueil.
+        let _ = a.update(Message::Preferences(Box::default()));
+        assert_eq!(a.accueil_vu(), Some(true));
+    }
+
+    /// « Ouvrir le journal » dit le chemin dans une notice ; il n'ouvre rien.
+    #[test]
+    fn le_lien_du_journal_dit_le_chemin() {
+        let (mut a, mut rx) = connected();
+        let _ = a.update(Message::Journal);
+        let notice = a.notice().expect("le lien pose une notice");
+        assert!(rx.try_recv().is_err(), "le démon n'a rien à voir là-dedans");
+        match demarrage::repertoire_du_journal() {
+            Some(chemin) => {
+                assert!(!notice.erreur);
+                assert!(
+                    notice.texte.contains(&chemin.display().to_string()),
+                    "{}",
+                    notice.texte
+                );
+            }
+            None => assert!(notice.erreur),
+        }
+    }
+
+    /// Le refus de boucle est local (F-12) et se lit pourtant comme un refus
+    /// du démon : même conseil que `ErrorCode::WouldCycle`.
+    #[test]
+    fn un_refus_local_porte_le_meme_conseil_qu_un_refus_du_demon() {
+        use conduit_core::graph::{Direction, PortId};
+        use conduit_protocol::ErrorCode;
+
+        let (mut a, _rx) = connected();
+        let src = PortId::new(NodeId::new(1, 0), Direction::Output, 0);
+        let dst = PortId::new(NodeId::new(0, 0), Direction::Input, 0);
+        let _ = a.update(Message::Patchbay(patchbay::Geste::DebutLien(src)));
+        let _ = a.update(Message::Patchbay(patchbay::Geste::SurvolPort(Some(dst))));
+        let _ = a.update(Message::Patchbay(patchbay::Geste::FinLien));
+        let locale = a.notice().expect("le refus se dit").texte.clone();
+        assert!(
+            locale.ends_with(i18n::t(erreurs::conseil(ErrorCode::WouldCycle))),
+            "{locale}"
+        );
+        // Le même refus, venu du démon, se termine sur le même conseil.
+        a.apply_ipc(refus(ErrorCode::WouldCycle, "le lien créerait une boucle"));
+        let distante = a.notice().expect("le refus du démon se dit").texte.clone();
+        assert!(
+            distante.ends_with(i18n::t(erreurs::conseil(ErrorCode::WouldCycle))),
+            "{distante}"
+        );
     }
 
     #[test]

@@ -19,6 +19,7 @@
 //! d'environnement `ICED_TEST_BACKEND`.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use conduit_backend::{CableId, CableInfo, DeviceDirection, DeviceId, DeviceInfo};
 use conduit_core::graph::{Direction, LinkId, LinkInfo, NodeId, PortId};
@@ -34,6 +35,7 @@ use conduit_gui::app::{App, Message};
 use conduit_gui::ipc;
 use conduit_gui::model::Snapshot;
 use conduit_gui::patchbay::Geste;
+use conduit_gui::preferences::Preferences;
 use conduit_gui::shell::Tab;
 use conduit_gui::{theme, typo};
 
@@ -236,13 +238,21 @@ fn chargement() -> Snapshot {
 /// `messages` amène l'application dans l'état à regarder — une confirmation
 /// de suppression ouverte, par exemple.
 fn rendre(nom: &str, onglet: Tab, theme: &iced::Theme, messages: Vec<Message>) {
+    rendre_avec(nom, onglet, theme, true, messages);
+}
+
+/// Comme [`rendre`], mais `charge` à faux laisse l'application sans miroir :
+/// le démon n'a jamais répondu, et c'est l'écran d'état qui s'affiche.
+fn rendre_avec(nom: &str, onglet: Tab, theme: &iced::Theme, charge: bool, messages: Vec<Message>) {
     let mut app = App::new(PathBuf::from("/tmp/conduitd.sock"));
     let (requester, _commandes) = ipc::Requester::channel(8);
     app.apply_ipc(ipc::Event::Started(requester));
-    app.apply_ipc(ipc::Event::Ready {
-        server: "conduitd 0.1.0".into(),
-        snapshot: Box::new(chargement()),
-    });
+    if charge {
+        app.apply_ipc(ipc::Event::Ready {
+            server: "conduitd 0.1.0".into(),
+            snapshot: Box::new(chargement()),
+        });
+    }
     let _ = app.update(Message::Tab(onglet));
     for message in messages {
         let _ = app.update(message);
@@ -305,4 +315,26 @@ fn apercus_des_vues() {
         &theme::sombre(),
         selection(),
     );
+    // L'écran « démon absent » : aucun `Ready`, une connexion perdue. Le
+    // contenu et l'en-tête disparaissent, la barre latérale reste avec sa
+    // pastille garance.
+    let perdu = || {
+        vec![Message::Ipc(ipc::Event::Lost {
+            reason: "connexion perdue".into(),
+            retry_in: Duration::from_secs(2),
+        })]
+    };
+    rendre_avec("demon-absent", Tab::Cables, &theme::clair(), false, perdu());
+    rendre_avec(
+        "demon-absent-sombre",
+        Tab::Cables,
+        &theme::sombre(),
+        false,
+        perdu(),
+    );
+    // L'écran de premier lancement : miroir chargé, et des préférences qui
+    // disent que l'accueil n'a jamais été acquitté.
+    let premier = || vec![Message::Preferences(Box::<Preferences>::default())];
+    rendre("accueil", Tab::Cables, &theme::clair(), premier());
+    rendre("accueil-sombre", Tab::Cables, &theme::sombre(), premier());
 }

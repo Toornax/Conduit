@@ -12,7 +12,7 @@ use conduit_backend::{CableId, CableSpec};
 use conduit_core::types::ChannelCount;
 use conduit_gui::ipc::{self, Event, Requester};
 use conduit_gui::model::Mirror;
-use conduit_protocol::{Command, Notification};
+use conduit_protocol::{Command, ErrorCode, Notification};
 use conduitd::config::Config;
 use conduitd::{Daemon, DaemonOptions};
 use tokio::sync::mpsc;
@@ -160,17 +160,20 @@ async fn a_refused_command_is_reported_without_breaking_the_session() {
 
     // Câble inexistant : le démon refuse, la session continue.
     requester.send(Command::CableRemove { id: CableId(42) });
-    let message = loop {
+    let erreur = loop {
         match next(&mut rx).await {
-            Event::Failed(message) => break message,
+            Event::Failed(erreur) => break erreur,
             Event::Notified(n) => mirror.apply(&n),
             other => panic!("événement inattendu : {other:?}"),
         }
     };
     assert!(
-        !message.is_empty(),
+        !erreur.message.is_empty(),
         "le message d'erreur doit être affichable"
     );
+    // Le code voyage avec le message : c'est lui qui choisit le conseil
+    // affiché en notice (`conduit_gui::erreurs`).
+    assert_eq!(erreur.code, ErrorCode::Cable, "{erreur:?}");
 
     // La session répond toujours : un ajout aboutit ensuite.
     requester.send(Command::CableAdd {

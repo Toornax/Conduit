@@ -272,7 +272,40 @@ pub(crate) fn fenetre<'a>(
         page = page.push(space::vertical().height(ESPACE_L));
     }
     page = page.push(contenu);
+    cadre(onglet, connexion, mirror, page.into())
+}
 
+/// La fenêtre d'un écran d'état ([`crate::etats`]) : la barre latérale, et à
+/// la place du contenu habituel, l'écran centré dans la page.
+///
+/// **Ni en-tête, ni vue** : ces écrans-là parlent seuls. La notice, en
+/// revanche, reste — c'est elle qui porte, par exemple, le chemin du journal
+/// que l'écran « démon absent » sait afficher.
+pub(crate) fn fenetre_d_etat<'a>(
+    onglet: Tab,
+    connexion: &Connection,
+    mirror: &Mirror,
+    notice: Option<&'a Notice>,
+    graisse: Weight,
+    contenu: Element<'a, Message>,
+) -> Element<'a, Message> {
+    let mut page = column![].width(Fill).height(Fill);
+    if let Some(notice) = notice {
+        page = page.push(bandeau(notice, graisse));
+        page = page.push(space::vertical().height(ESPACE_L));
+    }
+    page = page.push(container(contenu).center(Fill));
+    cadre(onglet, connexion, mirror, page.into())
+}
+
+/// Le décor commun aux deux fenêtres : barre latérale, filet de séparation, et
+/// la page à droite.
+fn cadre<'a>(
+    onglet: Tab,
+    connexion: &Connection,
+    mirror: &Mirror,
+    page: Element<'a, Message>,
+) -> Element<'a, Message> {
     // La rangée porte la hauteur : sans elle, la barre latérale et son filet
     // de séparation se réduiraient à la hauteur de leur contenu.
     container(

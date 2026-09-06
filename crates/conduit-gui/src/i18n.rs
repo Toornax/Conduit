@@ -53,6 +53,19 @@ textes! {
     Waiting => "conn.waiting", "En attente du démon…";
 
     BrandTagline => "brand.tagline", "Câble audio virtuel";
+    DaemonGone => "state.daemon.over", "Démon arrêté";
+    DaemonGoneTitle => "state.daemon.title", "Le démon conduitd ne répond pas.";
+    DaemonGoneDriver => "state.daemon.driver",
+        "Vos câbles, eux, continuent de fonctionner en boucle locale : ce qui entre dans leur sortie ressort dans leur entrée, car c'est le pilote qui les tient, pas le démon. Le routage vers votre carte son, les gains et les VU-mètres sont suspendus jusqu'à son redémarrage.";
+    DaemonGoneLinux => "state.daemon.linux",
+        "Vos câbles disparaissent avec lui : ce sont des nœuds PipeWire que le démon crée, et rien ne les tient en son absence. Ils reviendront à son redémarrage, avec le routage, les gains et les VU-mètres.";
+    OpenLog => "state.daemon.log", "Ouvrir le journal";
+    DaemonNoLog => "state.daemon.log.nowhere",
+        "Aucun répertoire de données : le démon n'a nulle part où écrire son journal.";
+    WelcomeOver => "state.welcome.over", "Installation terminée";
+    WelcomeTitle => "state.welcome.title", "Bienvenue dans Conduit.";
+    WelcomeStart => "state.welcome.start", "Commencer";
+    WelcomePatchbay => "state.welcome.patchbay", "Ouvrir le patchbay";
     DaemonRunning => "daemon.running", "conduitd en marche";
     DaemonStarting => "daemon.starting", "conduitd démarre…";
     DaemonStopped => "daemon.stopped", "conduitd arrêté";
@@ -172,6 +185,32 @@ textes! {
     NoXrun => "diag.xrun.none", "aucun xrun";
     Inconnu => "num.unknown", "—";
     Separateur => "ui.separator", "·";
+
+    // Les conseils qui complètent un message d'erreur (voir `crate::erreurs`).
+    // Le message du démon dit ce qui a échoué ; le conseil dit quoi faire
+    // ensuite (ADR-006).
+    AdviceNotFound => "error.advice.notfound",
+        "Le graphe a changé depuis l'affichage : laissez la vue se remettre à jour, puis recommencez.";
+    AdviceWouldCycle => "error.advice.wouldcycle",
+        "Supprimez d'abord un lien du chemin de retour, puis refaites celui-ci.";
+    AdviceInvalid => "error.advice.invalid",
+        "Un lien va d'une sortie vers une entrée, et une seule fois : vérifiez ses deux extrémités.";
+    AdviceDevice => "error.advice.device",
+        "Vérifiez que le périphérique est branché et qu'aucune autre application ne le monopolise ; la vue Diagnostic dit lesquels sont ouverts.";
+    AdviceCable => "error.advice.cable",
+        "Supprimez un câble devenu inutile, et vérifiez que le pilote Conduit est installé.";
+    AdviceBusy => "error.advice.busy",
+        "Le moteur est occupé : attendez un instant, puis réessayez.";
+    AdviceUnsupported => "error.advice.unsupported",
+        "Ce démon ne sait pas faire cela : mettez Conduit à jour, la GUI et le démon ensemble.";
+    AdviceInternal => "error.advice.internal",
+        "Consultez le journal du démon ; si cela se reproduit, exportez un rapport depuis la vue Diagnostic.";
+    AdviceDaemonMissing => "error.advice.daemon.missing",
+        "Réinstallez Conduit, ou lancez « conduitd » vous-même dans un terminal.";
+    AdviceDaemonRefused => "error.advice.daemon.refused",
+        "Consultez le journal du démon, puis réessayez.";
+    AdviceReport => "error.advice.report",
+        "Vérifiez les droits d'écriture du dossier, puis réessayez.";
 
     Remove => "action.remove", "Supprimer";
     RemoveIcon => "action.remove.icon", "×";
@@ -356,6 +395,65 @@ pub fn cycle_note(min: &str, max: &str, budget: &str) -> String {
 /// retrouver le fichier, l'interface n'ouvrant aucun explorateur.
 pub fn rapport_ecrit(chemin: &str) -> String {
     format!("Rapport écrit dans {chemin}")
+}
+
+/// Le paragraphe d'accueil, accordé au compte réel de câbles du miroir.
+///
+/// Le démon en crée deux par défaut (ADR-006 : « ça marche à l'installation »),
+/// mais la phrase ne l'affirme pas : elle dit ce que le miroir montre.
+pub fn accueil_cables(count: usize) -> String {
+    match count {
+        0 => "Aucun câble n'existe pour l'instant. « Ajouter un câble », dans la vue Câbles, \
+              en crée un : il apparaît aussitôt dans les réglages audio du système."
+            .to_string(),
+        1 => "Un câble a été créé. Il apparaît déjà comme sortie et comme entrée dans les \
+              réglages audio du système : il n'y a rien à configurer."
+            .to_string(),
+        n => format!(
+            "{n} câbles ont été créés. Ils apparaissent déjà comme sorties et comme entrées \
+             dans les réglages audio du système : il n'y a rien à configurer."
+        ),
+    }
+}
+
+/// La troisième ligne de contrôle de l'accueil : « 2 câbles · 48 kHz ·
+/// quantum 256 ».
+///
+/// La fréquence et le quantum arrivent déjà mis en forme (voir
+/// [`crate::format`]).
+pub fn accueil_reglages(cables: usize, frequence: &str, quantum: &str) -> String {
+    let quantum = format!("{} {quantum}", t(Text::Quantum));
+    juxtapose(&juxtapose(&cables_count(cables), frequence), &quantum)
+}
+
+/// « Journal du démon : /home/lea/.local/share/conduit/logs — un fichier
+/// conduitd.log par jour. »
+///
+/// La notice **dit le chemin** plutôt que d'ouvrir l'explorateur du système :
+/// ouvrir un fichier demanderait une dépendance de plus pour un geste que
+/// l'utilisateur fait très bien lui-même.
+pub fn journal_du_demon(chemin: &str) -> String {
+    format!("Journal du démon : {chemin} — un fichier conduitd.log par jour.")
+}
+
+/// Un message d'erreur suivi de son conseil : « nœud inconnu : 3 — Le graphe a
+/// changé depuis l'affichage… ».
+///
+/// Le message reste **tel quel et en premier** (ADR-006, ADR-010) : c'est lui
+/// qui connaît le détail, et il vient de qui l'a constaté. Le conseil suit,
+/// séparé par un tiret cadratin — ou par une simple espace quand le message se
+/// termine déjà par une ponctuation forte, deux phrases n'ayant pas besoin
+/// d'un tiret pour se suivre. Un message vide laisse le conseil seul.
+pub fn erreur_conseillee(message: &str, conseil: &str) -> String {
+    let message = message.trim_end();
+    if message.is_empty() {
+        return conseil.to_string();
+    }
+    if message.ends_with(['.', '!', '?', '…']) {
+        format!("{message} {conseil}")
+    } else {
+        format!("{message} — {conseil}")
+    }
 }
 
 /// « Démon non lancé : permission refusée »

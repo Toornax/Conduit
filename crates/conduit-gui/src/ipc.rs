@@ -14,7 +14,7 @@
 //! 3. connexion, `Subscribe` puis chargement initial, et [`Event::Ready`] ;
 //! 4. [`Event::Notified`] pour chaque notification du démon,
 //!    [`Event::Repondu`] pour ce qu'une commande a rapporté et
-//!    [`Event::Failed`] pour chaque commande refusée ;
+//!    [`Event::Failed`] pour chaque commande refusée, code d'erreur compris ;
 //! 5. à la perte de la connexion, [`Event::Lost`] puis nouvelle tentative
 //!    après un délai croissant de [`RETRY_MIN`] à [`RETRY_MAX`].
 
@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use conduit_protocol::client::{Client, ClientError};
 use conduit_protocol::{
-    Command, EngineStatus, LinkDescriptor, NodeDescriptor, Notification, Reply,
+    Command, EngineStatus, LinkDescriptor, NodeDescriptor, Notification, ProtocolError, Reply,
 };
 use tokio::sync::mpsc;
 
@@ -132,8 +132,13 @@ pub enum Event {
     /// démon a rédigé : il n'a rien à voir avec le miroir, il part vers un
     /// fichier.
     Repondu(Box<Reponse>),
-    /// Une commande a été refusée : message destiné à l'utilisateur.
-    Failed(String),
+    /// Une commande a été refusée.
+    ///
+    /// L'erreur est transmise **entière** — code et message : le message dit
+    /// ce qui a échoué, et le code dit quel conseil l'accompagne
+    /// (`crate::erreurs`). Ne garder que le message priverait l'interface de
+    /// la seule chose qui se raisonne à la machine.
+    Failed(ProtocolError),
     /// Connexion perdue ou impossible.
     Lost {
         /// Cause, telle qu'affichée à l'utilisateur.
@@ -308,7 +313,7 @@ async fn session<S: EventSink>(
             Step::Command(None) => return Ok(()),
             Step::Command(Some(command)) => match client.request(command).await? {
                 Err(error) => {
-                    if sink.send(Event::Failed(error.message)).await.is_err() {
+                    if sink.send(Event::Failed(error)).await.is_err() {
                         return Ok(());
                     }
                 }
