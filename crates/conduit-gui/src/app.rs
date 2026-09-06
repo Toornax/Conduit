@@ -277,8 +277,16 @@ impl App {
     /// arrivera par notification, ou par une nouvelle notice.
     fn request(&mut self, command: Command) {
         self.notice = None;
+        // Un réglage de gain ou de coupure ne produit aucune notification : le
+        // protocole y répond `Reply::Ok` et rien d'autre. Plutôt que de
+        // supposer localement le résultat, on redemande derrière l'état réel,
+        // dont la réponse revient en `ipc::Event::Relu`.
+        let relecture = relecture_apres(&command);
         if let Some(requester) = &self.requester {
             requester.send(command);
+            if let Some(relecture) = relecture {
+                requester.send(relecture);
+            }
         }
     }
 
@@ -553,6 +561,19 @@ impl App {
                     self.poser_notice(notice);
                 }
             }
+            // Une relecture demandée après un réglage de gain : le démon vient
+            // de dire l'état réel, la valeur montrée en avance n'a plus lieu
+            // d'être.
+            ipc::Event::Relu(relecture) => match *relecture {
+                ipc::Relecture::Nodes(nodes) => {
+                    self.mirror.remplace_nodes(nodes);
+                    self.patchbay.relu();
+                }
+                ipc::Relecture::Links(links) => {
+                    self.mirror.remplace_links(links);
+                    self.patchbay.relu();
+                }
+            },
             // Le message du démon dit déjà quoi faire (ADR-006).
             ipc::Event::Failed(message) => {
                 // La commande n'a pas abouti : plus rien n'est attendu.
@@ -721,6 +742,19 @@ async fn ecrire_les_preferences(positions: patchbay::Positions) {
     }
 }
 
+/// La relecture d'état à envoyer derrière une commande, s'il en faut une.
+///
+/// Seuls les réglages de gain et de coupure en demandent une : le protocole ne
+/// diffuse aucune notification pour eux, alors que toutes les autres commandes
+/// de l'interface se reflètent dans une `Notification`.
+fn relecture_apres(commande: &Command) -> Option<Command> {
+    match commande {
+        Command::SetNodeGain { .. } => Some(Command::Nodes),
+        Command::SetLinkGain { .. } => Some(Command::Links),
+        _ => None,
+    }
+}
+
 /// Puits d'événements de la `Subscription` d'`iced`.
 impl ipc::EventSink for iced::futures::channel::mpsc::Sender<ipc::Event> {
     async fn send(&mut self, event: ipc::Event) -> Result<(), ipc::Closed> {
@@ -781,6 +815,15 @@ mod tests {
         let command = rx.try_recv().expect("aucune commande émise");
         assert!(rx.try_recv().is_err(), "une seule commande attendue");
         command
+    }
+
+    /// Le réglage émis et la relecture qui le suit, en échouant s'il n'y a pas
+    /// exactement ces deux commandes.
+    fn sent_avec_relecture(rx: &mut mpsc::Receiver<Command>) -> (Command, Command) {
+        let reglage = rx.try_recv().expect("aucune commande émise");
+        let relecture = rx.try_recv().expect("aucune relecture émise");
+        assert!(rx.try_recv().is_err(), "deux commandes attendues");
+        (reglage, relecture)
     }
 
     #[test]
@@ -1218,21 +1261,30 @@ mod tests {
         assert_eq!(a.mirror().nodes[0].gain_db, Db::UNITY);
 
         let _ = a.update(Message::Patchbay(patchbay::Geste::FinGain(cible)));
+        let (reglage, relecture) = sent_avec_relecture(&mut rx);
         assert_eq!(
-            sent(&mut rx),
+            reglage,
             Command::SetNodeGain {
                 node: NodeId::new(0, 0),
                 gain_db: Some(Db::new(-18.0)),
                 muted: None,
             }
         );
+        // Le protocole ne notifie pas les gains : l'interface redemande.
+        assert_eq!(relecture, Command::Nodes);
         assert!(a.notice().is_none(), "un réglage de gain ne se raconte pas");
 
-        // La notification rend la main au miroir.
-        let _ = a.update(Message::Ipc(ipc::Event::Notified(Box::new(
-            Notification::NodeAdded(crate::model::fixtures::node(0, "a")),
-        ))));
-        assert_eq!(a.patchbay().gain_affiche(cible, Db::UNITY), Db::UNITY);
+        // La relecture rend la main au miroir.
+        let mut noeud = crate::model::fixtures::node(0, "a");
+        noeud.gain_db = Db::new(-18.0);
+        a.apply_ipc(ipc::Event::Relu(Box::new(ipc::Relecture::Nodes(vec![
+            noeud,
+        ]))));
+        assert_eq!(a.mirror().nodes[0].gain_db, Db::new(-18.0));
+        assert_eq!(
+            a.patchbay().gain_affiche(cible, Db::new(-18.0)),
+            Db::new(-18.0)
+        );
     }
 
     /// La butée basse de la glissière vaut silence : c'est `NEG_INF` qui part,
@@ -1246,14 +1298,16 @@ mod tests {
             patchbay::GAIN_MIN,
         )));
         let _ = a.update(Message::Patchbay(patchbay::Geste::FinGain(cible)));
+        let (reglage, relecture) = sent_avec_relecture(&mut rx);
         assert_eq!(
-            sent(&mut rx),
+            reglage,
             Command::SetLinkGain {
                 link: LinkId::new(0, 0),
                 gain_db: Some(Db::NEG_INF),
                 muted: None,
             }
         );
+        assert_eq!(relecture, Command::Links);
     }
 
     /// Le bouton de coupure envoie l'inverse du miroir, pose sa notice et
@@ -1263,14 +1317,16 @@ mod tests {
         let (mut a, mut rx) = connected();
         let cible = patchbay::Cible::Noeud(NodeId::new(0, 0));
         let _ = a.update(Message::Patchbay(patchbay::Geste::Muet(cible)));
+        let (reglage, relecture) = sent_avec_relecture(&mut rx);
         assert_eq!(
-            sent(&mut rx),
+            reglage,
             Command::SetNodeGain {
                 node: NodeId::new(0, 0),
                 gain_db: None,
                 muted: Some(true),
             }
         );
+        assert_eq!(relecture, Command::Nodes);
         assert_eq!(
             a.notice().map(|n| n.texte.as_str()),
             Some("« a » coupé : plus aucun son n'en sort.")
@@ -1283,8 +1339,10 @@ mod tests {
         let _ = a.update(Message::Patchbay(patchbay::Geste::Muet(
             patchbay::Cible::Lien(LinkId::new(0, 0)),
         )));
+        let (reglage, relecture) = sent_avec_relecture(&mut rx);
+        assert_eq!(relecture, Command::Links);
         assert_eq!(
-            sent(&mut rx),
+            reglage,
             Command::SetLinkGain {
                 link: LinkId::new(0, 0),
                 gain_db: None,

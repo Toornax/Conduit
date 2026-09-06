@@ -80,6 +80,21 @@ impl Mirror {
         self.links.iter().find(|l| l.link.id == id)
     }
 
+    /// Remplace les nœuds par ce que le démon vient de décrire.
+    ///
+    /// Sert aux relectures ([`crate::ipc::Relecture`]) : le protocole ne
+    /// diffuse aucune notification pour un changement de gain ou de coupure,
+    /// l'interface redemande donc la liste plutôt que de supposer le résultat.
+    pub fn remplace_nodes(&mut self, nodes: Vec<NodeDescriptor>) {
+        self.nodes = nodes;
+    }
+
+    /// Remplace les liens par ce que le démon vient de décrire. Même raison que
+    /// [`Mirror::remplace_nodes`].
+    pub fn remplace_links(&mut self, links: Vec<LinkDescriptor>) {
+        self.links = links;
+    }
+
     /// Réduit une notification dans l'état. Pure : aucune entrée/sortie, et
     /// idempotente pour les ajouts (le démon peut rediffuser un état déjà
     /// contenu dans le chargement initial).

@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use conduit_protocol::client::{Client, ClientError};
-use conduit_protocol::{Command, Notification, Reply};
+use conduit_protocol::{Command, LinkDescriptor, NodeDescriptor, Notification, Reply};
 use tokio::sync::mpsc;
 
 use crate::model::Snapshot;
@@ -112,6 +112,15 @@ pub enum Event {
     },
     /// Notification diffusée par le démon.
     Notified(Box<Notification>),
+    /// Réponse à une relecture d'état demandée par l'interface.
+    ///
+    /// Le protocole ne diffuse **aucune** notification pour un changement de
+    /// gain ou de coupure (`Command::SetNodeGain` et `SetLinkGain` répondent
+    /// `Reply::Ok` et rien d'autre). Plutôt que de supposer localement le
+    /// résultat, l'interface renvoie un `Nodes` ou un `Links` derrière le
+    /// réglage et remplace la partie correspondante du miroir par ce que le
+    /// démon vient de dire.
+    Relu(Box<Relecture>),
     /// Une commande a été refusée : message destiné à l'utilisateur.
     Failed(String),
     /// Connexion perdue ou impossible.
@@ -121,6 +130,15 @@ pub enum Event {
         /// Délai avant la tentative suivante.
         retry_in: Duration,
     },
+}
+
+/// Ce qu'une relecture d'état a rapporté.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Relecture {
+    /// Les nœuds du graphe, tels que le démon les décrit maintenant.
+    Nodes(Vec<NodeDescriptor>),
+    /// Les liens du graphe, tels que le démon les décrit maintenant.
+    Links(Vec<LinkDescriptor>),
 }
 
 /// Puits d'événements : abstrait le canal de la `Subscription` d'`iced`, ce qui
@@ -211,6 +229,15 @@ pub async fn load(client: &mut Client) -> Result<Snapshot, ClientError> {
     })
 }
 
+/// Traduit une réponse en relecture d'état, s'il y en a une à en tirer.
+fn relecture(reply: Reply) -> Option<Relecture> {
+    match reply {
+        Reply::Nodes { nodes } => Some(Relecture::Nodes(nodes)),
+        Reply::Links { links } => Some(Relecture::Links(links)),
+        _ => None,
+    }
+}
+
 /// Ce qui a réveillé la boucle d'une session.
 enum Step {
     /// Une commande à envoyer, ou `None` si la file est fermée.
@@ -255,13 +282,23 @@ async fn session<S: EventSink>(
         };
         match step {
             Step::Command(None) => return Ok(()),
-            Step::Command(Some(command)) => {
-                if let Err(error) = client.request(command).await? {
+            Step::Command(Some(command)) => match client.request(command).await? {
+                Err(error) => {
                     if sink.send(Event::Failed(error.message)).await.is_err() {
                         return Ok(());
                     }
                 }
-            }
+                // Seules les relectures demandées par l'interface rapportent
+                // quelque chose : les autres réponses sont des accusés de
+                // réception, l'état venant des notifications.
+                Ok(reply) => {
+                    if let Some(relecture) = relecture(reply) {
+                        if sink.send(Event::Relu(Box::new(relecture))).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+            },
             Step::Event(event) => {
                 if sink.send(Event::Notified(Box::new(event?))).await.is_err() {
                     return Ok(());
@@ -274,6 +311,27 @@ async fn session<S: EventSink>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Seules les réponses d'une relecture rapportent un état ; les autres
+    /// sont des accusés de réception.
+    #[test]
+    fn seules_les_listes_valent_relecture() {
+        assert_eq!(
+            relecture(Reply::Nodes { nodes: vec![] }),
+            Some(Relecture::Nodes(vec![]))
+        );
+        assert_eq!(
+            relecture(Reply::Links { links: vec![] }),
+            Some(Relecture::Links(vec![]))
+        );
+        assert_eq!(relecture(Reply::Ok), None);
+        assert_eq!(
+            relecture(Reply::Dump {
+                text: "état".into()
+            }),
+            None
+        );
+    }
 
     #[test]
     fn backoff_grows_from_one_to_five_seconds() {

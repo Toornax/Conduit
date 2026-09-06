@@ -70,9 +70,14 @@
 //! notification, et ce n'en est pas pour autant une anticipation du résultat :
 //! ce qui s'affiche est la **position du doigt**, pas l'état du démon. La
 //! distinction se voit dans le code — [`State::glissement`] ne touche jamais au
-//! miroir — et dans le comportement : dès qu'une notification concernant la
-//! cible arrive ([`State::notifie`]), la valeur locale est jetée et l'affichage
-//! retombe sur le miroir.
+//! miroir — et dans le comportement : dès que le démon a parlé, la valeur
+//! locale est jetée et l'affichage retombe sur le miroir.
+//!
+//! Le démon parle ici par une **relecture** et non par une notification : le
+//! protocole n'en diffuse aucune pour un gain ou une coupure. L'interface
+//! renvoie donc un `Nodes` ou un `Links` derrière chaque réglage et remplace la
+//! partie correspondante du miroir ([`State::relu`], [`crate::ipc::Relecture`])
+//! — plutôt que de supposer localement ce que le démon a fait.
 //!
 //! La **butée basse** de la glissière ([`GAIN_MIN`], −60 dB) n'est pas un gain
 //! de −60 dB : c'est un silence, et c'est [`Db::NEG_INF`] qui part au démon
@@ -928,6 +933,16 @@ impl State {
         if self.glissement.is_some_and(|g| g.cible == cible) {
             self.glissement = None;
         }
+    }
+
+    /// Une relecture est arrivée : le démon vient de dire l'état réel des
+    /// gains, la valeur montrée localement n'a plus lieu d'être.
+    ///
+    /// C'est l'autre façon de refermer la parenthèse d'état local, et la seule
+    /// qui vaille pour un gain : le protocole ne diffuse aucune notification
+    /// quand un gain ou une coupure change (voir [`crate::ipc::Relecture`]).
+    pub fn relu(&mut self) {
+        self.glissement = None;
     }
 
     /// Oublie tout réglage local : le miroir vient d'être rechargé.
