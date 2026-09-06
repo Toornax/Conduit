@@ -136,19 +136,43 @@ fn chargement() -> Snapshot {
             cycles: 0,
         },
         // Représentatif de ce qu'une carte peut être : les cinq étiquettes,
-        // les trois colonnes de rôle, un nœud sans entrée et un sans sortie.
+        // les trois colonnes de rôle, un nœud sans entrée et un sans sortie —
+        // et, pour le pied de gain, un gain positif, un gain négatif, un nœud
+        // au silence, un nœud coupé et un nœud suspendu, dont les réglages
+        // sont désactivés.
         nodes: vec![
-            noeud(0, "Lecteur de musique", 0, 2),
+            NodeDescriptor {
+                gain_db: Db::new(3.0),
+                ..noeud(0, "Lecteur de musique", 0, 2)
+            },
             peripherique(1, "Micro USB", 0, 1, NodeState::Active, None),
-            peripherique(2, "Conduit 1", 2, 2, NodeState::Active, Some(1)),
-            peripherique(3, "Conduit 2", 1, 1, NodeState::Active, Some(2)),
-            noeud(4, "Visioconférence", 2, 2),
+            NodeDescriptor {
+                gain_db: Db::new(-6.0),
+                ..peripherique(2, "Conduit 1", 2, 2, NodeState::Active, Some(1))
+            },
+            NodeDescriptor {
+                muted: true,
+                ..peripherique(3, "Conduit 2", 1, 1, NodeState::Active, Some(2))
+            },
+            NodeDescriptor {
+                gain_db: Db::NEG_INF,
+                ..noeud(4, "Visioconférence", 2, 2)
+            },
             peripherique(5, "Haut-parleurs", 2, 0, NodeState::Driver, None),
             peripherique(6, "Interface Scarlett", 2, 2, NodeState::Suspended, None),
         ],
         // Les deux trajets que la maquette montre : la musique qui sort par
-        // les haut-parleurs, le micro qui entre en visioconférence.
-        links: vec![lien(0, 0, 2), lien(1, 2, 5), lien(2, 1, 3), lien(3, 3, 4)],
+        // les haut-parleurs, le micro qui entre en visioconférence. Le premier
+        // porte un gain, que l'aperçu « patchbay-lien » montre dans l'en-tête.
+        links: vec![
+            lien(0, 0, 2),
+            LinkDescriptor {
+                gain_db: Db::new(-4.5),
+                ..lien(1, 2, 5)
+            },
+            lien(2, 1, 3),
+            lien(3, 3, 4),
+        ],
         // Représentatif des états qu'une ligne peut prendre : alias donné ou
         // absent, canaux au-delà de la stéréo, câble inactif.
         cables: vec![

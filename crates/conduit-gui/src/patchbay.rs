@@ -1,11 +1,12 @@
 //! Vue « Patchbay » : le graphe du démon en cartes déplaçables et en liens
-//! (M2-04, M2-05).
+//! (M2-04, M2-05, M2-06).
 //!
 //! Un nœud du graphe est une **carte** : son libellé et une étiquette d'état
 //! en en-tête, puis ses ports — les entrées à gauche, les sorties à droite,
-//! chacun marqué d'une pastille d'or posée à cheval sur le bord de la carte.
-//! Un lien est une **courbe d'or** tirée d'une pastille de sortie à une
-//! pastille d'entrée. Les **gains** arrivent au commit suivant (M2-06).
+//! chacun marqué d'une pastille d'or posée à cheval sur le bord de la carte —,
+//! et enfin son **pied** : la glissière de gain, le libellé en décibels et le
+//! bouton de coupure (F-13). Un lien est une **courbe d'or** tirée d'une
+//! pastille de sortie à une pastille d'entrée.
 //!
 //! # Une scène hybride : un canevas dessous, de vraies cartes dessus
 //!
@@ -16,8 +17,8 @@
 //! habituellement les patchbays —, mais il ne sait rien faire d'autre : pas de
 //! focus clavier, pas de bouton, pas d'infobulle, et un rendu de texte qui
 //! n'est pas celui du reste de la fenêtre. Les cartes sont donc de vrais
-//! widgets, avec les vraies polices, le vrai thème et, demain, la vraie
-//! glissière de gain de M2-06.
+//! widgets, avec les vraies polices, le vrai thème et la vraie glissière de
+//! gain du pied.
 //!
 //! Le canevas, lui, garde ce que les widgets ne savent pas faire : dessiner
 //! des courbes entre deux points quelconques et suivre le curseur pendant un
@@ -56,6 +57,36 @@
 //! et refuser n'est pas anticiper. Le démon reste l'autorité : s'il refuse à
 //! son tour, c'est sa phrase qui s'affiche.
 //!
+//! # Le gain : une commande au relâchement, une valeur montrée pendant le
+//! geste
+//!
+//! Une glissière d'`iced` émet un message **par pixel parcouru**. Envoyer
+//! `SetNodeGain` à chaque message inonderait le démon d'une centaine de
+//! commandes pour un seul geste : la commande ne part donc qu'au relâchement
+//! ([`Slider::on_release`]), et la valeur parcourue est retenue le temps du
+//! geste dans [`State::glissement`].
+//!
+//! C'est le **seul** endroit de la GUI où un état local devance la
+//! notification, et ce n'en est pas pour autant une anticipation du résultat :
+//! ce qui s'affiche est la **position du doigt**, pas l'état du démon. La
+//! distinction se voit dans le code — [`State::glissement`] ne touche jamais au
+//! miroir — et dans le comportement : dès qu'une notification concernant la
+//! cible arrive ([`State::notifie`]), la valeur locale est jetée et l'affichage
+//! retombe sur le miroir.
+//!
+//! La **butée basse** de la glissière ([`GAIN_MIN`], −60 dB) n'est pas un gain
+//! de −60 dB : c'est un silence, et c'est [`Db::NEG_INF`] qui part au démon
+//! (voir [`gain_de_position`]).
+//!
+//! Le bouton de coupure, lui, n'a pas ce problème — un clic, une commande — et
+//! **n'anticipe rien** : l'état coupé qu'il dessine est celui du miroir.
+//!
+//! Aucune notice n'accompagne un réglage de gain : le geste est continu, une
+//! phrase par mouvement serait du bruit. La coupure, elle, en mérite une (voir
+//! [`crate::app`]).
+//!
+//! [`Slider::on_release`]: iced::widget::Slider::on_release
+//!
 //! # Le déplacement est un réglage local
 //!
 //! Déplacer une carte ne change rien au graphe : aucune commande n'est
@@ -70,23 +101,28 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use conduit_core::graph::{Direction, LinkId, NodeId, PortId};
+use conduit_core::types::Db;
 use conduit_protocol::api::NodeKey;
-use conduit_protocol::{Command, LinkDescriptor, NodeDescriptor, NodeState};
+use conduit_protocol::{Command, LinkDescriptor, NodeDescriptor, NodeState, Notification};
 use iced::font::Weight;
 use iced::mouse;
 use iced::widget::canvas::{LineCap, LineDash, LineJoin, Path, Stroke};
 use iced::widget::text::{LineHeight, Wrapping};
 use iced::widget::{
-    canvas, column, container, mouse_area, pin, row, rule, scrollable, space, stack, text,
+    button, canvas, column, container, mouse_area, pin, row, rule, scrollable, slider, space,
+    stack, text,
 };
-use iced::{Center, Element, Fill, Padding, Point, Rectangle, Renderer, Size, Theme, Vector};
+use iced::{
+    Center, Color, Element, Fill, Length, Padding, Point, Rectangle, Renderer, Right, Size, Theme,
+    Vector,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::app::Message;
 use crate::i18n::{self, Text};
 use crate::model::Mirror;
-use crate::theme::{jetons, CORPS_INTERFACE, ESPACE_S, FILET};
-use crate::{style, typo};
+use crate::theme::{jetons, Jetons, CORPS_INTERFACE, ESPACE_S, FILET};
+use crate::{format, style, typo};
 
 // --- Mesures de la maquette -------------------------------------------------
 
@@ -117,6 +153,33 @@ const PADDING_PORTS: f32 = 12.0;
 const CORPS_ETIQUETTE: f32 = 10.0;
 /// Corps du nom d'un port.
 const CORPS_PORT: f32 = 11.0;
+/// Corps du libellé en décibels et du bouton de coupure.
+const CORPS_GAIN: f32 = 11.0;
+/// Padding du pied d'une carte : 4 en haut, 10 sur les côtés, 8 en bas.
+const PADDING_PIED: Padding = Padding {
+    top: 4.0,
+    right: 10.0,
+    bottom: 8.0,
+    left: 10.0,
+};
+/// Hauteur des réglages d'un pied : celle du bouton de coupure, le plus haut
+/// des trois.
+const HAUTEUR_REGLAGE: f32 = 22.0;
+/// Hauteur du pied d'une carte, padding compris.
+pub const HAUTEUR_PIED: f32 = PADDING_PIED.top + HAUTEUR_REGLAGE + PADDING_PIED.bottom;
+/// Hauteur de la glissière de gain.
+const HAUTEUR_GLISSIERE: f32 = 18.0;
+/// Largeur du libellé en décibels.
+///
+/// Elle est **fixée** : `tnum` étant inaccessible depuis `iced` (voir
+/// [`crate::typo`]), c'est la largeur de la cellule qui tient la colonne quand
+/// la valeur change.
+const LARGEUR_GAIN: f32 = 44.0;
+/// Largeur du bouton de coupure.
+const LARGEUR_MUET: f32 = 24.0;
+/// Largeur de la glissière du réglage de lien, dans l'en-tête : là, rien ne
+/// dit la place à prendre, il faut donc la donner.
+const LARGEUR_GLISSIERE_ENTETE: f32 = 96.0;
 /// Interligne serré des textes d'une carte : un libellé n'a pas besoin des
 /// 1,6 du texte courant.
 const INTERLIGNE_SERRE: f32 = 1.1;
@@ -224,13 +287,13 @@ pub fn etiquette(noeud: &NodeDescriptor) -> Etiquette {
 
 /// Hauteur d'une carte à `entrees` entrées et `sorties` sorties.
 ///
-/// L'en-tête, son filet, et une grille de ports à deux colonnes : c'est la
-/// plus fournie des deux qui donne le nombre de lignes. Les constantes sont
-/// celles de la composition — un test le vérifie en mesurant une carte
-/// réellement composée.
+/// L'en-tête, son filet, une grille de ports à deux colonnes — c'est la plus
+/// fournie des deux qui donne le nombre de lignes —, un second filet et le
+/// pied de gain. Les constantes sont celles de la composition : un test le
+/// vérifie en mesurant une carte réellement composée.
 pub fn hauteur_carte(entrees: usize, sorties: usize) -> f32 {
     let lignes = entrees.max(sorties) as f32;
-    HAUTEUR_ENTETE + FILET + 2.0 * MARGE_PORTS + lignes * HAUTEUR_PORT
+    HAUTEUR_ENTETE + FILET + 2.0 * MARGE_PORTS + lignes * HAUTEUR_PORT + FILET + HAUTEUR_PIED
 }
 
 /// Où et sur quelle hauteur une carte est posée, dans le repère de la scène.
@@ -374,6 +437,116 @@ pub fn etendue(placements: &[Placement]) -> Size {
         hauteur = hauteur.max(p.position.y + p.hauteur + MARGE_SCENE);
     }
     Size::new(largeur, hauteur)
+}
+
+// --- Gains ------------------------------------------------------------------
+
+/// Butée basse de la glissière de gain, en décibels.
+///
+/// Elle ne vaut **pas** −60 dB : elle vaut silence (voir
+/// [`gain_de_position`]). Le protocole accepte jusqu'à
+/// [`Db::SILENCE_THRESHOLD`] (−120 dB), mais une course de 120 dB rendrait le
+/// dernier tiers inaudible et le premier intouchable.
+pub const GAIN_MIN: f32 = -60.0;
+/// Butée haute de la glissière de gain, en décibels.
+///
+/// Le protocole autorise jusqu'à [`Db::MAX`] (+24 dB) ; +12 suffit à rattraper
+/// une source faible sans mettre la saturation à portée d'un geste distrait.
+pub const GAIN_MAX: f32 = 12.0;
+/// Pas de la glissière de gain, en décibels.
+pub const GAIN_PAS: f32 = 1.0;
+
+/// Position de glissière qui montre le gain donné.
+///
+/// Un gain hors course est **ramené à la butée** : le démon peut connaître
+/// +24 dB, la glissière ne sait pas le montrer. Le silence se pose sur la
+/// butée basse, qui est justement ce qu'il faut y lire.
+pub fn position_de_gain(db: Db) -> f32 {
+    if db.is_silent() {
+        return GAIN_MIN;
+    }
+    db.get().clamp(GAIN_MIN, GAIN_MAX)
+}
+
+/// Gain que la glissière demande à cette position.
+///
+/// La **butée basse vaut silence** : `−60` donne [`Db::NEG_INF`] et non
+/// `Db::new(-60.0)`. Descendre une glissière à fond, c'est demander à ne plus
+/// rien entendre, pas à entendre un millionième.
+pub fn gain_de_position(position: f32) -> Db {
+    let position = position.clamp(GAIN_MIN, GAIN_MAX);
+    if position <= GAIN_MIN {
+        Db::NEG_INF
+    } else {
+        Db::new(position.round())
+    }
+}
+
+/// Ce dont un réglage de gain change la valeur : un nœud, ou un lien.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cible {
+    /// Un nœud du graphe.
+    Noeud(NodeId),
+    /// Un lien du graphe.
+    Lien(LinkId),
+}
+
+impl Cible {
+    /// La commande qui porte ce réglage au démon.
+    pub fn commande(self, gain_db: Option<Db>, muted: Option<bool>) -> Command {
+        match self {
+            Cible::Noeud(node) => Command::SetNodeGain {
+                node,
+                gain_db,
+                muted,
+            },
+            Cible::Lien(link) => Command::SetLinkGain {
+                link,
+                gain_db,
+                muted,
+            },
+        }
+    }
+}
+
+/// L'état coupé d'une cible réglable, tel que le miroir le connaît.
+///
+/// `None` dit qu'il n'y a rien à régler : la cible a disparu du miroir, ou
+/// c'est un **nœud suspendu** — son périphérique est absent, sa carte est
+/// voilée et ses réglages sont désactivés.
+pub fn coupure(cible: Cible, noeuds: &[NodeDescriptor], links: &[LinkDescriptor]) -> Option<bool> {
+    match cible {
+        Cible::Noeud(id) => noeuds
+            .iter()
+            .find(|n| n.id == id)
+            .filter(|n| n.state != NodeState::Suspended)
+            .map(|n| n.muted),
+        Cible::Lien(id) => links.iter().find(|l| l.link.id == id).map(|l| l.muted),
+    }
+}
+
+/// Vrai si le gain de cette cible se règle : voir [`coupure`].
+pub fn reglable(cible: Cible, noeuds: &[NodeDescriptor], links: &[LinkDescriptor]) -> bool {
+    coupure(cible, noeuds, links).is_some()
+}
+
+/// La cible dont une notification dit quelque chose, s'il y en a une.
+///
+/// C'est elle qui décide si la valeur montrée pendant un geste doit céder la
+/// place à celle du miroir (voir [`State::notifie`]). Le protocole n'a pas
+/// aujourd'hui de notification propre au gain : les variantes listées ici sont
+/// celles qui remplacent ou retirent un descripteur, donc celles qui peuvent
+/// contredire ce qui est affiché.
+pub fn cible_notifiee(notification: &Notification) -> Option<Cible> {
+    match notification {
+        Notification::NodeAdded(node) => Some(Cible::Noeud(node.id)),
+        Notification::NodeRemoved { id, .. } | Notification::NodeStateChanged { id, .. } => {
+            Some(Cible::Noeud(*id))
+        }
+        Notification::LinkAdded(link) => Some(Cible::Lien(link.link.id)),
+        Notification::LinkRemoved { id } => Some(Cible::Lien(*id)),
+        _ => None,
+    }
 }
 
 // --- Liens ------------------------------------------------------------------
@@ -601,6 +774,15 @@ pub enum Geste {
     Selection(Option<LinkId>),
     /// Suppr ou Retour arrière : le lien sélectionné s'en va.
     Supprimer,
+    /// La glissière de gain d'une cible est à cette position, en décibels.
+    ///
+    /// `iced` en émet un par pixel : rien ne part au démon (voir le module).
+    Gain(Cible, f32),
+    /// La glissière de gain d'une cible est relâchée : la valeur atteinte part
+    /// au démon.
+    FinGain(Cible),
+    /// Le bouton de coupure d'une cible est pressé.
+    Muet(Cible),
 }
 
 /// Le lien en cours de tirage.
@@ -653,6 +835,19 @@ pub struct Saisie {
     pub deplacee: bool,
 }
 
+/// La glissière de gain qu'un doigt est en train de promener.
+///
+/// C'est la seule valeur que la vue montre avant que le démon ne l'ait
+/// annoncée — et ce n'est pas son état à lui, c'est la position du doigt (voir
+/// le module).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Glissement {
+    /// Ce dont le gain est réglé.
+    pub cible: Cible,
+    /// Position courante de la glissière, en décibels.
+    pub position: f32,
+}
+
 /// État de la vue, distinct du miroir du démon.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct State {
@@ -667,6 +862,13 @@ pub struct State {
     /// Il peut désigner un lien que le démon vient de retirer :
     /// [`State::lien_selectionne`] ne le rend que s'il est encore là.
     pub selection: Option<LinkId>,
+    /// Glissière de gain en cours de réglage, s'il y en a une.
+    ///
+    /// Elle survit au relâchement : la commande est partie, mais le démon n'a
+    /// encore rien annoncé, et faire retomber l'affichage sur l'ancienne
+    /// valeur du miroir le temps de l'aller-retour serait un clignotement.
+    /// C'est [`State::notifie`] qui la jette.
+    pub glissement: Option<Glissement>,
 }
 
 impl State {
@@ -691,15 +893,59 @@ impl State {
         links.iter().any(|l| l.link.id == id).then_some(id)
     }
 
+    /// Position que la glissière d'une cible doit montrer : celle du doigt
+    /// pendant le geste, celle du miroir sinon.
+    pub fn position_de(&self, cible: Cible, db: Db) -> f32 {
+        match self.glissement {
+            Some(g) if g.cible == cible => g.position,
+            _ => position_de_gain(db),
+        }
+    }
+
+    /// Gain que le libellé d'une cible doit écrire : celui du doigt pendant le
+    /// geste, celui du miroir sinon.
+    ///
+    /// Hors geste, c'est bien la valeur **du miroir** qui est écrite, et non
+    /// sa traduction en position : le démon a le droit de connaître un gain
+    /// que la glissière ne sait pas montrer, et le libellé ne doit pas
+    /// l'arrondir pour autant.
+    pub fn gain_affiche(&self, cible: Cible, db: Db) -> Db {
+        match self.glissement {
+            Some(g) if g.cible == cible => gain_de_position(g.position),
+            _ => db,
+        }
+    }
+
+    /// Une notification est arrivée : la valeur montrée localement pour sa
+    /// cible n'a plus lieu d'être.
+    ///
+    /// C'est ce qui referme la seule parenthèse d'état local de la GUI :
+    /// passé ce point, l'affichage ne dit plus que le miroir.
+    pub fn notifie(&mut self, notification: &Notification) {
+        let Some(cible) = cible_notifiee(notification) else {
+            return;
+        };
+        if self.glissement.is_some_and(|g| g.cible == cible) {
+            self.glissement = None;
+        }
+    }
+
+    /// Oublie tout réglage local : le miroir vient d'être rechargé.
+    pub fn recharge(&mut self) {
+        self.glissement = None;
+    }
+
     /// Réduit un geste et dit ce qu'il demande à l'application.
     ///
     /// Pure : aucune entrée/sortie. `placements` dit où les cartes se
-    /// trouvaient au moment de la saisie, `links` ce que le démon a déjà
-    /// branché — le seul refus décidé ici est celui de la boucle.
+    /// trouvaient au moment de la saisie, `noeuds` et `links` ce que le démon
+    /// a annoncé — le seul refus décidé ici est celui de la boucle, et la
+    /// coupure y lit l'état qu'elle doit inverser.
     pub fn reduire(
         &mut self,
         geste: Geste,
         placements: &[Placement],
+        noeuds: &[NodeDescriptor],
         links: &[LinkDescriptor],
     ) -> Effet {
         match geste {
@@ -760,6 +1006,27 @@ impl State {
             Geste::Supprimer => {
                 if let Some(link) = self.lien_selectionne(links) {
                     return Effet::Commande(Command::Unlink { link });
+                }
+            }
+            Geste::Gain(cible, position) => {
+                // Un message par pixel : rien ne part au démon, la valeur est
+                // seulement montrée (voir le module).
+                if reglable(cible, noeuds, links) {
+                    self.glissement = Some(Glissement { cible, position });
+                }
+            }
+            Geste::FinGain(cible) => {
+                if let Some(glissement) = self.glissement.filter(|g| g.cible == cible) {
+                    return Effet::Commande(
+                        cible.commande(Some(gain_de_position(glissement.position)), None),
+                    );
+                }
+            }
+            Geste::Muet(cible) => {
+                // L'état coupé vient du miroir : le bouton envoie son inverse
+                // et n'anticipe pas ce que le démon en fera.
+                if let Some(muted) = coupure(cible, noeuds, links) {
+                    return Effet::Commande(cible.commande(None, Some(!muted)));
                 }
             }
         }
@@ -1000,7 +1267,7 @@ fn scene<'a>(mirror: &'a Mirror, state: &'a State, graisse: Weight) -> Element<'
     for (noeud, placement) in mirror.nodes.iter().zip(&placements) {
         let saisie = state.saisie_de(&placement.cle);
         couches = couches.push(
-            pin(carte(noeud, placement, saisie, graisse))
+            pin(carte(noeud, placement, saisie, state, graisse))
                 // La carte est épinglée par son coin, pastilles comprises :
                 // celles-ci débordent à gauche.
                 .x(placement.position.x - DEBORDEMENT)
@@ -1028,6 +1295,7 @@ fn carte<'a>(
     noeud: &'a NodeDescriptor,
     placement: &Placement,
     saisie: bool,
+    state: &State,
     graisse: Weight,
 ) -> Element<'a, Message> {
     let opacite = opacite(noeud);
@@ -1038,7 +1306,7 @@ fn carte<'a>(
         position: Point::new(DEBORDEMENT, 0.0),
         hauteur: placement.hauteur,
     };
-    let mut couches = stack![container(corps(noeud, saisie, opacite, graisse))
+    let mut couches = stack![container(corps(noeud, saisie, state, opacite, graisse))
         .padding(Padding::ZERO.horizontal(DEBORDEMENT))];
     for (direction, ports) in [
         (Direction::Input, &noeud.inputs),
@@ -1083,10 +1351,11 @@ fn pastille<'a>(
 }
 
 /// Le corps de la carte : l'en-tête saisissable, son filet, la grille des
-/// ports.
+/// ports, un second filet et le pied de gain.
 fn corps<'a>(
     noeud: &'a NodeDescriptor,
     saisie: bool,
+    state: &State,
     opacite: f32,
     graisse: Weight,
 ) -> Element<'a, Message> {
@@ -1095,11 +1364,146 @@ fn corps<'a>(
         entete(noeud, saisie, opacite, graisse),
         rule::horizontal(FILET).style(style::filet),
         ports(noeud, opacite, graisse),
+        rule::horizontal(FILET).style(style::filet),
+        pied(noeud, state, opacite, graisse),
     ])
     .id(ID_CARTE)
     .width(LARGEUR_CARTE)
     .style(style::carte_noeud(pilote, opacite))
     .into()
+}
+
+/// Le pied de la carte : la glissière de gain, le libellé en décibels et le
+/// bouton de coupure.
+///
+/// Un nœud **suspendu** garde le dessin et perd la main : son bouton est
+/// désactivé, et sa glissière — `iced` n'a pas d'état désactivé pour une
+/// glissière — est refusée par [`State::reduire`], ce qui revient au même
+/// puisque sa valeur vient du miroir et ne bouge donc pas.
+fn pied<'a>(
+    noeud: &NodeDescriptor,
+    state: &State,
+    opacite: f32,
+    graisse: Weight,
+) -> Element<'a, Message> {
+    let cible = Cible::Noeud(noeud.id);
+    let reglages = reglage(
+        Reglage {
+            cible,
+            position: state.position_de(cible, noeud.gain_db),
+            affiche: state.gain_affiche(cible, noeud.gain_db),
+            muted: noeud.muted,
+            actif: noeud.state != NodeState::Suspended,
+            opacite,
+            largeur: Length::Fill,
+            // Le pied vit sur une surface posée, comme le reste de la carte.
+            encre: |j| j.texte_2_carte,
+        },
+        graisse,
+    );
+    container(reglages)
+        .padding(PADDING_PIED)
+        .width(Fill)
+        .height(HAUTEUR_PIED)
+        .into()
+}
+
+/// Le réglage de gain du lien sélectionné, tel que l'en-tête le porte.
+///
+/// La maquette ne lui donne pas de place sur la scène — un lien est une courbe,
+/// pas une carte —, mais F-13 l'exige : il est donc posé là où le lien est déjà
+/// l'objet courant, à côté de « Supprimer le lien ». Il disparaît avec la
+/// sélection.
+pub fn reglage_de_lien<'a>(
+    lien: &LinkDescriptor,
+    state: &State,
+    actif: bool,
+    graisse: Weight,
+) -> Element<'a, Message> {
+    let cible = Cible::Lien(lien.link.id);
+    container(reglage(
+        Reglage {
+            cible,
+            position: state.position_de(cible, lien.gain_db),
+            affiche: state.gain_affiche(cible, lien.gain_db),
+            muted: lien.muted,
+            actif,
+            opacite: 1.0,
+            largeur: Length::Fixed(LARGEUR_GLISSIERE_ENTETE),
+            // L'en-tête, lui, est sur le fond de la fenêtre.
+            encre: |j| j.texte_2,
+        },
+        graisse,
+    ))
+    // La hauteur d'un bouton, pour s'aligner sur les autres actions.
+    .height(style::HAUTEUR_BOUTON)
+    .align_y(Center)
+    .into()
+}
+
+/// Ce qu'un réglage de gain montre, et de quoi il dispose.
+struct Reglage {
+    /// Nœud ou lien réglé.
+    cible: Cible,
+    /// Position de la glissière, en décibels.
+    position: f32,
+    /// Gain écrit par le libellé.
+    affiche: Db,
+    /// État coupé dessiné par le bouton.
+    muted: bool,
+    /// Faux quand le réglage n'a pas la main : nœud suspendu, démon absent.
+    actif: bool,
+    /// Voile de la carte qui le porte (voir [`style::carte_noeud`]).
+    opacite: f32,
+    /// Largeur donnée à la glissière ; le reste est de taille fixe.
+    largeur: Length,
+    /// Encre du libellé, selon la surface qui le porte.
+    encre: fn(&Jetons) -> Color,
+}
+
+/// Le dessin d'un réglage de gain : la glissière, le libellé, le bouton.
+///
+/// La glissière n'envoie **rien** pendant le geste : elle publie une position,
+/// et c'est son relâchement qui parle au démon (voir le module).
+fn reglage<'a>(r: Reglage, graisse: Weight) -> Element<'a, Message> {
+    let cible = r.cible;
+    let glissiere = slider(GAIN_MIN..=GAIN_MAX, r.position, move |position| {
+        Message::Patchbay(Geste::Gain(cible, position))
+    })
+    .on_release(Message::Patchbay(Geste::FinGain(cible)))
+    .step(GAIN_PAS)
+    .width(r.largeur)
+    .height(HAUTEUR_GLISSIERE)
+    .style(style::curseur_voile(r.opacite));
+
+    let libelle = text(format::decibels(r.affiche))
+        .size(CORPS_GAIN)
+        .line_height(LineHeight::Relative(INTERLIGNE_SERRE))
+        .font(typo::texte_a(graisse, CORPS_GAIN))
+        .wrapping(Wrapping::None)
+        .width(LARGEUR_GAIN)
+        .align_x(Right)
+        .style(style::texte_voile(r.encre, r.opacite));
+
+    let coupure = button(
+        text(i18n::t(Text::Mute))
+            .size(CORPS_GAIN)
+            .font(typo::interface())
+            .width(Fill)
+            .height(Fill)
+            .align_x(Center)
+            .align_y(Center),
+    )
+    .width(LARGEUR_MUET)
+    .height(HAUTEUR_REGLAGE)
+    .padding(0)
+    .on_press_maybe(r.actif.then_some(Message::Patchbay(Geste::Muet(cible))))
+    .style(style::bouton_muet(r.muted));
+
+    row![glissiere, libelle, coupure]
+        .spacing(ESPACE_S)
+        .align_y(Center)
+        .into()
 }
 
 /// L'en-tête : le libellé à gauche, l'étiquette d'état à droite.
@@ -1259,6 +1663,15 @@ mod tests {
         }
     }
 
+    /// Un nœud interne du rang donné : [`noeud`] les crée tous au rang 0, ce
+    /// qui suffit tant qu'un test ne parle pas d'un nœud en particulier.
+    fn noeud_n(rang: u32, nom: &str, entrees: usize, sorties: usize) -> NodeDescriptor {
+        NodeDescriptor {
+            id: id(rang),
+            ..noeud(nom, entrees, sorties)
+        }
+    }
+
     /// Un nœud interne à `entrees` entrées et `sorties` sorties.
     fn noeud(nom: &str, entrees: usize, sorties: usize) -> NodeDescriptor {
         NodeDescriptor {
@@ -1333,14 +1746,18 @@ mod tests {
         assert!(!Etiquette::Cable.accentuee());
     }
 
-    /// La hauteur suit la plus fournie des deux colonnes de ports.
+    /// La hauteur suit la plus fournie des deux colonnes de ports, et porte
+    /// toujours l'en-tête, ses deux filets et le pied de gain.
     #[test]
     fn la_hauteur_suit_la_colonne_la_plus_fournie() {
-        let nue = HAUTEUR_ENTETE + FILET + 2.0 * MARGE_PORTS;
+        let nue = HAUTEUR_ENTETE + FILET + 2.0 * MARGE_PORTS + FILET + HAUTEUR_PIED;
         assert_eq!(hauteur_carte(0, 0), nue);
         assert_eq!(hauteur_carte(2, 0), nue + 2.0 * HAUTEUR_PORT);
         assert_eq!(hauteur_carte(0, 2), nue + 2.0 * HAUTEUR_PORT);
         assert_eq!(hauteur_carte(1, 3), hauteur_carte(3, 1));
+        // Le pied compte pour de bon : une carte sans port n'est pas réduite
+        // à son en-tête.
+        assert!(hauteur_carte(0, 0) > HAUTEUR_ENTETE + FILET + 2.0 * MARGE_PORTS);
     }
 
     /// Une entrée s'attache à gauche, une sortie à droite, et chaque rang
@@ -1489,14 +1906,14 @@ mod tests {
         let mut state = State::default();
 
         assert_eq!(
-            state.reduire(Geste::Saisi("internal:a".into()), &placements, &[]),
+            state.reduire(Geste::Saisi("internal:a".into()), &placements, &[], &[]),
             Effet::Rien
         );
         assert!(state.deplacement() && state.saisie_de("internal:a"));
         // Le premier mouvement ne fait que noter l'écart au curseur.
         let curseur = Point::new(depart.x + 30.0, depart.y + 12.0);
         assert_eq!(
-            state.reduire(Geste::Deplace(curseur), &placements, &[]),
+            state.reduire(Geste::Deplace(curseur), &placements, &[], &[]),
             Effet::Rien
         );
         assert!(state.positions.is_empty(), "la carte n'a pas encore bougé");
@@ -1505,6 +1922,7 @@ mod tests {
             state.reduire(
                 Geste::Deplace(Point::new(curseur.x + 100.0, curseur.y + 40.0)),
                 &placements,
+                &[],
                 &[]
             ),
             Effet::Rien
@@ -1515,12 +1933,12 @@ mod tests {
         );
         // Le relâchement ferme la saisie et demande l'écriture.
         assert_eq!(
-            state.reduire(Geste::Relache, &placements, &[]),
+            state.reduire(Geste::Relache, &placements, &[], &[]),
             Effet::Enregistrer
         );
         assert!(!state.deplacement());
         assert_eq!(
-            state.reduire(Geste::Relache, &placements, &[]),
+            state.reduire(Geste::Relache, &placements, &[], &[]),
             Effet::Rien,
             "plus rien à écrire"
         );
@@ -1532,9 +1950,19 @@ mod tests {
         let noeuds = vec![noeud("a", 0, 1)];
         let placements = disposer(&noeuds, &Positions::default());
         let mut state = State::default();
-        state.reduire(Geste::Saisi("internal:a".into()), &placements, &[]);
-        state.reduire(Geste::Deplace(placements[0].position), &placements, &[]);
-        state.reduire(Geste::Deplace(Point::new(-500.0, -500.0)), &placements, &[]);
+        state.reduire(Geste::Saisi("internal:a".into()), &placements, &[], &[]);
+        state.reduire(
+            Geste::Deplace(placements[0].position),
+            &placements,
+            &[],
+            &[],
+        );
+        state.reduire(
+            Geste::Deplace(Point::new(-500.0, -500.0)),
+            &placements,
+            &[],
+            &[],
+        );
         assert_eq!(state.positions.get("internal:a"), Some(Point::ORIGIN));
     }
 
@@ -1544,16 +1972,16 @@ mod tests {
     fn un_geste_sans_carte_est_sans_effet() {
         let mut state = State::default();
         assert_eq!(
-            state.reduire(Geste::Saisi("internal:fantôme".into()), &[], &[]),
+            state.reduire(Geste::Saisi("internal:fantôme".into()), &[], &[], &[]),
             Effet::Rien
         );
         assert!(!state.deplacement());
         assert_eq!(
-            state.reduire(Geste::Deplace(Point::new(10.0, 10.0)), &[], &[]),
+            state.reduire(Geste::Deplace(Point::new(10.0, 10.0)), &[], &[], &[]),
             Effet::Rien
         );
         assert!(state.positions.is_empty());
-        assert_eq!(state.reduire(Geste::Relache, &[], &[]), Effet::Rien);
+        assert_eq!(state.reduire(Geste::Relache, &[], &[], &[]), Effet::Rien);
     }
 
     /// Les points de contrôle sortent horizontalement, d'au moins la tension
@@ -1671,16 +2099,16 @@ mod tests {
         let cible = PortId::new(id(1), Direction::Input, 0);
 
         assert_eq!(
-            state.reduire(Geste::DebutLien(source), &[], &[]),
+            state.reduire(Geste::DebutLien(source), &[], &[], &[]),
             Effet::Rien
         );
         assert!(state.en_tirage());
         assert_eq!(
-            state.reduire(Geste::SurvolPort(Some(cible)), &[], &[]),
+            state.reduire(Geste::SurvolPort(Some(cible)), &[], &[], &[]),
             Effet::Rien
         );
         assert_eq!(
-            state.reduire(Geste::FinLien, &[], &[]),
+            state.reduire(Geste::FinLien, &[], &[], &[]),
             Effet::Commande(Command::Link {
                 src: source,
                 dst: cible
@@ -1694,21 +2122,23 @@ mod tests {
     fn un_tirage_sans_cible_n_emet_rien() {
         let mut state = State::default();
         let source = PortId::new(id(0), Direction::Output, 0);
-        state.reduire(Geste::DebutLien(source), &[], &[]);
+        state.reduire(Geste::DebutLien(source), &[], &[], &[]);
         state.reduire(
             Geste::SurvolPort(Some(PortId::new(id(1), Direction::Input, 0))),
             &[],
             &[],
+            &[],
         );
         // Le curseur quitte la pastille avant le relâchement.
-        state.reduire(Geste::SurvolPort(None), &[], &[]);
-        assert_eq!(state.reduire(Geste::FinLien, &[], &[]), Effet::Rien);
+        state.reduire(Geste::SurvolPort(None), &[], &[], &[]);
+        assert_eq!(state.reduire(Geste::FinLien, &[], &[], &[]), Effet::Rien);
         assert!(!state.en_tirage());
         // Un relâchement sans tirage ne fait rien non plus.
-        assert_eq!(state.reduire(Geste::FinLien, &[], &[]), Effet::Rien);
+        assert_eq!(state.reduire(Geste::FinLien, &[], &[], &[]), Effet::Rien);
         // Une pastille d'entrée ne commence pas de tirage.
         state.reduire(
             Geste::DebutLien(PortId::new(id(0), Direction::Input, 0)),
+            &[],
             &[],
             &[],
         );
@@ -1724,36 +2154,40 @@ mod tests {
 
         // Un nœud vers lui-même : muet.
         let sortie = PortId::new(id(0), Direction::Output, 0);
-        state.reduire(Geste::DebutLien(sortie), &[], &liens);
+        state.reduire(Geste::DebutLien(sortie), &[], &[], &liens);
         state.reduire(
             Geste::SurvolPort(Some(PortId::new(id(0), Direction::Input, 0))),
             &[],
-            &liens,
-        );
-        assert_eq!(state.reduire(Geste::FinLien, &[], &liens), Effet::Rien);
-
-        // Le doublon exact : muet lui aussi.
-        state.reduire(Geste::DebutLien(sortie), &[], &liens);
-        state.reduire(
-            Geste::SurvolPort(Some(PortId::new(id(1), Direction::Input, 0))),
             &[],
             &liens,
         );
-        assert_eq!(state.reduire(Geste::FinLien, &[], &liens), Effet::Rien);
+        assert_eq!(state.reduire(Geste::FinLien, &[], &[], &liens), Effet::Rien);
+
+        // Le doublon exact : muet lui aussi.
+        state.reduire(Geste::DebutLien(sortie), &[], &[], &liens);
+        state.reduire(
+            Geste::SurvolPort(Some(PortId::new(id(1), Direction::Input, 0))),
+            &[],
+            &[],
+            &liens,
+        );
+        assert_eq!(state.reduire(Geste::FinLien, &[], &[], &liens), Effet::Rien);
 
         // La boucle : refusée, et dite.
         state.reduire(
             Geste::DebutLien(PortId::new(id(1), Direction::Output, 0)),
             &[],
+            &[],
             &liens,
         );
         state.reduire(
             Geste::SurvolPort(Some(PortId::new(id(0), Direction::Input, 0))),
             &[],
+            &[],
             &liens,
         );
         assert_eq!(
-            state.reduire(Geste::FinLien, &[], &liens),
+            state.reduire(Geste::FinLien, &[], &[], &liens),
             Effet::Boucle {
                 depuis: id(1),
                 vers: id(0)
@@ -1767,27 +2201,30 @@ mod tests {
         let liens = vec![lien(0, id(0), id(1)), lien(1, id(1), id(2))];
         let mut state = State::default();
         // Sans sélection, Suppr n'émet rien.
-        assert_eq!(state.reduire(Geste::Supprimer, &[], &liens), Effet::Rien);
+        assert_eq!(
+            state.reduire(Geste::Supprimer, &[], &[], &liens),
+            Effet::Rien
+        );
 
-        state.reduire(Geste::Selection(Some(LinkId::new(0, 0))), &[], &liens);
+        state.reduire(Geste::Selection(Some(LinkId::new(0, 0))), &[], &[], &liens);
         assert_eq!(state.lien_selectionne(&liens), Some(LinkId::new(0, 0)));
         assert_eq!(
-            state.reduire(Geste::Supprimer, &[], &liens),
+            state.reduire(Geste::Supprimer, &[], &[], &liens),
             Effet::Commande(Command::Unlink {
                 link: LinkId::new(0, 0)
             })
         );
         // Un second clic sur le même lien le désélectionne.
-        state.reduire(Geste::Selection(Some(LinkId::new(0, 0))), &[], &liens);
+        state.reduire(Geste::Selection(Some(LinkId::new(0, 0))), &[], &[], &liens);
         assert_eq!(state.lien_selectionne(&liens), None);
         // Un clic à l'écart désélectionne aussi.
-        state.reduire(Geste::Selection(Some(LinkId::new(1, 0))), &[], &liens);
-        state.reduire(Geste::Selection(None), &[], &liens);
+        state.reduire(Geste::Selection(Some(LinkId::new(1, 0))), &[], &[], &liens);
+        state.reduire(Geste::Selection(None), &[], &[], &liens);
         assert_eq!(state.lien_selectionne(&liens), None);
         // Un lien que le démon a retiré n'est plus sélectionné.
-        state.reduire(Geste::Selection(Some(LinkId::new(1, 0))), &[], &liens);
+        state.reduire(Geste::Selection(Some(LinkId::new(1, 0))), &[], &[], &liens);
         assert_eq!(state.lien_selectionne(&[]), None);
-        assert_eq!(state.reduire(Geste::Supprimer, &[], &[]), Effet::Rien);
+        assert_eq!(state.reduire(Geste::Supprimer, &[], &[], &[]), Effet::Rien);
     }
 
     /// Le générateur de test prend un nom libre et un niveau prudent.
@@ -1805,6 +2242,225 @@ mod tests {
         assert!(amplitude_test() < 1.0);
     }
 
+    /// La glissière et le gain se traduisent l'un dans l'autre, bornes
+    /// comprises — et la butée basse vaut **silence**, pas −60 dB.
+    #[test]
+    fn la_glissiere_et_le_gain_se_traduisent_dans_les_deux_sens() {
+        // Aller : du gain à la position.
+        assert_eq!(position_de_gain(Db::UNITY), 0.0);
+        assert_eq!(position_de_gain(Db::new(-12.0)), -12.0);
+        assert_eq!(position_de_gain(Db::NEG_INF), GAIN_MIN);
+        // Hors course : ramené à la butée, dans les deux sens.
+        assert_eq!(position_de_gain(Db::new(Db::MAX)), GAIN_MAX);
+        assert_eq!(position_de_gain(Db::new(-90.0)), GAIN_MIN);
+
+        // Retour : de la position au gain.
+        assert_eq!(gain_de_position(0.0), Db::UNITY);
+        assert_eq!(gain_de_position(GAIN_MAX), Db::new(12.0));
+        assert_eq!(gain_de_position(-12.0), Db::new(-12.0));
+        // La butée basse est un silence, et non un gain de −60 dB.
+        assert_eq!(gain_de_position(GAIN_MIN), Db::NEG_INF);
+        assert!(gain_de_position(GAIN_MIN).is_silent());
+        assert_ne!(gain_de_position(GAIN_MIN), Db::new(GAIN_MIN));
+        // Un pixel au-dessus de la butée, ce n'est déjà plus le silence.
+        assert_eq!(gain_de_position(-59.0), Db::new(-59.0));
+        // Arrondi au pas de la glissière, et bornes tenues hors course.
+        assert_eq!(gain_de_position(-3.4), Db::new(-3.0));
+        assert_eq!(gain_de_position(-3.6), Db::new(-4.0));
+        assert_eq!(gain_de_position(48.0), Db::new(GAIN_MAX));
+        assert_eq!(gain_de_position(-300.0), Db::NEG_INF);
+
+        // Aller-retour sur une valeur du pas : rien ne se perd.
+        for db in [Db::UNITY, Db::new(-24.0), Db::new(GAIN_MAX), Db::NEG_INF] {
+            assert_eq!(gain_de_position(position_de_gain(db)), db, "{db}");
+        }
+    }
+
+    /// La glissière ne parle au démon qu'au relâchement : les cent messages du
+    /// geste ne font que déplacer la valeur montrée.
+    #[test]
+    fn le_gain_n_est_envoye_qu_au_relachement() {
+        let noeuds = vec![noeud_n(0, "a", 0, 1)];
+        let cible = Cible::Noeud(id(0));
+        let mut state = State::default();
+
+        for position in [-2.0, -8.0, -12.0] {
+            assert_eq!(
+                state.reduire(Geste::Gain(cible, position), &[], &noeuds, &[]),
+                Effet::Rien,
+                "rien ne part pendant le geste"
+            );
+        }
+        assert_eq!(state.glissement.map(|g| g.position), Some(-12.0));
+        assert_eq!(
+            state.reduire(Geste::FinGain(cible), &[], &noeuds, &[]),
+            Effet::Commande(Command::SetNodeGain {
+                node: id(0),
+                gain_db: Some(Db::new(-12.0)),
+                muted: None,
+            })
+        );
+
+        // La butée basse envoie le silence, et un lien passe par la même
+        // porte.
+        let liens = vec![lien(0, id(0), id(1))];
+        let cible = Cible::Lien(LinkId::new(0, 0));
+        state.reduire(Geste::Gain(cible, GAIN_MIN), &[], &noeuds, &liens);
+        assert_eq!(
+            state.reduire(Geste::FinGain(cible), &[], &noeuds, &liens),
+            Effet::Commande(Command::SetLinkGain {
+                link: LinkId::new(0, 0),
+                gain_db: Some(Db::NEG_INF),
+                muted: None,
+            })
+        );
+
+        // Un relâchement qu'aucun geste n'a précédé n'envoie rien.
+        state.glissement = None;
+        assert_eq!(
+            state.reduire(Geste::FinGain(cible), &[], &noeuds, &liens),
+            Effet::Rien
+        );
+    }
+
+    /// Le bouton de coupure envoie l'inverse de ce que le miroir dit, et rien
+    /// d'autre — le gain reste inchangé.
+    #[test]
+    fn le_bouton_muet_envoie_l_inverse_de_l_etat_du_miroir() {
+        let mut coupe = noeud_n(0, "a", 0, 1);
+        coupe.muted = true;
+        let noeuds = vec![noeud_n(1, "b", 0, 1), coupe];
+        let mut liens = vec![lien(0, id(0), id(1))];
+        let mut state = State::default();
+
+        assert_eq!(
+            state.reduire(Geste::Muet(Cible::Noeud(id(1))), &[], &noeuds, &liens),
+            Effet::Commande(Command::SetNodeGain {
+                node: id(1),
+                gain_db: None,
+                muted: Some(true),
+            })
+        );
+        assert_eq!(
+            state.reduire(Geste::Muet(Cible::Noeud(id(0))), &[], &noeuds, &liens),
+            Effet::Commande(Command::SetNodeGain {
+                node: id(0),
+                gain_db: None,
+                muted: Some(false),
+            }),
+            "un nœud déjà coupé se rétablit"
+        );
+
+        let cible = Cible::Lien(LinkId::new(0, 0));
+        assert_eq!(
+            state.reduire(Geste::Muet(cible), &[], &noeuds, &liens),
+            Effet::Commande(Command::SetLinkGain {
+                link: LinkId::new(0, 0),
+                gain_db: None,
+                muted: Some(true),
+            })
+        );
+        liens[0].muted = true;
+        assert_eq!(
+            state.reduire(Geste::Muet(cible), &[], &noeuds, &liens),
+            Effet::Commande(Command::SetLinkGain {
+                link: LinkId::new(0, 0),
+                gain_db: None,
+                muted: Some(false),
+            })
+        );
+
+        // Une cible que le miroir ne connaît pas n'envoie rien.
+        assert_eq!(
+            state.reduire(Geste::Muet(Cible::Noeud(id(9))), &[], &noeuds, &liens),
+            Effet::Rien
+        );
+        assert_eq!(
+            state.reduire(
+                Geste::Muet(Cible::Lien(LinkId::new(9, 0))),
+                &[],
+                &noeuds,
+                &liens
+            ),
+            Effet::Rien
+        );
+    }
+
+    /// La valeur montrée est celle du doigt pendant le geste, puis celle du
+    /// miroir dès qu'une notification arrive.
+    #[test]
+    fn la_valeur_montree_retombe_sur_le_miroir_a_la_notification() {
+        let noeuds = vec![noeud_n(0, "a", 0, 1)];
+        let cible = Cible::Noeud(id(0));
+        let du_demon = Db::new(-3.0);
+        let mut state = State::default();
+
+        // Hors geste : la valeur du miroir, sans passer par la glissière —
+        // une valeur que la course ne sait pas montrer n'est pas arrondie.
+        assert_eq!(state.gain_affiche(cible, du_demon), du_demon);
+        assert_eq!(state.position_de(cible, du_demon), -3.0);
+        assert_eq!(state.gain_affiche(cible, Db::new(-3.5)), Db::new(-3.5));
+
+        // Pendant le geste : la position du doigt, pour la glissière comme
+        // pour le libellé.
+        state.reduire(Geste::Gain(cible, -20.0), &[], &noeuds, &[]);
+        assert_eq!(state.position_de(cible, du_demon), -20.0);
+        assert_eq!(state.gain_affiche(cible, du_demon), Db::new(-20.0));
+        // Une autre cible n'est pas concernée.
+        let autre = Cible::Lien(LinkId::new(0, 0));
+        assert_eq!(state.gain_affiche(autre, du_demon), du_demon);
+
+        // Le relâchement envoie, mais ne rend pas encore la main : le démon
+        // n'a rien annoncé.
+        state.reduire(Geste::FinGain(cible), &[], &noeuds, &[]);
+        assert_eq!(state.gain_affiche(cible, du_demon), Db::new(-20.0));
+
+        // Une notification qui parle d'autre chose ne change rien…
+        state.notifie(&Notification::LinkRemoved {
+            id: LinkId::new(7, 0),
+        });
+        assert_eq!(state.gain_affiche(cible, du_demon), Db::new(-20.0));
+        // … celle qui parle de la cible, si.
+        state.notifie(&Notification::NodeAdded(noeuds[0].clone()));
+        assert_eq!(state.glissement, None);
+        assert_eq!(state.gain_affiche(cible, du_demon), du_demon);
+        assert_eq!(state.position_de(cible, du_demon), -3.0);
+
+        // Un rechargement complet oublie tout, lui aussi.
+        state.reduire(Geste::Gain(cible, -30.0), &[], &noeuds, &[]);
+        state.recharge();
+        assert_eq!(state.glissement, None);
+    }
+
+    /// Un nœud suspendu garde son dessin et perd la main : ni glissière, ni
+    /// coupure.
+    #[test]
+    fn un_noeud_suspendu_ne_regle_rien() {
+        let mut suspendu = noeud_n(0, "hp", 2, 0);
+        suspendu.state = NodeState::Suspended;
+        let noeuds = vec![suspendu];
+        let cible = Cible::Noeud(id(0));
+        let mut state = State::default();
+
+        assert!(!reglable(cible, &noeuds, &[]));
+        assert_eq!(coupure(cible, &noeuds, &[]), None);
+        assert_eq!(
+            state.reduire(Geste::Gain(cible, -20.0), &[], &noeuds, &[]),
+            Effet::Rien
+        );
+        assert_eq!(state.glissement, None, "la valeur montrée ne bouge pas");
+        assert_eq!(
+            state.reduire(Geste::FinGain(cible), &[], &noeuds, &[]),
+            Effet::Rien
+        );
+        assert_eq!(
+            state.reduire(Geste::Muet(cible), &[], &noeuds, &[]),
+            Effet::Rien
+        );
+        // La carte, elle, reste là : c'est le voile qui le dit.
+        assert_eq!(opacite(&noeuds[0]), style::OPACITE_SUSPENDU);
+    }
+
     /// La hauteur calculée est celle de la carte réellement composée.
     ///
     /// C'est le contrat de l'architecture hybride : le canevas ne mesure rien,
@@ -1819,7 +2475,7 @@ mod tests {
                 position: Point::ORIGIN,
                 hauteur: hauteur_carte(entrees, sorties),
             };
-            let mesuree = mesurer(corps(&n, false, 1.0, Weight::Normal));
+            let mesuree = mesurer(corps(&n, false, &State::default(), 1.0, Weight::Normal));
             assert_eq!(
                 mesuree,
                 hauteur_carte(entrees, sorties),

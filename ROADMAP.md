@@ -541,7 +541,10 @@ testée d'abord avec le backend null, puis sur Windows.
   Canvas `iced`, disposition automatique, positions mémorisées.
 - [x] **M2-05** `feat(gui): patchbay, liens par glisser-déposer et suppression`
   *Fait quand* : lien créé/supprimé via IPC ; cycle refusé avec message (F-11, F-12).
-- [ ] **M2-06** `feat(gui): gains par lien et par nœud, muet`
+- [x] **M2-06** `feat(gui): gains par lien et par nœud, muet`
+  Pied de carte (glissière −60 à +12 dB, libellé, bouton « M ») ; le gain de lien est dans
+  l'en-tête, faute de place sur une courbe. Commande envoyée au relâchement, butée basse
+  au silence (F-13).
 - [ ] **M2-07** `feat(gui): VU-mètres temps réel`
   *Fait quand* : rafraîchissement 30 Hz sans charge CPU notable.
 - [ ] **M2-08** `feat(gui): vue Diagnostic (xruns, latence, pilote, export de rapport)`

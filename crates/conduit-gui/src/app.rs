@@ -358,9 +358,12 @@ impl App {
                 // elle qui dit où la carte saisie se trouvait, et contre les
                 // liens du miroir, qui disent ce qui est déjà branché.
                 let placements = patchbay::disposer(&self.mirror.nodes, &self.patchbay.positions);
-                let effet = self
-                    .patchbay
-                    .reduire(geste, &placements, &self.mirror.links);
+                let effet = self.patchbay.reduire(
+                    geste,
+                    &placements,
+                    &self.mirror.nodes,
+                    &self.mirror.links,
+                );
                 return self.appliquer(effet);
             }
             Message::AddGenerator => {
@@ -412,10 +415,53 @@ impl App {
                 if let Command::Unlink { link } = &commande {
                     self.attente = Some(Attente::Delien(*link));
                 }
+                // La notice de coupure, elle, se compose avant l'envoi : elle
+                // nomme le lien, que la commande partie ne dit plus.
+                let coupure = self.notice_de_coupure(&commande);
                 self.request(commande);
+                if let Some(notice) = coupure {
+                    self.poser_notice(notice);
+                    return self.minuteur();
+                }
             }
         }
         Task::none()
+    }
+
+    /// La notice qu'une coupure mérite, si cette commande en est une.
+    ///
+    /// Elle est posée **au clic**, et non au vu d'une notification comme celles
+    /// des câbles et des liens : le protocole n'annonce aucun changement de
+    /// gain — ni `SetNodeGain` ni `SetLinkGain` ne produit de notification. La
+    /// phrase dit donc ce qui a été demandé ; si le démon refuse, la sienne la
+    /// remplace ([`ipc::Event::Failed`]).
+    ///
+    /// Un réglage de gain, lui, n'a droit à aucune notice : c'est un geste
+    /// continu, et une phrase par mouvement serait du bruit.
+    fn notice_de_coupure(&self, commande: &Command) -> Option<Notice> {
+        match commande {
+            Command::SetNodeGain {
+                node,
+                muted: Some(coupe),
+                ..
+            } => Some(Notice::info(i18n::noeud_coupe(
+                &self.libelle_noeud(*node),
+                *coupe,
+            ))),
+            Command::SetLinkGain {
+                link,
+                muted: Some(coupe),
+                ..
+            } => {
+                let (source, destination) = self.extremites_du_lien(*link)?;
+                Some(Notice::info(i18n::lien_coupe(
+                    &source,
+                    &destination,
+                    *coupe,
+                )))
+            }
+            _ => None,
+        }
     }
 
     /// Le libellé d'un nœud du miroir, ou son identifiant s'il a disparu.
@@ -486,6 +532,7 @@ impl App {
             ipc::Event::Ready { server, snapshot } => {
                 self.mirror.reset(*snapshot);
                 self.cables.close_dialogs();
+                self.patchbay.recharge();
                 self.notice = None;
                 self.attente = None;
                 self.connection = Connection::Ready { server };
@@ -499,6 +546,9 @@ impl App {
                 // miroir qui dit si le câble annoncé est nouveau.
                 let notice = self.notice_attendue(&notification);
                 self.mirror.apply(&notification);
+                // Le miroir a parlé : la valeur qu'une glissière montrait en
+                // avance sur lui n'a plus lieu d'être.
+                self.patchbay.notifie(&notification);
                 if let Some(notice) = notice {
                     self.poser_notice(notice);
                 }
@@ -600,9 +650,22 @@ impl App {
             ),
             Tab::Patchbay => {
                 let mut actions = Vec::new();
-                // « Supprimer le lien » n'existe que s'il y a un lien à
-                // supprimer : la maquette ne montre pas d'action grisée ici.
-                if self.patchbay.lien_selectionne(&self.mirror.links).is_some() {
+                // Le gain du lien et « Supprimer le lien » n'existent que s'il
+                // y a un lien : la maquette ne montre pas d'action grisée ici.
+                // Le réglage de gain n'est pas dans la maquette du tout — un
+                // lien est une courbe, il n'a pas de carte où le poser —, mais
+                // F-13 l'exige : il va là où le lien est déjà l'objet courant.
+                if let Some(lien) = self
+                    .patchbay
+                    .lien_selectionne(&self.mirror.links)
+                    .and_then(|id| self.mirror.link(id))
+                {
+                    actions.push(patchbay::reglage_de_lien(
+                        lien,
+                        &self.patchbay,
+                        enabled,
+                        graisse,
+                    ));
                     actions.push(shell::action_lien(
                         Text::PatchbayLinkRemove,
                         enabled.then_some(Message::Patchbay(patchbay::Geste::Supprimer)),
@@ -1134,6 +1197,123 @@ mod tests {
                  Reliez sa sortie à une entrée pour l'entendre."
             )
         );
+    }
+
+    /// La glissière de gain d'un nœud : rien pendant le geste, la commande au
+    /// relâchement, et aucune notice — un geste continu n'en mérite pas.
+    #[test]
+    fn regler_un_gain_n_envoie_qu_au_relachement_et_sans_notice() {
+        let (mut a, mut rx) = connected();
+        let cible = patchbay::Cible::Noeud(NodeId::new(0, 0));
+        for position in [-4.0, -9.0, -18.0] {
+            let _ = a.update(Message::Patchbay(patchbay::Geste::Gain(cible, position)));
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "le glissement n'atteint pas le démon"
+        );
+        // Ce qui s'affiche entre-temps est la position du doigt, pas le
+        // miroir, qui reste à son gain unité.
+        assert_eq!(a.patchbay().gain_affiche(cible, Db::UNITY), Db::new(-18.0));
+        assert_eq!(a.mirror().nodes[0].gain_db, Db::UNITY);
+
+        let _ = a.update(Message::Patchbay(patchbay::Geste::FinGain(cible)));
+        assert_eq!(
+            sent(&mut rx),
+            Command::SetNodeGain {
+                node: NodeId::new(0, 0),
+                gain_db: Some(Db::new(-18.0)),
+                muted: None,
+            }
+        );
+        assert!(a.notice().is_none(), "un réglage de gain ne se raconte pas");
+
+        // La notification rend la main au miroir.
+        let _ = a.update(Message::Ipc(ipc::Event::Notified(Box::new(
+            Notification::NodeAdded(crate::model::fixtures::node(0, "a")),
+        ))));
+        assert_eq!(a.patchbay().gain_affiche(cible, Db::UNITY), Db::UNITY);
+    }
+
+    /// La butée basse de la glissière vaut silence : c'est `NEG_INF` qui part,
+    /// pas −60 dB.
+    #[test]
+    fn la_butee_basse_de_la_glissiere_envoie_le_silence() {
+        let (mut a, mut rx) = connected();
+        let cible = patchbay::Cible::Lien(LinkId::new(0, 0));
+        let _ = a.update(Message::Patchbay(patchbay::Geste::Gain(
+            cible,
+            patchbay::GAIN_MIN,
+        )));
+        let _ = a.update(Message::Patchbay(patchbay::Geste::FinGain(cible)));
+        assert_eq!(
+            sent(&mut rx),
+            Command::SetLinkGain {
+                link: LinkId::new(0, 0),
+                gain_db: Some(Db::NEG_INF),
+                muted: None,
+            }
+        );
+    }
+
+    /// Le bouton de coupure envoie l'inverse du miroir, pose sa notice et
+    /// n'anticipe rien : le miroir garde son état.
+    #[test]
+    fn couper_un_noeud_envoie_l_inverse_et_pose_une_notice() {
+        let (mut a, mut rx) = connected();
+        let cible = patchbay::Cible::Noeud(NodeId::new(0, 0));
+        let _ = a.update(Message::Patchbay(patchbay::Geste::Muet(cible)));
+        assert_eq!(
+            sent(&mut rx),
+            Command::SetNodeGain {
+                node: NodeId::new(0, 0),
+                gain_db: None,
+                muted: Some(true),
+            }
+        );
+        assert_eq!(
+            a.notice().map(|n| n.texte.as_str()),
+            Some("« a » coupé : plus aucun son n'en sort.")
+        );
+        assert!(!a.notice().unwrap().erreur);
+        assert!(!a.mirror().nodes[0].muted, "rien n'est coupé localement");
+
+        // Le lien sélectionné se coupe par la même porte, et sa notice nomme
+        // ses deux extrémités.
+        let _ = a.update(Message::Patchbay(patchbay::Geste::Muet(
+            patchbay::Cible::Lien(LinkId::new(0, 0)),
+        )));
+        assert_eq!(
+            sent(&mut rx),
+            Command::SetLinkGain {
+                link: LinkId::new(0, 0),
+                gain_db: None,
+                muted: Some(true),
+            }
+        );
+        assert_eq!(
+            a.notice().map(|n| n.texte.as_str()),
+            Some("Lien coupé entre « a » et « b ».")
+        );
+    }
+
+    /// Un nœud suspendu n'envoie rien, ni gain ni coupure.
+    #[test]
+    fn les_reglages_d_un_noeud_suspendu_n_emettent_rien() {
+        let (mut a, mut rx) = connected();
+        a.apply_ipc(ipc::Event::Notified(Box::new(
+            Notification::NodeStateChanged {
+                id: NodeId::new(0, 0),
+                state: conduit_protocol::NodeState::Suspended,
+            },
+        )));
+        let cible = patchbay::Cible::Noeud(NodeId::new(0, 0));
+        let _ = a.update(Message::Patchbay(patchbay::Geste::Gain(cible, -30.0)));
+        let _ = a.update(Message::Patchbay(patchbay::Geste::FinGain(cible)));
+        let _ = a.update(Message::Patchbay(patchbay::Geste::Muet(cible)));
+        assert!(rx.try_recv().is_err(), "un nœud suspendu ne règle rien");
+        assert!(a.notice().is_none());
+        assert_eq!(a.patchbay().gain_affiche(cible, Db::UNITY), Db::UNITY);
     }
 
     #[test]

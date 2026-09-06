@@ -99,6 +99,7 @@ textes! {
     NodeUtility => "patchbay.node.utility", "Utilitaire";
     PatchbayLinkRemove => "patchbay.link.remove", "Supprimer le lien";
     PatchbayGenerator => "patchbay.generator", "Générateur de test";
+    Mute => "action.mute", "M";
 
     GraphDriver => "patchbay.driver", "Pilote de graphe";
     Quantum => "patchbay.quantum", "quantum";
@@ -219,6 +220,27 @@ pub fn lien_refuse_boucle(source: &str, destination: &str) -> String {
 /// « Lien supprimé entre « Lecteur de musique » et « Conduit 1 ». »
 pub fn lien_supprime(source: &str, destination: &str) -> String {
     format!("Lien supprimé entre « {source} » et « {destination} ».")
+}
+
+/// « « Haut-parleurs » coupé : plus aucun son n'en sort. » ou
+/// « « Haut-parleurs » rétabli. »
+///
+/// La coupure mérite une phrase — elle fait taire quelque chose, et rien
+/// d'autre à l'écran ne le crie —, là où un réglage de gain n'en mérite
+/// aucune : c'est un geste continu, une phrase par mouvement serait du bruit.
+pub fn noeud_coupe(nom: &str, coupe: bool) -> String {
+    if coupe {
+        format!("« {nom} » coupé : plus aucun son n'en sort.")
+    } else {
+        format!("« {nom} » rétabli.")
+    }
+}
+
+/// « Lien coupé entre « Lecteur de musique » et « Conduit 1 ». » ou
+/// « Lien rétabli entre … ».
+pub fn lien_coupe(source: &str, destination: &str, coupe: bool) -> String {
+    let quoi = if coupe { "coupé" } else { "rétabli" };
+    format!("Lien {quoi} entre « {source} » et « {destination} ».")
 }
 
 /// « « Générateur de test » créé : sinus à 440 Hz, −12,0 dB. Reliez sa sortie
@@ -345,6 +367,27 @@ mod tests {
             generateur_cree("Générateur de test", "440 Hz", "−12,0 dB"),
             "« Générateur de test » créé : sinus à 440 Hz, −12,0 dB. \
              Reliez sa sortie à une entrée pour l'entendre."
+        );
+    }
+
+    /// Les deux notices de coupure disent ce qui se tait, et ce qui revient.
+    #[test]
+    fn les_notices_de_coupure_disent_les_deux_sens() {
+        assert_eq!(
+            noeud_coupe("Haut-parleurs", true),
+            "« Haut-parleurs » coupé : plus aucun son n'en sort."
+        );
+        assert_eq!(
+            noeud_coupe("Haut-parleurs", false),
+            "« Haut-parleurs » rétabli."
+        );
+        assert_eq!(
+            lien_coupe("Lecteur de musique", "Conduit 1", true),
+            "Lien coupé entre « Lecteur de musique » et « Conduit 1 »."
+        );
+        assert_eq!(
+            lien_coupe("Lecteur de musique", "Conduit 1", false),
+            "Lien rétabli entre « Lecteur de musique » et « Conduit 1 »."
         );
     }
 

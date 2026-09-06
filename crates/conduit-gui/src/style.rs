@@ -228,6 +228,54 @@ pub fn bouton_discret(theme: &Theme, status: button::Status) -> button::Style {
     )
 }
 
+/// Rayon du bouton de coupure : 24 × 22 px ne portent pas le rayon commun de
+/// 8 sans devenir une pastille.
+pub const RAYON_MUET: f32 = 6.0;
+
+/// Bouton de coupure d'un gain — le « M » du pied d'une carte de nœud et du
+/// réglage de lien de l'en-tête.
+///
+/// Au repos, il ressemble au [bouton de pas](bouton_pas) : ni fond, filet de
+/// contour, libellé en texte secondaire des surfaces posées, survol qui glisse
+/// vers l'accent du mode. **Coupé**, il devient un aplat de garance — la
+/// matière de l'alerte, invariante entre les deux modes — dont le libellé
+/// prend le grège : c'est le maximum de contraste disponible sur la garance
+/// (7,5:1, contre 2,0:1 pour l'encre), et il ne peut donc pas suivre le mode.
+///
+/// Le survol n'ajoute rien à l'état coupé : c'est déjà l'état le plus marqué
+/// de la carte, et une seconde couleur d'accent y contredirait le thème.
+pub fn bouton_muet(coupe: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        let j = jetons(theme);
+        let survole = status == button::Status::Hovered;
+        let (fond_bouton, encre, filet) = if coupe {
+            // `CLAIR.surface` et non `j.surface` : la garance ne change pas
+            // d'un mode à l'autre, son partenaire lisible non plus.
+            (
+                Some(fond(j.garance)),
+                crate::theme::CLAIR.surface,
+                j.garance,
+            )
+        } else if survole {
+            (None, j.accent_texte, j.accent_texte)
+        } else {
+            (None, j.texte_2_carte, j.contour)
+        };
+        finir(
+            status,
+            button::Style {
+                background: fond_bouton,
+                text_color: encre,
+                border: Border {
+                    radius: Radius::from(RAYON_MUET),
+                    ..filet_de(filet)
+                },
+                ..button::Style::default()
+            },
+        )
+    }
+}
+
 // --- Surfaces ---------------------------------------------------------------
 
 /// Fond de la fenêtre.
@@ -324,8 +372,8 @@ pub fn carte_noeud(pilote: bool, opacite: f32) -> impl Fn(&Theme) -> container::
     }
 }
 
-/// Rayon d'une barre de niveau : la seule exception au rayon commun, une
-/// barre de 4 px de haut ne peut pas porter un rayon de 8.
+/// Rayon d'une barre de niveau : une barre de 4 px de haut ne peut pas porter
+/// un rayon de 8 (voir aussi [`RAYON_MUET`]).
 pub const RAYON_BARRE: f32 = 2.0;
 
 /// Rail d'une barre de niveau : le fond de la fenêtre creusé dans la ligne.
@@ -515,6 +563,31 @@ pub fn curseur_gain(theme: &Theme, status: slider::Status) -> slider::Style {
     }
 }
 
+/// Curseur de gain voilé du même facteur que la carte qui le porte (voir
+/// [`carte_noeud`]).
+///
+/// `iced` n'a pas d'état désactivé pour une glissière : le voile d'un nœud
+/// suspendu est tout ce qui le dit à l'œil, et c'est la réduction du geste qui
+/// le tient pour de bon (voir [`crate::patchbay::State::reduire`]).
+pub fn curseur_voile(opacite: f32) -> impl Fn(&Theme, slider::Status) -> slider::Style {
+    move |theme, status| {
+        let mut style = curseur_gain(theme, status);
+        let (gauche, droite) = style.rail.backgrounds;
+        style.rail.backgrounds = (voiler(gauche, opacite), voiler(droite, opacite));
+        style.handle.background = voiler(style.handle.background, opacite);
+        style.handle.border_color = opacifier(style.handle.border_color, opacite);
+        style
+    }
+}
+
+/// Un fond voilé du facteur donné ; les fonds du thème sont tous des aplats.
+fn voiler(arriere_plan: Background, opacite: f32) -> Background {
+    match arriere_plan {
+        Background::Color(c) => fond(opacifier(c, opacite)),
+        autre => autre,
+    }
+}
+
 /// Liste déroulante fermée : surface posée, filet de contour qui glisse vers
 /// l'or au survol et vers la garance à l'ouverture.
 ///
@@ -594,7 +667,7 @@ pub fn defilement(theme: &Theme, status: scrollable::Status) -> scrollable::Styl
 mod tests {
     use super::*;
 
-    use crate::theme::{contraste, seuil_contraste, CORPS_META, GREGE, OR};
+    use crate::theme::{contraste, seuil_contraste, CLAIR, CORPS_META, GARANCE, GREGE, OR, SOMBRE};
 
     /// Une closure de style de bouton, nommée pour le rapport d'échec.
     type StyleBouton = (&'static str, fn(&Theme, button::Status) -> button::Style);
@@ -637,6 +710,18 @@ mod tests {
         for (quoi, style) in boutons_de_ligne {
             for status in ETATS_OPAQUES {
                 couples.push((quoi, style(theme, status).text_color, j.surface_2));
+            }
+        }
+        // Le bouton de coupure : au repos sur la surface qui le porte — la
+        // carte d'un nœud, ou le fond de la fenêtre pour un lien —, coupé sur
+        // son propre aplat de garance.
+        for status in ETATS_OPAQUES {
+            let repos = bouton_muet(false)(theme, status);
+            couples.push(("muet", repos.text_color, j.surface_2));
+            couples.push(("muet.entête", repos.text_color, j.surface));
+            let coupe = bouton_muet(true)(theme, status);
+            if let Some(Background::Color(f)) = coupe.background {
+                couples.push(("muet.coupé", coupe.text_color, f));
             }
         }
         for actif in [false, true] {
@@ -740,6 +825,8 @@ mod tests {
                     bouton_secondaire(&theme, status),
                     bouton_pas(&theme, status),
                     bouton_discret(&theme, status),
+                    bouton_muet(false)(&theme, status),
+                    bouton_muet(true)(&theme, status),
                     lien(&theme, status),
                 ] {
                     assert_eq!(style.shadow, Shadow::default());
@@ -798,6 +885,8 @@ mod tests {
                 bordures.push(bouton_primaire(&theme, status).border);
                 bordures.push(bouton_secondaire(&theme, status).border);
                 bordures.push(bouton_pas(&theme, status).border);
+                bordures.push(bouton_muet(false)(&theme, status).border);
+                bordures.push(bouton_muet(true)(&theme, status).border);
             }
             for b in bordures {
                 assert_eq!(b.width, FILET, "filet de {} px", b.width);
@@ -896,6 +985,65 @@ mod tests {
             assert_eq!(repos.rail.backgrounds.0, Background::Color(j.or));
             let tire = curseur_gain(&theme, slider::Status::Dragged);
             assert_eq!(tire.handle.border_color, j.garance);
+        }
+    }
+
+    /// Le voile d'un nœud suspendu descend jusque dans son curseur.
+    #[test]
+    fn le_curseur_se_voile_comme_la_carte_qui_le_porte() {
+        for theme in themes() {
+            let j = jetons(&theme);
+            let plein = curseur_voile(1.0)(&theme, slider::Status::Active);
+            assert_eq!(plein, curseur_gain(&theme, slider::Status::Active));
+            let voile = curseur_voile(OPACITE_SUSPENDU)(&theme, slider::Status::Active);
+            assert_eq!(
+                voile.rail.backgrounds.0,
+                Background::Color(opacifier(j.or, OPACITE_SUSPENDU))
+            );
+            assert_eq!(
+                voile.handle.border_color.a,
+                j.or.a * OPACITE_SUSPENDU,
+                "le poignet se voile aussi"
+            );
+            // Le voile n'est qu'une opacité : les couleurs ne changent pas.
+            assert_eq!(voile.handle.shape, plein.handle.shape);
+        }
+    }
+
+    /// Le bouton de coupure : filet de contour au repos, aplat de garance
+    /// quand la coupure est active — et son libellé sur la matière claire, qui
+    /// est le seul ton lisible sur la garance dans les deux modes.
+    #[test]
+    fn le_bouton_muet_passe_a_la_garance_quand_il_coupe() {
+        for theme in themes() {
+            let j = jetons(&theme);
+            let repos = bouton_muet(false)(&theme, button::Status::Active);
+            assert!(repos.background.is_none());
+            assert_eq!(repos.text_color, j.texte_2_carte);
+            assert_eq!(repos.border.color, j.contour);
+            assert_eq!(repos.border.radius, Radius::from(RAYON_MUET));
+
+            let coupe = bouton_muet(true)(&theme, button::Status::Active);
+            assert_eq!(coupe.background, Some(Background::Color(j.garance)));
+            assert_eq!(coupe.border.color, j.garance);
+            assert_eq!(coupe.text_color, CLAIR.surface);
+            // Invariant entre les deux modes : la garance l'est, son partenaire
+            // lisible doit l'être aussi.
+            assert_eq!(coupe.text_color, GREGE);
+            assert!(
+                contraste(coupe.text_color, GARANCE) >= 4.5,
+                "la matière claire doit tenir sur la garance"
+            );
+            assert!(
+                contraste(SOMBRE.surface, GARANCE) < 4.5,
+                "si l'encre passait, ce choix serait à revoir"
+            );
+            // Le survol n'ajoute rien à l'état coupé.
+            assert_eq!(coupe, bouton_muet(true)(&theme, button::Status::Hovered));
+            // Au repos, en revanche, il glisse vers l'accent du mode.
+            let survol = bouton_muet(false)(&theme, button::Status::Hovered);
+            assert_eq!(survol.text_color, j.accent_texte);
+            assert_eq!(survol.border.color, j.accent_texte);
         }
     }
 }
