@@ -14,6 +14,8 @@
 //! - [`shell`], [`cables`], [`patchbay`] et [`diagnostic`] : coquille de la
 //!   fenêtre (barre latérale, en-tête, bandeau de notice) et les trois vues
 //!   qui l'habitent ;
+//! - [`demarrage`] : où trouver le démon et comment le lancer quand il manque
+//!   (F-51) ;
 //! - [`preferences`] : ce que la fenêtre retient d'une session à l'autre ;
 //! - [`model`] : miroir de l'état du démon, alimenté par réduction pure des
 //!   notifications ;
@@ -32,6 +34,7 @@
 
 pub mod app;
 pub mod cables;
+pub mod demarrage;
 pub mod diagnostic;
 pub mod format;
 pub mod i18n;

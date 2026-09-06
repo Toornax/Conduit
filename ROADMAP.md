@@ -555,7 +555,12 @@ testée d'abord avec le backend null, puis sur Windows.
   L'export reprend le rapport texte du démon (`Command::Dump`) et l'écrit dans Documents.
 - [ ] **M2-09** `feat(gui): icône de zone de notification et menu rapide`
   *Fait quand* : état OK / xruns / pilote absent visible, ouverture de la fenêtre au clic.
-- [ ] **M2-10** `feat(gui): démarrage du démon si absent`
+- [x] **M2-10** `feat(gui): démarrage du démon si absent`
+  Le binaire `conduitd` est cherché à côté de l'exécutable courant (disposition du MSI
+  comme d'un `cargo build`), à défaut dans le `PATH` ; il est lancé détaché, sans console
+  sous Windows, avec le `--socket` que la GUI surveille. La GUI ne l'attend pas : la boucle
+  de reconnexion voit le démon apparaître. Le bouton « Démarrer le démon » passe en
+  « Démarrage… » jusqu'à la connexion (F-51).
 - [x] **M2-11a** `feat(gui): thème clair/sombre`
   Design system « Sericæ » : jetons, polices embarquées, styles de widgets, formatage français.
   *Fait quand* : la fenêtre suit le mode du système, contraste WCAG AA vérifié par test

@@ -21,7 +21,7 @@ use crate::ipc::{self, Requester};
 use crate::model::Mirror;
 use crate::preferences::Preferences;
 use crate::shell::{self, Tab};
-use crate::{cables, diagnostic, format, patchbay, theme, typo};
+use crate::{cables, demarrage, diagnostic, format, patchbay, theme, typo};
 
 /// État de la connexion au démon.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -130,6 +130,14 @@ enum Attente {
 /// Temps d'affichage d'une notice avant son effacement.
 pub const DUREE_NOTICE: Duration = Duration::from_millis(4_500);
 
+/// Temps pendant lequel le bouton de démarrage reste en « Démarrage… ».
+///
+/// Le démon lancé n'est pas attendu ([`crate::demarrage`]) : rien ne dit qu'il
+/// arrive. Le drapeau se lève donc à la connexion, ou au bout de ce délai —
+/// large, puisqu'il doit couvrir le démarrage du démon **et** la tentative de
+/// reconnexion suivante, espacée d'au plus [`ipc::RETRY_MAX`].
+pub const DUREE_DEMARRAGE: Duration = Duration::from_secs(12);
+
 /// Message de l'application.
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -142,6 +150,16 @@ pub enum Message {
     /// Fin du minuteur de la notice de génération donnée ; une notice plus
     /// récente n'est pas effacée.
     NoticeExpiree(u32),
+    /// Démarre le démon, qui ne répond pas (F-51).
+    StartDaemon,
+    /// Le lancement du démon a abouti — le processus est parti — ou a échoué.
+    ///
+    /// Ce n'est **pas** la connexion : le démon n'est pas attendu, et c'est la
+    /// boucle de reconnexion qui dira s'il est là.
+    DemonLance(Result<(), demarrage::Echec>),
+    /// Fin du délai d'attente du démarrage demandé de ce numéro ; une demande
+    /// plus récente n'est pas libérée.
+    DemarrageExpire(u32),
     /// Crée un câble stéréo sans nom (`CableAdd`) : le démon le nomme, et
     /// l'utilisateur lui donne ensuite un alias dans sa ligne.
     AddCable,
@@ -196,6 +214,8 @@ pub struct App {
     attente: Option<Attente>,
     rapport: Option<String>,
     generation: u32,
+    demarrage: bool,
+    tentative: u32,
     mode: iced::theme::Mode,
 }
 
@@ -214,6 +234,8 @@ impl App {
             attente: None,
             rapport: None,
             generation: 0,
+            demarrage: false,
+            tentative: 0,
             mode: iced::theme::Mode::default(),
         }
     }
@@ -268,6 +290,12 @@ impl App {
     /// Notice affichée sous l'en-tête, s'il y en a une.
     pub fn notice(&self) -> Option<&Notice> {
         self.notice.as_ref()
+    }
+
+    /// Vrai tant qu'un démarrage du démon a été demandé sans qu'on sache
+    /// encore ce qu'il en est.
+    pub fn demarrage(&self) -> bool {
+        self.demarrage
     }
 
     /// Mode clair ou sombre annoncé par le système.
@@ -336,6 +364,36 @@ impl App {
                 // suivante : seule la génération courante s'efface.
                 if self.generation == generation {
                     self.notice = None;
+                }
+            }
+            Message::StartDaemon => {
+                // Le lancement touche au disque et crée un processus : il part
+                // dans une tâche, `update` n'attend rien.
+                self.tentative = self.tentative.wrapping_add(1);
+                self.demarrage = true;
+                self.notice = None;
+                let socket = self.socket.clone();
+                let tentative = self.tentative;
+                return Task::batch([
+                    Task::perform(demarrer_le_demon(socket), Message::DemonLance),
+                    Task::perform(attendre_le_demarrage(), move |()| {
+                        Message::DemarrageExpire(tentative)
+                    }),
+                ]);
+            }
+            // Le processus est parti : rien à annoncer, c'est la reconnexion
+            // qui dira si le démon répond.
+            Message::DemonLance(Ok(())) => {}
+            Message::DemonLance(Err(echec)) => {
+                self.demarrage = false;
+                self.poser_notice(Notice::erreur(echec.texte()));
+                return self.minuteur();
+            }
+            Message::DemarrageExpire(tentative) => {
+                // Le minuteur d'une demande abandonnée ne libère pas le bouton
+                // d'une demande plus récente.
+                if self.tentative == tentative {
+                    self.demarrage = false;
                 }
             }
             Message::AddCable => {
@@ -575,6 +633,10 @@ impl App {
                 self.notice = None;
                 self.attente = None;
                 self.rapport = None;
+                // Le démon répond : qu'il vienne d'être lancé par la GUI ou
+                // qu'il ait été là depuis toujours, il n'y a plus rien à
+                // démarrer.
+                self.demarrage = false;
                 self.connection = Connection::Ready { server };
             }
             ipc::Event::Lost { reason, retry_in } => {
@@ -696,7 +758,7 @@ impl App {
     pub fn view(&self) -> Element<'_, Message> {
         let enabled = self.connection.is_ready();
         let graisse = theme::jetons(&self.theme()).graisse_texte;
-        let (actions, contenu) = match self.tab {
+        let (mut actions, contenu) = match self.tab {
             Tab::Cables => (
                 vec![shell::action_primaire(
                     Text::CablesAdd,
@@ -744,6 +806,13 @@ impl App {
                 diagnostic::view(&self.mirror, enabled, graisse),
             ),
         };
+        // Démon arrêté : les actions de la vue sont toutes grisées, et la
+        // seule qui puisse encore aboutir prend la place de tête, à droite.
+        // Pendant les tentatives de connexion, en revanche, rien ne dit encore
+        // que le démon manque : proposer de le démarrer serait prématuré.
+        if shell::EtatDemon::depuis(&self.connection) == shell::EtatDemon::Arrete {
+            actions.push(shell::action_demarrer(self.demarrage));
+        }
         shell::fenetre(
             self.tab,
             &self.connection,
@@ -763,6 +832,21 @@ impl App {
 /// la tâche sans l'exécuter.
 async fn attendre_la_notice() {
     tokio::time::sleep(DUREE_NOTICE).await;
+}
+
+/// Attend le temps que le bouton de démarrage reste en « Démarrage… ».
+async fn attendre_le_demarrage() {
+    tokio::time::sleep(DUREE_DEMARRAGE).await;
+}
+
+/// Lance le démon hors du fil de l'interface (F-51).
+///
+/// La recherche du binaire interroge le disque et la création du processus
+/// peut bloquer : les deux vont dans un fil de travail. Le résultat ne dit que
+/// le lancement, pas la connexion — voir [`crate::demarrage`].
+async fn demarrer_le_demon(socket: PathBuf) -> Result<(), demarrage::Echec> {
+    let lancement = tokio::task::spawn_blocking(move || demarrage::lancer(&socket)).await;
+    lancement.unwrap_or_else(|erreur| Err(demarrage::Echec::Refus(erreur.to_string())))
 }
 
 /// Lit le fichier de préférences hors du fil de l'interface.
@@ -1525,6 +1609,74 @@ mod tests {
             Some("Rapport non écrit : permission refusée")
         );
         assert!(a.notice().unwrap().erreur);
+    }
+
+    /// Demander le démarrage arme le drapeau, qui grise le bouton ; la
+    /// connexion le libère. Aucun processus n'est lancé : `update` rend la
+    /// tâche sans l'exécuter.
+    #[test]
+    fn demander_le_demarrage_arme_le_drapeau_jusqu_a_la_connexion() {
+        let mut a = app();
+        assert!(!a.demarrage());
+        let _ = a.update(Message::StartDaemon);
+        assert!(a.demarrage(), "le bouton passe en « Démarrage… »");
+        // Le bouton grisé n'a plus de message : rien à redemander.
+        assert!(matches!(
+            shell::libelle_de_demarrage(a.demarrage()),
+            Text::DaemonStartPending
+        ));
+        a.apply_ipc(ipc::Event::Ready {
+            server: "conduitd 0.1.0".into(),
+            snapshot: Box::new(snapshot()),
+        });
+        assert!(!a.demarrage(), "le démon répond : plus rien à démarrer");
+        assert!(matches!(
+            shell::libelle_de_demarrage(a.demarrage()),
+            Text::DaemonStart
+        ));
+    }
+
+    /// Si rien ne vient, le minuteur rend le bouton au bout de
+    /// [`DUREE_DEMARRAGE`] — et celui d'une demande abandonnée ne rend pas le
+    /// bouton d'une demande plus récente.
+    #[test]
+    fn le_minuteur_du_demarrage_ne_libere_que_sa_propre_demande() {
+        let mut a = app();
+        let _ = a.update(Message::StartDaemon);
+        let premiere = a.tentative;
+        let _ = a.update(Message::StartDaemon);
+        assert_ne!(a.tentative, premiere);
+        let _ = a.update(Message::DemarrageExpire(premiere));
+        assert!(
+            a.demarrage(),
+            "le minuteur de la demande abandonnée n'a rien à libérer"
+        );
+        let _ = a.update(Message::DemarrageExpire(a.tentative));
+        assert!(!a.demarrage());
+    }
+
+    /// Un lancement refusé rend le bouton et le dit, en reprenant la cause du
+    /// système telle quelle.
+    #[test]
+    fn un_lancement_refuse_rend_le_bouton_et_se_dit() {
+        let mut a = app();
+        let _ = a.update(Message::StartDaemon);
+        let _ = a.update(Message::DemonLance(Err(demarrage::Echec::Refus(
+            "permission refusée".into(),
+        ))));
+        assert!(!a.demarrage());
+        let notice = a.notice().expect("un lancement refusé se dit");
+        assert!(notice.erreur);
+        assert!(
+            notice.texte.contains("permission refusée"),
+            "{}",
+            notice.texte
+        );
+        // Un lancement réussi, lui, n'annonce rien : la reconnexion parlera.
+        let _ = a.update(Message::StartDaemon);
+        let _ = a.update(Message::DemonLance(Ok(())));
+        assert!(a.demarrage(), "le bouton reste en « Démarrage… »");
+        assert!(a.notice().is_none());
     }
 
     #[test]

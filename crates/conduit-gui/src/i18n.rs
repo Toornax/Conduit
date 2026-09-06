@@ -56,6 +56,10 @@ textes! {
     DaemonRunning => "daemon.running", "conduitd en marche";
     DaemonStarting => "daemon.starting", "conduitd démarre…";
     DaemonStopped => "daemon.stopped", "conduitd arrêté";
+    DaemonStart => "daemon.start", "Démarrer le démon";
+    DaemonStartPending => "daemon.start.pending", "Démarrage…";
+    DaemonNotFound => "daemon.notfound",
+        "conduitd est introuvable : ni à côté de Conduit, ni dans le PATH.";
     DriverWindows => "driver.windows", "Pilote noyau conduit-kmd";
     DriverMacos => "driver.macos", "Plugin HAL conduit-hal";
     DriverLinux => "driver.linux", "Nœuds PipeWire (sans pilote)";
@@ -352,6 +356,14 @@ pub fn cycle_note(min: &str, max: &str, budget: &str) -> String {
 /// retrouver le fichier, l'interface n'ouvrant aucun explorateur.
 pub fn rapport_ecrit(chemin: &str) -> String {
     format!("Rapport écrit dans {chemin}")
+}
+
+/// « Démon non lancé : permission refusée »
+///
+/// La cause vient du système : elle est reprise telle quelle, sans
+/// reformulation (ADR-006).
+pub fn demon_non_lance(cause: &str) -> String {
+    format!("Démon non lancé : {cause}")
 }
 
 /// « Rapport non écrit : permission refusée. »

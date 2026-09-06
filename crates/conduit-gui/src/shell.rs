@@ -168,6 +168,18 @@ pub fn pilote_plateforme() -> &'static str {
     })
 }
 
+/// Le libellé du bouton qui démarre le démon (F-51).
+///
+/// Tant que le démarrage est demandé, le bouton dit « Démarrage… » et ne
+/// répond plus : le lancement est parti, il n'y a rien à redemander.
+pub fn libelle_de_demarrage(demande: bool) -> Text {
+    if demande {
+        Text::DaemonStartPending
+    } else {
+        Text::DaemonStart
+    }
+}
+
 /// Libellé du nœud pilote du graphe.
 pub fn libelle_pilote(pilote: &DriverStatus) -> String {
     match pilote {
@@ -456,6 +468,17 @@ pub(crate) fn action_primaire<'a>(libelle: Text, message: Option<Message>) -> El
     .padding(Padding::new(0.0).horizontal(style::PADDING_BOUTON))
     .style(style::bouton_primaire)
     .into()
+}
+
+/// Le bouton qui démarre le démon, en bouton primaire.
+///
+/// Il ne s'affiche que lorsque le démon ne répond pas : c'est alors la seule
+/// action de la fenêtre qui puisse encore aboutir.
+pub(crate) fn action_demarrer<'a>(demande: bool) -> Element<'a, Message> {
+    action_primaire(
+        libelle_de_demarrage(demande),
+        (!demande).then_some(Message::StartDaemon),
+    )
 }
 
 /// Une action d'appoint d'une vue, en bouton secondaire ; `message` absent la
