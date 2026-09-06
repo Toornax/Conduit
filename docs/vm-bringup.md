@@ -120,6 +120,32 @@ câbles audio virtuels) »**. Vérifier aussi dans `mmsys.cpl`.
 3. *Le nom est bon mais trop long* : raccourcir la description du périphérique, c'est
    elle qui fournit la partie entre parenthèses.
 
+## 3 bis. Où lancer les mesures audio : le piège qui a coûté une journée
+
+**Toute mesure audio faite au mauvais endroit ne mesure rien**, et le symptôme est
+exactement celui d'un pilote muet. Deux pièges, découverts le 2026-09-06 après des heures
+de fausses pistes sur le pilote, qui lui n'avait rien.
+
+1. **PowerShell Direct ouvre ses sessions dans la session 0**, celle des services. Elle
+   est isolée de la session interactive et n'a pas l'audio de l'utilisateur, exactement ce
+   que dit [ADR-013](adr/013-demarrage-du-demon-sous-windows.md) à propos du démon. Un
+   test lancé par `Invoke-Command -VMName` énumère bien les endpoints, ouvre les flux et
+   reçoit des trames **à la bonne cadence**, mais toutes silencieuses. Rien ne signale
+   l'erreur.
+2. **Le mode session étendue de `vmconnect` redirige l'audio vers l'hôte.** La session
+   ouverte ainsi ne voit qu'un « périphérique audio distant » et **pas** les endpoints de
+   la machine : le test ne trouve même plus le câble.
+
+**La bonne configuration** : ouvrir `vmconnect` en **session de base** (désactiver le mode
+session étendue), ouvrir une session Windows à la console, et lancer les mesures **dans
+cette session**. Depuis l'hôte, on y arrive par une tâche planifiée créée avec un jeton
+interactif (`schtasks /create … /ru <utilisateur> /it`, puis `schtasks /run`), la sortie
+étant redirigée vers un fichier que l'hôte relit ensuite.
+
+**Le réflexe, avant de suspecter le pilote** : vérifier la session du processus de test et
+le volume des endpoints. `conduit-looptest` les affiche désormais lui-même et prévient
+quand la mesure ne peut pas avoir de sens.
+
 ## 4. M1a-07 — une application peut jouer sur l'endpoint
 
 Dans la VM, jouer un fichier sur « Conduit 1 » (l'application Musique, ou
