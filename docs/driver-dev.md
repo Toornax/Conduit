@@ -151,25 +151,30 @@ chargées est dans [vm-bringup.md](vm-bringup.md) : ordre, résultat attendu à 
 
 Jamais de pilote de test sur la machine de développement : un bug = écran bleu, et le
 mode `testsigning` affaiblit la machine. Les scripts du dépôt ne lancent jamais
-`pnputil`, `devgen` ni `bcdedit` **sur l'hôte** : `vm-prepare.ps1` et `vm-cycle.ps1` les
-exécutent dans l'invité par PowerShell Direct (`Invoke-Command -VMName`).
+`pnputil`, `devgen`, `bcdedit`, `verifier` ni `schtasks` **sur l'hôte** : `vm-prepare.ps1`,
+`vm-cycle.ps1` et `vm-run-console.ps1` les exécutent dans l'invité par PowerShell Direct
+(`Invoke-Command -VMName`). Seul `vm-debug.ps1` lance un exécutable sur l'hôte — `kd.exe`,
+un débogueur, qui ne charge rien.
 
-Trois scripts dans `drivers\windows\tools\`, à lancer dans l'ordre sur l'hôte.
-Prérequis : Hyper-V activé (Windows 11 Pro), le commutateur `Default Switch` (créé par
-Hyper-V, NAT vers l'hôte), une **ISO officielle de Windows 11** (microsoft.com,
-« Télécharger l'image de disque »), le WDK 26100 sur l'hôte (pour `devgen.exe`) et le
-paquet produit par `build.ps1`.
+Trois scripts de mise en place dans `drivers\windows\tools\`, à lancer dans l'ordre sur
+l'hôte, plus deux outils de séance. Prérequis : Hyper-V activé (Windows 11 Pro), le
+commutateur `Default Switch` (créé par Hyper-V, NAT vers l'hôte), une **ISO officielle de
+Windows 11** (microsoft.com, « Télécharger l'image de disque »), le WDK 26100 sur l'hôte
+(pour `devgen.exe` et `kd.exe`) et le paquet produit par `build.ps1`.
 
 | Script | Rôle | Une fois / à chaque fois |
 |---|---|---|
 | `vm-new.ps1 -IsoPath <iso>` | crée et démarre la VM | une fois |
-| `vm-prepare.ps1 -Credential <cred>` | `testsigning`, débogueur réseau, vidages, point de contrôle `propre` | une fois (ou après réinstallation) |
+| `vm-prepare.ps1 -Credential <cred>` | `testsigning`, débogueur **série**, filtre de traces, vidages, point de contrôle `propre` | une fois (ou après réinstallation) |
 | `vm-cycle.ps1 -Credential <cred> [-Count 100]` | copie le paquet, l'installe et le retire N fois | à chaque build à valider |
+| `vm-debug.ps1 [-StartVM] [-Follow]` | attache `kd.exe` au canal nommé **avant** de démarrer la VM | à chaque séance de débogage |
+| `vm-run-console.ps1 -Credential <cred> -Path <exe>` | exécute une commande **dans la session console** de l'invité | à chaque mesure audio |
 
 **Deux façons de lancer les scripts.** Piloter Hyper-V n'exige **pas** l'élévation :
-appartenir au groupe **Administrateurs Hyper-V** suffit. Les trois scripts acceptent donc
+appartenir au groupe **Administrateurs Hyper-V** suffit. Tous ces scripts acceptent donc
 l'une **ou** l'autre de ces deux situations, et s'arrêtent sinon avec un message qui
-rappelle les deux remèdes :
+rappelle les deux remèdes (`vm-debug.ps1` ne le vérifie qu'avec `-StartVM` : sans lui, il
+ne touche pas à Hyper-V) :
 
 1. **PowerShell lancé en tant qu'administrateur.** Rien à préparer, mais une invite UAC à
    chaque fois, et un terminal élevé pour toute la session.
@@ -196,8 +201,10 @@ création de VM (corrigé au commit `25b3557`).
 
 Les fonctions d'analyse partagées (`vm-common.psm1` : identifiant d'instance de `devgen`,
 `oemN.inf` de `pnputil /enum-drivers`, clé kdnet, résumé des durées, décision d'accès
-Hyper-V) ont des tests Pester dans `tools\tests\`
-(`Invoke-Pester drivers\windows\tools\tests`, syntaxe Pester 3/4 livrée avec Windows).
+Hyper-V, ligne de commande de `kd.exe`, décision de session console, fichier de commandes
+de la tâche planifiée, reconnaissance des endpoints fantômes) ont des tests Pester dans
+`tools\tests\` (`Invoke-Pester drivers\windows\tools\tests`, syntaxe Pester 3/4 livrée
+avec Windows).
 
 ### 3.1 Création : `vm-new.ps1`
 
@@ -220,18 +227,33 @@ registre `BypassNRO`, redémarrer).
 ### 3.2 Préparation : `vm-prepare.ps1`
 
 ```powershell
-$cred = Get-Credential test
-.\drivers\windows\tools\vm-prepare.ps1 -Name ConduitTest -Credential $cred   # [-HostIp <ip>] [-DebugPort 50000] [-DebugKey <clé>]
+$cred = Get-Credential nathan
+.\drivers\windows\tools\vm-prepare.ps1 -Name ConduitTest -Credential $cred   # [-DebugTransport serial|net] [-DebugPipe \\.\pipe\conduitdbg] [-DebugComPort 1]
 ```
 
 Dans l'invité, par PowerShell Direct : `bcdedit /set testsigning on`, `bcdedit /debug on`,
-`bcdedit /dbgsettings net hostip:<hôte> port:50000 key:<clé>` (hôte = adresse de
-`vEthernet (Default Switch)` par défaut ; clé générée et **affichée à la fin**, à
-conserver pour WinDbg), `CrashDumpEnabled = 2` (vidage noyau complet) et `AutoReboot = 1`
-dans `HKLM\SYSTEM\CurrentControlSet\Control\CrashControl`, veille, écran et hibernation
+le transport du débogueur, le **filtre de traces du noyau**, `CrashDumpEnabled = 2`
+(vidage noyau complet) et `AutoReboot = 1` dans
+`HKLM\SYSTEM\CurrentControlSet\Control\CrashControl`, veille, écran et hibernation
 désactivés. Puis redémarrage de l'invité, vérification que `testsigning` est bien actif
 (`bcdedit /enum`) et point de contrôle **`propre`** (`Checkpoint-VM`). Après un plantage
 inexpliqué : `Restore-VMCheckpoint -VMName ConduitTest -Name propre -Confirm:$false`.
+
+**Transport `serial` par défaut** : `bcdedit /dbgsettings serial debugport:1
+baudrate:115200` dans l'invité, et `Set-VMComPort -VMName ConduitTest -Number 1 -Path
+\\.\pipe\conduitdbg` sur l'hôte. Cette commande **exige la VM arrêtée** : le script
+termine donc par un arrêt complet, attache le canal, puis rallume — d'où un cycle un peu
+plus long qu'un simple redémarrage. Le transport réseau (`-DebugTransport net`, `bcdedit
+/dbgsettings net` et une clé kdnet) reste disponible et se comporte comme avant, mais
+**ne s'est jamais connecté sur ce poste** : ne le reprendre que pour l'y faire marcher.
+
+**Filtre de traces** : `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Debug Print
+Filter`, valeur `DEFAULT` (DWord) à `0xF`, **créée si la clé n'existe pas** — c'est le cas
+sur une installation neuve. Sans elle, seules les lignes de niveau *erreur* d'un pilote
+tiers traversent : les traces `kmd_log!` restent invisibles, et ce silence ressemble trait
+pour trait à un pilote qui ne démarre pas. Posée en registre, elle vaut dès l'amorçage,
+donc pour `DriverEntry` — contrairement à `ed nt!Kd_IHVDRIVER_Mask 0xf`, qui ne vaut que
+pour la séance de débogage en cours.
 
 ### 3.3 Cycle de chargement (M1a-02) : `vm-cycle.ps1`
 
@@ -243,7 +265,10 @@ inexpliqué : `Restore-VMCheckpoint -VMName ConduitTest -Name propre -Confirm:$f
 Le script copie le paquet et `devgen.exe` (WDK de l'hôte, version de `versions.json`)
 dans `C:\ConduitTest` de l'invité, importe `WDRLocalTestCert.cer` dans *Root* et
 *TrustedPublisher* de la machine invitée, retire les restes d'une exécution interrompue
-(périphériques `Root\ConduitCable`, paquets `oemN.inf` de `conduit_kmd.inf`), puis répète
+(périphériques `Root\ConduitCable`, paquets `oemN.inf` de `conduit_kmd.inf`, et **endpoints
+fantômes** — périphériques non présents dont le nom contient « Conduit » — qui fausseraient
+les mesures en dédoublant les instances ; rien d'autre n'est touché, cette VM servant aussi
+à comparer avec de vraies cartes son), puis répète
 `Count` fois, en affichant `i/Count OK` et la durée :
 
 1. `pnputil /add-driver conduit_kmd.inf /install` ;
@@ -356,21 +381,97 @@ d'autres formats, `--block` pour changer la taille de rappel demandée,
 `--no-capture` pour n'exercer que le rendu. `--self-test` (sans périphérique)
 vérifie l'outil lui-même. Détails dans [dev-guide.md](dev-guide.md) §4 quinquies.
 
+### 3.4 bis Mesurer dans la session console : `vm-run-console.ps1`
+
+**Une mesure audio lancée par `Invoke-Command -VMName` ne mesure rien.** PowerShell Direct
+ouvre ses sessions dans la **session 0**, celle des services, qui n'a aucun audio
+utilisateur : le test énumère les endpoints, ouvre les flux et reçoit des trames *à la
+bonne cadence*, toutes silencieuses, **sans le moindre signal d'erreur**. Le résultat a
+l'air d'un pilote en panne alors qu'il n'a aucun objet. Ce piège, cumulé au mode session
+étendue de `vmconnect` qui redirige l'audio vers l'hôte, a invalidé une journée entière de
+mesures ([vm-bringup.md](vm-bringup.md) §3 bis).
+
+```powershell
+.\drivers\windows\tools\vm-run-console.ps1 -Credential $cred `
+  -Path target\debug\conduit-looptest.exe -Arguments @("--repeat", "10")
+```
+
+Le script **refuse de travailler** tant qu'une session console interactive n'est pas
+ouverte dans l'invité, et le dit avec la marche à suivre : ouvrir `vmconnect` **en mode
+session de base** (pas étendue), ouvrir une session Windows à l'écran, relancer. La
+vérification ne dépend pas de la langue — `Win32_ComputerSystem.UserName` donne
+l'utilisateur ouvert à la console, et l'identifiant de session de *son* processus
+`explorer` doit différer de 0 ; jamais `quser`, dont toute la sortie est traduite.
+
+Ensuite : copie facultative de l'exécutable (`-Path`, sinon `-RemoteExecutable` pour un
+binaire déjà présent), création d'une tâche planifiée à **jeton interactif**
+(`schtasks /create … /ru <compte> /it /f`, aucun mot de passe nécessaire), `schtasks /run`,
+attente, relecture, suppression de la tâche (même en cas d'échec), et propagation du code
+de retour. Le compte vient toujours du `-Credential` : le compte réel de cette VM est
+`nathan`, pas le `test` de la documentation d'origine ; un compte qui ne serait pas celui
+ouvert à la console est refusé d'emblée, car la tâche `/it` ne partirait jamais.
+
+La fin d'exécution se constate par un **fichier de code de retour** écrit par la commande
+elle-même, jamais par `schtasks /query`, dont le statut est traduit. `-TimeoutSeconds`
+borne l'attente (prévoir large pour la charge d'une heure : `-TimeoutSeconds 4000`) ; la
+session PowerShell Direct est rouverte si elle tombe, et l'avancement s'imprime chaque
+minute. La sortie complète reste dans l'invité, sous `C:\ConduitTest\console-<horodatage>.out.txt`.
+
 ### 3.5 Driver Verifier et journal
 
 `verifier /standard /driver conduit_kmd.sys` puis redémarrage (retour : `verifier /reset`).
 Les messages `kmd_log!` (`conduit-kmd/src/log.rs`, `wdk::println!` → `DbgPrint`, profil
-`dev` seulement) passent par le débogueur : fenêtre de commande WinDbg ou DebugView
-(« Capture Kernel ») dans l'invité. Attendu à chaque cycle : `DriverEntry`, `AddDevice`,
-`StartDevice`, `DriverUnload`.
+`dev` seulement) passent par le débogueur : fenêtre de `kd.exe` ouverte par `vm-debug.ps1`
+(§4) ou DebugView (« Capture Kernel ») dans l'invité — à condition que le filtre de traces
+soit posé (§3.2). Attendu à chaque cycle : `DriverEntry`, `AddDevice`, `StartDevice`,
+`DriverUnload`.
+
+La charge d'une heure sous Driver Verifier (M1a-11) tourne sans surveillance avec
+`vm-run-console.ps1 -TimeoutSeconds 4000` : elle doit s'exécuter dans la session console,
+comme toute mesure audio.
 
 ## 4. Débogage noyau et plantages
 
-Sur l'hôte, WinDbg → *Attach to kernel* → *Net*, même port et même clé qu'au §3.2 ;
-la VM s'arrête au démarrage jusqu'à la connexion si `bcdedit /set {default} bootdebug on`.
-Commandes utiles : `!analyze -v` après un bug check, `!verifier 3` pour l'état de Driver
-Verifier, `lm m conduit*` pour vérifier que le module et son `.pdb` sont chargés
-(`.sympath+ <dossier du package>`), `bp conduit_kmd!DriverEntry`.
+Le transport qui **marche** ici est le **canal nommé série**, pas le réseau. La VM est
+préparée par `vm-prepare.ps1` (§3.2, transport `serial` par défaut) : son port COM 1 est
+attaché à `\\.\pipe\conduitdbg`.
+
+```powershell
+.\drivers\windows\tools\vm-debug.ps1 -StartVM -Follow    # [-Name ConduitTest] [-Pipe \\.\pipe\conduitdbg] [-LogPath <fichier>]
+```
+
+> **La règle qui débloque tout : le débogueur doit tenir le canal nommé AVANT que la
+> machine démarre.** Une VM démarrée en premier ne se laisse pas rattraper — la connexion
+> n'arrive jamais, et l'on passe la séance à chercher pourquoi. `-StartVM` encapsule
+> l'ordre : le script arrête la VM si nécessaire, lance `kd.exe`, **attend qu'il tienne le
+> canal**, puis seulement `Start-VM`. Ce n'est plus une consigne à retenir, c'est un
+> comportement.
+
+À la main, dans cet ordre et pas un autre :
+
+```powershell
+Stop-VM -Name ConduitTest
+kd.exe -k com:pipe,port=\\.\pipe\conduitdbg,resets=0,reconnect    # <KitsRoot10>\Debuggers\x64\
+Start-VM -Name ConduitTest
+```
+
+`resets=0,reconnect` est ce qui rend cet ordre praticable : le débogueur tient le canal
+sans lâcher tant que la VM n'a pas démarré, et se raccroche à chaque redémarrage de
+l'invité. `vm-debug.ps1` journalise tout (`-logo`, sous
+`drivers\windows\target\debug-logs\`), joue `ed nt!Kd_IHVDRIVER_Mask 0xf` puis `g` à la
+connexion (le masque de traces, aussi posé en registre par `vm-prepare.ps1`), et avec
+`-Follow` suit le journal en mettant en évidence les lignes du pilote.
+
+Commandes utiles dans la fenêtre de `kd.exe` : `!analyze -v` après un bug check,
+`!verifier 3` pour l'état de Driver Verifier, `lm m conduit*` pour vérifier que le module
+et son `.pdb` sont chargés (`.sympath+ <dossier du package>` puis `.reload`),
+`bp conduit_kmd!DriverEntry`, Ctrl+Inter pour interrompre l'invité et `g` pour le relâcher.
+La VM s'arrête au démarrage jusqu'à la connexion si `bcdedit /set {default} bootdebug on`
+(dans l'invité).
+
+Le transport **réseau** (kdnet, WinDbg → *Attach to kernel* → *Net*, port et clé de
+`vm-prepare.ps1 -DebugTransport net`) est resté disponible mais **ne s'est jamais connecté
+sur ce poste** : ne pas y passer de temps sans raison précise.
 
 Une panique Rust se traduit par le bug check **`0xE0000001`** (`conduit-kmd/src/panic.rs`,
 `KeBugCheckEx`) : `!analyze -v` l'affiche avec ses quatre paramètres.
@@ -395,6 +496,11 @@ fichier de la VM vers l'hôte. L'ouvrir dans WinDbg (`.sympath` sur le dossier d
 | `signtool verify` : « terminated in a root certificate which is not trusted » | Normal sur l'hôte : `WDRLocalTestCert` est auto-signé. `vm-cycle.ps1` importe le `.cer` dans la VM (§3.3). |
 | Un script `tools\*.ps1` échoue avec « Jeton inattendu » ou « Le terminateur " est manquant » sur une ligne contenant `—`, `œ` ou `…` | Fichier UTF-8 **sans BOM** : Windows PowerShell 5.1 le lit en ANSI et prend des octets pour des guillemets typographiques. Tous les scripts du dépôt sont en UTF-8 avec BOM ; conserver ce BOM en éditant. |
 | `vm-prepare.ps1` : « testsigning n'est pas actif après redémarrage » | Secure Boot encore actif sur la VM : `Set-VMFirmware -VMName ConduitTest -EnableSecureBoot Off` (VM arrêtée), puis relancer le script. |
+| `vm-run-console.ps1` : « Aucune session console interactive » | Voulu. Ouvrir `vmconnect` **en mode session de base** (pas étendue, qui redirige l'audio vers l'hôte), ouvrir une session Windows à l'écran avec le compte du `-Credential`, attendre le bureau, relancer. Sans cela la mesure tournerait dans la session 0 et serait silencieuse sans erreur (§3.4 bis). |
+| `vm-run-console.ps1` : « Le compte ouvert à la console est … mais -Credential désigne … » | La tâche `/it` ne se déclenche que pour l'utilisateur ouvert à la console. Le compte réel de la VM est `nathan`, pas `test` : passer le bon `-Credential`. |
+| Le débogueur ne se connecte jamais au canal nommé | La VM a démarré **avant** le débogueur. Arrêter la VM, relancer `vm-debug.ps1 -StartVM`, qui impose l'ordre. Vérifier aussi le port COM : `Get-VMComPort -VMName ConduitTest` doit montrer `\\.\pipe\conduitdbg` (attaché par `vm-prepare.ps1`, VM arrêtée). |
+| Aucune trace `kmd_log!` alors que le pilote démarre | Filtre de traces absent : `Debug Print Filter\DEFAULT = 0xF` (§3.2), ou `ed nt!Kd_IHVDRIVER_Mask 0xf` dans le débogueur pour la séance en cours. Vérifier aussi le profil : `kmd_log!` n'existe qu'en `dev`. |
+| `vm-prepare.ps1` : « Set-VMComPort exige une VM ARRÊTÉE » | L'invité ne s'est pas éteint (mise à jour en cours, invité figé). `Stop-VM -Name ConduitTest`, puis relancer le script. |
 | `vm-cycle.ps1` : « Le périphérique … n'est pas passé en état OK », problème 10 ou 28 | 10 : `StartDevice` ou PortCls a échoué (journal `kmd_log!`, événement Kernel-PnP 411). 28 : l'INF ne correspond pas (`pnputil /enum-drivers` dans la VM, certificat importé ?). |
 
 ## 6. Dépôt
