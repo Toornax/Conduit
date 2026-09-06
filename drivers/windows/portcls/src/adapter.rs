@@ -20,14 +20,14 @@
 //! PortCls les déréférence, et seul l'appelant sait qu'ils sont ceux du rappel en cours.
 
 use conduit_com::{ComPtr, ComRef, ComVtable, NtStatus, STATUS_NOT_IMPLEMENTED};
-use portcls_sys::{IPort, IUnknown, PDEVICE_OBJECT, PIRP};
+use portcls_sys::{GUID, IPort, IUnknown, PDEVICE_OBJECT, PIRP};
 
 use crate::received::ResourceList;
 
 #[cfg(feature = "kernel")]
 use conduit_com::{STATUS_INVALID_PARAMETER, nt_success};
 #[cfg(feature = "kernel")]
-use portcls_sys::{GUID, PPORT, PcNewPort, PcRegisterPhysicalConnection, PcRegisterSubdevice};
+use portcls_sys::{PPORT, PcNewPort, PcRegisterPhysicalConnection, PcRegisterSubdevice};
 
 /// Référence `IUnknown` sur un objet COM du pilote (`AddRef`) : la forme sous laquelle
 /// `IPort::Init` reçoit le miniport et `PcRegisterSubdevice` le port.
@@ -184,9 +184,48 @@ pub const WAVE_CAPTURE_0: [u16; 13] = utf16z("WaveCapture0");
 /// Nom du sous-périphérique topologie capture du câble 0 (`TopoCapture0`).
 pub const TOPO_CAPTURE_0: [u16; 13] = utf16z("TopoCapture0");
 
+/// GUID de base des **noms de broche** des câbles (driver-design.md §4.2), dernier octet
+/// à zéro : [`pin_name_guid`] y écrit le numéro du câble.
+///
+/// Généré par `[guid]::NewGuid()`, propre à Conduit : aucune catégorie KS ne décrit un
+/// câble virtuel, et c'est le GUID `KsPinDescriptor.Name` — pas la catégorie — que KS
+/// interroge en premier pour répondre à `KSPROPERTY_PIN_NAME`.
+const PIN_NAME_BASE: GUID = GUID {
+    Data1: 0xCAA7_4E3D,
+    Data2: 0x9BD5,
+    Data3: 0x4F78,
+    Data4: [0x8E, 0xAC, 0x26, 0xA5, 0xA1, 0xAE, 0x0F, 0x00],
+};
+
+/// GUID de nom de broche du câble `cable` : [`PIN_NAME_BASE`] dont le dernier octet vaut
+/// `cable`. C'est la valeur de `KsPinDescriptor.Name` des broches endpoint des filtres
+/// topologie, et la clé que l'INF associe à « Conduit *n+1* » sous
+/// `HKR\MediaCategories` (`conduit_kmd.inx`, `GUID.PinName.Cable<n>`).
+///
+/// `portcls/tests/inf.rs` vérifie que l'INF et cette fonction ne divergent pas.
+#[allow(clippy::indexing_slicing)] // index constant dans un tableau de 8 octets
+#[must_use]
+pub const fn pin_name_guid(cable: u8) -> GUID {
+    let mut guid = PIN_NAME_BASE;
+    guid.Data4[7] = cable;
+    guid
+}
+
+/// GUID de nom de broche du câble 0, associé à « Conduit 1 ».
+pub const PIN_NAME_CABLE_0: GUID = pin_name_guid(0);
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guid_de_nom_de_broche_porte_le_numero_de_cable() {
+        assert_eq!(PIN_NAME_CABLE_0.Data4[7], 0);
+        assert_eq!(pin_name_guid(15).Data4[7], 15);
+        // Seul le dernier octet varie : le reste identifie Conduit.
+        assert_eq!(pin_name_guid(15).Data1, PIN_NAME_CABLE_0.Data1);
+        assert_eq!(pin_name_guid(15).Data4[..7], PIN_NAME_CABLE_0.Data4[..7]);
+    }
 
     #[test]
     fn noms_utf16_termines_par_nul() {

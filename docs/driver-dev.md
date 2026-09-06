@@ -64,7 +64,7 @@ stable 1.96.1 MSVC), ses lints anti-panique (`Cargo.toml`) et `rustflags =
 sont propres.
 
 ```powershell
-.\drivers\windows\tools\check.ps1               # fmt, clippy -D warnings, tests portcls-sys (± com) et portcls, build conduit-kmd, golden à jour
+.\drivers\windows\tools\check.ps1               # fmt, clippy -D warnings, tests portcls-sys (± com) et portcls (dont cohérence INF ↔ Rust), build conduit-kmd, golden à jour
 .\drivers\windows\tools\build.ps1               # cargo wdk build --profile dev
 .\drivers\windows\tools\build.ps1 -Profile release
 ```
@@ -123,6 +123,22 @@ Conventions imposées par `cargo-wdk` 0.1.1 (le nom du crate y est pris avec des
   d'où le modèle `NT$ARCH$.10.0...16299` ;
 - le dossier `target` doit rester dans `drivers/windows` : `wdk-build` remonte depuis
   `OUT_DIR` jusqu'au `Cargo.lock` du workspace (pas de `CARGO_TARGET_DIR` externe).
+
+**Le `.inx` est en UTF-16 LE dans la copie de travail** (M1a-09) : un INF contenant des
+caractères non ASCII doit l'être, et `stampinf` recopie l'encodage tel quel. Le dépôt le
+garde en UTF-8 — les diffs restent lisibles — grâce à `.gitattributes`
+(`*.inx text working-tree-encoding=UTF-16LE-BOM eol=crlf`). Un `git` antérieur à 2.21 ou
+un éditeur qui réenregistre le fichier en UTF-8 casserait silencieusement les libellés
+accentués : `check.ps1` échoue alors, et `git checkout -- drivers/windows/conduit-kmd/conduit_kmd.inx`
+rétablit l'encodage.
+
+**Cohérence INF ↔ Rust** (M1a-09) : `portcls\tests\inf.rs`, lancé par `cargo test -p portcls`
+donc par `check.ps1` et la CI, relit le `.inx` et le compare aux constantes du pilote —
+noms de référence des `AddInterface` contre `WAVE_RENDER_0`… (`portcls::adapter`), GUID de
+nom de broche contre `pin_name_guid(0)`, GUID `KSCATEGORY_*` contre ceux des en-têtes du
+WDK, jetons `%…%` tous définis. Ces divergences ne se voient sinon que dans la VM, et mal :
+périphérique installé sans le moindre endpoint, ou endpoint mal nommé
+([driver-design.md](driver-design.md) §4.2).
 
 Le build de `wdk-sys` régénère les bindings de `ntddk.h` avec bindgen (`LLVM 17`), une
 minute environ la première fois ; ensuite le cache Cargo suffit.
@@ -224,9 +240,52 @@ pnputil /enum-drivers                                  # repérer oemN.inf du fo
 pnputil /delete-driver oemN.inf /uninstall /force
 ```
 
-Le gestionnaire de périphériques doit montrer *Conduit Virtual Audio Cable* sous
+Le gestionnaire de périphériques doit montrer *Conduit — câbles audio virtuels* sous
 *Contrôleurs audio, vidéo et jeu* entre `/add` et `/remove` (sans endpoint audio avant
 M1a-06).
+
+### 3.3 bis Vérifier le nom des endpoints (M1a-09)
+
+Le nom affiché se compose du nom de la **broche bridge** et de celui de l'adaptateur
+([driver-design.md](driver-design.md) §4.2) : attendu « Conduit 1 (Conduit — câbles audio
+virtuels) », un endpoint de rendu et un de capture. Dans l'invité, périphérique créé :
+
+```powershell
+# 1. Les endpoints tels que l'utilisateur les voit (nom composé, sens, état).
+Get-PnpDevice -Class AudioEndpoint | Format-Table FriendlyName, Status, InstanceId -Auto
+
+# 2. Les quatre filtres KS de l'adaptateur (les FriendlyName de l'INF, diagnostic).
+Get-PnpDevice -Class MEDIA | Where-Object InstanceId -like 'ROOT\MEDIA*' |
+  Format-Table FriendlyName, Status, InstanceId -Auto
+
+# 3. La chaîne que KS résout pour le GUID de nom de broche : doit valoir « Conduit 1 ».
+#    <NNNN> est l'instance de classe du périphérique (0000, 0001…).
+Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e96c-e325-11ce-bfc1-08002be10318}' |
+  ForEach-Object { Get-ItemProperty "$($_.PSPath)\MediaCategories\{CAA74E3D-9BD5-4F78-8EAC-26A5A1AE0F00}" -ErrorAction SilentlyContinue }
+
+# 4. Le panneau historique, qui montre le nom et permet de le renommer à la main.
+mmsys.cpl
+```
+
+Les réglages Son de Windows 11 (*Paramètres → Système → Son*) affichent la même chaîne que
+la colonne `FriendlyName` du point 1 (`PKEY_Device_FriendlyName`). Le module
+`AudioDeviceCmdlets` (`Install-Module AudioDeviceCmdlets`), s'il est installé dans
+l'invité, donne la même liste avec `Get-AudioDevice -List` ; il n'est pas requis.
+`.\conduit-looptest.exe --list` (§3.4) sert aussi de vérification : il cherche les
+endpoints nommés `Conduit 1`.
+
+Diagnostic si le nom n'est pas le bon :
+
+- **« Haut-parleurs » / « Ligne »** : KS n'a pas trouvé de chaîne pour le GUID
+  `KsPinDescriptor.Name` et est retombé sur la catégorie de la broche. Vérifier le
+  point 3 ; si la clé est absente, l'`AddReg` de l'INF n'a pas été appliqué.
+- **aucun endpoint** alors que le périphérique est en état `OK` : les noms de référence des
+  `AddInterface` ne correspondent pas à ceux passés à `PcRegisterSubdevice`, ou une
+  connexion physique manque. `cargo test -p portcls` (test `inf.rs`) couvre le premier cas
+  sur l'hôte, avant même de démarrer la VM.
+- **texte accentué abîmé** (« câbles ») : la copie de travail du `.inx` a perdu son
+  encodage UTF-16 LE. `git checkout -- drivers/windows/conduit-kmd/conduit_kmd.inx` puis
+  reconstruire ; `tools/check.ps1` le détecte aussi.
 
 ### 3.4 Test de boucle (M1a-10) : `conduit-looptest`
 

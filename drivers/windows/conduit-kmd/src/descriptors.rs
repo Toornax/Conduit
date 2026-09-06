@@ -29,6 +29,11 @@
 //! | `TopoCapture` | [`TOPO_CAPTURE_PIN_ENDPOINT`] = 0 | `IN` | `NONE` | `KSNODETYPE_LINE_CONNECTOR` : l'endpoint |
 //! | | [`TOPO_CAPTURE_PIN_BRIDGE`] = 1 | `OUT` | `NONE` | bridge vers `WaveCapture` |
 //!
+//! Les deux broches endpoint sont les seules à porter un `KsPinDescriptor.Name`
+//! (`portcls::pin_name_guid(0)`, M1a-09) : c'est ce GUID que KS résout en « Conduit 1 »
+//! par la clé `HKR\MediaCategories` que l'INF écrit, et donc le nom que l'utilisateur
+//! voit (driver-design.md §4.2). Toutes les autres broches laissent `Name` nul.
+//!
 //! Les numéros de broche suivent la direction des données, comme dans §4.1 et dans
 //! SYSVAD : la broche 0 est toujours l'entrée (`KSPIN_DATAFLOW_IN`), la broche 1 la
 //! sortie ; c'est pourquoi les constantes sont nommées par filtre et non par rôle.
@@ -203,18 +208,25 @@ const fn range_ptr<T>(range: &'static Shared<T>) -> PKSDATARANGE {
     ptr::from_ref(range).cast::<KSDATARANGE>().cast_mut()
 }
 
-/// Broche de filtre : `flow`/`comm` (§4.1), catégorie `category`, plages `ranges`
+/// Broche de filtre : `flow`/`comm` (§4.1), catégorie `category`, nom `name` (§4.2 :
+/// GUID que KS résout en chaîne dans `HKR\MediaCategories` pour répondre à
+/// `KSPROPERTY_PIN_NAME` — `None` laisse KS retomber sur la catégorie), plages `ranges`
 /// (tableau de pointeurs logé dans une `static`), `instances` instances possibles
 /// (globales et par filtre : 1 pour une broche système, 0 pour une broche bridge, qui ne
-/// s'instancie pas). Ni interface ni médium déclarés (défauts KS), pas de nom, pas de
-/// table d'automatisation propre.
+/// s'instancie pas). Ni interface ni médium déclarés (défauts KS), pas de table
+/// d'automatisation propre.
 pub const fn pin<const N: usize>(
     flow: KSPIN_DATAFLOW::Type,
     comm: KSPIN_COMMUNICATION::Type,
     category: &'static GUID,
+    name: Option<&'static GUID>,
     ranges: &'static Shared<[PKSDATARANGE; N]>,
     instances: ULONG,
 ) -> PCPIN_DESCRIPTOR {
+    let name = match name {
+        Some(guid) => ptr::from_ref(guid),
+        None => ptr::null(),
+    };
     PCPIN_DESCRIPTOR {
         MaxGlobalInstanceCount: instances,
         MaxFilterInstanceCount: instances,
@@ -230,7 +242,7 @@ pub const fn pin<const N: usize>(
             DataFlow: flow,
             Communication: comm,
             Category: category,
-            Name: ptr::null(),
+            Name: name,
             __bindgen_anon_1: KSPIN_DESCRIPTOR__bindgen_ty_1 { Reserved: 0 },
         },
     }
@@ -243,6 +255,7 @@ pub const fn bridge_pin(flow: KSPIN_DATAFLOW::Type) -> PCPIN_DESCRIPTOR {
         flow,
         KSPIN_COMMUNICATION::KSPIN_COMMUNICATION_NONE,
         &CATEGORY_AUDIO,
+        None,
         &BRIDGE_RANGES,
         0,
     )
@@ -255,6 +268,7 @@ const fn system_pin(flow: KSPIN_DATAFLOW::Type) -> PCPIN_DESCRIPTOR {
         flow,
         KSPIN_COMMUNICATION::KSPIN_COMMUNICATION_SINK,
         &CATEGORY_AUDIO,
+        None,
         &SYSTEM_RANGES,
         1,
     )
@@ -263,11 +277,16 @@ const fn system_pin(flow: KSPIN_DATAFLOW::Type) -> PCPIN_DESCRIPTOR {
 /// Broche endpoint d'un filtre topologie : `KSPIN_COMMUNICATION_NONE`, catégorie
 /// `KSNODETYPE_SPEAKER` ou `KSNODETYPE_LINE_CONNECTOR` (c'est elle que le générateur
 /// d'endpoints expose), plage analogique, aucune instance.
+///
+/// C'est **la seule broche nommée** : son GUID `Name` ([`PIN_NAME_CABLE_0`]) est ce que
+/// KS résout en « Conduit 1 » (§4.2). Sans lui, KS retomberait sur la catégorie et
+/// l'endpoint s'appellerait « Haut-parleurs » ou « Ligne ».
 const fn endpoint_pin(flow: KSPIN_DATAFLOW::Type, category: &'static GUID) -> PCPIN_DESCRIPTOR {
     pin(
         flow,
         KSPIN_COMMUNICATION::KSPIN_COMMUNICATION_NONE,
         category,
+        Some(&PIN_NAME_CABLE_0),
         &BRIDGE_RANGES,
         0,
     )
@@ -325,6 +344,10 @@ static CATEGORY_AUDIO: GUID = KSCATEGORY_AUDIO;
 static CATEGORY_SPEAKER: GUID = KSNODETYPE_SPEAKER;
 /// `KSNODETYPE_LINE_CONNECTOR`, catégorie de la broche endpoint capture.
 static CATEGORY_LINE_CONNECTOR: GUID = KSNODETYPE_LINE_CONNECTOR;
+/// GUID de nom des broches endpoint du câble 0, adressable : `KsPinDescriptor.Name` en
+/// prend l'adresse et PortCls la conserve (§4.2). L'INF associe ce même GUID à
+/// « Conduit 1 » (`conduit_kmd.inx`, `GUID.PinName.Cable0`).
+static PIN_NAME_CABLE_0: GUID = portcls::PIN_NAME_CABLE_0;
 
 /// Plage système flottante 32 bits.
 static RANGE_F32: Shared<KSDATARANGE_AUDIO> =
@@ -473,6 +496,19 @@ const _: () = {
     // SAFETY: idem.
     let analog = unsafe { analog_range().__bindgen_anon_1 };
     assert!(analog.FormatSize == 64);
+
+    // Nom de broche (§4.2) : seules les deux broches endpoint des filtres topologie en
+    // portent un (`endpoint_pin` n'a qu'un GUID à donner, celui du câble 0) ; comparer
+    // les adresses ici est hors de portée de l'évaluation `const`, l'absence ou la
+    // présence suffit.
+    assert!(!TOPO_RENDER_PINS[1].KsPinDescriptor.Name.is_null());
+    assert!(!TOPO_CAPTURE_PINS[0].KsPinDescriptor.Name.is_null());
+    assert!(TOPO_RENDER_PINS[0].KsPinDescriptor.Name.is_null());
+    assert!(TOPO_CAPTURE_PINS[1].KsPinDescriptor.Name.is_null());
+    assert!(WAVE_RENDER_PINS[0].KsPinDescriptor.Name.is_null());
+    assert!(WAVE_RENDER_PINS[1].KsPinDescriptor.Name.is_null());
+    assert!(WAVE_CAPTURE_PINS[0].KsPinDescriptor.Name.is_null());
+    assert!(WAVE_CAPTURE_PINS[1].KsPinDescriptor.Name.is_null());
 
     // Connexion directe 0 → 1 via `PCFILTER_NODE`.
     let direct = connection(PCFILTER_NODE, 0, PCFILTER_NODE, 1);

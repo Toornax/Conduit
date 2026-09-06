@@ -349,6 +349,15 @@ proposition : trois semaines de travail effectif). Porte de décision en M1a-12.
   *État* : capture en boucle locale livrée (timer Ex haute résolution par câble, copie
   sous spin lock) ; à vérifier dans la VM.
 - [ ] **M1a-09** `feat(driver): INF complet, endpoints nommés Conduit 1`
+  INF complet (`conduit_kmd.inx` en UTF-16 LE, `DeviceDesc`, `.NT.HW` DeviceType et SDDL,
+  `FriendlyName` des quatre interfaces) et nom d'endpoint : les broches endpoint des
+  filtres topologie portent un GUID `KsPinDescriptor.Name`
+  (`portcls::adapter::pin_name_guid`) que l'INF associe à « Conduit 1 » sous
+  `HKR\MediaCategories` — le seul levier documenté, l'INF seul ne suffit pas
+  ([driver-design.md](docs/driver-design.md) §4.2).
+  *Fait quand* : les réglages Son montrent « Conduit 1 » en rendu et en capture.
+  *État* : INF complet et cohérence des noms vérifiée automatiquement ; l'affichage
+  « Conduit 1 » reste à constater dans la VM.
 - [ ] **M1a-10** `test(driver): script de test de boucle (sinus → capture, vérification)`
   Outil utilisateur (Rust, WASAPI) qui joue un sinus sur le rendu, capture, et vérifie
   fréquence, continuité de phase et absence de trous. `crates/conduit-looptest`

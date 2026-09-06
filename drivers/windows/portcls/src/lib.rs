@@ -18,7 +18,7 @@
 //! | [`wavert`] | trait [`MiniportWaveRT`] ↔ `IMiniportWaveRTVtbl`, [`StreamObject`] (flux à type effacé rendu à `NewStream`) |
 //! | [`stream`] | traits [`MiniportWaveRTStream`] / [`MiniportWaveRTStreamNotification`] ↔ leurs vtables, [`AudioBuffer`] |
 //! | [`received`] | enveloppes des interfaces reçues : [`ResourceList`], [`PortTopology`], [`PortWaveRT`], [`PortWaveRTStream`], [`RegistryKey`] |
-//! | [`adapter`] | côté adaptateur : `PcNewPort`, `IPort::Init`, `PcRegisterSubdevice`, `PcRegisterPhysicalConnection` (feature `kernel`), noms des sous-périphériques |
+//! | [`adapter`] | côté adaptateur : `PcNewPort`, `IPort::Init`, `PcRegisterSubdevice`, `PcRegisterPhysicalConnection` (feature `kernel`), noms des sous-périphériques et GUID de nom de broche partagés avec l'INF |
 //! | [`status`] | `STATUS_BUFFER_OVERFLOW`, `STATUS_BUFFER_TOO_SMALL`, `STATUS_NOT_SUPPORTED` |
 //!
 //! # Feature `kernel`
@@ -81,8 +81,8 @@ pub use conduit_com;
 pub use portcls_sys;
 
 pub use adapter::{
-    TOPO_CAPTURE_0, TOPO_RENDER_0, WAVE_CAPTURE_0, WAVE_RENDER_0, as_unknown, port_init,
-    ref_as_unknown, utf16z,
+    PIN_NAME_CABLE_0, TOPO_CAPTURE_0, TOPO_RENDER_0, WAVE_CAPTURE_0, WAVE_RENDER_0, as_unknown,
+    pin_name_guid, port_init, ref_as_unknown, utf16z,
 };
 #[cfg(feature = "kernel")]
 pub use adapter::{new_port, register_physical_connection, register_subdevice};
