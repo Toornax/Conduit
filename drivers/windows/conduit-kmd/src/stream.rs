@@ -154,29 +154,67 @@ impl WaveStream {
         notification_count: Option<u32>,
         requested_bytes: u32,
     ) -> Result<AudioBuffer, NtStatus> {
+        // Journaliser l'ENTRÉE, pas seulement le succès : le moteur audio demande d'abord
+        // un tampon avec notifications, et un refus de notre part le fait retomber
+        // silencieusement en mode scrutation. C'est exactement ce qui a coûté une journée
+        // de diagnostic le 2026-09-06 : la trace ne montrait que « notifications None »,
+        // sans dire qu'une demande avec notifications avait été refusée juste avant.
+        kmd_log!(
+            "{}{}::Allocate(notifications {notification_count:?}, {requested_bytes} octets)",
+            self.name(),
+            self.n
+        );
         let rate = self.format.sample_rate;
         let bytes = match notification_count {
             None => buffer_bytes(requested_bytes, self.frame_bytes, rate),
+            // Aucune borne sur le nombre de périodes : le moteur en demande couramment
+            // plus de deux, et SYSVAD n'exige que la divisibilité de la taille. Une borne
+            // arbitraire ici faisait échouer le mode événementiel sans laisser de trace.
             Some(count) => {
-                if !(1..=2).contains(&count) {
-                    return Err(STATUS_INVALID_PARAMETER);
-                }
                 buffer_bytes_for_notifications(requested_bytes, self.frame_bytes, rate, count)
             }
-        }
-        .ok_or(STATUS_UNSUCCESSFUL)?;
+        };
+        let Some(bytes) = bytes else {
+            kmd_log!(
+                "{}{}::Allocate refusé : taille impossible pour {requested_bytes} octets, trame {}, {notification_count:?} période(s)",
+                self.name(),
+                self.n,
+                self.frame_bytes
+            );
+            return Err(STATUS_UNSUCCESSFUL);
+        };
         // `frame_bytes ≠ 0` (disposition valide) et `bytes` en est un multiple.
-        let frames = bytes
-            .checked_div(self.frame_bytes)
-            .ok_or(STATUS_UNSUCCESSFUL)?;
+        let Some(frames) = bytes.checked_div(self.frame_bytes) else {
+            kmd_log!(
+                "{}{}::Allocate refusé : trame nulle",
+                self.name(),
+                self.n
+            );
+            return Err(STATUS_UNSUCCESSFUL);
+        };
         let notifier = match notification_count {
             None => None,
-            Some(count) => Some(Notifier::new(frames, count).ok_or(STATUS_UNSUCCESSFUL)?),
+            Some(count) => match Notifier::new(frames, count) {
+                Some(n) => Some(n),
+                None => {
+                    kmd_log!(
+                        "{}{}::Allocate refusé : {frames} trames indivisibles par {count} période(s)",
+                        self.name(),
+                        self.n
+                    );
+                    return Err(STATUS_UNSUCCESSFUL);
+                }
+            },
         };
 
         // Un seul tampon par flux ; vérifié avant l'allocation (hors verrou pendant
         // celle-ci) et de nouveau à l'inscription.
         if self.shared.lock().buffer.is_some() {
+            kmd_log!(
+                "{}{}::Allocate refusé : un tampon est déjà alloué pour ce flux",
+                self.name(),
+                self.n
+            );
             return Err(STATUS_INVALID_DEVICE_REQUEST);
         }
 
