@@ -71,7 +71,8 @@ try {
     Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
   }
 
-  # Scripts de VM : analyse syntaxique seulement (ils exigent Hyper-V et l'élévation) ;
+  # Scripts de VM : analyse syntaxique seulement (ils exigent Hyper-V et un accès
+  # administrateur ou Administrateurs Hyper-V) ;
   # les tests Pester des fonctions pures se lancent à part (Invoke-Pester tools\tests).
   Write-Host "== analyse syntaxique des scripts tools\*.ps1, *.psm1"
   $scripts = Get-ChildItem -Path $PSScriptRoot -Recurse -Include "*.ps1", "*.psm1"
