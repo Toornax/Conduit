@@ -37,12 +37,25 @@ M1a et la partie Windows de M1b ont avancé en parallèle.
   par câble, donc le pilote.
 - **M1b.A, M1b.B, M1b.D** : bloquées par la même VM (le helper et le MSI supposent la
   propriété de configuration du pilote validée).
+- **M2** : ouvert et mené en parallèle, puisqu'il ne dépend pas de la VM — la GUI se
+  développe avec le backend `null`. Onze tâches cochées : les trois vues (Câbles,
+  Patchbay, Diagnostic), le thème clair/sombre, le démarrage du démon et les messages
+  d'erreur orientés action. La fenêtre suit la maquette Sericæ
+  ([docs/design-system.md](docs/design-system.md), ADR-014 pour les polices embarquées).
+  Restent ouverts : les VU-mètres (M2-07, le protocole ne pousse aucun niveau), la zone
+  de notification (M2-09), les traductions (M2-11b), le repli logiciel et le paquet Nix
+  (M2-12, M2-12b), les captures de référence (M2-14) et le packaging (M2-15).
 - Conception et décisions de la reprise : [docs/driver-design.md](docs/driver-design.md),
   [docs/windows-drivers-rs.md](docs/windows-drivers-rs.md), ADR-012 (workspace noyau
   séparé) et ADR-013 (démon démarré à l'ouverture de session, pas un service).
 
 **Prochaine action, hors code** : obtenir une ISO Windows 11 et dérouler
 [docs/vm-bringup.md](docs/vm-bringup.md).
+
+**Dette repérée pendant M2**, à traiter hors GUI : le protocole ne diffuse **aucune**
+notification quand un gain ou une coupure change (`SetNodeGain`, `SetLinkGain` répondent
+`Reply::Ok` et rien d'autre), ce qui oblige tout client à relire l'état derrière chaque
+réglage. Rediffuser le descripteur du nœud ou du lien suffirait.
 
 ---
 
