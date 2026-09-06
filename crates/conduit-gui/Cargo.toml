@@ -2,13 +2,37 @@
 name = "conduit-gui"
 version.workspace = true
 edition.workspace = true
+# NOTE : `iced` 0.14 (édition 2024) exige en réalité Rust 1.88. La MSRV du
+# workspace reste déclarée à 1.85 pour ne pas la changer ici ; la toolchain
+# épinglée (1.96.1) la couvre. À trancher au niveau du workspace.
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Conduit — conduit-gui"
+description = "Conduit — interface graphique iced : câbles, patchbay, diagnostic"
+
+[[bin]]
+name = "conduit"
+path = "src/main.rs"
 
 [dependencies]
+conduit-core = { workspace = true, features = ["serde"] }
+conduit-backend = { workspace = true, features = ["serde"] }
+conduit-protocol = { workspace = true, features = ["client"] }
+iced = { version = "0.14", features = ["tokio", "canvas"] }
+directories = "6"
+serde = { workspace = true }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+conduitd = { path = "../conduitd", version = "0.1.0" }
+iced_test = "0.14"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "time"] }
 
 [lints]
 workspace = true

@@ -37,12 +37,25 @@ M1a et la partie Windows de M1b ont avancé en parallèle.
   par câble, donc le pilote.
 - **M1b.A, M1b.B, M1b.D** : bloquées par la même VM (le helper et le MSI supposent la
   propriété de configuration du pilote validée).
+- **M2** : ouvert et mené en parallèle, puisqu'il ne dépend pas de la VM — la GUI se
+  développe avec le backend `null`. Onze tâches cochées : les trois vues (Câbles,
+  Patchbay, Diagnostic), le thème clair/sombre, le démarrage du démon et les messages
+  d'erreur orientés action. La fenêtre suit la maquette Sericæ
+  ([docs/design-system.md](docs/design-system.md), ADR-014 pour les polices embarquées).
+  Restent ouverts : les VU-mètres (M2-07, le protocole ne pousse aucun niveau), la zone
+  de notification (M2-09), les traductions (M2-11b), le repli logiciel et le paquet Nix
+  (M2-12, M2-12b), les captures de référence (M2-14) et le packaging (M2-15).
 - Conception et décisions de la reprise : [docs/driver-design.md](docs/driver-design.md),
   [docs/windows-drivers-rs.md](docs/windows-drivers-rs.md), ADR-012 (workspace noyau
   séparé) et ADR-013 (démon démarré à l'ouverture de session, pas un service).
 
 **Prochaine action, hors code** : obtenir une ISO Windows 11 et dérouler
 [docs/vm-bringup.md](docs/vm-bringup.md).
+
+**Dette repérée pendant M2**, à traiter hors GUI : le protocole ne diffuse **aucune**
+notification quand un gain ou une coupure change (`SetNodeGain`, `SetLinkGain` répondent
+`Reply::Ok` et rien d'autre), ce qui oblige tout client à relire l'état derrière chaque
+réglage. Rediffuser le descripteur du nœud ou du lien suffirait.
 
 ---
 
@@ -531,32 +544,55 @@ signé par attestation, HLK audio passé, latence conforme à SPEC §5.6, endura
 Objectif : un utilisateur cible fait un routage complet sans documentation. Développée et
 testée d'abord avec le backend null, puis sur Windows.
 
-- [ ] **M2-01** `feat(gui): squelette iced, client IPC asynchrone, reconnexion`
+- [x] **M2-01** `feat(gui): squelette iced, client IPC asynchrone, reconnexion`
   *Fait quand* : la fenêtre affiche l'état de connexion et se reconnecte après redémarrage du démon.
-- [ ] **M2-02** `feat(gui): état miroir du démon alimenté par les événements`
+- [x] **M2-02** `feat(gui): état miroir du démon alimenté par les événements`
   *Fait quand* : tests de réduction d'état pour chaque événement.
-- [ ] **M2-03** `feat(gui): vue Câbles (liste, ajouter, supprimer, renommer, canaux)`
+- [x] **M2-03** `feat(gui): vue Câbles (liste, ajouter, supprimer, renommer, canaux)`
   *Fait quand* : chaque action passe par l'IPC et se reflète dans l'OS (F-01, F-02, F-03).
-- [ ] **M2-04** `feat(gui): patchbay, rendu des nœuds et ports`
+- [x] **M2-04** `feat(gui): patchbay, rendu des nœuds et ports`
   Canvas `iced`, disposition automatique, positions mémorisées.
-- [ ] **M2-05** `feat(gui): patchbay, liens par glisser-déposer et suppression`
+- [x] **M2-05** `feat(gui): patchbay, liens par glisser-déposer et suppression`
   *Fait quand* : lien créé/supprimé via IPC ; cycle refusé avec message (F-11, F-12).
-- [ ] **M2-06** `feat(gui): gains par lien et par nœud, muet`
+- [x] **M2-06** `feat(gui): gains par lien et par nœud, muet`
+  Pied de carte (glissière −60 à +12 dB, libellé, bouton « M ») ; le gain de lien est dans
+  l'en-tête, faute de place sur une courbe. Commande envoyée au relâchement, butée basse
+  au silence (F-13).
 - [ ] **M2-07** `feat(gui): VU-mètres temps réel`
   *Fait quand* : rafraîchissement 30 Hz sans charge CPU notable.
-- [ ] **M2-08** `feat(gui): vue Diagnostic (xruns, latence, pilote, export de rapport)`
+- [x] **M2-08** `feat(gui): vue Diagnostic (xruns, latence, pilote, export de rapport)`
+  Quatre tuiles (xruns, latence estimée, temps de cycle, charge d'un cœur), tableau des
+  périphériques et colonne « Moteur » où se choisit le pilote de graphe. Le quantum et la
+  fréquence y sont en lecture seule, faute de commande au protocole ; la latence par nœud et
+  la capacité de tampon n'existant pas non plus, la vue le dit plutôt que de les inventer.
+  L'export reprend le rapport texte du démon (`Command::Dump`) et l'écrit dans Documents.
 - [ ] **M2-09** `feat(gui): icône de zone de notification et menu rapide`
   *Fait quand* : état OK / xruns / pilote absent visible, ouverture de la fenêtre au clic.
-- [ ] **M2-10** `feat(gui): démarrage du démon si absent`
-- [ ] **M2-11** `feat(gui): thème clair/sombre, traductions fr et en`
+- [x] **M2-10** `feat(gui): démarrage du démon si absent`
+  Le binaire `conduitd` est cherché à côté de l'exécutable courant (disposition du MSI
+  comme d'un `cargo build`), à défaut dans le `PATH` ; il est lancé détaché, sans console
+  sous Windows, avec le `--socket` que la GUI surveille. La GUI ne l'attend pas : la boucle
+  de reconnexion voit le démon apparaître. Le bouton « Démarrer le démon » passe en
+  « Démarrage… » jusqu'à la connexion (F-51).
+- [x] **M2-11a** `feat(gui): thème clair/sombre`
+  Design system « Sericæ » : jetons, polices embarquées, styles de widgets, formatage français.
+  *Fait quand* : la fenêtre suit le mode du système, contraste WCAG AA vérifié par test
+  (`docs/design-system.md`, ADR-014).
+- [ ] **M2-11b** `feat(gui): traductions fr et en (fluent)`
+  La table `i18n.rs` devient un catalogue `fluent` ; la langue suit celle du système.
 - [ ] **M2-12** `feat(gui): repli logiciel tiny-skia`
   *Fait quand* : fonctionne dans une VM sans GPU.
 - [ ] **M2-12b** `chore(nix): package conduit-gui avec wrapper des bibliothèques graphiques`
   Wayland, X11, `libxkbcommon`, Vulkan, OpenGL fournis par `RPATH`/wrapper.
   *Fait quand* : `nix run .#conduit-gui` démarre sur NixOS et sur une distribution classique
   avec Nix installé.
-- [ ] **M2-13** `feat(gui): messages d'erreur orientés action`
-  Chaque erreur du protocole a un texte utilisateur avec la marche à suivre.
+- [x] **M2-13** `feat(gui): écrans d'état et messages d'erreur orientés action`
+  Chacun des huit `ErrorCode` a son conseil, ajouté après le message du démon, qui reste
+  affiché tel quel et en premier (ADR-006) ; les erreurs locales de la fenêtre — refus de
+  boucle, démon non lancé, rapport non écrit — prennent le même format. Deux écrans d'état
+  remplacent la vue : « démon absent » quand le démon n'a jamais répondu (le texte suit la
+  plateforme : boucle locale sous Windows et macOS, câbles disparus sous Linux, où F-05
+  n'est pas garanti), et l'accueil de premier lancement, affiché une seule fois.
 - [ ] **M2-14** `test(gui): tests hors écran et captures de référence`
 - [ ] **M2-15** `feat(packaging): GUI dans le MSI, raccourci, lancement à la session`
 - [ ] **M2-16** `test: session de test utilisateur`

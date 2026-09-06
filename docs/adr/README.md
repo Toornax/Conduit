@@ -20,3 +20,4 @@ Gabarit : contexte, décision, conséquences, statut.
 | [ADR-011](011-noeud-de-peripherique-a-role.md) | Un nœud par périphérique, rôle changé à chaud sans recompiler | acceptée |
 | [ADR-012](012-workspace-noyau-separe.md) | Workspace noyau séparé, logique du pilote dans un crate portable | acceptée |
 | [ADR-013](013-demarrage-du-demon-sous-windows.md) | Le démon Windows démarre à l'ouverture de session, il n'est pas un service | acceptée |
+| [ADR-014](014-polices-embarquees-ofl.md) | Polices embarquées sous OFL-1.1 dans le binaire de la GUI | acceptée |
