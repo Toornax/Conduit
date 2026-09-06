@@ -27,16 +27,16 @@ Ordre général : M0 et M1a en parallèle, puis M1b, M2, M3, M4, M5.
 Le poste Windows est en place depuis le 2026-09-05 (WDK 26100, LLVM 17.0.6, `cargo-wdk`) :
 M1a et la partie Windows de M1b ont avancé en parallèle.
 
-- **M1a** : les onze tâches de code sont écrites et vérifiées hors noyau (bindings,
-  modèle COM, adaptateur, flux, boucle locale, INF, outil de mesure). Quatre sont
-  cochées ; **sept attendent d'être chargées dans une VM** (M1a-02, 05, 06, 07, 08, 09,
-  10), faute d'ISO Windows 11. Leur séquence de validation, résultats attendus et
-  diagnostics : [docs/vm-bringup.md](docs/vm-bringup.md).
+- **M1a** : **l'audio traverse le câble.** Chargé dans la VM `ConduitTest` le 2026-09-06,
+  le pilote fait apparaître deux endpoints « Conduit 1 » et le test de boucle passe dix
+  fois sur dix — M1a-05 à M1a-10 cochées. Restent M1a-02 (un chargement sur cent a
+  échoué), M1a-11 (Driver Verifier) et la porte M1a-12. Séquence de validation, résultats
+  attendus et diagnostics : [docs/vm-bringup.md](docs/vm-bringup.md).
 - **M1b.C** : M1b-30, 32, 33 et 35 cochées ; le démon charge WASAPI par défaut sous
   Windows et tourne sans xrun (1 h, deux cartes, 720 006 cycles). M1b-31 attend la boucle
   par câble, donc le pilote.
-- **M1b.A, M1b.B, M1b.D** : bloquées par la même VM (le helper et le MSI supposent la
-  propriété de configuration du pilote validée).
+- **M1b.A, M1b.B, M1b.D** : débloquées par la VM, qui valide désormais la propriété de
+  configuration du pilote supposée par le helper et le MSI ; pas encore reprises.
 - **M2** : ouvert et mené en parallèle, puisqu'il ne dépend pas de la VM — la GUI se
   développe avec le backend `null`. Onze tâches cochées : les trois vues (Câbles,
   Patchbay, Diagnostic), le thème clair/sombre, le démarrage du démon et les messages
@@ -321,11 +321,14 @@ allocation dans le fil audio, CI verte partout, couverture ≥ 80 % sur `core` e
 Objectif : prouver qu'un pilote PortCls/WaveRT en Rust est faisable. Délai borné (à fixer,
 proposition : trois semaines de travail effectif). Porte de décision en M1a-12.
 
-**Le code est écrit ; il n'a jamais été chargé.** Les sept tâches portant une ligne
-*État* se valident en une seule session de VM, dans l'ordre donné par
-[docs/vm-bringup.md](docs/vm-bringup.md), qui donne aussi le résultat attendu et l'arbre
-de diagnostic de chacune. Deux jours de travail effectif au 2026-09-06, à comparer au
-délai borné lors de la porte M1a-12.
+**L'audio traverse le câble.** Le 2026-09-06 dans la machine virtuelle `ConduitTest`, le
+pilote se charge, enregistre ses quatre sous-périphériques, Windows en construit deux
+endpoints nommés « Conduit 1 », et le test de boucle passe **10 fois sur 10** : 440,00 Hz,
+amplitude 0,500, aucune rupture de phase, aucun trou — M1a-05 à M1a-10 sont validées d'un
+coup. Restent M1a-02 (un chargement sur cent a échoué), M1a-11 et la porte M1a-12. La
+séquence de validation, le résultat attendu et l'arbre de diagnostic de chaque tâche :
+[docs/vm-bringup.md](docs/vm-bringup.md). Deux jours de travail effectif au 2026-09-06, à
+comparer au délai borné lors de la porte M1a-12.
 
 - [x] **M1a-01** `chore(driver): environnement de build WDK et windows-drivers-rs`
   Hors Nix (SPEC §5.11). Extension de `packaging/windows/setup-env.ps1` (WDK 26100, LLVM
@@ -343,7 +346,9 @@ délai borné lors de la porte M1a-12.
 - [ ] **M1a-02** `feat(driver): pilote WDM minimal chargé et déchargé en mode test`
   `DriverEntry`, `AddDevice`, `Unload`, INF, catalogue de test, installation `pnputil`.
   *Fait quand* : chargement/déchargement 100 fois sans erreur dans la VM.
-  *État* : code et scripts prêts (commit), validation VM en attente d'une ISO Windows 11.
+  *État* : chargé et déchargé dans la VM ; **32 cycles sur 100 puis échec au 33ᵉ**
+  (`0xC00000E5`, non diagnostiqué). Le déchargement à chaud échoue (`sc stop` 1052), d'où
+  le redémarrage entre deux versions du pilote.
 - [x] **M1a-03** `feat(portcls): bindings PortCls et KS générés en mode C (structures, GUID, vtables)`
   `bindgen` via `wdk_build::BuilderExt::wdk_default` sur `ks.h`, `ksmedia.h`, `punknown.h`,
   `drmk.h`, `portcls.h` avec `#define INTERFACE void` ; les vtables COM sortent plates du mode
@@ -357,15 +362,14 @@ délai borné lors de la porte M1a-12.
   (`drivers/windows/portcls`, driver-design §3), enveloppes `ResourceList`/`PortTopology`.
   *Fait quand* : tests en mode utilisateur (AddRef/Release, QueryInterface, un faux « port »
   appelant la vtable) ; Miri sur le modèle objet.
-- [ ] **M1a-05** `feat(portcls): enveloppes IMiniportWaveRT, IMiniportWaveRTStream, IPortWaveRT`
+- [x] **M1a-05** `feat(portcls): enveloppes IMiniportWaveRT, IMiniportWaveRTStream, IPortWaveRT`
   Traits `MiniportWaveRT`, `MiniportWaveRTStream`, `MiniportWaveRTStreamNotification` et
   leurs vtables (ordre du header 26100), `StreamObject` (flux à type effacé rendu par
   `NewStream`), enveloppes reçues `PortWaveRT`/`PortWaveRTStream` (`AllocatePagesForMdl`…),
   `adapter` (`PcNewPort`, `IPort::Init`, `PcRegisterSubdevice`, `PcRegisterPhysicalConnection`
   sous la feature `kernel`, noms UTF-16 des sous-périphériques).
   *Fait quand* : idem, plus les appels vers `IPortWaveRT` (`PcNewPort`, `RegisterSubdevice`) fonctionnent dans la VM.
-  *État* : enveloppes livrées et testées avec un faux PortCls ; appels PcNewPort/RegisterSubdevice à valider dans la VM (M1a-06).
-- [ ] **M1a-06** `feat(driver): adaptateur enregistrant une topologie rendu et capture`
+- [x] **M1a-06** `feat(driver): adaptateur enregistrant une topologie rendu et capture`
   `StartDevice` (`conduit-kmd::adapter`) : `PcNewPort`, `IPort::Init`, `PcRegisterSubdevice`
   pour `WaveRender0`, `TopoRender0`, `WaveCapture0`, `TopoCapture0`, puis
   `PcRegisterPhysicalConnection` entre broches bridge ; tables KS `static` en `const`
@@ -373,16 +377,12 @@ délai borné lors de la porte M1a-12.
   état de câble `static` (`cable`), INF avec les `AddInterface` `KSCATEGORY_*`
   ([driver-design.md](docs/driver-design.md) §4.1).
   *Fait quand* : le gestionnaire de périphériques montre un endpoint rendu et un capture.
-  *État* : adaptateur, descripteurs et INF livrés ; endpoints à constater dans la VM.
-- [ ] **M1a-07** `feat(driver): miniport WaveRT rendu avec tampon cyclique et horloge timer`
+- [x] **M1a-07** `feat(driver): miniport WaveRT rendu avec tampon cyclique et horloge timer`
   Allocation du tampon cyclique, position via timer noyau, formats 48 kHz float32 et PCM16.
   *Fait quand* : une application lit un fichier sur l'endpoint sans erreur, position cohérente.
-  *État* : flux rendu livré (tampon MDL, position QPC, notifications par timer) ; lecture réelle à vérifier dans la VM.
-- [ ] **M1a-08** `feat(driver): miniport WaveRT capture en boucle locale sur le rendu`
+- [x] **M1a-08** `feat(driver): miniport WaveRT capture en boucle locale sur le rendu`
   *Fait quand* : un enregistreur capture ce que joue le lecteur.
-  *État* : capture en boucle locale livrée (timer Ex haute résolution par câble, copie
-  sous spin lock) ; à vérifier dans la VM.
-- [ ] **M1a-09** `feat(driver): INF complet, endpoints nommés Conduit 1`
+- [x] **M1a-09** `feat(driver): INF complet, endpoints nommés Conduit 1`
   INF complet (`conduit_kmd.inx` en UTF-16 LE, `DeviceDesc`, `.NT.HW` DeviceType et SDDL,
   `FriendlyName` des quatre interfaces) et nom d'endpoint : les broches endpoint des
   filtres topologie portent un GUID `KsPinDescriptor.Name`
@@ -390,9 +390,7 @@ délai borné lors de la porte M1a-12.
   `HKR\MediaCategories` — le seul levier documenté, l'INF seul ne suffit pas
   ([driver-design.md](docs/driver-design.md) §4.2).
   *Fait quand* : les réglages Son montrent « Conduit 1 » en rendu et en capture.
-  *État* : INF complet et cohérence des noms vérifiée automatiquement ; l'affichage
-  « Conduit 1 » reste à constater dans la VM.
-- [ ] **M1a-10** `test(driver): script de test de boucle (sinus → capture, vérification)`
+- [x] **M1a-10** `test(driver): script de test de boucle (sinus → capture, vérification)`
   Outil utilisateur (Rust, WASAPI) qui joue un sinus sur le rendu, capture, et vérifie
   fréquence, continuité de phase et absence de trous. `crates/conduit-looptest`
   (binaire du workspace racine, ADR-012 §4) : module `analysis` sans plateforme
@@ -401,13 +399,11 @@ délai borné lors de la porte M1a-12.
   `--self-test` ([dev-guide.md](docs/dev-guide.md) §4 quinquies,
   [driver-dev.md](docs/driver-dev.md) §3.4).
   *Fait quand* : passe 10 fois de suite.
-  *État* : outil et analyse livrés et testés sur signaux synthétiques ; les 10 passes
-  réelles attendent le pilote dans la VM.
 - [ ] **M1a-11** `test(driver): 1 h Driver Verifier sans erreur, collecte automatique des dumps`
-- [ ] **M1a-12** `docs: ADR-014 résultat du spike`
+- [ ] **M1a-12** `docs: ADR-015 résultat du spike`
   Plan de validation et questions de la porte : [vm-bringup.md](docs/vm-bringup.md) §8.
-  (Le numéro ADR-009 annoncé à la rédaction de la feuille de route est pris depuis :
-  la porte de décision devient ADR-014.)
+  (Le numéro ADR-009 annoncé à la rédaction de la feuille de route est pris depuis, et
+  ADR-014 aussi : la porte de décision devient ADR-015.)
   **Porte de décision.** Succès → poursuite en Rust, M1b. Échec dans le délai → pilote C++
   dérivé de SYSVAD, `portcls-sys` conservé pour le helper si utile, reste de la roadmap inchangé.
 

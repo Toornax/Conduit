@@ -615,6 +615,29 @@ M1b-05 : 44,1/48/96 kHz, float32, PCM16, PCM24, canaux 1 à 8 selon la configura
 câble. Le mode partagé ne voit que le format du moteur ; les autres servent au mode
 exclusif.
 
+
+### 5.5 Le câble n'est pas transparent par défaut (mesuré le 2026-09-06)
+
+Les dix passes du test de boucle ont d'abord rendu un sinus à **0,229** d'amplitude pour
+0,500 demandée, sans le moindre trou ni rupture de phase : de l'audio parfait, mais
+atténué. L'endpoint de rendu était à **64 %** de volume, réglage qu'un utilisateur n'a
+jamais touché — c'est la valeur par défaut que Windows donne à un endpoint neuf.
+
+Faute de nœud de volume dans notre topologie, Windows insère son **APO logiciel** et
+applique le gain avant que les trames n'atteignent notre tampon. Un câble Conduit
+transporte donc, par défaut, un signal atténué et non l'original.
+
+C'est inacceptable pour un câble virtuel, dont la raison d'être est la transparence bit à
+bit. Deux réponses possibles, à trancher en M1b :
+
+1. **exposer un nœud `KSNODETYPE_VOLUME`** sur les filtres de topologie, initialisé à 0 dB
+   et piloté par nous — Windows cesse alors d'insérer son APO ;
+2. **forcer le volume de l'endpoint à 100 %** depuis le démon à la création du câble, ce
+   qui règle le symptôme sans régler la cause (l'utilisateur peut le rebaisser).
+
+La première est la bonne ; la seconde est ce que fait `conduit-looptest --set-volume`
+aujourd'hui pour que la mesure soit exploitable.
+
 ## 6. Surface de contrôle (M1b-04, décision anticipée)
 
 Pas d'objet de périphérique de contrôle séparé ni de dispatch d'IRP personnalisé :
@@ -664,7 +687,7 @@ câble marche sans le démon (F-05) après redémarrage.
 
 Aucun pilote de test ne se charge sur la machine de développement.
 
-## 9. Ce que le spike doit trancher (entrées d'ADR-009 bis / M1a-12)
+## 9. Ce que le spike doit trancher (entrées d'ADR-015 / M1a-12)
 
 1. `windows-drivers-rs` compile-t-il un WDM PortCls sans nightly et sans patch ?
 2. Les vtables manuelles passent-elles les tests d'offsets et PortCls accepte-t-il les
