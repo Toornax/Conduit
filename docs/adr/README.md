@@ -21,3 +21,4 @@ Gabarit : contexte, décision, conséquences, statut.
 | [ADR-012](012-workspace-noyau-separe.md) | Workspace noyau séparé, logique du pilote dans un crate portable | acceptée |
 | [ADR-013](013-demarrage-du-demon-sous-windows.md) | Le démon Windows démarre à l'ouverture de session, il n'est pas un service | acceptée |
 | [ADR-014](014-polices-embarquees-ofl.md) | Polices embarquées sous OFL-1.1 dans le binaire de la GUI | acceptée |
+| [ADR-015](015-resultat-du-spike-pilote-rust.md) | Résultat du spike : le pilote Windows reste en Rust | acceptée |

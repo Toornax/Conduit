@@ -27,11 +27,11 @@ Ordre général : M0 et M1a en parallèle, puis M1b, M2, M3, M4, M5.
 Le poste Windows est en place depuis le 2026-09-05 (WDK 26100, LLVM 17.0.6, `cargo-wdk`) :
 M1a et la partie Windows de M1b ont avancé en parallèle.
 
-- **M1a** : **l'audio traverse le câble.** Chargé dans la VM `ConduitTest`, le pilote fait
-  apparaître deux endpoints « Conduit 1 », le test de boucle passe dix fois sur dix et le
-  pilote enchaîne cent chargements sans erreur — M1a-02 et M1a-05 à M1a-10 cochées.
-  Restent M1a-11 (Driver Verifier) et la porte M1a-12. Séquence de validation, résultats
-  attendus et diagnostics : [docs/vm-bringup.md](docs/vm-bringup.md).
+- **M1a** : **close, et franchie.** Le pilote PortCls/WaveRT en Rust se charge cent fois
+  sans erreur, transporte l'audio dix passes sur dix, et tient une heure sous Driver
+  Verifier sans le moindre vidage. Les douze tâches sont cochées et
+  [ADR-015](docs/adr/015-resultat-du-spike-pilote-rust.md) tranche : on reste en Rust, le
+  repli C++ n'est pas exercé, en deux jours contre trois semaines proposées.
 - **M1b.C** : M1b-30, 32, 33 et 35 cochées ; le démon charge WASAPI par défaut sous
   Windows et tourne sans xrun (1 h, deux cartes, 720 006 cycles). M1b-31 attend la boucle
   par câble, donc le pilote.
@@ -321,16 +321,16 @@ allocation dans le fil audio, CI verte partout, couverture ≥ 80 % sur `core` e
 Objectif : prouver qu'un pilote PortCls/WaveRT en Rust est faisable. Délai borné (à fixer,
 proposition : trois semaines de travail effectif). Porte de décision en M1a-12.
 
-**L'audio traverse le câble, et le pilote se charge cent fois de suite.** Le 2026-09-06
-dans la machine virtuelle `ConduitTest`, le test de boucle passe **dix fois sur dix** —
-440,00 Hz, amplitude 0,500, aucune rupture de phase, aucun trou — et le 2026-09-07 le
-pilote enchaîne **100 chargements et déchargements sans erreur**, débogueur série attaché,
-aucun vidage. M1a-02 et M1a-05 à M1a-10 sont cochées. L'échec intermittent qui restait
-(`0xC00000E5` au 33ᵉ cycle) venait du **harnais de test**, pas du pilote : le script
-supprimait le paquet avant que le retrait du périphérique ne soit effectif, et PnP tentait
-un dernier démarrage sur un devnode mourant. Restent M1a-11 et la porte M1a-12. Séquence
-de validation, résultats attendus et arbre de diagnostic :
-[docs/vm-bringup.md](docs/vm-bringup.md).
+**Le spike est clos et sa porte est franchie.** Sur la machine virtuelle `ConduitTest`,
+le pilote se charge et se décharge **cent fois sans erreur** (deux séries), l'audio
+**traverse le câble** — dix passes sur dix à 440,00 Hz, amplitude 0,500, aucune rupture de
+phase, aucun trou — et une **heure sous Driver Verifier** (pool spécial, IRQL forcée,
+conformité DDI) passe sans écran bleu ni vidage, sur 360 cycles d'ouverture et fermeture
+des deux flux. Les douze tâches sont cochées.
+[ADR-015](docs/adr/015-resultat-du-spike-pilote-rust.md) répond aux quatre questions de la
+porte : le pilote **reste en Rust**, le repli C++ n'est pas exercé, et le délai borné n'est
+pas consommé — deux jours contre trois semaines proposées. La séquence de validation et
+l'arbre de diagnostic restent dans [docs/vm-bringup.md](docs/vm-bringup.md).
 
 - [x] **M1a-01** `chore(driver): environnement de build WDK et windows-drivers-rs`
   Hors Nix (SPEC §5.11). Extension de `packaging/windows/setup-env.ps1` (WDK 26100, LLVM
@@ -398,13 +398,12 @@ de validation, résultats attendus et arbre de diagnostic :
   `--self-test` ([dev-guide.md](docs/dev-guide.md) §4 quinquies,
   [driver-dev.md](docs/driver-dev.md) §3.4).
   *Fait quand* : passe 10 fois de suite.
-- [ ] **M1a-11** `test(driver): 1 h Driver Verifier sans erreur, collecte automatique des dumps`
-- [ ] **M1a-12** `docs: ADR-015 résultat du spike`
-  Plan de validation et questions de la porte : [vm-bringup.md](docs/vm-bringup.md) §8.
-  (Le numéro ADR-009 annoncé à la rédaction de la feuille de route est pris depuis, et
-  ADR-014 aussi : la porte de décision devient ADR-015.)
-  **Porte de décision.** Succès → poursuite en Rust, M1b. Échec dans le délai → pilote C++
-  dérivé de SYSVAD, `portcls-sys` conservé pour le helper si utile, reste de la roadmap inchangé.
+- [x] **M1a-11** `test(driver): 1 h Driver Verifier sans erreur, collecte automatique des dumps`
+- [x] **M1a-12** `docs: ADR-015 résultat du spike`
+  [ADR-015](docs/adr/015-resultat-du-spike-pilote-rust.md), acceptée le 2026-09-07 :
+  **la porte est franchie sur les quatre questions**, le pilote reste en Rust et le repli
+  C++ n'est pas exercé. Le délai borné n'est pas consommé — deux jours contre trois
+  semaines proposées.
 
 ---
 
