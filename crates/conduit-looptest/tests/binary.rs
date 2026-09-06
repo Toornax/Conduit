@@ -100,6 +100,7 @@ fn echo_et_capture_se_contredisent() {
 /// est vérifié, c'est la seule chose que le mode promet : le sinus a été
 /// **retrouvé** dans l'écho, et l'outil en tire la bonne conclusion.
 #[test]
+#[ignore = "émet un son sur le rendu par défaut : à lancer à la main (cargo test … -- --ignored)"]
 fn echo_du_rendu_par_defaut_entend_le_sinus() {
     let backend = match WasapiBackend::new() {
         Ok(backend) => backend,

@@ -75,6 +75,7 @@ impl Echo {
 }
 
 #[test]
+#[ignore = "émet un son sur le rendu par défaut : à lancer à la main (cargo test … -- --ignored)"]
 fn echo_entend_le_sinus() {
     let mut backend = backend();
     let id = default_or_skip!(backend, DeviceDirection::Render);
