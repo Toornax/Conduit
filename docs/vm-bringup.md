@@ -18,10 +18,20 @@ contredira est l'information la plus précieuse de la session : le noter tel que
 
 | Élément | Commande | Attendu |
 |---|---|---|
+| Accès à Hyper-V | `[Security.Principal.WindowsIdentity]::GetCurrent().Groups.Value -contains 'S-1-5-32-578'` | `True` — sinon lancer les scripts de VM en administrateur |
 | Environnement pilote | `.\packaging\windows\setup-env.ps1 -Check -Scope Driver` | « environnement Windows conforme (périmètre pilote) » |
 | Workspace noyau | `.\drivers\windows\tools\check.ps1` | « vérifications vertes » |
 | Paquet signé | `.\drivers\windows\tools\build.ps1` | `target\debug\conduit_kmd_package\` avec `.sys`, `.inf`, `.cat`, `.cer` |
 | ISO Windows 11 | — | image officielle Microsoft |
+
+Les scripts de VM acceptent une session **administrateur** ou une session ordinaire dont
+le compte est membre du groupe **Administrateurs Hyper-V**. Pour cette session de
+validation, qui est longue et enchaîne des commandes Cargo, la seconde est préférable :
+une fois, depuis un PowerShell administrateur, `Add-LocalGroupMember -SID S-1-5-32-578
+-Member "$env:USERNAME"` — le groupe est désigné par son SID, son nom étant traduit —
+**puis fermer et rouvrir la session Windows**, car le jeton n'intègre les appartenances
+de groupe qu'à l'ouverture de session (rouvrir le terminal ne suffit pas). Détails dans
+[driver-dev.md §3](driver-dev.md), « Deux façons de lancer les scripts ».
 
 ## 1. Créer et préparer la VM
 

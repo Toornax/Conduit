@@ -2,33 +2,244 @@
 .SYNOPSIS
   Fonctions partagées par les scripts de VM (vm-new.ps1, vm-prepare.ps1, vm-cycle.ps1).
 .DESCRIPTION
-  Les fonctions pures (analyse de sorties, génération de clé) sont testées par
-  tests\vm-common.Tests.ps1 (Pester 3/4). Les autres touchent au système (élévation,
-  registre, réseau de l'hôte) et ne sont pas testées.
+  Les fonctions pures (analyse de sorties, génération de clé, décision d'accès) sont
+  testées par tests\vm-common.Tests.ps1 (Pester 3/4). Les enveloppes qui touchent au
+  système (jeton courant, registre, réseau de l'hôte, Hyper-V) ne sont pas testées : la
+  décision en est systématiquement extraite dans une fonction pure à laquelle on passe
+  les données lues, pour qu'elle soit testable sans jeton ni hyperviseur réels.
+
+    Fonction pure (testée)                | Enveloppe système
+    --------------------------------------|--------------------------------
+    Test-SidPresent                       | Get-TokenSid
+    Get-HyperVAccessMessage               | Assert-HyperVAccess
+    Get-HyperVAccessHint                  | Invoke-HyperVChecked
+    Test-AccessDeniedError                | —
 #>
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+# Builtin\Hyper-V Administrators : « complete and unrestricted access to all features of
+# Hyper-V ». Appartenir à ce groupe suffit pour piloter Hyper-V, l'élévation n'est pas
+# requise :
+#   - « Ensure that your user account belongs to the Administrators group or the Hyper-V
+#     Administrators group »
+#     https://learn.microsoft.com/en-us/windows-server/virtualization/hyper-v/manage/remotely-manage-hyper-v-hosts
+#   - PowerShell Direct (Invoke-Command -VMName, New-PSSession -VMName,
+#     Copy-Item -To/FromSession) : « You must be logged into the host computer as a
+#     Hyper-V administrator »
+#     https://learn.microsoft.com/en-us/windows-server/virtualization/hyper-v/powershell-direct
+#   - Table des SID connus (S-1-5-32-578 = Builtin\Hyper-V Administrators)
+#     https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/understand-security-identifiers
+#
+# Toujours par le SID, JAMAIS par le nom du groupe : « Hyper-V Administrators » est
+# traduit selon la langue de Windows (« Administrateurs Hyper-V » en français). C'est
+# exactement le piège qui avait cassé la création de VM avant le commit 25b3557, où le
+# composant d'intégration était cherché par son nom traduit.
+$script:HyperVAdminsSid = "S-1-5-32-578"
 
 function Test-Elevated {
   <#
   .SYNOPSIS
     Vrai si le processus courant appartient au groupe Administrateurs.
+  .DESCRIPTION
+    Conservée bien que les scripts de VM n'exigent plus l'élévation (voir
+    Test-HyperVOperator) : elle resservira si une opération précise s'avère l'exiger.
   #>
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
   $principal = New-Object Security.Principal.WindowsPrincipal($identity)
   return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Assert-Elevated {
+function Test-SidPresent {
   <#
   .SYNOPSIS
-    Échoue avec un message clair si le script n'est pas lancé en administrateur.
+    Vrai si $Sid figure dans la liste de SID fournie (comparaison insensible à la casse).
+  .DESCRIPTION
+    Fonction pure : la lecture du jeton est faite à part (Get-TokenSid), pour que la
+    décision d'accès soit testable sans jeton réel. Les SID sont des chaînes ASCII dont
+    la casse n'est pas significative (« s-1-5-32-578 » désigne le même groupe).
+  .PARAMETER Sid
+    SID recherché, sous forme textuelle (S-1-5-32-578).
+  .PARAMETER TokenSids
+    SID présents dans le jeton, sous forme textuelle. Liste vide, $null ou contenant des
+    entrées vides acceptés (une lecture de jeton peut légitimement ne rien rendre).
+  #>
+  param(
+    [Parameter(Mandatory)][string]$Sid,
+    [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][AllowEmptyString()][string[]]$TokenSids
+  )
+  $wanted = $Sid.Trim()
+  foreach ($candidate in @($TokenSids)) {
+    if ($null -eq $candidate) { continue }
+    if ($candidate.Trim() -ieq $wanted) { return $true }
+  }
+  return $false
+}
+
+function Get-TokenSid {
+  <#
+  .SYNOPSIS
+    SID du jeton EFFECTIF du processus courant (compte + groupes), sous forme textuelle.
+  .DESCRIPTION
+    WindowsIdentity.Groups n'expose que les SID réellement actifs : les SID marqués
+    « refus uniquement » par le filtrage UAC en sont exclus (vérifié : en session non
+    élevée, S-1-5-32-544 apparaît dans `whoami /groups` mais pas ici). C'est la propriété
+    voulue : la documentation ne dit pas si S-1-5-32-578 survit à ce filtrage, mais le
+    code n'en dépend pas puisqu'il lit le jeton effectif. Si le SID était filtré,
+    Test-HyperVOperator renverrait faux et l'utilisateur verrait le message d'aide :
+    dégradation propre, jamais de faux positif.
+  #>
+  $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+  $sids = New-Object System.Collections.Generic.List[string]
+  if ($identity.User) { $sids.Add($identity.User.Value) }
+  foreach ($group in @($identity.Groups)) {
+    if ($null -eq $group) { continue }
+    # Un SID sans traduction possible lève sur .Translate, jamais sur .Value : on ne
+    # traduit pas, justement (les noms de groupes sont localisés).
+    $sids.Add($group.Value)
+  }
+  return $sids.ToArray()
+}
+
+function Test-HyperVOperator {
+  <#
+  .SYNOPSIS
+    Vrai si la session courante peut piloter Hyper-V : élevée (groupe Administrateurs),
+    ou porteuse du SID du groupe Administrateurs Hyper-V (S-1-5-32-578).
+  #>
+  if (Test-Elevated) { return $true }
+  return (Test-SidPresent -Sid $script:HyperVAdminsSid -TokenSids (Get-TokenSid))
+}
+
+function Get-HyperVAccessHint {
+  <#
+  .SYNOPSIS
+    Indice à ajouter à un refus d'accès venu d'Hyper-V : la cause la plus probable est
+    une appartenance au groupe acquise sans réouverture de session.
+  .DESCRIPTION
+    Fonction pure (aucune lecture du système), pour être testable et réutilisable dans
+    Invoke-HyperVChecked.
+  #>
+  return @(
+    "Cause la plus probable : l'appartenance au groupe Administrateurs Hyper-V"
+    "(SID $script:HyperVAdminsSid) a été ajoutée sans réouverture de session. Le jeton ne"
+    "prend une appartenance de groupe en compte qu'à l'OUVERTURE de la session Windows :"
+    "fermer la session et la rouvrir (redémarrer le terminal ne suffit pas)."
+  ) -join "`n"
+}
+
+function Get-HyperVAccessMessage {
+  <#
+  .SYNOPSIS
+    Message d'échec quand la session ne peut pas piloter Hyper-V : il donne LES DEUX
+    remèdes (relancer en administrateur, ou rejoindre le groupe Administrateurs Hyper-V).
+  .DESCRIPTION
+    Fonction pure : le nom d'utilisateur est passé en paramètre plutôt que lu dans
+    l'environnement, pour que le message soit testable tel quel.
   .PARAMETER Reason
-    Ce que l'élévation autorise (affiché dans le message).
+    Ce à quoi l'accès sert (affiché entre parenthèses).
+  .PARAMETER UserName
+    Compte à ajouter au groupe dans la commande proposée.
+  #>
+  param(
+    [Parameter(Mandatory)][string]$Reason,
+    [Parameter(Mandatory)][AllowEmptyString()][string]$UserName
+  )
+  $account = if ([string]::IsNullOrWhiteSpace($UserName)) { "<votre compte>" } else { $UserName }
+  return @(
+    "Accès à Hyper-V refusé ($Reason) : cette session n'est ni administrateur, ni membre"
+    "du groupe Administrateurs Hyper-V (SID $script:HyperVAdminsSid)."
+    ""
+    "Deux remèdes, au choix :"
+    "  1. Relancer ce script dans un PowerShell lancé en tant qu'administrateur ;"
+    "  2. ou, une seule fois, depuis un PowerShell administrateur :"
+    "       Add-LocalGroupMember -SID $script:HyperVAdminsSid -Member `"$account`""
+    "     PUIS FERMER ET ROUVRIR LA SESSION WINDOWS. Le jeton ne prend l'appartenance"
+    "     de groupe en compte qu'à l'ouverture de session : redémarrer le terminal ne"
+    "     suffit pas."
+  ) -join "`n"
+}
+
+function Assert-HyperVAccess {
+  <#
+  .SYNOPSIS
+    Échoue avec le message de Get-HyperVAccessMessage si la session ne peut pas piloter
+    Hyper-V (ni administrateur, ni membre du groupe Administrateurs Hyper-V).
+  .PARAMETER Reason
+    Ce à quoi l'accès sert (affiché dans le message).
   #>
   param([Parameter(Mandatory)][string]$Reason)
-  if (-not (Test-Elevated)) {
-    throw "Ce script doit être lancé dans un PowerShell administrateur ($Reason)."
+  if (-not (Test-HyperVOperator)) {
+    throw (Get-HyperVAccessMessage -Reason $Reason -UserName $env:USERNAME)
+  }
+}
+
+function Test-AccessDeniedError {
+  <#
+  .SYNOPSIS
+    Vrai si l'erreur est un refus d'accès (E_ACCESSDENIED, 0x80070005), y compris
+    enveloppée dans une ou plusieurs exceptions.
+  .DESCRIPTION
+    Reconnu par le HRESULT et par le type de l'exception, en remontant toute la chaîne
+    InnerException. JAMAIS par le texte du message : il est traduit selon la langue de
+    Windows, et s'y fier est le même piège que chercher un groupe par son nom.
+    La catégorie PermissionDenied de l'ErrorRecord est une énumération, pas du texte :
+    elle peut donc servir de signal supplémentaire.
+  .PARAMETER ErrorRecord
+    Un ErrorRecord (le `$_` d'un catch) ou directement une exception. $null accepté.
+  #>
+  param([Parameter(Mandatory)][AllowNull()]$ErrorRecord)
+  if ($null -eq $ErrorRecord) { return $false }
+
+  $accessDenied = -2147024891   # 0x80070005 (E_ACCESSDENIED), lu en Int32 signé.
+  $exception = $ErrorRecord
+  if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) {
+    if ($ErrorRecord.CategoryInfo -and
+        $ErrorRecord.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::PermissionDenied) {
+      return $true
+    }
+    $exception = $ErrorRecord.Exception
+  }
+
+  $depth = 0
+  while ($exception -and $depth -lt 16) {
+    if ($exception -is [System.UnauthorizedAccessException] -or
+        $exception -is [System.Security.SecurityException] -or
+        $exception -is [System.Management.Automation.PSSecurityException]) {
+      return $true
+    }
+    if ($exception.HResult -eq $accessDenied) { return $true }
+    $exception = $exception.InnerException
+    $depth++
+  }
+  return $false
+}
+
+function Invoke-HyperVChecked {
+  <#
+  .SYNOPSIS
+    Exécute la PREMIÈRE commande Hyper-V d'un script en transformant un refus d'accès en
+    message actionnable (Get-HyperVAccessHint).
+  .DESCRIPTION
+    Assert-HyperVAccess a déjà validé le jeton ; un refus d'accès à ce stade signifie
+    presque toujours que l'appartenance au groupe a été ajoutée sans réouverture de
+    session. Toute autre erreur est relancée telle quelle.
+  .PARAMETER What
+    Ce que la commande faisait (« inventaire des VM »), affiché en tête du message.
+  .PARAMETER Script
+    Le bloc à exécuter ; sa sortie est renvoyée telle quelle.
+  #>
+  param(
+    [Parameter(Mandatory)][string]$What,
+    [Parameter(Mandatory)][scriptblock]$Script
+  )
+  try {
+    return (& $Script)
+  } catch {
+    if (Test-AccessDeniedError -ErrorRecord $_) {
+      throw "$What : accès refusé par Hyper-V.`n$(Get-HyperVAccessHint)`n`nErreur d'origine : $($_.Exception.Message)"
+    }
+    throw
   }
 }
 
@@ -275,7 +486,9 @@ function New-GuestSession {
   throw "Impossible d'ouvrir une session PowerShell Direct vers « $Name » : $lastError"
 }
 
-Export-ModuleMember -Function Test-Elevated, Assert-Elevated, New-DebugKey, Test-DebugKey,
+Export-ModuleMember -Function Test-Elevated, Test-SidPresent, Get-TokenSid,
+  Test-HyperVOperator, Get-HyperVAccessHint, Get-HyperVAccessMessage, Assert-HyperVAccess,
+  Test-AccessDeniedError, Invoke-HyperVChecked, New-DebugKey, Test-DebugKey,
   Invoke-NativeChecked, Get-FunctionSource, ConvertFrom-DevgenAddOutput, Find-PublishedInf,
   Get-CycleSummary, Get-WdkRoot, Get-DevgenPath, Get-DefaultSwitchHostIp, Wait-VMHeartbeat,
   Wait-VMReboot, New-GuestSession

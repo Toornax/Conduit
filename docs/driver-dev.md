@@ -154,12 +154,11 @@ mode `testsigning` affaiblit la machine. Les scripts du dépôt ne lancent jamai
 `pnputil`, `devgen` ni `bcdedit` **sur l'hôte** : `vm-prepare.ps1` et `vm-cycle.ps1` les
 exécutent dans l'invité par PowerShell Direct (`Invoke-Command -VMName`).
 
-Trois scripts dans `drivers\windows\tools\`, à lancer dans l'ordre depuis un PowerShell
-**administrateur** de l'hôte (Hyper-V exige l'élévation ; chacun le vérifie et s'arrête
-avec un message clair sinon). Prérequis : Hyper-V activé (Windows 11 Pro), le
-commutateur `Default Switch` (créé par Hyper-V, NAT vers l'hôte), une **ISO officielle
-de Windows 11** (microsoft.com, « Télécharger l'image de disque »), le WDK 26100 sur
-l'hôte (pour `devgen.exe`) et le paquet produit par `build.ps1`.
+Trois scripts dans `drivers\windows\tools\`, à lancer dans l'ordre sur l'hôte.
+Prérequis : Hyper-V activé (Windows 11 Pro), le commutateur `Default Switch` (créé par
+Hyper-V, NAT vers l'hôte), une **ISO officielle de Windows 11** (microsoft.com,
+« Télécharger l'image de disque »), le WDK 26100 sur l'hôte (pour `devgen.exe`) et le
+paquet produit par `build.ps1`.
 
 | Script | Rôle | Une fois / à chaque fois |
 |---|---|---|
@@ -167,10 +166,38 @@ l'hôte (pour `devgen.exe`) et le paquet produit par `build.ps1`.
 | `vm-prepare.ps1 -Credential <cred>` | `testsigning`, débogueur réseau, vidages, point de contrôle `propre` | une fois (ou après réinstallation) |
 | `vm-cycle.ps1 -Credential <cred> [-Count 100]` | copie le paquet, l'installe et le retire N fois | à chaque build à valider |
 
+**Deux façons de lancer les scripts.** Piloter Hyper-V n'exige **pas** l'élévation :
+appartenir au groupe **Administrateurs Hyper-V** suffit. Les trois scripts acceptent donc
+l'une **ou** l'autre de ces deux situations, et s'arrêtent sinon avec un message qui
+rappelle les deux remèdes :
+
+1. **PowerShell lancé en tant qu'administrateur.** Rien à préparer, mais une invite UAC à
+   chaque fois, et un terminal élevé pour toute la session.
+2. **Session ordinaire, compte membre du groupe Administrateurs Hyper-V.** À privilégier
+   pour les **sessions de validation longues** (`vm-bringup.md`), où l'on enchaîne
+   `build.ps1`, `check.ps1` et `vm-cycle.ps1` : le terminal reste non élevé, donc les
+   outils Rust travaillent avec les droits habituels et les fichiers produits gardent le
+   bon propriétaire. Une fois, depuis un PowerShell administrateur :
+
+   ```powershell
+   Add-LocalGroupMember -SID S-1-5-32-578 -Member "$env:USERNAME"
+   ```
+
+> **Après cet ajout, fermer et rouvrir la session Windows.** Le jeton d'accès n'intègre
+> les appartenances de groupe qu'à l'**ouverture** de session : rouvrir le terminal, ou
+> même relancer l'explorateur, ne suffit pas. Tant que ce n'est pas fait, les scripts
+> refuseront de démarrer exactement comme avant.
+
+Le groupe est désigné par son **SID** `S-1-5-32-578` et non par son nom, qui est traduit
+(« Administrateurs Hyper-V » en français) : `Add-LocalGroupMember -Group "Hyper-V
+Administrators"` échoue sur un Windows français. Le code du dépôt applique la même règle
+(`vm-common.psm1`), après que le nom traduit d'un composant d'intégration eut cassé la
+création de VM (corrigé au commit `25b3557`).
+
 Les fonctions d'analyse partagées (`vm-common.psm1` : identifiant d'instance de `devgen`,
-`oemN.inf` de `pnputil /enum-drivers`, clé kdnet, résumé des durées) ont des tests Pester
-dans `tools\tests\` (`Invoke-Pester drivers\windows\tools\tests`, syntaxe Pester 3/4 livrée
-avec Windows).
+`oemN.inf` de `pnputil /enum-drivers`, clé kdnet, résumé des durées, décision d'accès
+Hyper-V) ont des tests Pester dans `tools\tests\`
+(`Invoke-Pester drivers\windows\tools\tests`, syntaxe Pester 3/4 livrée avec Windows).
 
 ### 3.1 Création : `vm-new.ps1`
 

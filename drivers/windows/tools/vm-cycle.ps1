@@ -46,7 +46,9 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 Import-Module (Join-Path $PSScriptRoot "vm-common.psm1") -Force
-Assert-Elevated -Reason "PowerShell Direct vers la VM"
+# PowerShell Direct exige d'être « logged into the host computer as a Hyper-V
+# administrator » : le groupe Administrateurs Hyper-V suffit (voir vm-common.psm1).
+Assert-HyperVAccess -Reason "PowerShell Direct vers la VM"
 
 $workspace = Split-Path -Parent $PSScriptRoot
 $repoRoot = Split-Path -Parent (Split-Path -Parent $workspace)
@@ -70,7 +72,10 @@ foreach ($file in @($infName, "conduit_kmd.sys", "conduit_kmd.cat", "WDRLocalTes
 $versions = Get-Content (Join-Path $repoRoot "packaging\windows\versions.json") -Raw | ConvertFrom-Json
 $devgen = Get-DevgenPath -WdkVersion $versions.wdk
 
-if (-not (Get-VM -Name $Name -ErrorAction SilentlyContinue)) {
+# Inventaire puis filtrage par nom, sans -ErrorAction SilentlyContinue, qui avalerait un
+# refus d'accès en le présentant comme une VM introuvable.
+$vms = @(Invoke-HyperVChecked -What "inventaire des VM" -Script { Get-VM })
+if (-not ($vms | Where-Object { $_.Name -eq $Name })) {
   throw "VM « $Name » introuvable : lancer d'abord vm-new.ps1 puis vm-prepare.ps1."
 }
 

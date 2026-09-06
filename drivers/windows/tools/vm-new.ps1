@@ -37,19 +37,26 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 Import-Module (Join-Path $PSScriptRoot "vm-common.psm1") -Force
-Assert-Elevated -Reason "création d'une VM Hyper-V"
+# Contrôle d'accès avant tout le reste : un problème de droits doit se voir tout de
+# suite, pas après un diagnostic trompeur sur l'ISO. Le groupe Administrateurs Hyper-V
+# suffit, l'élévation n'est pas exigée (voir vm-common.psm1).
+Assert-HyperVAccess -Reason "création d'une VM Hyper-V"
 
 if (-not (Test-Path -LiteralPath $IsoPath -PathType Leaf)) {
   throw "ISO introuvable : $IsoPath"
 }
 $IsoPath = (Resolve-Path -LiteralPath $IsoPath).Path
 
-if (Get-VM -Name $Name -ErrorAction SilentlyContinue) {
+# Inventaire puis filtrage par nom, sans -ErrorAction SilentlyContinue : « Get-VM -Name X
+# -ErrorAction SilentlyContinue » avale AUSSI un refus d'accès et le présente comme une
+# VM introuvable. Ici, un refus d'accès remonte, enrichi par Invoke-HyperVChecked.
+$vms = @(Invoke-HyperVChecked -What "inventaire des VM" -Script { Get-VM })
+if ($vms | Where-Object { $_.Name -eq $Name }) {
   throw "Une VM « $Name » existe déjà : la supprimer (Remove-VM) ou choisir un autre -Name."
 }
 
 $switch = "Default Switch"
-if (-not (Get-VMSwitch -Name $switch -ErrorAction SilentlyContinue)) {
+if (-not (@(Get-VMSwitch) | Where-Object { $_.Name -eq $switch })) {
   throw "Commutateur virtuel « $switch » introuvable : Hyper-V est-il activé (et la machine redémarrée) ?"
 }
 
@@ -118,7 +125,7 @@ Write-Host "  2. Installer Windows 11 (édition Pro conseillée) sur le disque u
 Write-Host "  3. À l'étape du compte : choisir un compte LOCAL, sans compte Microsoft"
 Write-Host "     (au besoin : Maj+F10, `OOBE\BYPASSNRO`, la VM redémarre, puis « Je n'ai pas Internet »)."
 Write-Host "     Nom d'utilisateur : test (administrateur), mot de passe au choix."
-Write-Host "  4. Une fois sur le bureau, sur l'hôte (PowerShell administrateur) :"
+Write-Host "  4. Une fois sur le bureau, sur l'hôte (même PowerShell que celui-ci) :"
 Write-Host "       `$cred = Get-Credential test"
 Write-Host "       .\vm-prepare.ps1 -Name $Name -Credential `$cred"
 Write-Host "  L'ISO peut ensuite être retirée : Set-VMDvdDrive -VMName $Name -Path `$null"
