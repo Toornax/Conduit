@@ -297,3 +297,269 @@ Describe "Get-FunctionSource" {
     { . $sb } | Should Not Throw
   }
 }
+
+Describe "Get-NamedPipeName" {
+  It "extrait le nom court d'un canal local" {
+    Get-NamedPipeName -Pipe '\\.\pipe\conduitdbg' | Should Be "conduitdbg"
+  }
+  It "accepte un nom de machine à la place du point" {
+    Get-NamedPipeName -Pipe '\\HOTE\pipe\conduitdbg' | Should Be "conduitdbg"
+  }
+  It "accepte un nom nu" {
+    Get-NamedPipeName -Pipe "conduitdbg" | Should Be "conduitdbg"
+  }
+  It "ignore les espaces autour" {
+    Get-NamedPipeName -Pipe '  \\.\pipe\conduitdbg  ' | Should Be "conduitdbg"
+  }
+  It "garde un nom imbriqué tel qu'il apparaît dans l'espace de noms des canaux" {
+    # vm-debug.ps1 compare les entrées de \\.\pipe\ avec cette fonction, et non avec
+    # Split-Path -Leaf, qui rend une chaîne VIDE sur « \\.\pipe\nom » (vérifié).
+    Get-NamedPipeName -Pipe '\\.\pipe\Winsock2\CatalogChangeListener-580-0' |
+      Should Be 'Winsock2\CatalogChangeListener-580-0'
+  }
+  It "refuse ce qui n'est pas un canal nommé" {
+    Get-NamedPipeName -Pipe "C:\temp\fichier" | Should BeNullOrEmpty
+    Get-NamedPipeName -Pipe "" | Should BeNullOrEmpty
+    Get-NamedPipeName -Pipe $null | Should BeNullOrEmpty
+  }
+}
+
+Describe "Get-KdCommandLine" {
+  $kdPath = "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\kd.exe"
+  $pipe = '\\.\pipe\conduitdbg'
+  $log = "C:\dev\target\debug-logs\kd.log"
+  $kd = Get-KdCommandLine -KdPath $kdPath -Pipe $pipe -LogPath $log `
+    -InitialCommands @("ed nt!Kd_IHVDRIVER_Mask 0xf", "g")
+
+  It "ouvre le canal nommé en série, avec resets=0 et reconnect" {
+    $kd.Arguments[0] | Should Be "-k"
+    $kd.Arguments[1] | Should Be 'com:pipe,port=\\.\pipe\conduitdbg,resets=0,reconnect'
+  }
+  It "journalise avec -logo" {
+    $index = [array]::IndexOf($kd.Arguments, "-logo")
+    ($index -ge 0) | Should Be $true
+    $kd.Arguments[$index + 1] | Should Be $log
+  }
+  It "joue les commandes initiales avec -c, séparées par un point-virgule" {
+    $index = [array]::IndexOf($kd.Arguments, "-c")
+    ($index -ge 0) | Should Be $true
+    $kd.Arguments[$index + 1] | Should Be "ed nt!Kd_IHVDRIVER_Mask 0xf; g"
+  }
+  It "cite les arguments qui contiennent des espaces, et eux seuls" {
+    $kd.ArgumentString.Contains('"ed nt!Kd_IHVDRIVER_Mask 0xf; g"') | Should Be $true
+    $kd.ArgumentString.Contains("-k com:pipe") | Should Be $true
+  }
+  It "cite le chemin du débogueur dans la ligne complète" {
+    $kd.CommandLine.StartsWith('"' + $kdPath + '"') | Should Be $true
+  }
+  It "n'ajoute pas -c sans commande initiale" {
+    $sans = Get-KdCommandLine -KdPath $kdPath -Pipe $pipe -LogPath $log -InitialCommands @()
+    ($sans.Arguments -contains "-c") | Should Be $false
+    $vides = Get-KdCommandLine -KdPath $kdPath -Pipe $pipe -LogPath $log -InitialCommands @("", "   ")
+    ($vides.Arguments -contains "-c") | Should Be $false
+  }
+  It "reprend le canal tel quel, quelle qu'en soit l'écriture" {
+    $court = Get-KdCommandLine -KdPath $kdPath -Pipe "conduitdbg" -LogPath $log
+    $court.Arguments[1] | Should Be "com:pipe,port=conduitdbg,resets=0,reconnect"
+  }
+}
+
+Describe "Get-AccountName / Test-SameAccount" {
+  It "retire le domaine ou la machine" {
+    Get-AccountName -UserName "CONDUITTEST\nathan" | Should Be "nathan"
+    Get-AccountName -UserName ".\nathan" | Should Be "nathan"
+    Get-AccountName -UserName "nathan" | Should Be "nathan"
+    Get-AccountName -UserName "nathan@exemple.local" | Should Be "nathan"
+  }
+  It "rend une chaîne vide sur une entrée vide" {
+    Get-AccountName -UserName "" | Should Be ""
+    Get-AccountName -UserName $null | Should Be ""
+  }
+  It "reconnaît le même compte écrit de trois façons" {
+    (Test-SameAccount -Left "CONDUITTEST\nathan" -Right "nathan") | Should Be $true
+    (Test-SameAccount -Left ".\nathan" -Right "CONDUITTEST\NATHAN") | Should Be $true
+  }
+  It "distingue deux comptes différents" {
+    (Test-SameAccount -Left "CONDUITTEST\nathan" -Right "test") | Should Be $false
+  }
+  It "refuse de conclure sur une entrée vide" {
+    (Test-SameAccount -Left "" -Right "nathan") | Should Be $false
+    (Test-SameAccount -Left $null -Right $null) | Should Be $false
+  }
+}
+
+Describe "Get-TaskRunAsUser" {
+  It "qualifie par la machine invitée un compte non qualifié" {
+    Get-TaskRunAsUser -UserName "nathan" -ComputerName "CONDUITTEST" | Should Be "CONDUITTEST\nathan"
+  }
+  It "remplace le point de « .\compte » par la machine" {
+    Get-TaskRunAsUser -UserName ".\nathan" -ComputerName "CONDUITTEST" | Should Be "CONDUITTEST\nathan"
+  }
+  It "laisse intact un compte déjà qualifié" {
+    Get-TaskRunAsUser -UserName "CONDUITTEST\nathan" -ComputerName "AUTRE" | Should Be "CONDUITTEST\nathan"
+    Get-TaskRunAsUser -UserName "nathan@exemple.local" -ComputerName "AUTRE" | Should Be "nathan@exemple.local"
+  }
+  It "se contente du compte quand la machine est inconnue" {
+    Get-TaskRunAsUser -UserName "nathan" -ComputerName "" | Should Be "nathan"
+  }
+  It "n'invente jamais de compte : il vient du -Credential" {
+    Get-TaskRunAsUser -UserName "test" -ComputerName "CONDUITTEST" | Should Be "CONDUITTEST\test"
+  }
+}
+
+Describe "Get-ConsoleSessionDecision" {
+  $console = "CONDUITTEST\nathan"
+  It "accepte une session console dont l'explorer n'est pas dans la session 0" {
+    $d = Get-ConsoleSessionDecision -ConsoleUser $console -ExplorerSessions @(
+      [pscustomobject]@{ UserName = $console; SessionId = 1 })
+    $d.Ready | Should Be $true
+    $d.SessionId | Should Be 1
+    $d.Reason | Should Be ""
+  }
+  It "reconnaît l'utilisateur quelle que soit la qualification du nom" {
+    $d = Get-ConsoleSessionDecision -ConsoleUser $console -ExplorerSessions @(
+      [pscustomobject]@{ UserName = "nathan"; SessionId = 2 })
+    $d.Ready | Should Be $true
+    $d.SessionId | Should Be 2
+  }
+  It "refuse un explorer qui n'est QUE dans la session 0 (celle des services, sans audio)" {
+    $d = Get-ConsoleSessionDecision -ConsoleUser $console -ExplorerSessions @(
+      [pscustomobject]@{ UserName = $console; SessionId = 0 })
+    $d.Ready | Should Be $false
+    $d.SessionId | Should Be 0
+    $d.Reason | Should Match "session 0"
+  }
+  It "refuse quand personne n'est ouvert à la console" {
+    $d = Get-ConsoleSessionDecision -ConsoleUser "" -ExplorerSessions @(
+      [pscustomobject]@{ UserName = $console; SessionId = 1 })
+    $d.Ready | Should Be $false
+    $d.Reason | Should Match "console"
+  }
+  It "refuse quand l'utilisateur ouvert n'a pas de bureau chargé" {
+    $d = Get-ConsoleSessionDecision -ConsoleUser $console -ExplorerSessions @()
+    $d.Ready | Should Be $false
+    ($d.SessionId -eq -1) | Should Be $true
+    $d.Reason | Should Match "explorer"
+  }
+  It "ignore l'explorer d'un AUTRE utilisateur" {
+    $d = Get-ConsoleSessionDecision -ConsoleUser $console -ExplorerSessions @(
+      [pscustomobject]@{ UserName = "CONDUITTEST\test"; SessionId = 3 })
+    $d.Ready | Should Be $false
+  }
+  It "supporte une liste nulle et des entrées incomplètes" {
+    (Get-ConsoleSessionDecision -ConsoleUser $console -ExplorerSessions $null).Ready | Should Be $false
+    $d = Get-ConsoleSessionDecision -ConsoleUser $console -ExplorerSessions @(
+      $null,
+      [pscustomobject]@{ UserName = $console },
+      [pscustomobject]@{ UserName = $console; SessionId = 1 })
+    $d.Ready | Should Be $true
+  }
+}
+
+Describe "Get-ConsoleRunScript" {
+  $texte = Get-ConsoleRunScript -Executable "C:\ConduitTest\conduit-looptest.exe" `
+    -Arguments @("--repeat", "10") -OutputPath "C:\ConduitTest\sortie.txt" `
+    -ExitCodePath "C:\ConduitTest\code.txt" -WorkingDirectory "C:\ConduitTest"
+  $lignes = $texte -split "`r`n"
+
+  It "se termine par des fins de ligne Windows" {
+    $texte.EndsWith("`r`n") | Should Be $true
+    $texte.Contains("`n`n") | Should Be $false
+  }
+  It "se place dans le dossier de travail" {
+    ($lignes -contains 'cd /d "C:\ConduitTest"') | Should Be $true
+  }
+  It "redirige sortie et erreur vers le fichier de sortie" {
+    $commande = @($lignes | Where-Object { $_ -like "*conduit-looptest.exe*" })[0]
+    $commande.Contains('"C:\ConduitTest\conduit-looptest.exe" --repeat 10') | Should Be $true
+    $commande.Contains('>"C:\ConduitTest\sortie.txt" 2>&1') | Should Be $true
+  }
+  It "écrit le code de retour AVEC la redirection en tête (sinon cmd lit le chiffre comme un flux)" {
+    $sentinelle = @($lignes | Where-Object { $_ -like "*code.txt*" })[0]
+    $sentinelle.StartsWith('>"C:\ConduitTest\code.txt" echo ') | Should Be $true
+    ($lignes -contains "set CONDUIT_CODE=%ERRORLEVEL%") | Should Be $true
+  }
+  It "capture le code AVANT toute autre commande" {
+    $iCommande = [array]::IndexOf($lignes, @($lignes | Where-Object { $_ -like "*conduit-looptest.exe*" })[0])
+    $iCode = [array]::IndexOf($lignes, "set CONDUIT_CODE=%ERRORLEVEL%")
+    ($iCode -eq $iCommande + 1) | Should Be $true
+  }
+  It "cite les arguments à espaces et double les pour-cent" {
+    $t = Get-ConsoleRunScript -Executable "C:\Program Files\outil.exe" `
+      -Arguments @("--nom", "Conduit 1", "--gabarit", "100%") `
+      -OutputPath "C:\o.txt" -ExitCodePath "C:\c.txt"
+    $t.Contains('"C:\Program Files\outil.exe" --nom "Conduit 1" --gabarit 100%%') | Should Be $true
+  }
+  It "accepte une commande sans argument ni dossier de travail" {
+    $t = Get-ConsoleRunScript -Executable "C:\a.exe" -Arguments @() -OutputPath "C:\o.txt" -ExitCodePath "C:\c.txt"
+    $t.Contains("cd /d") | Should Be $false
+    $t.Contains('"C:\a.exe" >"C:\o.txt" 2>&1') | Should Be $true
+  }
+}
+
+Describe "Test-ConduitGhostDevice" {
+  $audio = "{c166523c-fe0c-4a94-a586-f1a80cfbbf3e}"
+  $media = "{4d36e96c-e325-11ce-bfc1-08002be10318}"
+
+  It "retire un périphérique fantôme Root\ConduitCable" {
+    (Test-ConduitGhostDevice -InstanceId "ROOT\CONDUITCABLE\0000" -FriendlyName "Conduit — câbles audio virtuels" `
+      -ClassGuid $media -Present $false) | Should Be $true
+  }
+  It "retire un endpoint audio fantôme qui porte notre nom" {
+    (Test-ConduitGhostDevice -InstanceId "SWD\MMDEVAPI\{0.0.0.00000000}.{9d2a6c1e-5a0b}" `
+      -FriendlyName "Conduit 1 (Conduit — câbles audio virtuels)" -ClassGuid $audio -Present $false) | Should Be $true
+  }
+  It "reconnaît le GUID de classe sans accolades" {
+    (Test-ConduitGhostDevice -InstanceId "SWD\AUTRE\1" -FriendlyName "Conduit 1" `
+      -ClassGuid "c166523c-fe0c-4a94-a586-f1a80cfbbf3e" -Present $false) | Should Be $true
+  }
+  It "ne touche JAMAIS à un périphérique présent" {
+    (Test-ConduitGhostDevice -InstanceId "ROOT\CONDUITCABLE\0000" -FriendlyName "Conduit 1" `
+      -ClassGuid $media -Present $true) | Should Be $false
+    (Test-ConduitGhostDevice -InstanceId "SWD\MMDEVAPI\{0.0.0.1}" -FriendlyName "Conduit 1" `
+      -ClassGuid $audio -Present $true) | Should Be $false
+  }
+  It "ne touche pas aux endpoints fantômes d'une vraie carte son" {
+    (Test-ConduitGhostDevice -InstanceId "SWD\MMDEVAPI\{0.0.0.00000000}.{aaaa}" `
+      -FriendlyName "Haut-parleurs (Realtek High Definition Audio)" -ClassGuid $audio -Present $false) | Should Be $false
+  }
+  It "ne touche pas à un périphérique d'un autre fournisseur, même fantôme" {
+    (Test-ConduitGhostDevice -InstanceId "ROOT\MEDIA\0001" -FriendlyName "Périphérique audio virtuel X" `
+      -ClassGuid $media -Present $false) | Should Be $false
+  }
+  It "n'accepte un nom manquant que pour nos propres Root\ConduitCable" {
+    (Test-ConduitGhostDevice -InstanceId "ROOT\CONDUITCABLE\0000" -FriendlyName $null -ClassGuid $null -Present $false) | Should Be $true
+    (Test-ConduitGhostDevice -InstanceId "SWD\MMDEVAPI\{0.0.0.1}" -FriendlyName $null -ClassGuid $audio -Present $false) | Should Be $false
+  }
+  It "ignore la casse de l'identifiant d'instance" {
+    (Test-ConduitGhostDevice -InstanceId "Root\ConduitCable\0000" -FriendlyName "" -ClassGuid "" -Present $false) | Should Be $true
+  }
+  It "refuse un identifiant vide" {
+    (Test-ConduitGhostDevice -InstanceId "" -FriendlyName "Conduit 1" -ClassGuid $audio -Present $false) | Should Be $false
+  }
+  It "reste utilisable une fois transportée dans l'invité (aucune variable de module)" {
+    # vm-cycle.ps1 l'envoie par Get-FunctionSource : elle doit se suffire à elle-même.
+    $sb = [scriptblock]::Create((Get-FunctionSource -Name Test-ConduitGhostDevice) +
+      "`nTest-ConduitGhostDevice -InstanceId 'ROOT\CONDUITCABLE\0000' -FriendlyName '' -ClassGuid '' -Present `$false")
+    (& $sb) | Should Be $true
+  }
+}
+
+Describe "Surface exportée : débogage série et session console" {
+  $module = Get-Module vm-common
+  It "exporte les fonctions pures des nouveaux scripts" {
+    foreach ($name in @("Get-NamedPipeName", "Get-KdCommandLine", "Get-AccountName",
+                        "Test-SameAccount", "Get-TaskRunAsUser", "Get-ConsoleSessionDecision",
+                        "Get-ConsoleRunScript", "Test-ConduitGhostDevice")) {
+      $module.ExportedFunctions.ContainsKey($name) | Should Be $true
+    }
+  }
+  It "exporte les enveloppes système qu'elles accompagnent" {
+    foreach ($name in @("Get-KdPath", "Wait-VMOff")) {
+      $module.ExportedFunctions.ContainsKey($name) | Should Be $true
+    }
+  }
+  It "n'exporte pas l'aide interne de citation" {
+    $module.ExportedFunctions.ContainsKey("Format-NativeArgument") | Should Be $false
+  }
+}

@@ -5,7 +5,9 @@
   Étape 3/3 de docs/driver-dev.md §3, sur l'hôte, VM préparée par vm-prepare.ps1 et
   paquet produit par build.ps1. Par PowerShell Direct : copie le paquet et devgen.exe
   (WDK de l'hôte) dans l'invité, importe WDRLocalTestCert.cer dans Root et
-  TrustedPublisher de la machine invitée, nettoie les restes d'une exécution précédente,
+  TrustedPublisher de la machine invitée, nettoie les restes d'une exécution précédente
+  (périphériques et paquets restants, et endpoints FANTÔMES à nous, qui fausseraient les
+  mesures audio en dédoublant les instances),
   puis répète Count fois :
     1. pnputil /add-driver conduit_kmd.inf /install
     2. devgen /add /hardwareid "Root\ConduitCable"   (identifiant d'instance récupéré)
@@ -80,7 +82,8 @@ if (-not ($vms | Where-Object { $_.Name -eq $Name })) {
 }
 
 # Fonctions redéfinies dans l'invité à partir de leur texte.
-$helpers = @("Invoke-NativeChecked", "ConvertFrom-DevgenAddOutput", "Find-PublishedInf") |
+$helpers = @("Invoke-NativeChecked", "ConvertFrom-DevgenAddOutput", "Find-PublishedInf",
+  "Test-ConduitGhostDevice") |
   ForEach-Object { Get-FunctionSource -Name $_ }
 $helpers = $helpers -join "`n"
 
@@ -198,6 +201,29 @@ try {
         $etape = "retrait du périphérique restant $($dev.InstanceId)"
         Invoke-NativeChecked pnputil @("/remove-device", $dev.InstanceId) | Out-Null
       }
+      # Endpoints FANTÔMES (périphériques non présents) laissés par les cycles précédents.
+      # Ils faussent les mesures : l'outil peut jouer sur une instance et écouter sur une
+      # autre, et le symptôme est un silence, pas une erreur. On ne retire QUE ce qui nous
+      # appartient — Test-ConduitGhostDevice exige un périphérique non présent qui soit un
+      # Root\ConduitCable, ou un endpoint audio dont le nom contient « Conduit » — parce
+      # que cette VM sert aussi à comparer avec de vraies cartes son.
+      $etape = "inventaire des périphériques fantômes"
+      $ghosts = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
+        Test-ConduitGhostDevice -InstanceId $_.InstanceId -FriendlyName $_.FriendlyName `
+          -ClassGuid $_.ClassGuid -Present ([bool]$_.Present)
+      })
+      foreach ($ghost in $ghosts) {
+        Write-Host "  retrait du fantôme « $($ghost.FriendlyName) » [$($ghost.InstanceId)]"
+        $etape = "retrait du périphérique fantôme $($ghost.InstanceId)"
+        try {
+          Invoke-NativeChecked pnputil @("/remove-device", $ghost.InstanceId) | Out-Null
+        } catch {
+          # Un fantôme qui résiste n'est pas une raison d'annuler la série : le cycle,
+          # lui, ne dépend pas de sa disparition. On le signale et on continue.
+          Write-Host "    (retrait refusé, ignoré) $($_.Exception.Message)"
+        }
+      }
+
       $etape = "inventaire des paquets de pilote publiés"
       $enum = Invoke-NativeChecked pnputil @("/enum-drivers")
       foreach ($oem in @(Find-PublishedInf -Output $enum -OriginalName $InfName)) {

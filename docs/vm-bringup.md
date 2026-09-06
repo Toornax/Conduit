@@ -54,16 +54,28 @@ Get-VMNetworkAdapter -VMName ConduitTest | Connect-VMNetworkAdapter -SwitchName 
 ``` Puis :
 
 ```powershell
-$cred = Get-Credential test
+$cred = Get-Credential nathan
 .\drivers\windows\tools\vm-prepare.ps1 -Name ConduitTest -Credential $cred
 ```
 
-Active `testsigning`, le débogage noyau réseau (la clé est affichée : la noter), la
-collecte des vidages, désactive la veille, redémarre et crée le point de contrôle
-« propre ». **Revenir à ce point de contrôle** avant chaque reprise à froid.
+Active `testsigning`, le **débogage noyau par canal nommé série** (`\\.\pipe\conduitdbg`
+sur le port COM 1 : le transport réseau, lui, ne s'est jamais connecté sur ce poste), le
+**filtre de traces du noyau** (`Debug Print Filter\DEFAULT = 0xF`, sans lequel les
+`kmd_log!` du pilote sont invisibles), la collecte des vidages, désactive la veille,
+arrête l'invité le temps d'attacher le canal (`Set-VMComPort` exige la VM éteinte),
+rallume et crée le point de contrôle « propre ». **Revenir à ce point de contrôle** avant
+chaque reprise à froid.
+
+Le compte à passer est celui **réellement créé** dans la VM : c'est `nathan` ici, quoi
+qu'en dise l'habitude du `test` des premières versions de ce document.
 
 *Si `testsigning` est refusé* : Secure Boot est resté actif. Le désactiver dans les
 paramètres de la VM, redémarrer, relancer.
+
+Pour déboguer : `.\drivers\windows\tools\vm-debug.ps1 -StartVM -Follow`. **Le débogueur
+doit tenir le canal nommé avant que la machine démarre** — `-StartVM` impose cet ordre
+(arrêt, débogueur, attente, démarrage) ; une VM démarrée en premier ne se rattrape pas
+([driver-dev.md](driver-dev.md) §4).
 
 ## 2. M1a-02 — le pilote se charge et se décharge
 
@@ -83,7 +95,8 @@ moyenne. Aucun vidage rapatrié dans `drivers\windows\target\dumps\`.
 2. *`ExAllocateTimer` échoue au démarrage* → `STATUS_INSUFFICIENT_RESOURCES`, le
    périphérique ne démarre pas (M1a-08, décision assumée : pas de repli). Regarder le
    journal `DbgPrint`.
-3. *Écran bleu au chargement* : attacher WinDbg avant (§4 de driver-dev.md), `!analyze -v`.
+3. *Écran bleu au chargement* : attacher le débogueur AVANT de démarrer la VM
+   (`vm-debug.ps1 -StartVM`, §4 de driver-dev.md), puis `!analyze -v`.
    Un bug check `0xE0000001` est **notre** gestionnaire de panique : le message Rust est
    dans les paramètres, et c'est un bogue de logique, pas de noyau.
 4. *Fuite entre les cycles* : `!poolused` sur les tags `Cndt`, ils doivent revenir à zéro.
@@ -138,9 +151,25 @@ de fausses pistes sur le pilote, qui lui n'avait rien.
 
 **La bonne configuration** : ouvrir `vmconnect` en **session de base** (désactiver le mode
 session étendue), ouvrir une session Windows à la console, et lancer les mesures **dans
-cette session**. Depuis l'hôte, on y arrive par une tâche planifiée créée avec un jeton
-interactif (`schtasks /create … /ru <utilisateur> /it`, puis `schtasks /run`), la sortie
-étant redirigée vers un fichier que l'hôte relit ensuite.
+cette session**.
+
+Depuis l'hôte, cette recette est maintenant un script — elle n'est plus à retenir :
+
+```powershell
+.\drivers\windows\tools\vm-run-console.ps1 -Credential $cred `
+  -Path target\debug\conduit-looptest.exe -Arguments @("--repeat", "10")
+```
+
+`vm-run-console.ps1` **refuse de travailler** tant qu'une session console interactive n'est
+pas ouverte, et le dit avec la marche à suivre ci-dessus : il ne rendra jamais un résultat
+silencieusement faux. La vérification ne dépend pas de la langue
+(`Win32_ComputerSystem.UserName` pour l'utilisateur ouvert à la console, et l'identifiant
+de session de *son* `explorer`, qui doit différer de 0 — jamais `quser`, traduit). Il copie
+l'exécutable au besoin, crée une tâche planifiée à **jeton interactif**
+(`schtasks /create … /ru <compte du -Credential> /it /f`, sans mot de passe), la lance,
+attend le **fichier de code de retour** que la commande écrit elle-même (le statut de
+`schtasks /query` est traduit, donc inutilisable), relit la sortie, supprime la tâche et
+propage le code de retour. `-TimeoutSeconds 4000` couvre la charge d'une heure de l'étape 7.
 
 **Le réflexe, avant de suspecter le pilote** : vérifier la session du processus de test et
 le volume des endpoints. `conduit-looptest` les affiche désormais lui-même et prévient
@@ -251,7 +280,16 @@ périodique pointe vers l'avance de copie, des trous vers la période du timer.
 
 Activer Driver Verifier sur `conduit_kmd.sys` (paramètres standard, plus special pool et
 contrôle d'IRQL), redémarrer, puis rejouer les étapes 4 à 6 pendant une heure avec des
-ouvertures et fermetures répétées.
+ouvertures et fermetures répétées. Sans surveillance, et **dans la session console** (§3
+bis), sinon l'heure entière ne mesure rien :
+
+```powershell
+.\drivers\windows\tools\vm-run-console.ps1 -Credential $cred `
+  -RemoteExecutable conduit-looptest.exe -Arguments @("--repeat", "200") -TimeoutSeconds 4000
+```
+
+Le débogueur peut rester attaché pendant toute la charge (`vm-debug.ps1 -Follow`) : c'est
+lui qui recueillera le bug check si Driver Verifier en déclenche un.
 
 **Attendu** : aucun écran bleu, aucun vidage. C'est ce qui tranchera le dernier doute de
 conception : le double verrouillage câble puis flux à un niveau d'interruption élevé, et

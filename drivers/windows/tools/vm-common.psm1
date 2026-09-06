@@ -14,6 +14,10 @@
     Get-HyperVAccessMessage               | Assert-HyperVAccess
     Get-HyperVAccessHint                  | Invoke-HyperVChecked
     Test-AccessDeniedError                | —
+    Get-KdCommandLine, Get-NamedPipeName  | Get-KdPath (vm-debug.ps1)
+    Get-ConsoleSessionDecision            | lectures CIM dans l'invité (vm-run-console.ps1)
+    Get-ConsoleRunScript, Get-TaskRunAsUser | schtasks dans l'invité (vm-run-console.ps1)
+    Test-ConduitGhostDevice               | Get-PnpDevice dans l'invité (vm-cycle.ps1)
 #>
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -386,6 +390,314 @@ function Get-CycleSummary {
   }
 }
 
+function Format-NativeArgument {
+  <#
+  .SYNOPSIS
+    Entoure un argument de guillemets s'il en a besoin (espace, tabulation, ou argument
+    vide), pour composer une ligne de commande destinée à un exécutable natif.
+  .DESCRIPTION
+    Privée (non exportée) : elle sert à Get-KdCommandLine et Get-ConsoleRunScript, dont
+    les tests la couvrent. Windows PowerShell 5.1 ne cite RIEN quand on passe un tableau
+    à `Start-Process -ArgumentList` : la citation est donc à notre charge.
+  #>
+  param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+  if ($Value -match '[\s"]') { return '"' + ($Value -replace '"', '\"') + '"' }
+  if ($Value -eq "") { return '""' }
+  return $Value
+}
+
+function Get-NamedPipeName {
+  <#
+  .SYNOPSIS
+    Nom court d'un canal nommé local (« \\.\pipe\conduitdbg » → « conduitdbg »).
+  .DESCRIPTION
+    Fonction pure. Sert à chercher le canal dans l'espace de noms des canaux
+    (\\.\pipe\), qui n'expose que les noms courts : c'est ainsi que vm-debug.ps1 vérifie
+    que le débogueur tient bien le canal AVANT de démarrer la VM.
+  .PARAMETER Pipe
+    Chemin du canal, avec ou sans le préfixe « \\.\pipe\ » (le préfixe accepte aussi un
+    nom de machine, « \\HOTE\pipe\… », ignoré ici : seul le nom local a un sens).
+  .OUTPUTS
+    Le nom court, ou $null si la chaîne ne désigne pas un canal nommé.
+  #>
+  param([Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$Pipe)
+  if ([string]::IsNullOrWhiteSpace($Pipe)) { return $null }
+  $value = $Pipe.Trim()
+  if ($value -match '^\\\\[^\\]+\\pipe\\(.+)$') { return $Matches[1] }
+  if ($value -match '[\\/]') { return $null }
+  return $value
+}
+
+function Get-KdCommandLine {
+  <#
+  .SYNOPSIS
+    Compose l'appel de kd.exe pour un débogage noyau par canal nommé série.
+  .DESCRIPTION
+    Fonction pure : c'est la partie de vm-debug.ps1 qui se teste sans Hyper-V ni WDK.
+    `resets=0,reconnect` est ce qui rend l'ordre « débogueur d'abord, machine ensuite »
+    praticable : le débogueur tient le canal et ne lâche pas tant que la VM n'a pas
+    démarré, puis se raccroche à chaque redémarrage de l'invité.
+  .PARAMETER KdPath
+    Chemin de kd.exe (ou windbg.exe : mêmes options).
+  .PARAMETER Pipe
+    Canal nommé partagé avec le port COM de la VM (\\.\pipe\conduitdbg).
+  .PARAMETER LogPath
+    Fichier journal (-logo : écrase ; -loga ajouterait à la suite).
+  .PARAMETER InitialCommands
+    Commandes jouées à la connexion (-c). Les vides sont ignorées.
+  .OUTPUTS
+    Un objet { Path ; Arguments (tableau brut, pour Start-Process) ; ArgumentString
+    (arguments cités) ; CommandLine (ligne complète, pour l'affichage et le journal) }.
+  #>
+  param(
+    [Parameter(Mandatory)][string]$KdPath,
+    [Parameter(Mandatory)][string]$Pipe,
+    [Parameter(Mandatory)][string]$LogPath,
+    [AllowNull()][AllowEmptyCollection()][string[]]$InitialCommands = @()
+  )
+  $arguments = @("-k", "com:pipe,port=$Pipe,resets=0,reconnect", "-logo", $LogPath)
+  $commands = @(@($InitialCommands) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+  if ($commands.Count -gt 0) { $arguments += @("-c", ($commands -join "; ")) }
+  $quoted = @($arguments | ForEach-Object { Format-NativeArgument -Value $_ })
+  return [pscustomobject]@{
+    Path           = $KdPath
+    Arguments      = $arguments
+    ArgumentString = ($quoted -join " ")
+    CommandLine    = "$(Format-NativeArgument -Value $KdPath) $($quoted -join " ")"
+  }
+}
+
+function Test-SameAccount {
+  <#
+  .SYNOPSIS
+    Vrai si deux désignations de compte visent le même compte : « CONDUITTEST\nathan »,
+    « .\nathan » et « nathan » sont le même utilisateur.
+  .DESCRIPTION
+    Fonction pure. On compare le nom de compte seul, sans le domaine : l'invité nomme le
+    même utilisateur de trois façons selon la source (Win32_ComputerSystem, Win32_Process
+    GetOwner, le [pscredential] saisi par l'opérateur). La comparaison ignore la casse,
+    les noms de comptes Windows n'y étant pas sensibles.
+  #>
+  param(
+    [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$Left,
+    [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$Right
+  )
+  $a = Get-AccountName -UserName $Left
+  $b = Get-AccountName -UserName $Right
+  if ([string]::IsNullOrEmpty($a) -or [string]::IsNullOrEmpty($b)) { return $false }
+  return ($a -ieq $b)
+}
+
+function Get-AccountName {
+  <#
+  .SYNOPSIS
+    Nom de compte seul, sans domaine ni machine : « CONDUITTEST\nathan » → « nathan »,
+    « nathan@exemple » → « nathan », « .\nathan » → « nathan ».
+  #>
+  param([Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$UserName)
+  if ([string]::IsNullOrWhiteSpace($UserName)) { return "" }
+  $value = $UserName.Trim()
+  $slash = $value.LastIndexOf("\")
+  if ($slash -ge 0) { $value = $value.Substring($slash + 1) }
+  $at = $value.IndexOf("@")
+  if ($at -gt 0) { $value = $value.Substring(0, $at) }
+  return $value.Trim()
+}
+
+function Get-TaskRunAsUser {
+  <#
+  .SYNOPSIS
+    Compte à passer à `schtasks /ru` : qualifié par la machine invitée quand le
+    [pscredential] ne l'est pas (« nathan » → « CONDUITTEST\nathan »).
+  .DESCRIPTION
+    Fonction pure. Le compte vient TOUJOURS du [pscredential] fourni, jamais d'une
+    constante : le compte réel de la VM (`nathan`) n'est pas celui qu'annonçait la
+    documentation (`test`), et une tâche créée pour le mauvais compte ne se déclenche
+    jamais — l'attente irait jusqu'au délai maximal sans rien dire d'utile.
+  .PARAMETER UserName
+    Nom tel que saisi (nathan, .\nathan, CONDUITTEST\nathan, nathan@exemple).
+  .PARAMETER ComputerName
+    Nom de la machine invitée ($env:COMPUTERNAME lu DANS l'invité). Vide accepté.
+  #>
+  param(
+    [Parameter(Mandatory)][string]$UserName,
+    [Parameter(Mandatory)][AllowEmptyString()][string]$ComputerName
+  )
+  $value = $UserName.Trim()
+  if ($value.StartsWith(".\")) { $value = $value.Substring(2) }
+  if ($value.Contains("\") -or $value.Contains("@")) { return $value }
+  if ([string]::IsNullOrWhiteSpace($ComputerName)) { return $value }
+  return "$($ComputerName.Trim())\$value"
+}
+
+function Get-ConsoleSessionDecision {
+  <#
+  .SYNOPSIS
+    Décide, à partir de données brutes lues dans l'invité, si une session console
+    interactive y est ouverte — et laquelle.
+  .DESCRIPTION
+    Fonction pure : les lectures système sont faites à part (Win32_ComputerSystem et
+    Win32_Process dans l'invité), pour que la décision soit testable sans VM.
+
+    Aucune dépendance à la langue : ni `quser`, dont toute la sortie est traduite, ni le
+    moindre libellé d'état. On croise deux faits : l'utilisateur ouvert à la CONSOLE
+    (Win32_ComputerSystem.UserName, vide si personne) et l'identifiant de session de son
+    processus `explorer` (Win32_Process.SessionId), qui doit être DIFFÉRENT de 0 — la
+    session 0 est celle des services, sans audio utilisateur.
+  .PARAMETER ConsoleUser
+    (Get-CimInstance Win32_ComputerSystem).UserName de l'invité. Vide ou $null accepté.
+  .PARAMETER ExplorerSessions
+    Un objet par processus explorer.exe, portant UserName et SessionId.
+  .OUTPUTS
+    { Ready ; UserName ; SessionId (-1 si inconnu) ; Reason (vide si Ready) }.
+  #>
+  param(
+    [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$ConsoleUser,
+    [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][object[]]$ExplorerSessions
+  )
+  $user = if ($null -eq $ConsoleUser) { "" } else { $ConsoleUser.Trim() }
+  if ([string]::IsNullOrEmpty($user)) {
+    return [pscustomobject]@{
+      Ready = $false; UserName = ""; SessionId = -1
+      Reason = "aucun utilisateur n'est ouvert à la console de l'invité (Win32_ComputerSystem.UserName est vide)"
+    }
+  }
+
+  $matched = @()
+  foreach ($entry in @($ExplorerSessions)) {
+    if ($null -eq $entry) { continue }
+    $properties = $entry.PSObject.Properties
+    $owner = if ($properties.Match("UserName").Count -gt 0) { [string]$entry.UserName } else { "" }
+    $session = -1
+    if ($properties.Match("SessionId").Count -gt 0 -and $null -ne $entry.SessionId) {
+      $parsed = 0
+      if ([int]::TryParse([string]$entry.SessionId, [ref]$parsed)) { $session = $parsed }
+    }
+    if (Test-SameAccount -Left $owner -Right $user) { $matched += $session }
+  }
+
+  foreach ($session in $matched) {
+    if ($session -gt 0) {
+      return [pscustomobject]@{ Ready = $true; UserName = $user; SessionId = $session; Reason = "" }
+    }
+  }
+  if ($matched.Count -gt 0) {
+    return [pscustomobject]@{
+      Ready = $false; UserName = $user; SessionId = 0
+      Reason = "« $user » n'a d'explorer que dans la session 0, celle des services : elle n'a pas d'audio utilisateur"
+    }
+  }
+  return [pscustomobject]@{
+    Ready = $false; UserName = $user; SessionId = -1
+    Reason = "« $user » est ouvert mais son bureau n'est pas chargé (aucun processus explorer) : session verrouillée, déconnectée, ou console jamais ouverte"
+  }
+}
+
+function Get-ConsoleRunScript {
+  <#
+  .SYNOPSIS
+    Texte du fichier de commandes (.cmd) exécuté par la tâche planifiée dans la session
+    console : il lance l'exécutable, redirige sa sortie, PUIS écrit son code de retour
+    dans un second fichier qui sert de sentinelle de fin.
+  .DESCRIPTION
+    Fonction pure. Deux points ne sont pas négociables :
+
+    - la sentinelle. `schtasks /query` rend un statut TRADUIT (« En cours d'exécution »,
+      « Prêt ») : s'y fier reviendrait à analyser du texte localisé. Le fichier de code de
+      retour, lui, n'apparaît qu'une fois la commande terminée, et son contenu est un
+      entier. C'est le seul signal de fin utilisé ;
+    - l'ordre `> fichier echo %CODE%`. Écrit dans l'autre sens, `echo %CODE%>fichier`,
+      cmd.exe lirait le dernier chiffre du code comme un numéro de flux (`1>`) et le
+      fichier serait vide ou faux.
+  .PARAMETER Executable
+    Chemin de l'exécutable DANS l'invité.
+  .PARAMETER Arguments
+    Ses arguments, un par élément (cités au besoin).
+  .PARAMETER OutputPath
+    Fichier où la sortie (standard et erreur) est redirigée.
+  .PARAMETER ExitCodePath
+    Fichier sentinelle recevant le code de retour.
+  .PARAMETER WorkingDirectory
+    Dossier courant de la commande (facultatif).
+  #>
+  param(
+    [Parameter(Mandatory)][string]$Executable,
+    [AllowNull()][AllowEmptyCollection()][string[]]$Arguments = @(),
+    [Parameter(Mandatory)][string]$OutputPath,
+    [Parameter(Mandatory)][string]$ExitCodePath,
+    [string]$WorkingDirectory
+  )
+  # Un « % » d'argument doit être doublé pour traverser cmd.exe sans être pris pour une
+  # variable ; le fichier étant engendré, l'opérateur n'a rien à échapper lui-même.
+  $quoted = @(@($Arguments) | ForEach-Object {
+    if ($null -eq $_) { "" } else { (Format-NativeArgument -Value $_) -replace "%", "%%" }
+  })
+  # Les CHEMINS sont cités systématiquement, même sans espace : un dossier de travail
+  # changé un jour ne doit pas transformer un fichier de commandes correct en commande
+  # tronquée au premier espace. Un chemin Windows ne peut pas contenir de guillemet.
+  $exe = '"' + $Executable + '"'
+  $command = (@($exe) + $quoted) -join " "
+  $lines = @(
+    "@echo off",
+    "rem Engendré par vm-run-console.ps1 : ne pas modifier, il est réécrit à chaque appel."
+  )
+  if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) {
+    $lines += 'cd /d "' + $WorkingDirectory + '"'
+  }
+  $lines += "$command >`"$OutputPath`" 2>&1"
+  $lines += "set CONDUIT_CODE=%ERRORLEVEL%"
+  $lines += ">`"$ExitCodePath`" echo %CONDUIT_CODE%"
+  return (($lines -join "`r`n") + "`r`n")
+}
+
+function Test-ConduitGhostDevice {
+  <#
+  .SYNOPSIS
+    Vrai si un périphérique NON PRÉSENT (fantôme) nous appartient et peut donc être
+    retiré : périphérique Root\ConduitCable, ou endpoint audio dont le nom convivial
+    contient « Conduit ».
+  .DESCRIPTION
+    Fonction pure, aussi envoyée telle quelle dans l'invité (voir Get-FunctionSource) par
+    vm-cycle.ps1 — elle ne référence donc AUCUNE variable de module.
+
+    Prudence délibérée : cette VM sert aussi à comparer avec de vraies cartes son, et un
+    fantôme supprimé par erreur ne revient qu'au prochain branchement. Trois garde-fous :
+    un périphérique PRÉSENT n'est jamais candidat ; la classe est reconnue par son GUID
+    (le nom de classe affiché est traduit) ; et le nom convivial doit contenir « Conduit ».
+  .PARAMETER InstanceId
+    Identifiant d'instance (ROOT\CONDUITCABLE\0000, SWD\MMDEVAPI\{…}).
+  .PARAMETER FriendlyName
+    Nom convivial ; $null ou vide accepté (un fantôme peut n'en avoir plus).
+  .PARAMETER ClassGuid
+    GUID de classe, avec ou sans accolades ; $null accepté.
+  .PARAMETER Present
+    Faux pour un périphérique fantôme (Get-PnpDevice, propriété Present : un booléen,
+    contrairement à Status, qui est du texte traduit).
+  #>
+  param(
+    [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$InstanceId,
+    [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$FriendlyName,
+    [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$ClassGuid,
+    [Parameter(Mandatory)][bool]$Present
+  )
+  if ($Present) { return $false }
+  $id = if ($null -eq $InstanceId) { "" } else { $InstanceId.Trim() }
+  if ($id -eq "") { return $false }
+
+  # Nos propres périphériques racine : l'identifiant d'instance suffit et ne dépend de rien.
+  if ($id -imatch '^ROOT\\CONDUITCABLE\\') { return $true }
+
+  # Endpoints audio : classe AudioEndpoint {c166523c-fe0c-4a94-a586-f1a80cfbbf3e}, ou
+  # énumérateur SWD\MMDEVAPI (les deux désignent un endpoint ; on accepte l'un OU l'autre
+  # pour ne pas dépendre d'un seul identifiant). Et le nom doit être le nôtre.
+  $name = if ($null -eq $FriendlyName) { "" } else { $FriendlyName }
+  if ($name -inotlike "*conduit*") { return $false }
+  $guid = if ($null -eq $ClassGuid) { "" } else { ($ClassGuid -replace '[{}\s]', '') }
+  if ($guid -ieq "c166523c-fe0c-4a94-a586-f1a80cfbbf3e") { return $true }
+  if ($id -imatch '^SWD\\MMDEVAPI\\') { return $true }
+  return $false
+}
+
 function Get-WdkRoot {
   <#
   .SYNOPSIS
@@ -407,6 +719,22 @@ function Get-DevgenPath {
   param([Parameter(Mandatory)][string]$WdkVersion)
   $path = Join-Path (Get-WdkRoot) "Tools\$WdkVersion\x64\devgen.exe"
   if (-not (Test-Path $path)) { throw "devgen.exe introuvable : $path" }
+  return $path
+}
+
+function Get-KdPath {
+  <#
+  .SYNOPSIS
+    Chemin d'un débogueur des Debugging Tools for Windows sur l'hôte
+    (<KitsRoot10>\Debuggers\x64\kd.exe), résolu par le registre comme Get-DevgenPath.
+  .PARAMETER Name
+    kd.exe (console, celui qu'automatise vm-debug.ps1) ou windbg.exe (interface).
+  #>
+  param([ValidateSet("kd.exe", "windbg.exe")][string]$Name = "kd.exe")
+  $path = Join-Path (Get-WdkRoot) "Debuggers\x64\$Name"
+  if (-not (Test-Path $path)) {
+    throw "$Name introuvable : $path (installer les Debugging Tools for Windows du WDK)."
+  }
   return $path
 }
 
@@ -461,6 +789,28 @@ function Wait-VMReboot {
   Wait-VMHeartbeat -Name $Name -TimeoutSeconds $TimeoutSeconds
 }
 
+function Wait-VMOff {
+  <#
+  .SYNOPSIS
+    Attend que la VM soit à l'arrêt complet (état Off), avec un délai borné.
+  .DESCRIPTION
+    Nécessaire avant `Set-VMComPort`, qui refuse toute VM allumée : c'est la seule
+    fenêtre où le canal nommé série peut être attaché. L'état est comparé à l'énumération
+    VMState, jamais à un libellé affiché.
+  #>
+  param(
+    [Parameter(Mandatory)][string]$Name,
+    [int]$TimeoutSeconds = 300
+  )
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  while ((Get-Date) -lt $deadline) {
+    $vm = Get-VM -Name $Name
+    if ($vm.State -eq "Off") { return }
+    Start-Sleep -Seconds 2
+  }
+  throw "La VM « $Name » ne s'est pas arrêtée après $TimeoutSeconds s (état : $((Get-VM -Name $Name).State))."
+}
+
 function New-GuestSession {
   <#
   .SYNOPSIS
@@ -490,5 +840,7 @@ Export-ModuleMember -Function Test-Elevated, Test-SidPresent, Get-TokenSid,
   Test-HyperVOperator, Get-HyperVAccessHint, Get-HyperVAccessMessage, Assert-HyperVAccess,
   Test-AccessDeniedError, Invoke-HyperVChecked, New-DebugKey, Test-DebugKey,
   Invoke-NativeChecked, Get-FunctionSource, ConvertFrom-DevgenAddOutput, Find-PublishedInf,
-  Get-CycleSummary, Get-WdkRoot, Get-DevgenPath, Get-DefaultSwitchHostIp, Wait-VMHeartbeat,
-  Wait-VMReboot, New-GuestSession
+  Get-CycleSummary, Get-NamedPipeName, Get-KdCommandLine, Get-AccountName, Test-SameAccount,
+  Get-TaskRunAsUser, Get-ConsoleSessionDecision, Get-ConsoleRunScript, Test-ConduitGhostDevice,
+  Get-WdkRoot, Get-DevgenPath, Get-KdPath, Get-DefaultSwitchHostIp, Wait-VMHeartbeat,
+  Wait-VMReboot, Wait-VMOff, New-GuestSession
