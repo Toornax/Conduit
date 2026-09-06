@@ -80,8 +80,25 @@ try {
   # Points de contrôle manuels seulement (`propre`, pris par vm-prepare.ps1).
   Set-VM -VM $vm -AutomaticCheckpointsEnabled $false -CheckpointType Standard
 
-  # Interface de services invité : Copy-VMFile hôte → invité.
-  Enable-VMIntegrationService -VM $vm -Name "Guest Service Interface"
+  # Interface de services invité : confort seulement (Copy-VMFile hôte → invité en
+  # dépannage manuel). vm-prepare.ps1 et vm-cycle.ps1 n'en dépendent pas : ils passent
+  # par PowerShell Direct (Invoke-Command -VMName, Copy-Item -ToSession). Son échec ne
+  # doit donc jamais faire échouer la création de la VM.
+  #
+  # Le nom du composant est **traduit** selon la langue de Windows (« Interface de
+  # service Invité » en français) : `-Name` est donc inutilisable. On le retrouve par
+  # l'identifiant du composant, qui, lui, est invariant.
+  $guestServiceId = "6C09BB55-D683-4DA0-8931-C9BF705F6480"
+  try {
+    $svc = Get-VMIntegrationService -VM $vm | Where-Object { $_.Id -like "*$guestServiceId*" }
+    if ($svc) {
+      Enable-VMIntegrationService -VMIntegrationService $svc
+    } else {
+      Write-Warning "Interface de services invité introuvable (identifiant $guestServiceId) : ignorée, elle n'est pas nécessaire."
+    }
+  } catch {
+    Write-Warning "Interface de services invité non activée ($($_.Exception.Message)) : ignorée, elle n'est pas nécessaire."
+  }
 
   Start-VM -VM $vm
 } catch {
