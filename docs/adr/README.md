@@ -19,3 +19,4 @@ Gabarit : contexte, décision, conséquences, statut.
 | [ADR-010](010-protocole-source-de-verite-api.md) | `conduit-protocol` source de vérité de l'API, consommé par l'engine | acceptée |
 | [ADR-011](011-noeud-de-peripherique-a-role.md) | Un nœud par périphérique, rôle changé à chaud sans recompiler | acceptée |
 | [ADR-012](012-workspace-noyau-separe.md) | Workspace noyau séparé, logique du pilote dans un crate portable | acceptée |
+| [ADR-013](013-demarrage-du-demon-sous-windows.md) | Le démon Windows démarre à l'ouverture de session, il n'est pas un service | acceptée |

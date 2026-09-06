@@ -211,7 +211,9 @@ Identifiants stables pour tracer les tests (F-xx).
 
 - **F-50** Installeurs natifs : MSI (Windows), pkg (macOS), paquet ou script (Linux).
   Installation en un clic, sans étape manuelle.
-- **F-51** Démon enregistré comme service utilisateur : service Windows, unité systemd
+- **F-51** Démon démarré automatiquement pour l'utilisateur, sans étape manuelle :
+  **tâche planifiée à l'ouverture de session** sous Windows (pas un service SCM, qui
+  tournerait en session 0 sans accès à l'audio de l'utilisateur : ADR-013), unité systemd
   `--user`, LaunchAgent. La GUI démarre le démon si absent.
 - **F-52** Désinstallation propre : suppression du pilote, des périphériques et de la config.
 - **F-53** Mise à jour : la nouvelle version migre la configuration précédente.

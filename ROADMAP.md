@@ -454,7 +454,9 @@ signé par attestation, HLK audio passé, latence conforme à SPEC §5.6, endura
   commune à 43 µs, dérive Realtek − G27QC = −18 ppm ; `#[ignore]` 1 h avec le moteur).
 - [ ] **M1b-34** `feat(wasapi): CableControl via le helper`
   *Fait quand* : `conduitctl cable add` fonctionne de bout en bout (F-01, F-03).
-- [ ] **M1b-35** `feat(daemon): service Windows et démarrage automatique`
+- [ ] **M1b-35** `feat(daemon): démarrage à l'ouverture de session et instance unique`
+  Tâche planifiée par utilisateur (ADR-013), détection d'instance unique par le named pipe,
+  arrêt propre à la fermeture de session. **Pas** de service SCM pour le démon.
   *Fait quand* : le démon démarre à l'ouverture de session, le socket est accessible.
 
 ### M1b.D — Empaquetage et validation
