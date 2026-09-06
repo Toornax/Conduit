@@ -29,11 +29,12 @@ use std::time::Duration;
 use conduit_backend::{
     AudioCallback, Backend, DeviceDirection, DeviceHandle, DeviceInfo, StreamFormat, StreamIo,
 };
-use conduit_backend_wasapi::WasapiBackend;
+use conduit_backend_wasapi::{EndpointVolumeControl, WasapiBackend};
 use conduit_core::types::SampleRate;
 
 use crate::analysis::{self, SineSpec};
 use crate::cli::Args;
+use crate::volume::{Level, Reading, State};
 
 /// Préfixe du nom des endpoints du câble Conduit (`devices::cable_id_from_name`).
 const CABLE_PREFIX: &str = "Conduit 1";
@@ -170,6 +171,36 @@ impl Session {
             spec,
             seconds: args.seconds,
         })
+    }
+
+    /// Volume et coupure des endpoints que la mesure va utiliser.
+    ///
+    /// Relevé **avant** la première passe : un endpoint coupé ou à zéro rend toute
+    /// mesure silencieuse, et cela ressemble trait pour trait à un pilote muet. En
+    /// écho, l'endpoint de rendu est aussi celui qui est écouté : un seul relevé.
+    ///
+    /// Une lecture qui échoue devient un [`State::Unreadable`], jamais une erreur :
+    /// un diagnostic ne doit pas empêcher la mesure qu'il commente.
+    pub fn levels(&self) -> Vec<Reading> {
+        let mut endpoints = vec![("rendu", &self.render)];
+        if let Some(capture) = &self.capture {
+            endpoints.push(("capture", capture));
+        }
+        let control = match EndpointVolumeControl::new() {
+            Ok(control) => control,
+            Err(e) => {
+                return endpoints
+                    .into_iter()
+                    .map(|(role, device)| {
+                        Reading::new(role, &device.name, State::Unreadable(e.to_string()))
+                    })
+                    .collect()
+            }
+        };
+        endpoints
+            .into_iter()
+            .map(|(role, device)| Reading::new(role, &device.name, read(&control, &device.id)))
+            .collect()
     }
 
     /// Sinus tel qu'il sera joué **et** analysé : en écho, sa fréquence
@@ -324,18 +355,38 @@ pub fn enumerate(backend: &WasapiBackend) -> Result<Vec<DeviceInfo>, String> {
         .map_err(|e| format!("énumération des endpoints : {e}"))
 }
 
-/// Affiche les endpoints (`--list`).
+/// Relève le volume d'un endpoint, sans jamais échouer : une panne devient un
+/// [`State::Unreadable`], une absence de mélangeur un [`State::NoControl`].
+fn read(control: &EndpointVolumeControl, id: &conduit_backend::DeviceId) -> State {
+    match control.read(id) {
+        Ok(Some(volume)) => State::Known(Level {
+            scalar: volume.scalar,
+            muted: volume.muted,
+        }),
+        Ok(None) => State::NoControl,
+        Err(e) => State::Unreadable(e.to_string()),
+    }
+}
+
+/// Affiche les endpoints (`--list`), avec leur volume si `show_volume`.
 ///
 /// # Erreurs
 ///
-/// Message en français si le backend ou l'énumération échoue.
-pub fn list() -> Result<String, String> {
+/// Message en français si le backend, l'énumération ou — quand les volumes sont
+/// demandés — le contrôle du volume échoue.
+pub fn list(show_volume: bool) -> Result<String, String> {
     let backend = WasapiBackend::new().map_err(|e| format!("backend WASAPI indisponible : {e}"))?;
     let devices = enumerate(&backend)?;
+    // Demandé explicitement : une panne du contrôle est ici une vraie erreur, pas
+    // une ligne manquante qu'on laisserait passer inaperçue.
+    let control = show_volume
+        .then(EndpointVolumeControl::new)
+        .transpose()
+        .map_err(|e| format!("contrôle du volume indisponible : {e}"))?;
     let mut out = format!("{} endpoint(s) actif(s) :\n", devices.len());
     for device in &devices {
         out.push_str(&format!(
-            "  [{}] {}{}{}\n      {} canaux à {} Hz, bloc {} trames\n      id {}\n",
+            "  [{}] {}{}{}\n      {} canaux à {} Hz, bloc {} trames\n",
             device.direction,
             device.name,
             if device.is_default { " (défaut)" } else { "" },
@@ -347,8 +398,16 @@ pub fn list() -> Result<String, String> {
             device.channels,
             device.sample_rate.hz(),
             device.default_block,
-            device.id,
         ));
+        if let Some(control) = &control {
+            let reading = Reading::new(
+                device.direction.to_string(),
+                &device.name,
+                read(control, &device.id),
+            );
+            out.push_str(&format!("      volume {}\n", reading.describe()));
+        }
+        out.push_str(&format!("      id {}\n", device.id));
     }
     if !devices.iter().any(|d| d.name.starts_with(CABLE_PREFIX)) {
         out.push_str(&format!(
@@ -358,6 +417,86 @@ pub fn list() -> Result<String, String> {
         ));
     }
     Ok(out)
+}
+
+/// Règle le volume et la coupure des endpoints de `--render` et `--capture`
+/// (`--set-volume`, `--unmute`), et rend le compte rendu à imprimer.
+///
+/// Rien n'est joué : régler un volume ne doit pas avoir pour effet de bord d'émettre
+/// du son. L'état est affiché **avant et après**, pour que le réglage se vérifie
+/// lui-même — c'est le seul moyen de distinguer « réglé » de « refusé sans le dire ».
+///
+/// # Erreurs
+///
+/// Message en français si le backend, l'énumération, le contrôle du volume ou
+/// l'écriture échouent, ou si un endpoint désigné n'existe pas.
+pub fn adjust_volume(args: &Args) -> Result<String, String> {
+    let backend = WasapiBackend::new().map_err(|e| format!("backend WASAPI indisponible : {e}"))?;
+    let devices = enumerate(&backend)?;
+    let mut endpoints = vec![(
+        "rendu",
+        choose(&devices, DeviceDirection::Render, args.render.as_deref())?,
+    )];
+    if !args.capture_disabled() {
+        endpoints.push((
+            "capture",
+            choose(&devices, DeviceDirection::Capture, args.capture.as_deref())?,
+        ));
+    }
+    drop(backend);
+
+    let control = EndpointVolumeControl::new()
+        .map_err(|e| format!("contrôle du volume indisponible : {e}"))?;
+    let mut out = String::new();
+    for (role, device) in &endpoints {
+        let before = Reading::new(*role, &device.name, read(&control, &device.id));
+        let mut after = before.state.clone();
+        if let Some(scalar) = args.set_volume {
+            after = write(
+                control.set_scalar(&device.id, scalar),
+                "réglage du volume",
+                &device.name,
+            )?;
+        }
+        if args.unmute {
+            after = write(
+                control.set_mute(&device.id, false),
+                "rétablissement du son",
+                &device.name,
+            )?;
+        }
+        let after = Reading::new(*role, &device.name, after);
+        out.push_str(&format!(
+            "{} « {} »\n    avant : {}\n    après : {}\n",
+            role,
+            device.name,
+            before.describe(),
+            after.describe()
+        ));
+        if let Some(warning) = after.warning() {
+            out.push_str(&warning);
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
+/// Traduit le résultat d'une écriture de volume : `Ok(None)` (pas de contrôle) est
+/// une réponse, une erreur COM en est une aussi mais elle arrête l'action — on a
+/// demandé un réglage, pas un diagnostic.
+fn write(
+    result: Result<Option<conduit_backend_wasapi::EndpointVolume>, conduit_backend::BackendError>,
+    what: &str,
+    name: &str,
+) -> Result<State, String> {
+    match result {
+        Ok(Some(volume)) => Ok(State::Known(Level {
+            scalar: volume.scalar,
+            muted: volume.muted,
+        })),
+        Ok(None) => Ok(State::NoControl),
+        Err(e) => Err(format!("{what} de « {name} » : {e}")),
+    }
 }
 
 /// Choisit un endpoint : identifiant exact, sinon fragment de nom, sinon le câble.

@@ -60,6 +60,18 @@ pub struct Args {
     /// Liste les endpoints et sort.
     #[arg(long)]
     pub list: bool,
+    /// Affiche le volume et l'état de coupure : avec `--list`, pour chaque
+    /// endpoint listé ; sinon, pour ceux que la mesure va utiliser.
+    #[arg(long = "show-volume")]
+    pub show_volume: bool,
+    /// Règle le volume maître (0 à 1) des endpoints de `--render` et `--capture`,
+    /// affiche le résultat, et sort sans rien mesurer.
+    #[arg(long = "set-volume", value_name = "0..1")]
+    pub set_volume: Option<f32>,
+    /// Rétablit le son des endpoints de `--render` et `--capture` (annule la
+    /// coupure), affiche le résultat, et sort sans rien mesurer.
+    #[arg(long)]
+    pub unmute: bool,
     /// Test de l'outil lui-même : aucun périphérique n'est ouvert, la boucle est
     /// simulée en mémoire.
     #[arg(long = "self-test", hide = true)]
@@ -117,6 +129,16 @@ impl Args {
         self.no_capture || self.capture.as_deref() == Some("none")
     }
 
+    /// Vrai si l'outil doit **régler** un volume au lieu de mesurer
+    /// (`--set-volume`, `--unmute`).
+    ///
+    /// C'est une action à part entière, comme `--list` : elle applique, affiche le
+    /// résultat et sort. Rien n'est joué — un réglage de volume ne doit pas avoir
+    /// pour effet de bord d'émettre du son.
+    pub fn adjusts_volume(&self) -> bool {
+        self.set_volume.is_some() || self.unmute
+    }
+
     /// Trame à retirer en `--self-test`, si `--inject-glitch` a été donné (sans
     /// valeur : la trame du milieu de la passe).
     pub fn glitch_frame(&self) -> Option<usize> {
@@ -164,6 +186,28 @@ impl Args {
         }
         if self.phase_tolerance <= 0.0 {
             return Err("--phase-tolerance doit être strictement positive".to_string());
+        }
+        if let Some(volume) = self.set_volume {
+            if !(0.0..=1.0).contains(&volume) {
+                return Err(format!("--set-volume {volume} doit être dans [0, 1]"));
+            }
+        }
+        if self.adjusts_volume() {
+            if self.list {
+                return Err(
+                    "--set-volume et --unmute règlent les endpoints de --render et --capture ; \
+                     --list ne fait qu'énumérer. Gardez l'un des deux (--list --show-volume \
+                     affiche les volumes sans rien changer)"
+                        .to_string(),
+                );
+            }
+            if self.self_test {
+                return Err(
+                    "--set-volume et --unmute demandent un vrai endpoint : --self-test n'en \
+                     ouvre aucun"
+                        .to_string(),
+                );
+            }
         }
         if self.loopback {
             if self.capture.is_some() {
@@ -282,6 +326,39 @@ mod tests {
         assert_eq!(a.skip_frames(), 4_800);
         assert_eq!(a.skip_frames_at(44_100), 4_410);
         assert_eq!(a.skip_frames_at(96_000), 9_600);
+    }
+
+    #[test]
+    fn le_volume_a_regler_reste_dans_ses_bornes() {
+        assert!(parse(&["--set-volume", "0"]).validate().is_ok());
+        assert!(parse(&["--set-volume", "1"]).validate().is_ok());
+        assert!(parse(&["--set-volume", "0.5"]).validate().is_ok());
+        // `--set-volume=-0.1` et non `--set-volume -0.1` : clap prendrait la valeur
+        // négative pour une option courte inconnue.
+        for hors in ["--set-volume=-0.1", "--set-volume=1.5", "--set-volume=42"] {
+            let err = parse(&[hors]).validate().expect_err(hors);
+            assert!(err.contains("--set-volume"), "{err}");
+        }
+        assert!(parse(&["--set-volume", "nan"]).validate().is_err());
+    }
+
+    #[test]
+    fn regler_le_volume_est_une_action_a_part() {
+        assert!(!parse(&[]).adjusts_volume());
+        assert!(!parse(&["--show-volume"]).adjusts_volume());
+        assert!(parse(&["--unmute"]).adjusts_volume());
+        assert!(parse(&["--set-volume", "0.5"]).adjusts_volume());
+        // `--show-volume` n'est qu'un affichage : il se combine avec tout.
+        assert!(parse(&["--list", "--show-volume"]).validate().is_ok());
+        for (args, attendu) in [
+            (vec!["--list", "--unmute"], "--list"),
+            (vec!["--list", "--set-volume", "0.5"], "--list"),
+            (vec!["--self-test", "--unmute"], "--self-test"),
+            (vec!["--self-test", "--set-volume", "0.5"], "--self-test"),
+        ] {
+            let err = parse(&args).validate().expect_err(&format!("{args:?}"));
+            assert!(err.contains(attendu), "{err}");
+        }
     }
 
     #[test]

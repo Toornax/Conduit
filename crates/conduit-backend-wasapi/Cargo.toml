@@ -25,10 +25,16 @@ conduit-backend.workspace = true
 # - `Win32_System_Threading` + `Win32_Security` : CreateEventW, SetEvent,
 #   WaitForMultipleObjects (événement de tampon et événement d'arrêt d'un flux) ;
 # - `Win32_System_Performance` : QueryPerformanceCounter/Frequency, la base de
-#   temps des horodatages d'`IAudioClock` (module `clock`).
+#   temps des horodatages d'`IAudioClock` (module `clock`) ;
+# - `Win32_Media_Audio_Endpoints` : IAudioEndpointVolume, le volume maître et la
+#   coupure d'un endpoint (module `volume`) ;
+# - `Win32_System_RemoteDesktop` : ProcessIdToSessionId, la session Windows du
+#   processus — la session 0 (services) n'a pas l'audio de l'utilisateur, et une
+#   mesure y est sans objet (module `session`).
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
@@ -36,6 +42,7 @@ windows = { version = "0.62", features = [
     "Win32_Devices_FunctionDiscovery",
     "Win32_System_Threading",
     "Win32_System_Performance",
+    "Win32_System_RemoteDesktop",
     "Win32_Security",
 ] }
 # Le code que génère `#[implement]` nomme `::windows_core` : le crate doit être une

@@ -84,6 +84,37 @@ pub fn loopback_silent() -> String {
         .to_string()
 }
 
+/// La **session Windows** du processus, et ce qu'elle implique pour la mesure.
+///
+/// À imprimer avec tout diagnostic de silence : un test lancé dans la session des
+/// services (session 0 — un service, une tâche planifiée « même si l'utilisateur
+/// n'est pas connecté », un agent d'exécution à distance) n'a pas l'audio de
+/// l'utilisateur. Il ne mesure alors rien du tout, et tout ce qu'il conclurait du
+/// pilote serait faux. C'est un piège coûteux, et il ne se voit nulle part ailleurs
+/// dans la sortie.
+///
+/// `session` est `None` quand Windows a refusé de dire la session, et sur les
+/// autres systèmes.
+pub fn session_note(session: Option<u32>) -> String {
+    match session {
+        Some(0) => "session Windows : 0 — c'est la session des SERVICES, et c'est\n\
+                    probablement toute l'explication. Aucun périphérique audio de\n\
+                    l'utilisateur n'y est visible et rien de ce qui y est joué ne sort :\n\
+                    la mesure n'y a aucun sens. Relancez l'outil depuis une session\n\
+                    ouverte à l'écran — pour une tâche planifiée, « exécuter seulement\n\
+                    si l'utilisateur est connecté »."
+            .to_string(),
+        Some(id) => format!(
+            "session Windows : {id} — une session d'utilisateur, l'audio y existe. Ce\n\
+             n'est donc pas la session qui explique le silence."
+        ),
+        None => "session Windows : inconnue. Vérifiez à la main que l'outil tourne dans\n\
+                 une session d'utilisateur : la session 0, celle des services, n'a pas\n\
+                 l'audio de l'utilisateur et la mesure n'y aurait aucun sens."
+            .to_string(),
+    }
+}
+
 /// Document JSON complet (`--json`).
 pub fn json_document(spec: &SineSpec, passes: &[Pass]) -> Value {
     let ok = passes.iter().filter(|p| p.verdict.ok).count();
@@ -163,6 +194,34 @@ mod tests {
         // Aucune ligne trop longue pour un terminal étroit : le message doit rester
         // lisible là où on l'utilise, une console de VM.
         for texte in [&entendu, &silence] {
+            for ligne in texte.lines() {
+                assert!(ligne.chars().count() <= 80, "ligne trop longue : {ligne}");
+            }
+        }
+    }
+
+    #[test]
+    fn la_session_des_services_est_denoncee_les_autres_disculpees() {
+        let services = session_note(Some(0));
+        assert!(services.contains("SERVICES"), "{services}");
+        assert!(services.contains("aucun sens"), "{services}");
+
+        let utilisateur = session_note(Some(1));
+        assert!(
+            utilisateur.starts_with("session Windows : 1"),
+            "{utilisateur}"
+        );
+        assert!(!utilisateur.contains("SERVICES"), "{utilisateur}");
+        assert!(
+            utilisateur.contains("n'est donc pas la session"),
+            "{utilisateur}"
+        );
+
+        let inconnue = session_note(None);
+        assert!(inconnue.contains("inconnue"), "{inconnue}");
+        assert!(inconnue.contains("session 0"), "{inconnue}");
+
+        for texte in [&services, &utilisateur, &inconnue] {
             for ligne in texte.lines() {
                 assert!(ligne.chars().count() <= 80, "ligne trop longue : {ligne}");
             }

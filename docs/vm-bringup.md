@@ -171,8 +171,34 @@ l'étape suivante directement).
 **Attendu** : le son enregistré est celui joué. Compteurs du câble : les trames copiées
 croissent d'environ 48 000 par seconde, les débordements restent à zéro.
 
-**Si la capture n'entend rien, la première mesure à prendre est la capture en écho**,
-avant toute inspection du pilote :
+**Si la capture n'entend rien, deux réflexes d'abord — ils coûtent dix secondes et
+expliquent la moitié des mesures silencieuses :**
+
+1. **Le volume et la coupure des endpoints.** Un endpoint à zéro ou coupé rend toute
+   la chaîne muette, et ce silence est indiscernable d'un pilote en panne. Le pilote
+   Conduit crée ses endpoints avec une propriété de volume à zéro en registre : c'est
+   *exactement* le piège.
+
+   ```powershell
+   conduit-looptest --list --show-volume            # relever, sans rien changer
+   conduit-looptest --set-volume 1 --unmute         # corriger les deux côtés du câble
+   ```
+
+   L'outil relève de toute façon le volume avant chaque passe et avertit sur la sortie
+   d'erreur si l'un des endpoints est coupé ou à zéro ; il n'y a donc rien à faire à la
+   main si l'on lit ce qu'il imprime.
+
+2. **La session Windows dans laquelle tourne le test.** Un test lancé depuis un
+   service, une tâche planifiée « même si l'utilisateur n'est pas connecté » ou un
+   agent d'exécution à distance tourne dans la **session 0**, celle des services : il
+   n'y voit pas les périphériques audio de l'utilisateur et rien de ce qu'il joue ne
+   sort. La mesure n'y a **aucun sens** — ce n'est pas une mesure ratée, c'est une
+   mesure sans objet, et une journée peut y passer. `conduit-looptest` imprime la
+   session avec tout diagnostic de silence ; `(Get-Process -Id $PID).SessionId` la
+   donne aussi. Si elle vaut 0, relancer depuis une session ouverte à l'écran.
+
+**Ces deux points écartés, la mesure suivante est la capture en écho**, avant toute
+inspection du pilote :
 
 ```powershell
 conduit-looptest --render "Conduit 1" --loopback --seconds 2 --amplitude 0.05

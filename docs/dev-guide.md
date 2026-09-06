@@ -228,6 +228,35 @@ l'endpoint s'y applique** (mesuré sur le poste : un sinus demandé à 0,05 ress
 **émet un son** (1,5 s à 2 % d'amplitude sur le rendu par défaut) parce qu'on ne peut
 pas prouver qu'un écho prélève un mélange sans rien mélanger.
 
+**Volume d'un endpoint** (`volume`). `EndpointVolumeControl::{new, read, set_scalar,
+set_mute}` lit et écrit le **volume maître scalaire** (0 à 1, la position du curseur
+du mélangeur — pas des décibels) et la **coupure** d'un endpoint désigné par son
+identifiant. L'interface s'obtient par `IMMDevice::Activate::<IAudioEndpointVolume>`,
+comme l'`IAudioClient`. Hors du trait `Backend`, pour la même raison que l'écho et le
+mode exclusif. L'objet possède **son** appartement COM (MTA) et **son**
+`IMMDeviceEnumerator` : il ne passe pas par le fil MMDevice, sert donc sans backend
+ouvert, n'est ni `Send` ni `Sync`, et l'ordre de ses champs garantit que l'énumérateur
+meurt avant le `CoUninitialize`. Un endpoint **sans mélangeur** refuse l'activation
+par `E_NOINTERFACE` ou répond `E_NOTIMPL` : ces deux `HRESULT` deviennent `Ok(None)`,
+et non une erreur — c'est une réponse (« pas de contrôle ici »), pas une panne, et la
+distinction évite d'accuser un volume qu'on n'a pas vu. `EndpointVolume::clamp_scalar`
+borne l'écriture à `[0, 1]` (`NaN` → 0) plutôt que de laisser `E_INVALIDARG`
+remonter : un curseur ne va pas au-delà de ses butées. Les setters **relisent** après
+écriture, parce que Windows range la valeur sur les crans du périphérique.
+`tests/volume.rs` l'éprouve sur la carte réelle de la machine et **restaure la valeur
+initiale par une garde `Drop`** ; la coupure n'y est jamais changée, seulement
+réécrite à sa propre valeur. Un volume à zéro ou une coupure explique à elle seule
+toute chaîne muette, écho compris : c'est la première hypothèse à écarter avant
+d'accuser le pilote, et `conduit-looptest` s'en sert (§ 4 quinquies).
+
+**Session Windows** (`session`). `current_session_id()` rend la session du processus
+(`ProcessIdToSessionId`), `SERVICES_SESSION` vaut 0. Ce n'est pas de l'audio, c'en est
+la condition : le moteur audio appartient à une session ouverte par un utilisateur, et
+un processus de la session 0 (service, tâche planifiée « même si l'utilisateur n'est
+pas connecté », agent d'exécution à distance) n'y voit pas les périphériques et ne
+joue nulle part. Le renseignement vit ici plutôt que dans l'outil, qui interdit
+l'`unsafe` et n'a pas à ouvrir Win32 pour lui seul.
+
 **Mode exclusif** (`exclusive` + `convert`, M1b-32). En exclusif, le flux **prend le
 périphérique pour lui seul** : le moteur audio de Windows est court-circuité, plus
 aucune autre application n'y joue. C'est pourquoi c'est un **opt-in par backend**,
@@ -376,7 +405,33 @@ cargo run -p conduit-looptest -- --repeat 10               # le critère de la R
 cargo run -p conduit-looptest -- --json --repeat 10        # sortie machine
 cargo run -p conduit-looptest -- --self-test               # test de l'outil, sans périphérique
 cargo run -p conduit-looptest -- --loopback                # écho : le moteur délivre-t-il ?
+cargo run -p conduit-looptest -- --list --show-volume      # les endpoints, volume et coupure compris
+cargo run -p conduit-looptest -- --set-volume 0.5 --unmute # règle --render/--capture, affiche, sort
 ```
+
+**Le volume est vérifié avant chaque mesure.** Un endpoint coupé ou à zéro rend la
+boucle muette, et ce silence-là est indiscernable d'un pilote en panne : c'est une
+panne banale, invisible depuis le pilote, et elle a déjà coûté une journée. L'outil
+relève donc le volume et la coupure des endpoints qu'il va utiliser (§ 4 quater,
+`EndpointVolumeControl`), et **prévient si l'un est à zéro ou coupé** en nommant
+l'option qui corrige — un avertissement qui laisse chercher ne vaut pas mieux que pas
+d'avertissement. L'avertissement part sur la **sortie d'erreur**, pour rester visible
+en `--json` ; il n'interrompt rien (l'utilisateur peut vouloir mesurer quand même) et
+une lecture qui échoue devient un texte, jamais une erreur : un diagnostic ne doit pas
+empêcher la mesure qu'il commente. `--show-volume` affiche le relevé même quand tout
+va bien, et détaille chaque endpoint de `--list`. `--set-volume <0..1>` et `--unmute`
+règlent les endpoints de `--render` et `--capture`, affichent l'état **avant et
+après**, puis sortent : régler un volume ne doit pas avoir pour effet de bord
+d'émettre du son. Les deux sont refusés avec `--list` (qui n'énumère) et `--self-test`
+(qui n'ouvre aucun endpoint).
+
+Le diagnostic imprimé quand **aucun signal** n'est trouvé (`pass::Unusable::NoSignal`,
+typé pour cette raison : un enregistrement trop court est un réglage à corriger, pas
+un silence à expliquer) ajoute la **session Windows** du processus. Un test lancé dans
+la session des services (session 0) n'a pas l'audio de l'utilisateur : il ne mesure
+rien, et tout ce qu'il conclurait du pilote serait faux. C'est un piège qui ne se voit
+nulle part ailleurs dans la sortie, et dans lequel le projet est tombé une journée
+entière.
 
 `--loopback` répond à **l'autre moitié** de la question, celle qu'on oublie de poser
 quand une boucle est muette : *le moteur audio délivre-t-il seulement quelque chose
@@ -395,7 +450,8 @@ applications — à fermer pour une mesure propre. `--loopback` est incompatible
 Options utiles : `--render`/`--capture` (identifiant exact ou fragment de nom, ou
 `none`), `--freq`, `--rate`, `--channels`, `--seconds`, `--block`, `--amplitude`,
 `--skip-ms` (marge jetée après la détection du signal), `--phase-tolerance`,
-`--no-capture` (joue seulement), `--loopback` (capture en écho). **Codes de retour** : `0` toutes les passes
+`--no-capture` (joue seulement), `--loopback` (capture en écho), `--show-volume`,
+`--set-volume`, `--unmute`. **Codes de retour** : `0` toutes les passes
 passent, `1` au moins une échoue (le pilote est en cause), `2` l'environnement ne
 permet pas le test (endpoint absent, backend indisponible, options incohérentes,
 système autre que Windows) — c'est la distinction qui compte en CI.
