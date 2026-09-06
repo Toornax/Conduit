@@ -9,14 +9,21 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Crates utilisateur : périmètre User (Rust + Build Tools). Le WDK, LLVM et cargo-wdk
+  # ne servent qu'à drivers/windows et ne sont pas installés ici (job driver ci-dessous).
   build-test:
     name: build et tests (MSVC)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Environnement épinglé
+      # windows-latest a Rust préinstallé, mais pas forcément la version épinglée : on
+      # installe d'abord (sans -Check), on vérifie ensuite, comme le job driver.
+      - name: Environnement épinglé (toolchain)
         shell: pwsh
-        run: ./packaging/windows/setup-env.ps1 -Check
+        run: ./packaging/windows/setup-env.ps1 -Scope User
+      - name: Environnement épinglé (vérification)
+        shell: pwsh
+        run: ./packaging/windows/setup-env.ps1 -Check -Scope User
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -51,10 +58,10 @@ jobs:
           key: cargo-wdk-${{ env.CARGO_WDK_VERSION }}-${{ runner.os }}
       - name: Environnement épinglé (toolchain, cargo-wdk)
         shell: pwsh
-        run: ./packaging/windows/setup-env.ps1
+        run: ./packaging/windows/setup-env.ps1 -Scope Driver
       - name: Environnement épinglé (vérification)
         shell: pwsh
-        run: ./packaging/windows/setup-env.ps1 -Check
+        run: ./packaging/windows/setup-env.ps1 -Check -Scope Driver
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: drivers/windows

@@ -344,7 +344,9 @@ crates (impossible dans le bac à sable Nix) ; il tourne dans le devshell nightl
 en CI hors Nix.
 
 Windows : `packaging/windows/setup-env.ps1` installe ou vérifie (`-Check`) les
-versions de `versions.json`.
+versions de `versions.json`. `-Scope User` se limite à Rust et aux Build Tools, ce qu'il
+faut pour les crates utilisateur ; `-Scope Driver` (défaut) y ajoute le WDK, LLVM et
+`cargo-wdk`, nécessaires au seul `drivers/windows` (docs/driver-dev.md).
 
 ## 8. Ajouter un nœud interne
 

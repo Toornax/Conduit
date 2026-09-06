@@ -8,8 +8,19 @@
   Voir docs/driver-dev.md.
 .PARAMETER Check
   Ne rien installer : échouer si un outil manque ou si une version diffère de versions.json.
+.PARAMETER Scope
+  Périmètre vérifié (ou installé) :
+    Driver (défaut) tout l'outillage, y compris le WDK, LLVM et cargo-wdk : nécessaire pour
+                    construire drivers/windows.
+    User            seulement Rust et les Build Tools : suffit pour les crates utilisateur
+                    (conduitd, conduitctl, GUI), sans les plusieurs gigaoctets du WDK
+                    (SPEC §5.11 : contribuer sans l'outillage complet).
 #>
-param([switch]$Check)
+param(
+  [switch]$Check,
+  [ValidateSet("User", "Driver")]
+  [string]$Scope = "Driver"
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -182,17 +193,28 @@ function Require-CargoWdk {
   return $current
 }
 
+# Périmètre User : les crates utilisateur n'ont besoin que de Rust et des Build Tools.
+# Périmètre Driver : tout, drivers/windows exige en plus le WDK, LLVM et cargo-wdk.
 $rustcVersion = Require-Rust
 $buildTools = Require-BuildTools
-$wdkRoot = Require-Wdk
-$llvm = Require-Llvm
-$cargoWdk = Require-CargoWdk
 
-$crates = ($versions.wdk_crates.PSObject.Properties | ForEach-Object { "$($_.Name) $($_.Value)" }) -join ", "
-Write-Host "environnement Windows conforme :"
+if ($Scope -eq "Driver") {
+  $wdkRoot = Require-Wdk
+  $llvm = Require-Llvm
+  $cargoWdk = Require-CargoWdk
+}
+
+$perimetre = if ($Scope -eq "Driver") { "périmètre pilote" } else { "périmètre utilisateur" }
+Write-Host "environnement Windows conforme ($perimetre) :"
 Write-Host "  rust        $rustcVersion (toolchain $toolchain)"
 Write-Host "  Build Tools $buildTools (link.exe MSVC x64, SDK $($versions.windows_sdk))"
-Write-Host "  WDK         $($versions.wdk) ($wdkRoot)"
-Write-Host "  LLVM        $llvm"
-Write-Host "  cargo-wdk   $cargoWdk"
-Write-Host "  crates      $crates (épinglés dans drivers/windows/Cargo.toml)"
+if ($Scope -eq "Driver") {
+  $crates = ($versions.wdk_crates.PSObject.Properties | ForEach-Object { "$($_.Name) $($_.Value)" }) -join ", "
+  Write-Host "  WDK         $($versions.wdk) ($wdkRoot)"
+  Write-Host "  LLVM        $llvm"
+  Write-Host "  cargo-wdk   $cargoWdk"
+  Write-Host "  crates      $crates (épinglés dans drivers/windows/Cargo.toml)"
+} else {
+  Write-Host "  WDK, LLVM et cargo-wdk ne sont pas vérifiés en périmètre utilisateur ;"
+  Write-Host "  relancez avec -Scope Driver pour travailler sur drivers/windows."
+}

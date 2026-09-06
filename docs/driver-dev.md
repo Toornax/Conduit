@@ -32,11 +32,16 @@ winget install --id Microsoft.WinDbg -e
 ### 1.2 En utilisateur : `setup-env.ps1`
 
 ```powershell
-.\packaging\windows\setup-env.ps1          # installe ce qui ne demande pas d'élévation
-.\packaging\windows\setup-env.ps1 -Check   # ne touche à rien, échoue si une version diffère
+.\packaging\windows\setup-env.ps1 -Scope Driver          # installe ce qui ne demande pas d'élévation
+.\packaging\windows\setup-env.ps1 -Check -Scope Driver   # ne touche à rien, échoue si une version diffère
 ```
 
-Le script installe (ou vérifie, avec `-Check`) : rustup et la toolchain
+`-Scope Driver` est le défaut : il couvre tout l'outillage du pilote. Pour ne construire
+que les crates utilisateur (`conduitd`, `conduitctl`, la GUI), `-Scope User` suffit — il
+ne vérifie que Rust et les Build Tools, sans les plusieurs gigaoctets du WDK ni LLVM ni
+`cargo-wdk` (SPEC §5.11) ; c'est ce qu'utilise le job `build-test` de la CI Windows.
+
+En périmètre pilote, le script installe (ou vérifie, avec `-Check`) : rustup et la toolchain
 `1.96.1-x86_64-pc-windows-msvc` avec `rustfmt` et `clippy` ; `cargo-wdk` 0.1.1
 (`cargo install cargo-wdk --version 0.1.1 --locked`, quelques minutes de compilation).
 Il vérifie seulement, et affiche la commande winget à lancer en administrateur s'il
