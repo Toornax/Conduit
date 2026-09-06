@@ -454,10 +454,26 @@ signé par attestation, HLK audio passé, latence conforme à SPEC §5.6, endura
   commune à 43 µs, dérive Realtek − G27QC = −18 ppm ; `#[ignore]` 1 h avec le moteur).
 - [ ] **M1b-34** `feat(wasapi): CableControl via le helper`
   *Fait quand* : `conduitctl cable add` fonctionne de bout en bout (F-01, F-03).
-- [ ] **M1b-35** `feat(daemon): démarrage à l'ouverture de session et instance unique`
+- [x] **M1b-35** `feat(daemon): démarrage à l'ouverture de session et instance unique`
   Tâche planifiée par utilisateur (ADR-013), détection d'instance unique par le named pipe,
   arrêt propre à la fermeture de session. **Pas** de service SCM pour le démon.
   *Fait quand* : le démon démarre à l'ouverture de session, le socket est accessible.
+  **Instance unique** : `single_instance::check` interroge le point de contrôle avant
+  d'ouvrir le backend (Unix : socket orphelin supprimé ; Windows : ouverture du pipe,
+  `ERROR_PIPE_BUSY`/`ERROR_ACCESS_DENIED` = pris) ; un démon de trop sort en **3** avec un
+  message qui dit quoi faire, la course entre deux démarrages simultanés étant rattrapée
+  par `AddrInUse` sur `bind`. **Fin de session Windows** : fenêtre cachée de **premier
+  niveau** sur un fil dédié (`session_end`) — ni `SetConsoleCtrlHandler`
+  (`CTRL_LOGOFF_EVENT` « received only by services ») ni `HWND_MESSAGE` (hors des messages
+  diffusés) ne conviennent ; `WM_ENDSESSION` attend l'arrêt propre, borné à 3 s. Vérifié
+  bout en bout sur une tâche jetable, y compris sur le processus **sans console** lancé
+  par le Planificateur. **Autodémarrage** : `conduitd autostart <enable|disable|status>`,
+  `schtasks.exe` + XML UTF-16 (`autostart::xml`), `--task-name` caché pour les tests.
+  *État* : `--replace` **non implémenté** — le protocole n'a pas de commande d'arrêt
+  (`Command` s'arrête à `Load`), donc rien ne permet de demander au démon en place de
+  partir ; l'ajouter est une version de protocole (ADR-010) avec sa question de sécurité,
+  à trancher séparément. La suppression du **dossier** vide `Conduit` du Planificateur
+  (que `schtasks` ne sait pas faire) reste à traiter par la désinstallation, M1b-40.
 
 ### M1b.D — Empaquetage et validation
 
@@ -471,6 +487,8 @@ signé par attestation, HLK audio passé, latence conforme à SPEC §5.6, endura
 - [ ] **M1b-43** `test: endurance 24 h Windows`
   *Fait quand* : 0 xrun, 0 fuite, câbles créés/supprimés aléatoirement.
 - [ ] **M1b-44** `docs: guide utilisateur Windows (installation, dépannage)`
+  Ébauche commencée en M1b-35 : `docs/user/windows.md` (démarrage automatique, instance
+  unique, fermeture de session). Restent l'installation par le MSI et le dépannage.
 - [ ] **M1b-45** `chore: tag v0.2.0-windows`
 
 ---

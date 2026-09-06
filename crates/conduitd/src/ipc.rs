@@ -83,8 +83,17 @@ impl Listener {
                 .first_pipe_instance(true)
                 .create(&name)
                 .map_err(|e| {
+                    // ERROR_ACCESS_DENIED (5) et ERROR_PIPE_BUSY (231) sur
+                    // `first_pipe_instance` veulent dire « ce nom est déjà tenu » : c'est
+                    // le même cas que `AddrInUse` sous Unix, et `main` en fait le code de
+                    // retour 3 (crate::single_instance). Cette voie est la course des
+                    // deux démons lancés en même temps ; le cas normal est détecté avant.
+                    let kind = match e.raw_os_error() {
+                        Some(5) | Some(231) => std::io::ErrorKind::AddrInUse,
+                        _ => e.kind(),
+                    };
                     std::io::Error::new(
-                        e.kind(),
+                        kind,
                         format!(
                             "named pipe {} : {e} (un démon écoute déjà ? arrêtez-le ou utilisez --socket)",
                             name.display()

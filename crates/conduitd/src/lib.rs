@@ -1,15 +1,23 @@
 //! `conduitd` — le démon : moteur, IPC, persistance, règles.
 
-#![forbid(unsafe_code)]
+// `deny` et non `forbid` : le seul `unsafe` du démon est dans `session_end`, sous
+// `cfg(windows)` — les fenêtres Win32 n'ont pas de façade sûre (voir ce module et
+// docs/dev-guide.md §6). Partout ailleurs, y compris dans le binaire, l'`unsafe` reste
+// interdit.
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod autoconnect;
+pub mod autostart;
 pub mod config;
 pub mod ipc;
 pub mod logging;
 pub mod paths;
 pub mod persist;
 pub mod service;
+#[cfg(windows)]
+pub mod session_end;
+pub mod single_instance;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -172,11 +180,44 @@ impl Daemon {
         }
     }
 
-    /// Tourne jusqu'au signal d'arrêt (Ctrl-C / SIGTERM).
+    /// Tourne jusqu'au signal d'arrêt (Ctrl-C / SIGTERM), et sous Windows jusqu'à la
+    /// fermeture de session (`WM_ENDSESSION`, voir [`session_end`]).
     pub async fn run_until_signal(self) {
-        wait_for_signal().await;
-        tracing::info!("arrêt demandé");
+        #[cfg(windows)]
+        {
+            self.run_until_signal_windows().await;
+        }
+        #[cfg(not(windows))]
+        {
+            wait_for_signal().await;
+            tracing::info!("arrêt demandé");
+            self.shutdown().await;
+        }
+    }
+
+    /// Variante Windows : Ctrl-C **ou** fin de session.
+    ///
+    /// L'accusé de réception est envoyé après l'arrêt complet (état sauvegardé, flux
+    /// fermés) : c'est lui qui laisse le système achever la fermeture de session.
+    #[cfg(windows)]
+    async fn run_until_signal_windows(self) {
+        let session = session_end::spawn();
+        match &session {
+            Some(s) => {
+                tokio::select! {
+                    _ = wait_for_signal() => tracing::info!("arrêt demandé"),
+                    _ = s.wait() => tracing::info!("fermeture de session Windows : arrêt propre"),
+                }
+            }
+            None => {
+                wait_for_signal().await;
+                tracing::info!("arrêt demandé");
+            }
+        }
         self.shutdown().await;
+        if let Some(s) = session {
+            s.acknowledge();
+        }
     }
 }
 
