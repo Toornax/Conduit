@@ -379,6 +379,89 @@ même analyse ; `--inject-glitch [trame]` en retire une trame et doit faire sort
 en 1. Les tests d'intégration `tests/binary.rs` lancent ces trois cas sur la machine
 de développement, sans pilote et sans émettre de son.
 
+## 4 sexies. Cycle de vie du démon
+
+Trois questions, une réponse chacune : *qui tient le point de contrôle ?*, *comment le
+démon apprend-il que la session se ferme ?*, *qui le démarre ?* (ADR-013, M1b-35).
+
+### Instance unique
+
+Le point de contrôle **est** le verrou : pas de fichier `.pid`, qui peut mentir (PID
+recyclé, fichier oublié après un arrêt brutal). `conduitd::single_instance::check` pose
+toujours la même question — « quelqu'un répond-il là où j'allais écouter ? » — avant
+d'ouvrir le backend audio :
+
+- **Unix** : le fichier de socket existe et une connexion aboutit → un démon vit derrière ;
+  la connexion échoue → le fichier est **orphelin**, on le supprime et on continue.
+- **Windows** : un named pipe n'existe que tant qu'un processus le détient, il n'y a donc
+  pas d'orphelin. L'ouverture réussit (quelqu'un écoute) ou échoue avec
+  `ERROR_FILE_NOT_FOUND`. `ERROR_PIPE_BUSY` (231) et `ERROR_ACCESS_DENIED` (5) valent
+  « nom déjà tenu » : ce sont exactement les erreurs que `first_pipe_instance` rendrait.
+
+Un démon de trop sort en **3** avec « un démon Conduit est déjà en cours pour cette
+session… ». La course des deux démons lancés en même temps est rattrapée par
+`ipc::Listener::bind`, qui rend `ErrorKind::AddrInUse` dans ce cas — même verdict, même
+code de retour.
+
+Il n'y a **pas** de `--replace` : le protocole n'a aucune commande d'arrêt
+(`conduit_protocol::Command` va de `Status` à `Load`, sans `Shutdown`), donc rien ne
+permet de demander poliment au démon en place de partir. L'ajouter n'est pas une ligne de
+code mais une version de protocole (ADR-010 : le protocole est la source de vérité de
+l'API), avec sa question de sécurité — n'importe quel client du socket pourrait couper
+l'audio. À trancher ailleurs ; d'ici là, on arrête le démon existant par le système.
+
+### Fin de session Windows
+
+Le réflexe — `SetConsoleCtrlHandler` et `CTRL_LOGOFF_EVENT` — ne marche pas ici, et la
+documentation le dit : « *this signal is received only by services. Interactive
+applications are terminated at logoff* »
+([HandlerRoutine](https://learn.microsoft.com/en-us/windows/console/handlerroutine)).
+`conduitd` est justement une application interactive, et lancé par une tâche planifiée il
+n'a de toute façon pas de console.
+
+Le second réflexe — une fenêtre `HWND_MESSAGE` — ne marche pas non plus : « *A
+message-only window […] does not receive broadcast messages* »
+([Window Features](https://learn.microsoft.com/en-us/windows/win32/winmsg/window-features)),
+et `WM_QUERYENDSESSION` est diffusé aux fenêtres **de premier niveau**.
+
+`conduitd::session_end` crée donc, sur un fil dédié, une fenêtre de **premier niveau
+jamais montrée** (`WS_OVERLAPPED` sans `WS_VISIBLE`, `WS_EX_TOOLWINDOW` pour rester hors
+d'Alt+Tab) et pompe ses messages : `WM_QUERYENDSESSION` → `TRUE` immédiatement (on ne
+bloque jamais une fermeture de session), `WM_ENDSESSION` → réveil du démon puis **attente
+bornée** (3 s, `session_end::GRACE`) de l'accusé de réception, parce que le système peut
+tuer le processus dès le retour de la procédure de fenêtre. `ShutdownBlockReasonCreate`
+n'est pas utilisé : il sert à *retarder* l'arrêt en affichant une raison, ce que Microsoft
+réserve aux travaux ininterruptibles, alors que notre sauvegarde est l'écriture atomique
+d'un petit JSON (déjà refaite toutes les 500 ms par le service).
+
+C'est le seul `unsafe` du démon (§6). Sous Unix, `SIGTERM` et Ctrl-C restent le chemin
+d'arrêt, inchangés.
+
+### Autodémarrage
+
+`conduitd autostart <enable|disable|status>` gère la **tâche planifiée par utilisateur**
+`Conduit\conduitd` : déclencheur « à l'ouverture de session de cet utilisateur » avec 30 s
+de délai, `InteractiveToken` / `LeastPrivilege` (aucune élévation, SPEC §5.10),
+`StopExisting`, pas d'arrêt sur batterie, pas de limite de durée, trois redémarrages
+espacés d'une minute, `Priority` **5** — le défaut du Planificateur (7) donnerait
+`BELOW_NORMAL_PRIORITY_CLASS` à un démon audio.
+
+L'implémentation appelle `%SystemRoot%\System32\schtasks.exe` (chemin absolu, jamais le
+`PATH`) avec un fichier XML produit par `autostart::xml` et encodé en UTF-16LE avec BOM.
+Le XML plutôt que l'API COM du Planificateur : c'est le **format natif** de l'outil, celui
+que son interface exporte et réimporte, donc un artefact lisible par l'utilisateur et
+testable sans Windows — là où la même définition construite en COM n'existerait nulle
+part sous forme inspectable, et coûterait une centaine de lignes d'`unsafe` de plus. Le
+prix payé est la lecture d'une sortie **traduite** pour `status` : on la restitue telle
+quelle plutôt que de l'interpréter.
+
+Codes de retour : `0` fait (`status` : présente), `1` `schtasks` a échoué, `2` plateforme
+sans tâche planifiée (Linux/macOS : le message renvoie vers systemd `--user` ou un
+LaunchAgent, M4/M5), `4` `status` : absente. `disable` sur une tâche absente rend `0`
+(la désinstallation doit pouvoir l'appeler deux fois). `--task-name` (caché) vise une
+tâche jetable : c'est ce dont se servent les tests, qui n'approchent jamais la vraie tâche
+de l'utilisateur. Le guide utilisateur est [user/windows.md](user/windows.md).
+
 ## 5. Tests
 
 ```sh
@@ -403,8 +486,11 @@ Niveaux : unitaires par module ; intégration `conduit-engine/tests/scenarios.rs
 - Commits : Conventional Commits, scopes de ROADMAP (`core`, `engine`, `backend`,
   `null`, `protocol`, `daemon`, `cli`, `nix`, …). Une tâche = un commit, CI verte.
 - `unsafe` : interdit (`#![forbid(unsafe_code)]`) sauf `conduit-testing` (allocateur),
-  `conduit-backend::rt` (appels système) et `conduit-backend-wasapi` (appels COM),
-  chaque bloc commenté `SAFETY:` (lint `undocumented_unsafe_blocks` du workspace).
+  `conduit-backend::rt` (appels système), `conduit-backend-wasapi` (appels COM) et le seul
+  module `conduitd::session_end` (fenêtre Win32 de fin de session, `cfg(windows)` — le
+  crate est donc en `deny` plutôt qu'en `forbid`, avec un `#![allow]` local et motivé dans
+  ce module ; le binaire, lui, reste en `forbid`). Chaque bloc est commenté `SAFETY:`
+  (lint `undocumented_unsafe_blocks` du workspace).
 - Messages d'erreur : dire quoi faire (ADR-006). Codes stables dans
   `ProtocolError`.
 - Identifiants : `NodeId`/`LinkId` sont générationnels (jamais réutilisés) ; la

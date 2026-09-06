@@ -31,6 +31,21 @@ clap = { version = "4", features = ["derive"] }
 # Backend natif Windows (MMDevice + WASAPI) : `--backend auto` le choisit sous Windows.
 [target.'cfg(windows)'.dependencies]
 conduit-backend-wasapi = { workspace = true }
+# Fenêtre cachée de premier niveau qui reçoit `WM_QUERYENDSESSION` / `WM_ENDSESSION`
+# (module `session_end`) : c'est le seul moyen pour un processus sans console lancé par
+# une tâche planifiée d'être prévenu de la fermeture de session.
+# - `Win32_UI_WindowsAndMessaging` : RegisterClassW, CreateWindowExW, GetMessageW,
+#   DispatchMessageW, DefWindowProcW, PostQuitMessage, WM_* ;
+# - `Win32_System_LibraryLoader` : GetModuleHandleW (instance de la classe de fenêtre) ;
+# - `Win32_Foundation` : HWND, WPARAM, LPARAM, LRESULT ;
+# - `Win32_Graphics_Gdi` : `WNDCLASSW` (et donc `RegisterClassW`) contient un `HBRUSH`,
+#   le crate `windows` les place derrière cette feature — aucun dessin n'est fait.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [dev-dependencies]
 tempfile = "3"
