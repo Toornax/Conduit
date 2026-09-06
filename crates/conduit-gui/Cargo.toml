@@ -28,6 +28,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
 conduitd = { path = "../conduitd", version = "0.1.0" }
+iced_test = "0.14"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "time"] }
 
