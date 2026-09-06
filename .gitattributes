@@ -1,3 +1,10 @@
 * text=auto eol=lf
 *.png binary
 *.wav binary
+
+# Sources d'INF : un INF qui contient des caractères non ASCII doit être encodé en
+# UTF-16 LE (« General Guidelines for INF Files »), et Windows attend des fins de ligne
+# CRLF. Le dépôt garde le fichier en UTF-8/LF (diffs lisibles) ; git le restitue en
+# UTF-16 LE avec BOM dans la copie de travail, qui est ce que stampinf copie tel quel
+# dans le .inf produit. `cargo test -p portcls` (test inf.rs) échoue si le BOM manque.
+*.inx text working-tree-encoding=UTF-16LE-BOM eol=crlf

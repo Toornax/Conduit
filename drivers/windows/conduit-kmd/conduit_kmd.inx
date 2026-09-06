@@ -1,10 +1,22 @@
 ;
 ; conduit_kmd.inx : source de l'INF du pilote Conduit (câbles audio virtuels).
 ;
+; ENCODAGE : UTF-16 LE avec BOM dans la copie de travail. Un INF qui contient des
+; caractères non ASCII doit être en UTF-16 LE (« General Guidelines for INF Files » :
+; « if your INF contains non-ASCII characters, you must save the file as a Unicode
+; (UTF-16 LE) file ») ; en UTF-8 sans BOM, SetupAPI le relit dans la page de codes ANSI
+; et « câbles » deviendrait « câbles » dans le gestionnaire de périphériques.
+; `.gitattributes` garde le fichier en UTF-8 dans le dépôt (diffs lisibles) et le
+; restitue en UTF-16 LE : `*.inx text working-tree-encoding=UTF-16LE-BOM eol=crlf`.
+; Le test `portcls/tests/inf.rs` échoue si le BOM manque dans la copie de travail
+; (git trop ancien, fichier réécrit par un éditeur) : `git checkout -- <fichier>` répare.
+;
 ; `cargo wdk build` copie ce fichier en conduit_kmd.inf, remplace DriverVer et $ARCH$
-; (stampinf), génère le catalogue (inf2cat), signe avec le certificat de test et vérifie
-; avec `infverif /w` (exigences « Windows Driver » : fichiers dans le magasin des pilotes,
-; DIRID 13). Le nom du fichier est imposé par cargo-wdk : nom du crate avec `_`.
+; (stampinf, qui normalise aussi les fins de ligne en CRLF), génère le catalogue
+; (inf2cat), signe avec le certificat de test et vérifie avec `infverif /w` (exigences
+; « Windows Driver » : fichiers dans le magasin des pilotes, DIRID 13, écritures de
+; registre limitées aux clés du périphérique). Le nom du fichier est imposé par
+; cargo-wdk : nom du crate avec `_`.
 ;
 ; M1a-02 : adaptateur PortCls pour un périphérique énuméré à la racine (Root\ConduitCable),
 ; classe MEDIA. Include/Needs de ks.inf et wdmaudio.inf enregistrent Kernel Streaming et
@@ -14,9 +26,21 @@
 ; (docs/driver-design.md §4.1) : WaveRender0 (KSCATEGORY_AUDIO, RENDER, REALTIME),
 ; WaveCapture0 (AUDIO, CAPTURE, REALTIME), TopoRender0 et TopoCapture0 (AUDIO, TOPOLOGY).
 ; Le nom de référence de chaque AddInterface est le nom passé à PcRegisterSubdevice ;
-; CLSID est le proxy KS (ksproxy) et FriendlyName le nom que l'utilisateur voit
-; (« Conduit 1 », affiné en M1a-09). Structure de référence : SYSVAD SimpleAudioSample,
-; jamais copié.
+; CLSID est le proxy KS (ksproxy).
+; M1a-09 : nom des endpoints (docs/driver-design.md §4.2). Le nom affiché par Windows
+; est composé du **nom de la broche bridge** et du nom de l'adaptateur ; la broche se
+; nomme par son GUID `KsPinDescriptor.Name`, que ce fichier associe à « Conduit 1 » dans
+; `HKR\MediaCategories`. Le GUID est celui de `portcls::adapter::pin_name_guid(0)` et
+; `portcls/tests/inf.rs` vérifie l'égalité. Sécurité de l'objet de périphérique et
+; DeviceType dans .NT.HW.
+; Structure de référence : SYSVAD SimpleAudioSample, jamais copié.
+;
+; Désinstallation (F-52) : aucune section DelReg ni DelFiles n'est nécessaire. Toutes
+; les écritures de ce fichier sont des HKR — clé logicielle du périphérique
+; (ConduitCable_*_AddReg, sections .Interfaces) ou clé matérielle (.NT.HW) — que PnP
+; supprime avec le périphérique, et les fichiers vivent dans le magasin des pilotes
+; (DIRID 13, PnpLockdown=1), retirés par `pnputil /delete-driver`. Une section DelReg
+; serait d'ailleurs refusée par infverif /w si elle visait une clé hors du périphérique.
 ;
 
 [Version]
@@ -47,7 +71,7 @@ conduit_kmd.sys = 1
 Include   = ks.inf, wdmaudio.inf
 Needs     = KS.Registration, WDMAUDIO.Registration
 CopyFiles = ConduitCable_CopyFiles
-AddReg    = ConduitCable_AddReg
+AddReg    = ConduitCable_AddReg, ConduitCable_PinNames_AddReg
 
 [ConduitCable_CopyFiles]
 conduit_kmd.sys
@@ -55,6 +79,17 @@ conduit_kmd.sys
 [ConduitCable_AddReg]
 HKR,,AssociatedFilters,,"wdmaud,swmidi,redbook"
 HKR,,Driver,,conduit_kmd.sys
+
+; Noms de broche (§4.2). KS répond à KSPROPERTY_PIN_NAME en cherchant d'abord une chaîne
+; pour le GUID `KsPinDescriptor.Name` de la broche, puis, à défaut, pour son GUID
+; `KsPinDescriptor.Category`. Depuis Windows 10 1809 la recherche commence par la clé
+; **logicielle du périphérique** (HKR\MediaCategories), remplie par cette section : c'est
+; le seul levier documenté pour nommer un endpoint sans toucher à l'espace de noms global
+; (HKLM\SYSTEM\CurrentControlSet\Control\MediaCategories, réservé et interdit par
+; infverif /w). Sans elle, la catégorie KSNODETYPE_SPEAKER donnerait « Haut-parleurs » et
+; KSNODETYPE_LINE_CONNECTOR « Ligne ».
+[ConduitCable_PinNames_AddReg]
+HKR,%MediaCategories%\%GUID.PinName.Cable0%,Name,,%PinName.Cable0%
 
 [ConduitCable_Install.NT.Services]
 AddService = conduit_kmd, 0x00000002, ConduitCable_Service
@@ -66,8 +101,24 @@ StartType     = 3
 ErrorControl  = 1
 ServiceBinary = %13%\conduit_kmd.sys
 
+; Objet de périphérique créé par PortCls : type FILE_DEVICE_SOUND et descripteur de
+; sécurité standard des adaptateurs audio (SDDL_DEVOBJ_SYS_ALL_ADM_RWX_WORLD_RWX_RES_RWX,
+; comme SYSVAD). Le service audio (audiodg.exe s'exécute sous LOCAL SERVICE) doit pouvoir
+; ouvrir les filtres KS ; le descripteur par défaut d'un périphérique énuméré à la racine
+; ne l'accorde pas, et l'échec se lit seulement comme « aucun endpoint ».
+[ConduitCable_Install.NT.HW]
+AddReg = ConduitCable_HW_AddReg
+
+[ConduitCable_HW_AddReg]
+HKR,,DeviceType,0x10001,0x0000001D
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GRGWGX;;;BA)(A;;GRGWGX;;;WD)(A;;GRGWGX;;;RC)"
+
 ; Interfaces KS des sous-périphériques (câble 0). Le deuxième champ est le nom de
-; référence du sous-périphérique, tel que PcRegisterSubdevice le reçoit.
+; référence du sous-périphérique, tel que PcRegisterSubdevice le reçoit : il doit
+; correspondre exactement aux constantes de `portcls::adapter`
+; (WAVE_RENDER_0, TOPO_RENDER_0, WAVE_CAPTURE_0, TOPO_CAPTURE_0). Une divergence donne un
+; périphérique qui s'installe sans publier aucun endpoint ; `portcls/tests/inf.rs` la
+; détecte.
 [ConduitCable_Install.NT.Interfaces]
 AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveRender0%,  WaveRender0.Interface
 AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_WaveRender0%,  WaveRender0.Interface
@@ -80,49 +131,64 @@ AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveCapture0%, WaveCapture0.Interf
 AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoCapture0%, TopoCapture0.Interface
 AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoCapture0%, TopoCapture0.Interface
 
+; FriendlyName par interface : nom du **filtre** dans le registre des interfaces de
+; périphérique, pas celui de l'endpoint (§4.2). Il sert au diagnostic (Get-PnpDevice
+; -Class MEDIA, regedit) : chacun nomme le câble et le rôle du filtre.
 [WaveRender0.Interface]
 AddReg = WaveRender0.Interface.AddReg
 
 [WaveRender0.Interface.AddReg]
 HKR,,CLSID,,%Proxy.CLSID%
-HKR,,FriendlyName,,%Conduit.Render0.FriendlyName%
+HKR,,FriendlyName,,%Conduit.WaveRender0.FriendlyName%
 
 [TopoRender0.Interface]
 AddReg = TopoRender0.Interface.AddReg
 
 [TopoRender0.Interface.AddReg]
 HKR,,CLSID,,%Proxy.CLSID%
-HKR,,FriendlyName,,%Conduit.Render0.FriendlyName%
+HKR,,FriendlyName,,%Conduit.TopoRender0.FriendlyName%
 
 [WaveCapture0.Interface]
 AddReg = WaveCapture0.Interface.AddReg
 
 [WaveCapture0.Interface.AddReg]
 HKR,,CLSID,,%Proxy.CLSID%
-HKR,,FriendlyName,,%Conduit.Capture0.FriendlyName%
+HKR,,FriendlyName,,%Conduit.WaveCapture0.FriendlyName%
 
 [TopoCapture0.Interface]
 AddReg = TopoCapture0.Interface.AddReg
 
 [TopoCapture0.Interface.AddReg]
 HKR,,CLSID,,%Proxy.CLSID%
-HKR,,FriendlyName,,%Conduit.Capture0.FriendlyName%
+HKR,,FriendlyName,,%Conduit.TopoCapture0.FriendlyName%
 
 [Strings]
 Conduit                  = "Conduit"
-DiskName                 = "Conduit Installation Disk"
-ConduitCable.DeviceDesc  = "Conduit Virtual Audio Cable"
-ConduitCable.ServiceDesc = "Conduit Virtual Audio Cable Driver"
+DiskName                 = "Disque d'installation Conduit"
+ConduitCable.DeviceDesc  = "Conduit — câbles audio virtuels"
+ConduitCable.ServiceDesc = "Conduit — pilote de câbles audio virtuels"
 
-; Noms de sous-périphérique (portcls::adapter : WAVE_RENDER_0…) et noms affichés.
-KSNAME_WaveRender0          = "WaveRender0"
-KSNAME_TopoRender0          = "TopoRender0"
-KSNAME_WaveCapture0         = "WaveCapture0"
-KSNAME_TopoCapture0         = "TopoCapture0"
-Conduit.Render0.FriendlyName  = "Conduit 1"
-Conduit.Capture0.FriendlyName = "Conduit 1"
+; Noms de sous-périphérique : identiques aux constantes de `portcls::adapter`.
+KSNAME_WaveRender0  = "WaveRender0"
+KSNAME_TopoRender0  = "TopoRender0"
+KSNAME_WaveCapture0 = "WaveCapture0"
+KSNAME_TopoCapture0 = "TopoCapture0"
 
-; Catégories KS (ksmedia.h) et proxy KS (ksproxy.ax).
+; Noms des filtres dans le registre des interfaces (diagnostic).
+Conduit.WaveRender0.FriendlyName  = "Conduit 1 (rendu, WaveRT)"
+Conduit.TopoRender0.FriendlyName  = "Conduit 1 (rendu, topologie)"
+Conduit.WaveCapture0.FriendlyName = "Conduit 1 (capture, WaveRT)"
+Conduit.TopoCapture0.FriendlyName = "Conduit 1 (capture, topologie)"
+
+; Nom de broche du câble 0 : c'est lui que l'utilisateur voit (§4.2). Le GUID est
+; `portcls::adapter::pin_name_guid(0)` ; le dernier octet porte le numéro de câble, ce qui
+; donnera les seize GUID de M1b-02. Sous-clé « MediaCategories » de la clé logicielle du
+; périphérique (HKR), pas l'espace global HKLM.
+MediaCategories        = "MediaCategories"
+GUID.PinName.Cable0    = "{CAA74E3D-9BD5-4F78-8EAC-26A5A1AE0F00}"
+PinName.Cable0         = "Conduit 1"
+
+; Catégories KS (ksmedia.h) et proxy KS (ksproxy.ax, %SystemRoot%\INF\ks.inf).
 KSCATEGORY_AUDIO    = "{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
 KSCATEGORY_RENDER   = "{65E8773E-8F56-11D0-A3B9-00A0C9223196}"
 KSCATEGORY_CAPTURE  = "{65E8773D-8F56-11D0-A3B9-00A0C9223196}"

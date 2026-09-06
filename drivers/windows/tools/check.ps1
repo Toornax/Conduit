@@ -9,6 +9,13 @@
   en test.
   Vérifie aussi que portcls-sys\tests\layout.golden (oracle cl.exe des bindings) est à
   jour : régénération dans un dossier temporaire (regen-layout.ps1) et comparaison.
+
+  Cohérence INF ↔ Rust (M1a-09) : `cargo test -p portcls` lance portcls\tests\inf.rs, qui
+  relit conduit-kmd\conduit_kmd.inx et le compare aux constantes du pilote — noms de
+  sous-périphériques des AddInterface contre WAVE_RENDER_0…, GUID de nom de broche contre
+  pin_name_guid(0), GUID de catégorie contre portcls_sys::KSCATEGORY_*, et encodage
+  UTF-16 LE de la copie de travail. Une divergence y est une panne muette dans la VM
+  (périphérique installé, aucun endpoint, ou endpoint mal nommé) : elle échoue ici.
 #>
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"

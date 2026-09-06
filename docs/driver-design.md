@@ -253,16 +253,49 @@ Les nœuds de topologie sont réduits au minimum que le générateur d'endpoints
 `KSNODETYPE_LINE_CONNECTOR` (capture) et un jack. Référence de structure : SYSVAD
 `SimpleAudioSample` (MIT), jamais copié.
 
-INF : source `conduit.inx` (`cargo wdk build` le transforme en `.inf` par `stampinf`,
-génère le `.cat` par `inf2cat`, le vérifie par `infverif` et signe `.sys` et `.cat` avec le
-certificat de test `WDRLocalTestCert` qu'il crée au besoin). Classe `MEDIA`, périphérique
-énuméré à la racine (`Root\ConduitCable`), `Include=ks.inf,wdmaudio.inf`,
+INF : source `conduit-kmd/conduit_kmd.inx` — le nom est imposé par cargo-wdk, qui le
+transforme en `.inf` par `stampinf`, génère le `.cat` par `inf2cat`, le vérifie par
+`infverif /w` et signe `.sys` et `.cat` avec le certificat de test `WDRLocalTestCert`
+qu'il crée au besoin. Classe `MEDIA`, périphérique énuméré à la racine
+(`Root\ConduitCable`), `Include=ks.inf,wdmaudio.inf`,
 `Needs=KS.Registration,WDMAUDIO.Registration`, interfaces `KSCATEGORY_AUDIO`,
-`KSCATEGORY_RENDER`, `KSCATEGORY_CAPTURE`, `KSCATEGORY_REALTIME`, `FriendlyName`
-« Conduit *n* » (M1a-09). Installation dans la VM : importer `WDRLocalTestCert.cer` dans
-*Trusted Root* et *Trusted Publishers*, `pnputil /add-driver conduit.inf /install`, puis
-créer le nœud racine avec `devgen /add /hardwareid "Root\ConduitCable"` (WDK 26100).
-Retrait : `devgen /remove <id>` puis `pnputil /delete-driver oem<N>.inf /uninstall /force`.
+`KSCATEGORY_RENDER`, `KSCATEGORY_CAPTURE`, `KSCATEGORY_REALTIME`, `KSCATEGORY_TOPOLOGY`
+par sous-périphérique, `DeviceType` `FILE_DEVICE_SOUND` et descripteur de sécurité de
+l'objet de périphérique dans `.NT.HW`, et l'enregistrement du **nom de broche** qui donne
+leur nom aux endpoints (§4.2). Installation dans la VM : importer `WDRLocalTestCert.cer`
+dans *Trusted Root* et *Trusted Publishers*,
+`pnputil /add-driver conduit_kmd.inf /install`, puis créer le nœud racine avec
+`devgen /add /hardwareid "Root\ConduitCable"` (WDK 26100). Retrait : `devgen /remove <id>`
+puis `pnputil /delete-driver oem<N>.inf /uninstall /force`.
+
+Le fichier `.inx` est encodé en **UTF-16 LE** dans la copie de travail : un INF qui
+contient des caractères non ASCII doit l'être (*General Guidelines for INF Files* :
+« if your INF contains non-ASCII characters, you must save the file as a Unicode
+(UTF-16 LE) file »), sans quoi SetupAPI le relit dans la page de codes ANSI et
+« câbles » devient « câbles ». `.gitattributes` (`*.inx text
+working-tree-encoding=UTF-16LE-BOM eol=crlf`) garde le dépôt en UTF-8 — les diffs restent
+lisibles — et restitue l'UTF-16 à l'extraction ; `stampinf` recopie l'encodage tel quel
+dans le `.inf` produit et normalise les fins de ligne en CRLF. Le test
+`portcls/tests/inf.rs` échoue si la copie de travail perd le BOM.
+
+Rien dans l'INF n'est **supprimé** explicitement à la désinstallation (F-52) : toutes ses
+écritures sont des `HKR` — clé logicielle ou matérielle du périphérique — que PnP retire
+avec lui, et les fichiers vivent dans le magasin des pilotes (DIRID 13, `PnpLockdown=1`),
+effacés par `pnputil /delete-driver`. Ni `DelReg` ni `DelFiles` ne sont donc nécessaires,
+et une écriture hors des clés du périphérique serait de toute façon refusée par
+`infverif /w`.
+
+Ce que l'INF **ne fait pas**, et pourquoi :
+
+Les valeurs héritées `HKR,Drivers,SubClasses` et `HKR,Drivers\wave|midi|mixer\wdmaud.drv`
+que SYSVAD écrit ne sont **pas** reprises : elles décrivent des sous-classes wave, MIDI et
+mixer que ce pilote n'expose pas (aucun nœud MIDI, aucun nœud de mixage avant M1b-03) et
+le chemin qui construit les endpoints ne les lit pas. `AssociatedFilters` suffit à déclarer
+les filtres attendus par wdmaud. À revoir en M1b-03 si une application MME s'avère les
+exiger.
+
+Pas de `[SignatureAttributes]` `DRMLevel` non plus : le pilote n'implémente aucun contenu
+protégé (`IDrmPort`, `PcAddContentHandlers`) et le déclarer serait faux.
 
 ### 4.1 Descripteurs de filtres (M1a-06, minimum accepté par le générateur d'endpoints)
 
@@ -299,6 +332,10 @@ le spike (`PCAUTOMATION_TABLE` sans propriétés ; PortCls gère `KSPROPSETID_Pi
 `KSPROPSETID_Topology`). Catégories du filtre : `CategoryCount = 0`, PortCls fournit les
 siennes (`KSCATEGORY_AUDIO`, `RENDER`/`CAPTURE`, `REALTIME` pour WaveRT ; `AUDIO`,
 `TOPOLOGY` pour la topologie) ; l'INF les publie par `AddInterface` (M1a-06).
+
+Réalité M1a-09 : les deux broches endpoint (`TopoRender<n>` broche 1, `TopoCapture<n>`
+broche 0) portent en plus un GUID `KsPinDescriptor.Name` — les six autres broches laissent
+le champ nul. C'est lui qui donne son nom à l'endpoint (§4.2).
 
 Réalité des bindings (M1a-06) : `PCFILTER_NODE` (`((ULONG)-1)`) et les `WAVE_FORMAT_*`
 de `mmreg.h` ne sortent pas de bindgen, ils sont recopiés dans `portcls-sys::fixups` ;
@@ -339,6 +376,101 @@ Ordre de verrouillage fixe : **câble puis flux** — et, entre les deux flux, r
 capture, seul `Cable::on_tick` prenant les deux. `StartDevice` appelle `Cable::start`, qui
 oublie les flux d'un cycle précédent et crée le timer haute résolution du câble (§5.3) ;
 `DriverUnload` appelle `cable::shutdown`, qui le supprime.
+
+### 4.2 Noms d'endpoint (M1a-09)
+
+**D'où vient le nom qu'un utilisateur voit.** Le service *AudioEndpointBuilder* surveille
+la classe d'interface `KSCATEGORY_AUDIO` ; à l'arrivée d'une interface il cherche « any
+unconnected bridge pins », crée un endpoint pour chacune, puis « sets the default
+properties for the endpoint. For example, AudioEndpointBuilder sets the name, icon, and
+the form factor » (*Audio Endpoint Builder Algorithm*). La règle de nommage y est
+explicite : « The naming convention that is used for the endpoints is based on the
+friendly names of the bridge pins. »
+
+Le nom d'une broche vient de `KSPROPERTY_PIN_NAME`, que KS traite lui-même — « the client
+uses KSPROPERTY_PIN_NAME to retrieve the **Registry name** of a pin factory » — en
+cherchant, dans l'ordre (*Friendly Names for Audio Endpoint Devices*) :
+
+1. une chaîne pour le GUID `KsPinDescriptor.Name` de la broche ;
+2. à défaut, une chaîne pour son GUID `KsPinDescriptor.Category`.
+
+Et, depuis Windows 10 1809, la recherche commence par la **clé logicielle du
+périphérique** — « KS first looks for an entry in the device's software key. This is
+created by the INF through an AddReg section referenced by the [Models] section […] using
+the HKR\MediaCategories key » — avant de retomber sur l'espace de noms global
+`HKLM\SYSTEM\CurrentControlSet\Control\MediaCategories`, « reserved for global definitions
+and should not be modified by new drivers ».
+
+Côté application, MMDevice compose trois propriétés (*Device Properties*, Core Audio) :
+
+| Propriété | Contenu | Origine |
+|---|---|---|
+| `PKEY_Device_DeviceDesc` | « Speakers » | le nom de la broche bridge ci-dessus |
+| `PKEY_DeviceInterface_FriendlyName` | « XYZ Audio Adapter » | le nom de l'adaptateur |
+| `PKEY_Device_FriendlyName` | « Speakers (XYZ Audio Adapter) » | les deux, entre parenthèses |
+
+C'est `PKEY_Device_FriendlyName` que les réglages Son de Windows 11 affichent. La
+documentation le confirme côté endpoint : « the property store copies its initial value
+for the PKEY_Device_DeviceDesc property key from the friendly name string that is
+associated with the KS pin category GUID in the registry ».
+
+**Conséquence pour Conduit.** Nos deux broches endpoint portaient les catégories
+`KSNODETYPE_SPEAKER` et `KSNODETYPE_LINE_CONNECTOR` et **aucun** GUID `Name` : KS serait
+donc retombé sur la catégorie, résolue par les entrées que `ks.inf` (`KS.Registration` →
+`PinNameRegistration`) écrit dans l'espace global. Vérifié sur le poste de développement
+(Windows 11 fr-FR) :
+
+```text
+HKLM\SYSTEM\CurrentControlSet\Control\MediaCategories\{DFF21CE1-F70F-11D0-B917-00A0C9223196}  Name = Haut-parleurs
+HKLM\SYSTEM\CurrentControlSet\Control\MediaCategories\{DFF21FE3-F70F-11D0-B917-00A0C9223196}  Name = Ligne
+```
+
+Les endpoints se seraient donc appelés « Haut-parleurs (…) » et « Ligne (…) ».
+
+**L'INF seul ne suffit pas.** Le `FriendlyName` que les sections `.Interfaces` posent sur
+chaque interface KS (`HKR,,FriendlyName`) nomme le **filtre** dans le registre des
+interfaces de périphérique, pas l'endpoint : aucun texte de la documentation ne le relie
+au nom composé ci-dessus, et SYSVAD y met des libellés (« Simple Audio Sample Topology
+Speaker ») qui n'apparaissent nulle part dans les réglages Son. Il reste utile au
+diagnostic, et c'est à ce titre que Conduit le renseigne sur les quatre interfaces.
+
+Le seul levier documenté est donc le couple **GUID de nom de broche + chaîne dans
+`HKR\MediaCategories`** :
+
+- côté pilote, les deux broches endpoint (`TopoRender<n>` broche 1, `TopoCapture<n>`
+  broche 0) déclarent `KsPinDescriptor.Name = portcls::pin_name_guid(n)` — un GUID propre
+  à Conduit dont le dernier octet porte le numéro de câble, ce qui donnera les seize de
+  M1b-02 ;
+- côté INF, `[ConduitCable_PinNames_AddReg]` écrit
+  `HKR,%MediaCategories%\%GUID.PinName.Cable0%,Name,,"Conduit 1"`.
+
+Il n'y a **rien à implémenter** de `KSPROPERTY_PIN_NAME` : KS y répond seul à partir du
+registre. `KSJACK_DESCRIPTION` ne joue aucun rôle dans le nom — il décrit le connecteur
+physique (type, couleur, emplacement, présence) et servira en M1b-03.
+
+Les deux valeurs se trouvent de part et d'autre d'une frontière qu'aucun compilateur ne
+franchit ; `portcls/tests/inf.rs` (lancé par `tools/check.ps1` et la CI) relit l'INX et
+compare, de même que pour les noms de sous-périphériques des `AddInterface` et pour les
+GUID `KSCATEGORY_*`.
+
+**À constater dans la VM.** Deux points restent à observer, faute de machine de test :
+
+1. Le nom composé attendu est « Conduit 1 (Conduit — câbles audio virtuels) », le second
+   membre venant du `DeviceDesc` de l'adaptateur. Si les parenthèses gênent, c'est le
+   `DeviceDesc` qu'il faudra raccourcir.
+2. La page *Audio Endpoint Builder Algorithm* — antérieure au mécanisme de 1809 — affirme
+   que « in the case of speaker endpoints, the name has been hardcoded to "Speakers" and
+   cannot be altered by your driver or a third-party application ». Elle décrit le nom tiré
+   de la **catégorie** ; la page *Friendly Names* (2022) donne la priorité au GUID `Name`.
+   Si malgré tout l'endpoint de rendu s'affiche « Haut-parleurs », le repli est de changer
+   la catégorie de sa broche endpoint (`KSNODETYPE_LINE_CONNECTOR` au lieu de
+   `KSNODETYPE_SPEAKER`), au prix de l'icône et du rang de sélection par défaut (rendu :
+   Speakers > Line-out > SPDIF).
+
+Sources : *Audio Endpoint Builder Algorithm*, *Friendly Names for Audio Endpoint Devices*,
+*Pin Category Property*, *KSPROPERTY_PIN_NAME* (WDK), *Device Properties* et
+*PKEY_DeviceInterface_FriendlyName* (Core Audio), *General Guidelines for INF Files*, plus
+`%SystemRoot%\INF\ks.inf` et le registre du poste pour les noms de catégorie constatés.
 
 ## 5. Horloge, positions, boucle locale
 
