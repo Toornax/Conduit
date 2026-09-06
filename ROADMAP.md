@@ -27,10 +27,10 @@ Ordre général : M0 et M1a en parallèle, puis M1b, M2, M3, M4, M5.
 Le poste Windows est en place depuis le 2026-09-05 (WDK 26100, LLVM 17.0.6, `cargo-wdk`) :
 M1a et la partie Windows de M1b ont avancé en parallèle.
 
-- **M1a** : **l'audio traverse le câble.** Chargé dans la VM `ConduitTest` le 2026-09-06,
-  le pilote fait apparaître deux endpoints « Conduit 1 » et le test de boucle passe dix
-  fois sur dix — M1a-05 à M1a-10 cochées. Restent M1a-02 (un chargement sur cent a
-  échoué), M1a-11 (Driver Verifier) et la porte M1a-12. Séquence de validation, résultats
+- **M1a** : **l'audio traverse le câble.** Chargé dans la VM `ConduitTest`, le pilote fait
+  apparaître deux endpoints « Conduit 1 », le test de boucle passe dix fois sur dix et le
+  pilote enchaîne cent chargements sans erreur — M1a-02 et M1a-05 à M1a-10 cochées.
+  Restent M1a-11 (Driver Verifier) et la porte M1a-12. Séquence de validation, résultats
   attendus et diagnostics : [docs/vm-bringup.md](docs/vm-bringup.md).
 - **M1b.C** : M1b-30, 32, 33 et 35 cochées ; le démon charge WASAPI par défaut sous
   Windows et tourne sans xrun (1 h, deux cartes, 720 006 cycles). M1b-31 attend la boucle
@@ -321,14 +321,16 @@ allocation dans le fil audio, CI verte partout, couverture ≥ 80 % sur `core` e
 Objectif : prouver qu'un pilote PortCls/WaveRT en Rust est faisable. Délai borné (à fixer,
 proposition : trois semaines de travail effectif). Porte de décision en M1a-12.
 
-**L'audio traverse le câble.** Le 2026-09-06 dans la machine virtuelle `ConduitTest`, le
-pilote se charge, enregistre ses quatre sous-périphériques, Windows en construit deux
-endpoints nommés « Conduit 1 », et le test de boucle passe **10 fois sur 10** : 440,00 Hz,
-amplitude 0,500, aucune rupture de phase, aucun trou — M1a-05 à M1a-10 sont validées d'un
-coup. Restent M1a-02 (un chargement sur cent a échoué), M1a-11 et la porte M1a-12. La
-séquence de validation, le résultat attendu et l'arbre de diagnostic de chaque tâche :
-[docs/vm-bringup.md](docs/vm-bringup.md). Deux jours de travail effectif au 2026-09-06, à
-comparer au délai borné lors de la porte M1a-12.
+**L'audio traverse le câble, et le pilote se charge cent fois de suite.** Le 2026-09-06
+dans la machine virtuelle `ConduitTest`, le test de boucle passe **dix fois sur dix** —
+440,00 Hz, amplitude 0,500, aucune rupture de phase, aucun trou — et le 2026-09-07 le
+pilote enchaîne **100 chargements et déchargements sans erreur**, débogueur série attaché,
+aucun vidage. M1a-02 et M1a-05 à M1a-10 sont cochées. L'échec intermittent qui restait
+(`0xC00000E5` au 33ᵉ cycle) venait du **harnais de test**, pas du pilote : le script
+supprimait le paquet avant que le retrait du périphérique ne soit effectif, et PnP tentait
+un dernier démarrage sur un devnode mourant. Restent M1a-11 et la porte M1a-12. Séquence
+de validation, résultats attendus et arbre de diagnostic :
+[docs/vm-bringup.md](docs/vm-bringup.md).
 
 - [x] **M1a-01** `chore(driver): environnement de build WDK et windows-drivers-rs`
   Hors Nix (SPEC §5.11). Extension de `packaging/windows/setup-env.ps1` (WDK 26100, LLVM
@@ -343,12 +345,9 @@ comparer au délai borné lors de la porte M1a-12.
   Crate `#![no_std]` sans `unsafe` du workspace racine (ADR-012, [driver-design.md](docs/driver-design.md) §2.1) :
   modules `position`, `ring`, `format` ; lints anti-panique en `deny`.
   *Fait quand* : proptest et Miri verts dans `nix flake check` et sous Windows.
-- [ ] **M1a-02** `feat(driver): pilote WDM minimal chargé et déchargé en mode test`
+- [x] **M1a-02** `feat(driver): pilote WDM minimal chargé et déchargé en mode test`
   `DriverEntry`, `AddDevice`, `Unload`, INF, catalogue de test, installation `pnputil`.
   *Fait quand* : chargement/déchargement 100 fois sans erreur dans la VM.
-  *État* : chargé et déchargé dans la VM ; **32 cycles sur 100 puis échec au 33ᵉ**
-  (`0xC00000E5`, non diagnostiqué). Le déchargement à chaud échoue (`sc stop` 1052), d'où
-  le redémarrage entre deux versions du pilote.
 - [x] **M1a-03** `feat(portcls): bindings PortCls et KS générés en mode C (structures, GUID, vtables)`
   `bindgen` via `wdk_build::BuilderExt::wdk_default` sur `ks.h`, `ksmedia.h`, `punknown.h`,
   `drmk.h`, `portcls.h` avec `#define INTERFACE void` ; les vtables COM sortent plates du mode
