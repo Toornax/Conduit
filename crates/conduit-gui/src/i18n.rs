@@ -65,8 +65,6 @@ textes! {
     TabCables => "tab.cables", "Câbles";
     TabPatchbay => "tab.patchbay", "Patchbay";
     TabDiagnostic => "tab.diagnostic", "Diagnostic";
-    DiagnosticSoon => "tab.diagnostic.soon",
-        "La page de diagnostic arrive plus tard : xruns, latence, pilote et export de rapport.";
 
     CablesAdd => "cables.add", "Ajouter un câble";
     CablesNone => "cables.none", "Aucun câble pour l'instant";
@@ -105,6 +103,50 @@ textes! {
     Quantum => "patchbay.quantum", "quantum";
     EngineUptime => "diag.uptime", "Moteur en marche depuis";
 
+    DiagXruns => "diag.tile.xruns", "Xruns";
+    DiagXrunsGoal => "diag.tile.xruns.goal", "Objectif : 0";
+    DiagXrunsReset => "diag.xruns.reset", "Remettre à zéro";
+    DiagLatency => "diag.tile.latency", "Latence estimée";
+    DiagLatencyPath => "diag.tile.latency.note", "Câble → carte son";
+    DiagCycle => "diag.tile.cycle", "Temps de cycle";
+    DiagLoad => "diag.tile.load", "Charge CPU";
+    DiagCore => "diag.tile.load.core", "un cœur";
+    DiagMin => "diag.min", "min";
+    DiagMax => "diag.max", "max";
+    DiagBudget => "diag.budget", "budget";
+    ColumnNode => "diag.column.node", "Nœud";
+    ColumnLatency => "diag.column.latency", "Latence";
+    ColumnBuffer => "diag.column.buffer", "Tampon";
+    ColumnRatio => "diag.column.ratio", "Ratio";
+    NodeStateInternal => "node.state.internal", "Interne";
+    NodeStateActive => "node.state.active", "Actif";
+    NodeStateDriver => "node.state.driver", "Pilote";
+    NodeStateSuspended => "node.state.suspended", "Suspendu";
+    DiagNoDevice => "diag.devices.empty",
+        "Aucun périphérique ouvert : le moteur tourne sur son horloge interne.";
+    DiagLatencyNote => "diag.latency.note",
+        "La latence est celle du moteur — deux quanta —, la même pour tous les nœuds : le protocole n'en mesure aucune par nœud.";
+    DiagBufferNote => "diag.buffer.note",
+        "Le remplissage est un nombre de trames ; la barre le rapporte au plus grand remplissage du tableau, faute de capacité annoncée.";
+    DiagEngine => "diag.engine", "Moteur";
+    DriverAuto => "driver.auto", "automatique";
+    DiagDriverHot => "diag.driver.hot",
+        "Le changement se fait à chaud : un court silence est possible.";
+    DiagQuantum => "diag.quantum", "Quantum";
+    DiagSampleRate => "diag.samplerate", "Fréquence";
+    DiagReadOnly => "diag.readonly",
+        "Réglés au démarrage du démon : le protocole n'a aucune commande pour les changer.";
+    DiagPlatform => "diag.platform", "Pilote de plateforme";
+    DiagPlatformWindows => "diag.platform.windows",
+        "Un pilote noyau installe les câbles comme des cartes son du système ; toute application les voit dans les réglages audio de Windows.";
+    DiagPlatformMacos => "diag.platform.macos",
+        "Un plugin HAL, chargé par coreaudiod, installe les câbles comme des périphériques du système ; aucune extension noyau n'est requise.";
+    DiagPlatformLinux => "diag.platform.linux",
+        "Aucun pilote n'est installé : les câbles sont des nœuds PipeWire, que le démon crée dans le graphe du serveur audio.";
+    DiagExport => "diag.export", "Exporter un rapport";
+    DiagNoDirectory => "diag.export.nowhere",
+        "Aucun répertoire où écrire : ni Documents, ni répertoire de données.";
+
     ThemeLight => "theme.light", "Sericæ clair";
     ThemeDark => "theme.dark", "Sericæ sombre";
 
@@ -117,6 +159,9 @@ textes! {
     UnitDb => "unit.db", "dB";
     UnitPercent => "unit.percent", "%";
     UnitRatio => "unit.ratio", "×";
+    UnitUs => "unit.us", "µs";
+    UnitFrame => "unit.frame", "trame";
+    UnitFrames => "unit.frames", "trames";
     Silence => "unit.silence", "−∞";
     Xrun => "diag.xrun", "xrun";
     Xruns => "diag.xruns", "xruns";
@@ -270,6 +315,51 @@ pub fn patchbay_subtitle(pilote: &str, frequence: &str, quantum: &str) -> String
 /// 2 xruns ».
 pub fn diagnostic_subtitle(duree: &str, xruns: &str) -> String {
     juxtapose(&format!("{} {duree}", t(Text::EngineUptime)), xruns)
+}
+
+/// Le compte de nœuds, accordé : « aucun nœud », « 1 nœud », « 7 nœuds ».
+pub fn noeuds_count(count: usize) -> String {
+    match count {
+        0 => "aucun nœud".to_string(),
+        1 => "1 nœud".to_string(),
+        n => format!("{n} nœuds"),
+    }
+}
+
+/// Note de la tuile « Charge CPU » : « 7 nœuds · un cœur ».
+///
+/// Le moteur exécute son graphe sur **un** fil : la charge est celle d'un
+/// cœur, pas celle de la machine. La note le dit plutôt que de laisser croire
+/// à une mesure système.
+pub fn charge_note(noeuds: usize) -> String {
+    juxtapose(&noeuds_count(noeuds), t(Text::DiagCore))
+}
+
+/// Note de la tuile « Temps de cycle » : « min 511 µs · max 3 704 µs ·
+/// budget 5 333 µs ».
+///
+/// Les trois durées arrivent déjà mises en forme (voir [`crate::format`]).
+pub fn cycle_note(min: &str, max: &str, budget: &str) -> String {
+    let min = format!("{} {min}", t(Text::DiagMin));
+    let max = format!("{} {max}", t(Text::DiagMax));
+    let budget = format!("{} {budget}", t(Text::DiagBudget));
+    juxtapose(&juxtapose(&min, &max), &budget)
+}
+
+/// « Rapport écrit dans /home/lea/Documents/conduit-diagnostic-2026-09-06.txt »
+///
+/// La notice nomme le chemin : c'est la seule façon pour l'utilisateur de
+/// retrouver le fichier, l'interface n'ouvrant aucun explorateur.
+pub fn rapport_ecrit(chemin: &str) -> String {
+    format!("Rapport écrit dans {chemin}")
+}
+
+/// « Rapport non écrit : permission refusée. »
+///
+/// La cause vient du système : elle est reprise telle quelle, sans
+/// reformulation (ADR-006).
+pub fn rapport_non_ecrit(erreur: &str) -> String {
+    format!("Rapport non écrit : {erreur}")
 }
 
 #[cfg(test)]

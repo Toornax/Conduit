@@ -547,7 +547,12 @@ testée d'abord avec le backend null, puis sur Windows.
   au silence (F-13).
 - [ ] **M2-07** `feat(gui): VU-mètres temps réel`
   *Fait quand* : rafraîchissement 30 Hz sans charge CPU notable.
-- [ ] **M2-08** `feat(gui): vue Diagnostic (xruns, latence, pilote, export de rapport)`
+- [x] **M2-08** `feat(gui): vue Diagnostic (xruns, latence, pilote, export de rapport)`
+  Quatre tuiles (xruns, latence estimée, temps de cycle, charge d'un cœur), tableau des
+  périphériques et colonne « Moteur » où se choisit le pilote de graphe. Le quantum et la
+  fréquence y sont en lecture seule, faute de commande au protocole ; la latence par nœud et
+  la capacité de tampon n'existant pas non plus, la vue le dit plutôt que de les inventer.
+  L'export reprend le rapport texte du démon (`Command::Dump`) et l'écrit dans Documents.
 - [ ] **M2-09** `feat(gui): icône de zone de notification et menu rapide`
   *Fait quand* : état OK / xruns / pilote absent visible, ouverture de la fenêtre au clic.
 - [ ] **M2-10** `feat(gui): démarrage du démon si absent`

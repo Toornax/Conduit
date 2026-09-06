@@ -26,8 +26,8 @@ use conduit_core::node::PortSpec;
 use conduit_core::types::{ChannelCount, Db, Quantum, SampleRate};
 use conduit_protocol::api::NodeKey;
 use conduit_protocol::{
-    DriverChoice, DriverStatus, EngineStatus, LinkDescriptor, NodeDescriptor, NodeState,
-    TimingSnapshot,
+    DeviceStatus, DriverChoice, DriverStatus, EngineStatus, LinkDescriptor, NodeDescriptor,
+    NodeState, TimingSnapshot,
 };
 
 use conduit_gui::app::{App, Message};
@@ -104,6 +104,32 @@ fn peripherique(
     }
 }
 
+/// L'état d'un périphérique ouvert par le moteur, tel que `Status` le décrit.
+///
+/// Les valeurs sont celles que le backend `null` produit en marche : un
+/// remplissage de tampon de l'ordre du millier de trames et un ratio de
+/// rééchantillonnage à quelques millionièmes de 1.
+fn etat_de_peripherique(
+    node: u32,
+    nom: &str,
+    etat: NodeState,
+    underruns: u64,
+    overruns: u64,
+    fill: u32,
+    ratio: f64,
+) -> DeviceStatus {
+    DeviceStatus {
+        id: DeviceId::new(format!("null:{}", nom.to_lowercase().replace(' ', "-"))),
+        node: NodeId::new(node, 0),
+        state: etat,
+        underruns,
+        overruns,
+        fill,
+        ratio,
+        locked: etat != NodeState::Suspended,
+    }
+}
+
 /// Un lien du premier port de sortie du nœud `src` à la première entrée de
 /// `dst`.
 fn lien(index: u32, src: u32, dst: u32) -> LinkDescriptor {
@@ -129,11 +155,32 @@ fn chargement() -> Snapshot {
             driver_choice: DriverChoice::Auto,
             nodes: 7,
             links: 4,
-            timing: TimingSnapshot::default(),
-            xruns: 0,
-            devices: vec![],
+            // Trois heures de marche à 256 trames et 48 kHz : le budget d'un
+            // cycle vaut 5 333 µs, et le moteur en consomme le tiers.
+            timing: TimingSnapshot {
+                count: 2_025_000,
+                min_ns: 511_000,
+                avg_ns: 1_854_000,
+                max_ns: 3_704_000,
+                last_ns: 1_792_000,
+                budget_ns: 5_333_000,
+                overruns: 5,
+            },
+            xruns: 7,
+            // Les périphériques que le moteur a ouverts : le pilote du graphe,
+            // les deux côtés des deux câbles, et une interface suspendue —
+            // celle-ci pour voir, dans la colonne « Latence », le tiret
+            // cadratin d'un nœud qui ne tourne pas, et une barre de tampon
+            // vide.
+            devices: vec![
+                etat_de_peripherique(5, "Haut-parleurs", NodeState::Driver, 0, 0, 831, 1.0),
+                etat_de_peripherique(2, "Conduit 1", NodeState::Active, 3, 0, 960, 1.000_018),
+                etat_de_peripherique(3, "Conduit 2", NodeState::Active, 0, 1, 892, 0.999_821),
+                etat_de_peripherique(1, "Micro USB", NodeState::Active, 1, 0, 480, 1.000_204),
+                etat_de_peripherique(6, "Interface Scarlett", NodeState::Suspended, 0, 0, 0, 1.0),
+            ],
             position: 48_000 * 3_600 * 3,
-            cycles: 0,
+            cycles: 2_025_000,
         },
         // Représentatif de ce qu'une carte peut être : les cinq étiquettes,
         // les trois colonnes de rôle, un nœud sans entrée et un sans sortie —

@@ -109,6 +109,42 @@ pub fn ratio(valeur: f64) -> String {
     avec_unite(nombre(valeur, 2), Text::UnitRatio)
 }
 
+/// Le ratio d'un rééchantillonneur, à la millionième : « 1,000018 ».
+///
+/// Ce ratio-là vaut toujours à peu de chose près 1 : les deux décimales de
+/// [`ratio`] l'écriraient « 1,00 » et n'en diraient rien — c'est la sixième
+/// qui porte la dérive d'horloge. `conduitctl status` l'écrit déjà ainsi
+/// (`{:.6}`) ; la GUI ne le contredit pas.
+///
+/// Sans unité : le « × » de [`ratio`] annonce un facteur d'échelle, pas une
+/// horloge qui glisse.
+pub fn ratio_reechantillonnage(valeur: f64) -> String {
+    nombre(valeur, 6)
+}
+
+/// Une durée en microsecondes, à l'entier : « 5 333 µs ».
+///
+/// C'est l'unité dans laquelle `conduitctl` écrit les temps de cycle, et donc
+/// celle dans laquelle la vue Diagnostic les détaille.
+pub fn microsecondes(us: u64) -> String {
+    avec_unite(entier(us), Text::UnitUs)
+}
+
+/// Un remplissage de tampon, accordé : « 1 trame », « 960 trames ».
+///
+/// [`DeviceStatus::fill`] est un **nombre de trames**, et le protocole
+/// n'annonce aucune capacité : il n'y a pas de pourcentage à en tirer.
+///
+/// [`DeviceStatus::fill`]: conduit_protocol::DeviceStatus::fill
+pub fn trames(compte: u32) -> String {
+    let unite = if compte <= 1 {
+        Text::UnitFrame
+    } else {
+        Text::UnitFrames
+    };
+    format!("{}{INSECABLE}{}", entier(u64::from(compte)), i18n::t(unite))
+}
+
 /// Un décompte de xruns : « aucun xrun », « 1 xrun », « 1 234 xruns ».
 pub fn xruns(compte: u64) -> String {
     match compte {
@@ -186,6 +222,37 @@ mod tests {
         assert_eq!(pourcentage(0.425), "43\u{a0}%");
         assert_eq!(pourcentage(1.0), "100\u{a0}%");
         assert_eq!(ratio(1.5), "1,50\u{a0}×");
+    }
+
+    /// Le ratio d'un rééchantillonneur se lit à la sixième décimale, sans
+    /// unité : c'est là que se voit la dérive d'horloge.
+    #[test]
+    fn le_ratio_de_reechantillonnage_va_a_la_millionieme() {
+        assert_eq!(ratio_reechantillonnage(1.0), "1,000000");
+        assert_eq!(ratio_reechantillonnage(0.999_821), "0,999821");
+        assert_eq!(ratio_reechantillonnage(1.000_018), "1,000018");
+        // Les deux décimales de `ratio` n'en diraient rien : c'est bien deux
+        // fonctions qu'il faut.
+        assert_eq!(ratio(1.000_018), "1,00\u{a0}×");
+        assert!(!ratio_reechantillonnage(1.0).contains('×'));
+    }
+
+    /// Les microsecondes s'écrivent à l'entier, milliers groupés.
+    #[test]
+    fn les_microsecondes_s_ecrivent_a_l_entier() {
+        assert_eq!(microsecondes(511), "511\u{a0}µs");
+        assert_eq!(microsecondes(5_333), "5\u{202f}333\u{a0}µs");
+        assert_eq!(microsecondes(0), "0\u{a0}µs");
+    }
+
+    /// Le remplissage s'écrit en trames, accordé, jamais en pourcentage.
+    #[test]
+    fn le_remplissage_s_ecrit_en_trames() {
+        assert_eq!(trames(0), "0\u{a0}trame");
+        assert_eq!(trames(1), "1\u{a0}trame");
+        assert_eq!(trames(960), "960\u{a0}trames");
+        assert_eq!(trames(1_920), "1\u{202f}920\u{a0}trames");
+        assert!(!trames(960).contains('%'));
     }
 
     /// Les gains sont signés ; le silence s'écrit « −∞ dB ».

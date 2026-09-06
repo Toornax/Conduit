@@ -444,20 +444,6 @@ fn bandeau<'a>(notice: &'a Notice, graisse: Weight) -> Element<'a, Message> {
     .into()
 }
 
-/// Le contenu d'une vue qui n'existe pas encore : la phrase qui l'annonce.
-pub(crate) fn a_venir<'a>(quoi: Text, graisse: Weight) -> Element<'a, Message> {
-    column![
-        text(i18n::t(quoi))
-            .size(CORPS_INTERFACE)
-            .font(typo::texte_a(graisse, CORPS_INTERFACE))
-            .style(style::texte_en(|j| j.texte)),
-        space::vertical(),
-    ]
-    .width(Fill)
-    .height(Fill)
-    .into()
-}
-
 /// L'action principale d'une vue, en bouton primaire ; `message` absent la
 /// grise.
 pub(crate) fn action_primaire<'a>(libelle: Text, message: Option<Message>) -> Element<'a, Message> {

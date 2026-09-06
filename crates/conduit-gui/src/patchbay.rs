@@ -76,7 +76,7 @@
 //! Le démon parle ici par une **relecture** et non par une notification : le
 //! protocole n'en diffuse aucune pour un gain ou une coupure. L'interface
 //! renvoie donc un `Nodes` ou un `Links` derrière chaque réglage et remplace la
-//! partie correspondante du miroir ([`State::relu`], [`crate::ipc::Relecture`])
+//! partie correspondante du miroir ([`State::relu`], [`crate::ipc::Reponse`])
 //! — plutôt que de supposer localement ce que le démon a fait.
 //!
 //! La **butée basse** de la glissière ([`GAIN_MIN`], −60 dB) n'est pas un gain
@@ -940,7 +940,7 @@ impl State {
     ///
     /// C'est l'autre façon de refermer la parenthèse d'état local, et la seule
     /// qui vaille pour un gain : le protocole ne diffuse aucune notification
-    /// quand un gain ou une coupure change (voir [`crate::ipc::Relecture`]).
+    /// quand un gain ou une coupure change (voir [`crate::ipc::Reponse`]).
     pub fn relu(&mut self) {
         self.glissement = None;
     }

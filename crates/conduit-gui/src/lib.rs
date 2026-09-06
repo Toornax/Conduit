@@ -11,8 +11,9 @@
 //! - [`typo`] : les trois familles embarquées et les capitales espacées ;
 //! - [`style`] : les closures de style des widgets `iced` ;
 //! - [`mod@format`] : mise en forme française des grandeurs affichées ;
-//! - [`shell`], [`cables`] et [`patchbay`] : coquille de la fenêtre (barre
-//!   latérale, en-tête, bandeau de notice) et les deux vues qui l'habitent ;
+//! - [`shell`], [`cables`], [`patchbay`] et [`diagnostic`] : coquille de la
+//!   fenêtre (barre latérale, en-tête, bandeau de notice) et les trois vues
+//!   qui l'habitent ;
 //! - [`preferences`] : ce que la fenêtre retient d'une session à l'autre ;
 //! - [`model`] : miroir de l'état du démon, alimenté par réduction pure des
 //!   notifications ;
@@ -31,6 +32,7 @@
 
 pub mod app;
 pub mod cables;
+pub mod diagnostic;
 pub mod format;
 pub mod i18n;
 pub mod ipc;

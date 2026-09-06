@@ -82,7 +82,7 @@ impl Mirror {
 
     /// Remplace les nœuds par ce que le démon vient de décrire.
     ///
-    /// Sert aux relectures ([`crate::ipc::Relecture`]) : le protocole ne
+    /// Sert aux relectures ([`crate::ipc::Reponse`]) : le protocole ne
     /// diffuse aucune notification pour un changement de gain ou de coupure,
     /// l'interface redemande donc la liste plutôt que de supposer le résultat.
     pub fn remplace_nodes(&mut self, nodes: Vec<NodeDescriptor>) {
@@ -93,6 +93,22 @@ impl Mirror {
     /// [`Mirror::remplace_nodes`].
     pub fn remplace_links(&mut self, links: Vec<LinkDescriptor>) {
         self.links = links;
+    }
+
+    /// Remplace l'état global par ce que le démon vient de décrire.
+    ///
+    /// Même raison que [`Mirror::remplace_nodes`] : ni `SetDriver` — pour ce
+    /// qui est du **choix** configuré, `DriverChanged` ne disant que le pilote
+    /// effectif — ni `ResetXruns` ne produisent de notification, l'interface
+    /// relit donc `Status` derrière.
+    ///
+    /// Le compteur de xruns suit celui du démon, comme au chargement initial :
+    /// c'est la seule façon pour une remise à zéro d'être visible. Un
+    /// événement du fil audio arrivé entre la demande et la réponse peut être
+    /// compté deux fois ; sur un compteur de xruns, l'écart est sans portée.
+    pub fn remplace_status(&mut self, status: EngineStatus) {
+        self.xruns = status.xruns;
+        self.status = Some(status);
     }
 
     /// Réduit une notification dans l'état. Pure : aucune entrée/sortie, et
@@ -178,7 +194,7 @@ pub(crate) mod fixtures {
     use conduit_core::node::PortSpec;
     use conduit_core::types::{ChannelCount, Db, Quantum, SampleRate};
     use conduit_protocol::api::NodeKey;
-    use conduit_protocol::{DriverChoice, NodeState, TimingSnapshot};
+    use conduit_protocol::{DeviceStatus, DriverChoice, NodeState, TimingSnapshot};
 
     /// État global minimal, avec trois xruns déjà comptés par le démon.
     pub(crate) fn status() -> EngineStatus {
@@ -224,6 +240,20 @@ pub(crate) mod fixtures {
             },
             gain_db: Db::UNITY,
             muted: false,
+        }
+    }
+
+    /// État d'un périphérique du moteur, tel que `Status` le décrit.
+    pub(crate) fn device(index: u32, id: &str, state: NodeState) -> DeviceStatus {
+        DeviceStatus {
+            id: conduit_backend::DeviceId::new(id),
+            node: NodeId::new(index, 0),
+            state,
+            underruns: 0,
+            overruns: 0,
+            fill: 960,
+            ratio: 1.0,
+            locked: true,
         }
     }
 

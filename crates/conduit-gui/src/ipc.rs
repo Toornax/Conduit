@@ -13,6 +13,7 @@
 //! 2. [`Event::Connecting`] avant chaque tentative ;
 //! 3. connexion, `Subscribe` puis chargement initial, et [`Event::Ready`] ;
 //! 4. [`Event::Notified`] pour chaque notification du démon,
+//!    [`Event::Repondu`] pour ce qu'une commande a rapporté et
 //!    [`Event::Failed`] pour chaque commande refusée ;
 //! 5. à la perte de la connexion, [`Event::Lost`] puis nouvelle tentative
 //!    après un délai croissant de [`RETRY_MIN`] à [`RETRY_MAX`].
@@ -22,7 +23,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use conduit_protocol::client::{Client, ClientError};
-use conduit_protocol::{Command, LinkDescriptor, NodeDescriptor, Notification, Reply};
+use conduit_protocol::{
+    Command, EngineStatus, LinkDescriptor, NodeDescriptor, Notification, Reply,
+};
 use tokio::sync::mpsc;
 
 use crate::model::Snapshot;
@@ -112,15 +115,23 @@ pub enum Event {
     },
     /// Notification diffusée par le démon.
     Notified(Box<Notification>),
-    /// Réponse à une relecture d'état demandée par l'interface.
+    /// Ce qu'une commande de l'interface a rapporté, au-delà d'un accusé de
+    /// réception.
     ///
-    /// Le protocole ne diffuse **aucune** notification pour un changement de
-    /// gain ou de coupure (`Command::SetNodeGain` et `SetLinkGain` répondent
-    /// `Reply::Ok` et rien d'autre). Plutôt que de supposer localement le
-    /// résultat, l'interface renvoie un `Nodes` ou un `Links` derrière le
-    /// réglage et remplace la partie correspondante du miroir par ce que le
-    /// démon vient de dire.
-    Relu(Box<Relecture>),
+    /// Deux cas s'y rangent.
+    ///
+    /// **Les relectures d'état.** Le protocole ne diffuse aucune notification
+    /// pour un changement de gain ou de coupure (`Command::SetNodeGain` et
+    /// `SetLinkGain` répondent `Reply::Ok` et rien d'autre), ni pour
+    /// `SetDriver` côté choix configuré, ni pour `ResetXruns`. Plutôt que de
+    /// supposer localement le résultat, l'interface renvoie un `Nodes`, un
+    /// `Links` ou un `Status` derrière la commande et remplace la partie
+    /// correspondante du miroir par ce que le démon vient de dire.
+    ///
+    /// **Le rapport de diagnostic.** `Command::Dump` répond un texte que le
+    /// démon a rédigé : il n'a rien à voir avec le miroir, il part vers un
+    /// fichier.
+    Repondu(Box<Reponse>),
     /// Une commande a été refusée : message destiné à l'utilisateur.
     Failed(String),
     /// Connexion perdue ou impossible.
@@ -132,13 +143,20 @@ pub enum Event {
     },
 }
 
-/// Ce qu'une relecture d'état a rapporté.
+/// Ce qu'une réponse du démon a rapporté à l'interface.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Relecture {
+pub enum Reponse {
     /// Les nœuds du graphe, tels que le démon les décrit maintenant.
     Nodes(Vec<NodeDescriptor>),
     /// Les liens du graphe, tels que le démon les décrit maintenant.
     Links(Vec<LinkDescriptor>),
+    /// L'état global, tel que le démon le décrit maintenant.
+    ///
+    /// Encadré : [`EngineStatus`] pèse près de dix fois les autres variantes.
+    Statut(Box<EngineStatus>),
+    /// Le rapport de diagnostic, déjà rédigé par le démon
+    /// (`conduitd::service::Service::dump`).
+    Rapport(String),
 }
 
 /// Puits d'événements : abstrait le canal de la `Subscription` d'`iced`, ce qui
@@ -229,11 +247,17 @@ pub async fn load(client: &mut Client) -> Result<Snapshot, ClientError> {
     })
 }
 
-/// Traduit une réponse en relecture d'état, s'il y en a une à en tirer.
-fn relecture(reply: Reply) -> Option<Relecture> {
+/// Traduit une réponse du démon en [`Reponse`], s'il y a quelque chose à en
+/// tirer.
+///
+/// Les autres réponses sont de simples accusés de réception : l'état vient des
+/// notifications.
+fn reponse(reply: Reply) -> Option<Reponse> {
     match reply {
-        Reply::Nodes { nodes } => Some(Relecture::Nodes(nodes)),
-        Reply::Links { links } => Some(Relecture::Links(links)),
+        Reply::Nodes { nodes } => Some(Reponse::Nodes(nodes)),
+        Reply::Links { links } => Some(Reponse::Links(links)),
+        Reply::Status(status) => Some(Reponse::Statut(Box::new(status))),
+        Reply::Dump { text } => Some(Reponse::Rapport(text)),
         _ => None,
     }
 }
@@ -288,12 +312,12 @@ async fn session<S: EventSink>(
                         return Ok(());
                     }
                 }
-                // Seules les relectures demandées par l'interface rapportent
-                // quelque chose : les autres réponses sont des accusés de
-                // réception, l'état venant des notifications.
+                // Seules les réponses demandées par l'interface rapportent
+                // quelque chose : les autres sont des accusés de réception,
+                // l'état venant des notifications.
                 Ok(reply) => {
-                    if let Some(relecture) = relecture(reply) {
-                        if sink.send(Event::Relu(Box::new(relecture))).await.is_err() {
+                    if let Some(reponse) = reponse(reply) {
+                        if sink.send(Event::Repondu(Box::new(reponse))).await.is_err() {
                             return Ok(());
                         }
                     }
@@ -312,25 +336,25 @@ async fn session<S: EventSink>(
 mod tests {
     use super::*;
 
-    /// Seules les réponses d'une relecture rapportent un état ; les autres
-    /// sont des accusés de réception.
+    /// Les listes, l'état et le rapport rapportent quelque chose ; le reste
+    /// n'est qu'un accusé de réception.
     #[test]
-    fn seules_les_listes_valent_relecture() {
+    fn seules_certaines_reponses_rapportent_quelque_chose() {
         assert_eq!(
-            relecture(Reply::Nodes { nodes: vec![] }),
-            Some(Relecture::Nodes(vec![]))
+            reponse(Reply::Nodes { nodes: vec![] }),
+            Some(Reponse::Nodes(vec![]))
         );
         assert_eq!(
-            relecture(Reply::Links { links: vec![] }),
-            Some(Relecture::Links(vec![]))
+            reponse(Reply::Links { links: vec![] }),
+            Some(Reponse::Links(vec![]))
         );
-        assert_eq!(relecture(Reply::Ok), None);
         assert_eq!(
-            relecture(Reply::Dump {
-                text: "état".into()
+            reponse(Reply::Dump {
+                text: "conduitd 0.1.0".into()
             }),
-            None
+            Some(Reponse::Rapport("conduitd 0.1.0".into()))
         );
+        assert_eq!(reponse(Reply::Ok), None);
     }
 
     #[test]

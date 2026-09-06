@@ -5,7 +5,7 @@
 //! protocole, et des notifications en changements d'état.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use conduit_backend::{CableId, CableSpec};
 use conduit_core::graph::{LinkId, NodeId};
@@ -14,14 +14,14 @@ use iced::keyboard::{self, key::Named};
 use iced::{Element, Subscription, Task};
 
 use conduit_protocol::api::InternalKind;
-use conduit_protocol::{Command, Notification};
+use conduit_protocol::{Command, DriverChoice, Notification};
 
 use crate::i18n::{self, Text};
 use crate::ipc::{self, Requester};
 use crate::model::Mirror;
 use crate::preferences::Preferences;
 use crate::shell::{self, Tab};
-use crate::{cables, format, patchbay, theme, typo};
+use crate::{cables, diagnostic, format, patchbay, theme, typo};
 
 /// État de la connexion au démon.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -165,6 +165,14 @@ pub enum Message {
     Patchbay(patchbay::Geste),
     /// Crée un générateur de sinus de test (`AddInternal`).
     AddGenerator,
+    /// Choisit le pilote de graphe (`SetDriver`).
+    ChoisirPilote(DriverChoice),
+    /// Remet les compteurs de xruns à zéro (`ResetXruns`).
+    ReinitialiserXruns,
+    /// Demande au démon son rapport de diagnostic (`Dump`).
+    ExporterRapport,
+    /// Écriture du rapport terminée : le chemin écrit, ou la cause de l'échec.
+    RapportEcrit(Result<PathBuf, String>),
     /// Préférences lues au démarrage.
     Preferences(Box<Preferences>),
     /// Écriture des préférences terminée ; son résultat n'a rien à annoncer.
@@ -186,6 +194,7 @@ pub struct App {
     patchbay: patchbay::State,
     notice: Option<Notice>,
     attente: Option<Attente>,
+    rapport: Option<String>,
     generation: u32,
     mode: iced::theme::Mode,
 }
@@ -203,6 +212,7 @@ impl App {
             patchbay: patchbay::State::default(),
             notice: None,
             attente: None,
+            rapport: None,
             generation: 0,
             mode: iced::theme::Mode::default(),
         }
@@ -280,7 +290,7 @@ impl App {
         // Un réglage de gain ou de coupure ne produit aucune notification : le
         // protocole y répond `Reply::Ok` et rien d'autre. Plutôt que de
         // supposer localement le résultat, on redemande derrière l'état réel,
-        // dont la réponse revient en `ipc::Event::Relu`.
+        // dont la réponse revient en `ipc::Event::Repondu`.
         let relecture = relecture_apres(&command);
         if let Some(requester) = &self.requester {
             requester.send(command);
@@ -302,6 +312,12 @@ impl App {
             Message::Ipc(event) => {
                 let avant = self.generation;
                 self.apply_ipc(event);
+                // Le rapport que le démon vient de rendre part au disque dans
+                // une tâche : `apply_ipc` reste sans entrée/sortie, et le fil
+                // de l'interface ne bloque pas sur une écriture.
+                if let Some(rapport) = self.rapport.take() {
+                    return Task::perform(ecrire_le_rapport(rapport), Message::RapportEcrit);
+                }
                 // Une notice posée par l'événement a besoin de son minuteur.
                 if self.generation != avant {
                     return self.minuteur();
@@ -387,6 +403,21 @@ impl App {
                         channels: patchbay::CANAUX_TEST,
                     },
                 });
+            }
+            Message::ChoisirPilote(choice) => {
+                // Aucun optimisme : l'affichage attend la notification
+                // `DriverChanged` et la relecture d'état qui suit.
+                self.request(Command::SetDriver { choice });
+            }
+            Message::ReinitialiserXruns => self.request(Command::ResetXruns),
+            Message::ExporterRapport => self.request(Command::Dump),
+            Message::RapportEcrit(resultat) => {
+                let notice = match resultat {
+                    Ok(chemin) => Notice::info(i18n::rapport_ecrit(&chemin.display().to_string())),
+                    Err(erreur) => Notice::erreur(i18n::rapport_non_ecrit(&erreur)),
+                };
+                self.poser_notice(notice);
+                return self.minuteur();
             }
             Message::Preferences(preferences) => {
                 // Les positions lues ne remplacent pas celles d'un
@@ -543,6 +574,7 @@ impl App {
                 self.patchbay.recharge();
                 self.notice = None;
                 self.attente = None;
+                self.rapport = None;
                 self.connection = Connection::Ready { server };
             }
             ipc::Event::Lost { reason, retry_in } => {
@@ -561,18 +593,21 @@ impl App {
                     self.poser_notice(notice);
                 }
             }
-            // Une relecture demandée après un réglage de gain : le démon vient
-            // de dire l'état réel, la valeur montrée en avance n'a plus lieu
-            // d'être.
-            ipc::Event::Relu(relecture) => match *relecture {
-                ipc::Relecture::Nodes(nodes) => {
+            // Ce qu'une commande a rapporté. Pour une relecture, le démon
+            // vient de dire l'état réel : la valeur montrée en avance n'a plus
+            // lieu d'être. Pour le rapport, le texte est mis de côté et
+            // `update` l'envoie au disque dans une tâche.
+            ipc::Event::Repondu(reponse) => match *reponse {
+                ipc::Reponse::Nodes(nodes) => {
                     self.mirror.remplace_nodes(nodes);
                     self.patchbay.relu();
                 }
-                ipc::Relecture::Links(links) => {
+                ipc::Reponse::Links(links) => {
                     self.mirror.remplace_links(links);
                     self.patchbay.relu();
                 }
+                ipc::Reponse::Statut(status) => self.mirror.remplace_status(*status),
+                ipc::Reponse::Rapport(texte) => self.rapport = Some(texte),
             },
             // Le message du démon dit déjà quoi faire (ADR-006).
             ipc::Event::Failed(message) => {
@@ -701,7 +736,13 @@ impl App {
                     patchbay::view(&self.mirror, &self.patchbay, graisse),
                 )
             }
-            Tab::Diagnostic => (Vec::new(), shell::a_venir(Text::DiagnosticSoon, graisse)),
+            Tab::Diagnostic => (
+                vec![shell::action_secondaire(
+                    Text::DiagExport,
+                    enabled.then_some(Message::ExporterRapport),
+                )],
+                diagnostic::view(&self.mirror, enabled, graisse),
+            ),
         };
         shell::fenetre(
             self.tab,
@@ -742,15 +783,47 @@ async fn ecrire_les_preferences(positions: patchbay::Positions) {
     }
 }
 
+/// Écrit le rapport de diagnostic hors du fil de l'interface.
+///
+/// `update` ne touche jamais au disque : l'écriture part dans une tâche, et son
+/// résultat revient en [`Message::RapportEcrit`] — le chemin à annoncer, ou la
+/// cause de l'échec, telle que le système la donne (ADR-006).
+///
+/// Le texte n'est pas rédigé ici : c'est celui que le démon a produit pour
+/// `Command::Dump`.
+async fn ecrire_le_rapport(texte: String) -> Result<PathBuf, String> {
+    let ecriture = tokio::task::spawn_blocking(move || {
+        let chemin = diagnostic::chemin_du_rapport(SystemTime::now())
+            .ok_or_else(|| i18n::t(Text::DiagNoDirectory).to_string())?;
+        if let Some(parent) = chemin.parent() {
+            std::fs::create_dir_all(parent).map_err(|erreur| erreur.to_string())?;
+        }
+        std::fs::write(&chemin, texte).map_err(|erreur| erreur.to_string())?;
+        Ok(chemin)
+    })
+    .await;
+    ecriture.unwrap_or_else(|erreur| Err(erreur.to_string()))
+}
+
 /// La relecture d'état à envoyer derrière une commande, s'il en faut une.
 ///
-/// Seuls les réglages de gain et de coupure en demandent une : le protocole ne
-/// diffuse aucune notification pour eux, alors que toutes les autres commandes
-/// de l'interface se reflètent dans une `Notification`.
+/// Quatre commandes en demandent une, faute de notification qui les reflète :
+///
+/// - les réglages de gain et de coupure, auxquels le protocole répond
+///   `Reply::Ok` et rien d'autre ;
+/// - `SetDriver`, dont la notification `DriverChanged` dit le pilote
+///   **effectif** mais pas le **choix** configuré, celui-là même que la liste
+///   déroulante de la vue Diagnostic montre ;
+/// - `ResetXruns`, qui ne s'annonce nulle part alors que la tuile des xruns
+///   doit retomber à zéro.
+///
+/// Toutes les autres commandes de l'interface se reflètent dans une
+/// `Notification`.
 fn relecture_apres(commande: &Command) -> Option<Command> {
     match commande {
         Command::SetNodeGain { .. } => Some(Command::Nodes),
         Command::SetLinkGain { .. } => Some(Command::Links),
+        Command::SetDriver { .. } | Command::ResetXruns => Some(Command::Status),
         _ => None,
     }
 }
@@ -1277,7 +1350,7 @@ mod tests {
         // La relecture rend la main au miroir.
         let mut noeud = crate::model::fixtures::node(0, "a");
         noeud.gain_db = Db::new(-18.0);
-        a.apply_ipc(ipc::Event::Relu(Box::new(ipc::Relecture::Nodes(vec![
+        a.apply_ipc(ipc::Event::Repondu(Box::new(ipc::Reponse::Nodes(vec![
             noeud,
         ]))));
         assert_eq!(a.mirror().nodes[0].gain_db, Db::new(-18.0));
@@ -1372,6 +1445,86 @@ mod tests {
         assert!(rx.try_recv().is_err(), "un nœud suspendu ne règle rien");
         assert!(a.notice().is_none());
         assert_eq!(a.patchbay().gain_affiche(cible, Db::UNITY), Db::UNITY);
+    }
+
+    /// Choisir un pilote envoie `SetDriver` et relit l'état : la notification
+    /// `DriverChanged` ne dit que le pilote effectif, pas le choix configuré.
+    #[test]
+    fn choisir_un_pilote_envoie_set_driver_et_relit_l_etat() {
+        let (mut a, mut rx) = connected();
+        let choix = DriverChoice::Device {
+            id: conduit_backend::DeviceId::new("null:hp"),
+        };
+        let _ = a.update(Message::ChoisirPilote(choix.clone()));
+        let (commande, relecture) = sent_avec_relecture(&mut rx);
+        assert_eq!(commande, Command::SetDriver { choice: choix });
+        assert_eq!(relecture, Command::Status);
+        // Aucun optimisme : le miroir garde le pilote qu'il connaissait.
+        assert_eq!(
+            a.mirror().status.as_ref().unwrap().driver,
+            conduit_protocol::DriverStatus::Internal
+        );
+    }
+
+    /// Remettre les xruns à zéro envoie `ResetXruns` et relit l'état : rien
+    /// n'annonce cette commande, et la tuile doit pourtant retomber à zéro.
+    #[test]
+    fn remettre_les_xruns_a_zero_relit_l_etat() {
+        let (mut a, mut rx) = connected();
+        assert_eq!(a.mirror().xruns, 3);
+        let _ = a.update(Message::ReinitialiserXruns);
+        let (commande, relecture) = sent_avec_relecture(&mut rx);
+        assert_eq!(commande, Command::ResetXruns);
+        assert_eq!(relecture, Command::Status);
+        // Le compteur ne bouge qu'au vu de la réponse du démon.
+        assert_eq!(a.mirror().xruns, 3);
+        let mut remis = crate::model::fixtures::status();
+        remis.xruns = 0;
+        a.apply_ipc(ipc::Event::Repondu(Box::new(ipc::Reponse::Statut(
+            Box::new(remis),
+        ))));
+        assert_eq!(a.mirror().xruns, 0);
+    }
+
+    /// L'export demande son rapport au démon, et n'écrit rien avant sa
+    /// réponse.
+    #[test]
+    fn exporter_un_rapport_demande_le_texte_au_demon() {
+        let (mut a, mut rx) = connected();
+        let _ = a.update(Message::ExporterRapport);
+        assert_eq!(sent(&mut rx), Command::Dump);
+        assert!(a.notice().is_none(), "rien n'est annoncé avant l'écriture");
+        // La réponse met le texte de côté sans toucher au miroir : c'est
+        // `update` qui l'envoie au disque, dans une tâche.
+        let avant = a.mirror().clone();
+        a.apply_ipc(ipc::Event::Repondu(Box::new(ipc::Reponse::Rapport(
+            "conduitd 0.1.0\n".into(),
+        ))));
+        assert_eq!(a.mirror(), &avant);
+        assert_eq!(a.rapport.as_deref(), Some("conduitd 0.1.0\n"));
+    }
+
+    /// L'écriture terminée s'annonce : le chemin au succès, la cause du
+    /// système à l'échec.
+    #[test]
+    fn l_ecriture_du_rapport_s_annonce_avec_son_chemin() {
+        let (mut a, _rx) = connected();
+        let chemin = PathBuf::from("/home/lea/Documents/conduit-diagnostic-2026-09-06.txt");
+        let _ = a.update(Message::RapportEcrit(Ok(chemin)));
+        assert_eq!(
+            a.notice().map(|n| n.texte.as_str()),
+            Some(
+                "Rapport écrit dans \
+                 /home/lea/Documents/conduit-diagnostic-2026-09-06.txt"
+            )
+        );
+        assert!(!a.notice().unwrap().erreur);
+        let _ = a.update(Message::RapportEcrit(Err("permission refusée".into())));
+        assert_eq!(
+            a.notice().map(|n| n.texte.as_str()),
+            Some("Rapport non écrit : permission refusée")
+        );
+        assert!(a.notice().unwrap().erreur);
     }
 
     #[test]
