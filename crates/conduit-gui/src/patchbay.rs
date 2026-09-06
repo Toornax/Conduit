@@ -901,12 +901,22 @@ impl canvas::Program<Message> for Graphe {
         }
         let j = jetons(theme);
         let mut frame = canvas::Frame::new(renderer, bornes.size());
+        // Dès qu'un lien est choisi, les autres passent au voile d'or. L'accent
+        // seul ne suffirait pas : en mode sombre il **est** l'or, et le lien
+        // choisi ne se distinguerait que par son épaisseur. Voiler le reste
+        // fait ressortir la sélection dans les deux modes, sans introduire une
+        // seconde couleur d'accent sur la surface.
+        let une_selection = self.selection.is_some();
         for courbe in &self.courbes {
             let choisi = self.selection == Some(courbe.lien);
             frame.stroke(
                 &chemin(courbe.depart, courbe.arrivee),
                 Stroke {
-                    style: canvas::Style::Solid(if choisi { j.accent_texte } else { j.or }),
+                    style: canvas::Style::Solid(match (choisi, une_selection) {
+                        (true, _) => j.accent_texte,
+                        (false, true) => j.voile_d_or,
+                        (false, false) => j.or,
+                    }),
                     width: if choisi {
                         EPAISSEUR_LIEN_CHOISI
                     } else {
