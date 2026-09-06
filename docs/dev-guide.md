@@ -35,6 +35,7 @@ conduit-core ← conduit-backend ← conduit-protocol ← conduit-engine ← con
 | `conduit-com` | modèle objet COM du pilote : `ComObject`, `ComPtr`, `ComRef` | aucune |
 | `portcls-sys` | bindings PortCls/KS générés, testables en mode utilisateur (`drivers/windows`, workspace noyau, ADR-012) | Windows |
 | `conduit-kmd` | le pilote noyau `.sys` : WDM, `no_std`, PortCls/WaveRT (`drivers/windows`, workspace noyau ; [driver-dev.md](driver-dev.md)) | Windows |
+| `conduit-looptest` | outil de test de boucle du pilote (§4 quinquies) : sinus → rendu → capture → vérification | Windows (le crate compile partout) |
 
 ## 2. Le fil audio
 
@@ -246,6 +247,59 @@ sinus audible
 et l'heure d'endurance avec le moteur (une carte pilote, l'autre asynchrone,
 xruns = 0 ; `CONDUIT_ENDURANCE_SECS` pour raccourcir)
 (`cargo test -p conduit-backend-wasapi --test two_devices -- --ignored --nocapture`).
+
+## 4 quinquies. Outil de test de boucle
+
+`conduit-looptest` (M1a-10) répond à une seule question : **ce que le pilote rend
+ressort-il intact de la capture ?** Il joue un sinus sur un endpoint de rendu,
+enregistre l'endpoint de capture, et mesure. Par défaut les deux endpoints sont les
+deux côtés du câble `Conduit 1` : c'est le pilote qui est testé, pas la carte son.
+Il ne réécrit pas WASAPI, il appelle `conduit-backend-wasapi`
+(`WasapiBackend::{new, devices, open}`, `DeviceHandle::{start, stop}`).
+
+```sh
+cargo run -p conduit-looptest -- --list                    # les endpoints vus par WASAPI
+cargo run -p conduit-looptest -- --repeat 10               # le critère de la ROADMAP
+cargo run -p conduit-looptest -- --json --repeat 10        # sortie machine
+cargo run -p conduit-looptest -- --self-test               # test de l'outil, sans périphérique
+```
+
+Options utiles : `--render`/`--capture` (identifiant exact ou fragment de nom, ou
+`none`), `--freq`, `--rate`, `--channels`, `--seconds`, `--block`, `--amplitude`,
+`--skip-ms` (marge jetée après la détection du signal), `--phase-tolerance`,
+`--no-capture` (joue seulement). **Codes de retour** : `0` toutes les passes
+passent, `1` au moins une échoue (le pilote est en cause), `2` l'environnement ne
+permet pas le test (endpoint absent, backend indisponible, options incohérentes,
+système autre que Windows) — c'est la distinction qui compte en CI.
+
+Le module `analysis` est le cœur, et il ne dépend d'aucune plateforme :
+
+- **fréquence** : ajustement au sens des moindres carrés de `a·cos(ωn) + b·sin(ωn)`,
+  sans FFT ni nouvelle dépendance — corrélations en un passage, sommes `Σcos²` et
+  compagnie en forme close, maximum cherché par raffinements successifs autour de
+  la fréquence attendue (±5 %) puis section dorée. Sur signaux synthétiques l'écart
+  mesuré est inférieur à 0,001 ppm ; la tolérance du verdict est 200 ppm ;
+- **continuité de phase** : le même ajustement par blocs de 128 trames, avec une
+  référence de temps globale et la dérive lente retirée (médiane des écarts). Une
+  trame perdue ou dupliquée décale tout ce qui suit de `ω` radians — 0,058 rad
+  seulement à 440 Hz et 48 kHz : le seuil effectif est donc `min(--phase-tolerance,
+  max(0,005, 0,3·ω))`, pas la tolérance brute. C'est **le** détecteur de
+  discontinuité de la boucle ;
+- **trous** : suites d'au moins 8 trames sous −80 dBFS ;
+- **amplitude**, **écrêtage** (`|x| ≥ 0,999`) et **THD+N**.
+
+Verdict : un refus par critère, avec le chiffre mesuré, le seuil et ce qu'il faut
+regarder (« trames perdues ou dupliquées dans la boucle », « sous-alimentation du
+tampon »…). Le rappel de capture n'alloue ni ne verrouille : l'enregistrement vit
+dans un tableau d'`AtomicU32` réservé à l'ouverture, écrit par index, avec un
+compteur atomique de trames — la seule façon d'écrire depuis un fil temps réel sans
+`unsafe`.
+
+`--self-test` (caché) teste l'outil lui-même : il fabrique en mémoire ce qu'une
+boucle parfaite rendrait (préambule silencieux puis sinus) et le fait passer par la
+même analyse ; `--inject-glitch [trame]` en retire une trame et doit faire sortir
+en 1. Les tests d'intégration `tests/binary.rs` lancent ces trois cas sur la machine
+de développement, sans pilote et sans émettre de son.
 
 ## 5. Tests
 

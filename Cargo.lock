@@ -340,6 +340,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "conduit-looptest"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "conduit-backend",
+ "conduit-backend-wasapi",
+ "conduit-core",
+ "proptest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "conduit-protocol"
 version = "0.1.0"
 dependencies = [

@@ -349,8 +349,15 @@ proposition : trois semaines de travail effectif). Porte de décision en M1a-12.
 - [ ] **M1a-09** `feat(driver): INF complet, endpoints nommés Conduit 1`
 - [ ] **M1a-10** `test(driver): script de test de boucle (sinus → capture, vérification)`
   Outil utilisateur (Rust, WASAPI) qui joue un sinus sur le rendu, capture, et vérifie
-  fréquence, continuité de phase et absence de trous.
+  fréquence, continuité de phase et absence de trous. `crates/conduit-looptest`
+  (binaire du workspace racine, ADR-012 §4) : module `analysis` sans plateforme
+  (moindres carrés `a·cos + b·sin` sans FFT, phase par blocs, trous, écrêtage,
+  verdict) au-dessus de `conduit-backend-wasapi` ; `--repeat`, `--json`, `--list`,
+  `--self-test` ([dev-guide.md](docs/dev-guide.md) §4 quinquies,
+  [driver-dev.md](docs/driver-dev.md) §3.4).
   *Fait quand* : passe 10 fois de suite.
+  *État* : outil et analyse livrés et testés sur signaux synthétiques ; les 10 passes
+  réelles attendent le pilote dans la VM.
 - [ ] **M1a-11** `test(driver): 1 h Driver Verifier sans erreur, collecte automatique des dumps`
 - [ ] **M1a-12** `docs: ADR-009 résultat du spike`
   **Porte de décision.** Succès → poursuite en Rust, M1b. Échec dans le délai → pilote C++

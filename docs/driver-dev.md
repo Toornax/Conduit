@@ -223,7 +223,42 @@ Le gestionnaire de périphériques doit montrer *Conduit Virtual Audio Cable* so
 *Contrôleurs audio, vidéo et jeu* entre `/add` et `/remove` (sans endpoint audio avant
 M1a-06).
 
-### 3.4 Driver Verifier et journal
+### 3.4 Test de boucle (M1a-10) : `conduit-looptest`
+
+Une fois le pilote installé et les endpoints `Conduit 1` visibles dans l'invité, la
+boucle se vérifie avec l'outil du workspace racine. Copiez le binaire dans la VM
+(`cargo build -p conduit-looptest` sur l'hôte, puis `target\debug\conduit-looptest.exe`)
+ou construisez-le dans l'invité, et lancez **la commande du critère** :
+
+```powershell
+.\conduit-looptest.exe --list          # les deux côtés de « Conduit 1 » doivent apparaître
+.\conduit-looptest.exe --repeat 10     # le critère M1a-10 : 10 passes de suite
+```
+
+Sans argument de périphérique, l'outil prend les deux endpoints nommés `Conduit 1` :
+il joue un sinus de 440 Hz sur le rendu pendant 2 s, enregistre la capture, jette le
+préambule, puis vérifie la fréquence (200 ppm), l'amplitude, la continuité de phase
+(aucune trame perdue ni dupliquée) et l'absence de trous. Une ligne par passe, puis
+un résumé :
+
+```text
+passe 3/10 : 440,00 Hz, amplitude 0,500, 0 saut(s), 0 trou(s) → OK
+résumé : 10/10 passe(s) OK — fréquence de 440,000 à 440,000 Hz, 0 saut(s), 0 trame(s) de trou
+```
+
+**Codes de retour** : `0` les dix passes passent (critère atteint), `1` au moins une
+échoue — le message dit quoi regarder (« trames perdues ou dupliquées dans la boucle
+(position du tampon cyclique du pilote) », « sous-alimentation du tampon ») —, `2`
+l'environnement ne permet pas le test : c'est le code que rend `--list` sans câble,
+c'est-à-dire pilote non chargé. `--json` donne la même chose pour un script.
+
+Utile au diagnostic : `--seconds`, `--rate 44100` et `--channels` pour couvrir
+d'autres formats, `--block` pour changer la taille de rappel demandée,
+`--freq 997` pour un signal non harmonique de la taille de bloc,
+`--no-capture` pour n'exercer que le rendu. `--self-test` (sans périphérique)
+vérifie l'outil lui-même. Détails dans [dev-guide.md](dev-guide.md) §4 quinquies.
+
+### 3.5 Driver Verifier et journal
 
 `verifier /standard /driver conduit_kmd.sys` puis redémarrage (retour : `verifier /reset`).
 Les messages `kmd_log!` (`conduit-kmd/src/log.rs`, `wdk::println!` → `DbgPrint`, profil
