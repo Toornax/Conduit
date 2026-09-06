@@ -75,12 +75,9 @@ const ECART_SOUS_TITRE: f32 = 6.0;
 const ECART_ENTETE: f32 = 18.0;
 /// Écart entre le filet d'or de l'en-tête et le contenu de la vue.
 const ECART_CONTENU: f32 = 20.0;
-/// Largeur fixe de la cellule des xruns : `tnum` étant inaccessible, une
-/// colonne de chiffres ne s'aligne qu'à largeur fixée (`docs/design-system.md`
-/// § 6.2).
-const LARGEUR_XRUNS: f32 = 80.0;
-/// Largeur fixe de la cellule de latence, pour la même raison.
-const LARGEUR_LATENCE: f32 = 56.0;
+/// Décalage vertical de la pastille pour qu'elle s'aligne sur la première
+/// ligne de son libellé, et non sur le milieu d'un libellé qui se replie.
+const RETRAIT_PASTILLE: f32 = 4.0;
 
 // --- Onglets ----------------------------------------------------------------
 
@@ -350,10 +347,13 @@ fn pied<'a>(connexion: &Connection, mirror: &Mirror) -> Element<'a, Message> {
     column![
         ligne_pastille(etat.couleur(), etat.libelle().to_string()),
         ligne_pastille(CELADON, pilote_plateforme().to_string()),
+        // Une ligne libre, pas une colonne de tableau : rien n'a à s'aligner
+        // dessous, donc pas de largeur fixée (voir `docs/design-system.md`
+        // § 6.2, qui ne vise que les colonnes).
         row![
-            meta(xruns).width(LARGEUR_XRUNS),
+            meta(xruns),
             meta(i18n::t(Text::Separateur).to_string()),
-            meta(latence).width(LARGEUR_LATENCE),
+            meta(latence),
         ]
         .spacing(ESPACE_S)
         .align_y(Center),
@@ -374,14 +374,17 @@ fn meta<'a>(contenu: String) -> iced::widget::Text<'a> {
 /// Une pastille de 8 px suivie de son libellé.
 fn ligne_pastille<'a>(couleur: Color, libelle: String) -> Element<'a, Message> {
     row![
-        container(space::horizontal())
-            .width(PASTILLE)
-            .height(PASTILLE)
-            .style(style::pastille(couleur)),
+        container(
+            container(space::horizontal())
+                .width(PASTILLE)
+                .height(PASTILLE)
+                .style(style::pastille(couleur))
+        )
+        .padding(iced::Padding::ZERO.top(RETRAIT_PASTILLE)),
         meta(libelle),
     ]
     .spacing(ESPACE_S)
-    .align_y(Center)
+    .align_y(iced::Top)
     .into()
 }
 
