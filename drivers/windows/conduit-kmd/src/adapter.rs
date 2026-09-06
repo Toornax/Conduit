@@ -104,8 +104,10 @@ unsafe fn install_cable(
     let Some(cable) = cable::cable(n) else {
         return fail("câble inconnu", STATUS_INVALID_PARAMETER);
     };
-    if cable.reset() {
-        kmd_log!("StartDevice : le câble {n} avait encore un flux ouvert (oublié)");
+    // Oublie les flux d'un éventuel cycle précédent et crée le timer haute résolution de
+    // la boucle locale (§5.3) : sans lui, le câble ne transporterait rien.
+    if let Err(status) = cable.start() {
+        return fail("démarrage du câble (timer haute résolution)", status);
     }
     // M1a : seuls les noms du câble 0 existent (`portcls::adapter`) ; M1b-02 les
     // générera par numéro.

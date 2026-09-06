@@ -346,6 +346,8 @@ proposition : trois semaines de travail effectif). Porte de décision en M1a-12.
   *État* : flux rendu livré (tampon MDL, position QPC, notifications par timer) ; lecture réelle à vérifier dans la VM.
 - [ ] **M1a-08** `feat(driver): miniport WaveRT capture en boucle locale sur le rendu`
   *Fait quand* : un enregistreur capture ce que joue le lecteur.
+  *État* : capture en boucle locale livrée (timer Ex haute résolution par câble, copie
+  sous spin lock) ; à vérifier dans la VM.
 - [ ] **M1a-09** `feat(driver): INF complet, endpoints nommés Conduit 1`
 - [ ] **M1a-10** `test(driver): script de test de boucle (sinus → capture, vérification)`
   Outil utilisateur (Rust, WASAPI) qui joue un sinus sur le rendu, capture, et vérifie

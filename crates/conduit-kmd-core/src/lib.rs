@@ -12,7 +12,10 @@
 //!   contre la liste supportée, taille de tampon bornée ;
 //! - les périodes de notification ([`notify`]) : quand signaler les événements
 //!   enregistrés par `IMiniportWaveRTStreamNotification`, à partir de la position
-//!   absolue, bouclage compris.
+//!   absolue, bouclage compris ;
+//! - le plan de copie de la boucle locale ([`loopback`]) : à chaque tick du timer du
+//!   câble, quelles trames de rendu écrire à quelles trames de capture, quand écrire
+//!   du silence, et quand le tick est trop en retard pour rattraper.
 //!
 //! Le pilote (workspace `drivers/windows`, jamais construit par Nix) dépend de ce
 //! crate par chemin ; le workspace racine le compile, le teste (proptest, Miri,
@@ -59,6 +62,7 @@
 extern crate std;
 
 pub mod format;
+pub mod loopback;
 pub mod notify;
 pub mod position;
 pub mod ring;
@@ -67,6 +71,7 @@ pub use format::{
     buffer_bytes, buffer_bytes_for_notifications, validate, FormatError, RequestedFormat,
     SampleKind, SupportedFormat, M1A_FORMATS,
 };
+pub use loopback::{CopyOp, Loopback, Plan, SilenceOp, StreamView, LEAD_MS};
 pub use notify::{align_frames, boundaries_crossed, Notifier};
 pub use position::{byte_offset, StreamPosition, VirtualClock};
 pub use ring::{copy_frames, silence, FrameLayout, RingError, SampleFormat};

@@ -5,7 +5,7 @@
 //! [windows-drivers-rs.md](../../../docs/windows-drivers-rs.md), installation et test dans
 //! [driver-dev.md](../../../docs/driver-dev.md).
 //!
-//! État (M1a-07) : pilote **directement bâti sur PortCls**, sans gestion PnP WDM
+//! État (M1a-08) : pilote **directement bâti sur PortCls**, sans gestion PnP WDM
 //! maison : `DriverEntry` délègue à `PcInitializeAdapterDriver` (qui installe les dispatch
 //! PnP/Power/SystemControl/Create/Close via `PcDispatchIrp` et son propre `DriverUnload`),
 //! `AddDevice` à `PcAddAdapterDevice`, et `StartDevice` à [`adapter::start_device`], qui
@@ -15,11 +15,13 @@
 //! (`PcRegisterPhysicalConnection`). Les tables KS sont les `static` de [`descriptors`],
 //! l'état partagé du câble celui de [`cable`]. Les fonctions et types PortCls viennent
 //! des bindings générés de `portcls-sys` (M1a-03), les objets COM des traits de
-//! `portcls` (M1a-04, M1a-05). Le flux **rendu** est livré ([`stream`], M1a-07) :
-//! tampon cyclique par `AllocatePagesForMdl`, position calculée par
-//! `KeQueryPerformanceCounter` ([`clock`]), état sous spin lock ([`sync`]),
-//! notifications par timer et DPC ([`timer`]). Le flux capture et la boucle locale
-//! arrivent en M1a-08 : `WaveCapture::NewStream` répond encore `STATUS_NOT_IMPLEMENTED`.
+//! `portcls` (M1a-04, M1a-05). Les deux flux sont livrés ([`stream`], un seul
+//! [`stream::WaveStream`] pour les deux sens) : tampon cyclique par
+//! `AllocatePagesForMdl`, position calculée par `KeQueryPerformanceCounter` ([`clock`]),
+//! état sous spin lock ([`sync`]). La **boucle locale** (M1a-08) tourne sur un timer
+//! haute résolution par câble ([`timer`], `EX_TIMER`) : à chaque tick de 1 ms,
+//! [`cable::Cable::on_tick`] applique le plan de `conduit_kmd_core::loopback` (copie
+//! rendu → capture, silence, ou rien) puis signale les notifications des deux flux.
 //!
 //! Le gestionnaire de panique est maison (`panic.rs`) : une panique en noyau se traduit
 //! par un bug check, jamais par une boucle infinie. La journalisation passe par
@@ -194,7 +196,8 @@ unsafe extern "C" fn start_device(
     status
 }
 
-/// Déchargement du pilote : rien à libérer côté Conduit ; enchaîne le `DriverUnload` de
+/// Déchargement du pilote : suppression des timers des câbles (le seul objet noyau que
+/// Conduit alloue lui-même, [`cable::shutdown`]), puis enchaînement du `DriverUnload` de
 /// PortCls (`PcDriverUnload`) mémorisé dans `DriverEntry`.
 ///
 /// IRQL : `PASSIVE_LEVEL`.
@@ -205,6 +208,10 @@ unsafe extern "C" fn start_device(
 /// périphérique ont été supprimés et toutes les E/S en cours terminées.
 unsafe extern "C" fn driver_unload(driver: PDRIVER_OBJECT) {
     kmd_log!("DriverUnload");
+
+    // `ExDeleteTimer(…, Cancel = TRUE, Wait = TRUE)` : au retour, plus aucun tick ne
+    // s'exécute et le contexte `static` du câble n'est plus référencé par le noyau.
+    cable::shutdown();
 
     // SAFETY: lecture unique après la fin de toute activité du pilote (voir `UnloadSlot`) ;
     // la valeur, si présente, est le `DriverUnload` que PortCls avait installé et qui

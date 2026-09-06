@@ -61,6 +61,7 @@ Contient tout ce qui se raisonne et se teste sans noyau :
 | `position` | horloge virtuelle : `frames_at(qpc_now, qpc_start, qpc_freq, rate)` en arithmétique 128 bits sans débordement ; conversion trames ↔ octets ↔ position cyclique | proptest (monotonie, pas de débordement à 2⁶³ ticks, exactitude à ±1 trame) |
 | `ring` | copie cyclique d'un tampon rendu vers un tampon capture entre deux positions, tailles différentes, avec conversion de format (M1a : float32 → float32, PCM16 → PCM16 ; M1b-05 : matrice complète) | proptest (aucune trame perdue ni dupliquée, wrap-around) |
 | `format` | validation d'un `KSDATAFORMAT_WAVEFORMATEXTENSIBLE` demandé contre la liste supportée ; taille de tampon bornée, alignée sur la période de notification | tables de cas, proptest |
+| `loopback` | plan de copie d'un tick (M1a-08) : `Loopback::plan(rendu, capture, avance)` → copie, silence, rien, ou débordement ; curseur et lien « même instant virtuel » entre les deux flux (§5.3) | tables de cas, proptest (blocs contigus sans trou ni recouvrement, décalage constant, bornes des tampons, jamais de panique) |
 | `notify` | périodes de notification (M1a-07) : `Notifier::advance(frames)` dit si une frontière de `buffer_frames / count` a été franchie depuis le dernier signal, sur la position absolue | tables de cas, proptest (cohérence avec la formulation cyclique en octets) |
 | `config` | structures `#[repr(C)]` de la propriété privée de configuration (M1b-04) et leur validation (`validate(&[u8]) -> Result<CableConfig, ConfigError>`) | fuzz (M1b-08), Miri |
 | `params` | bornes des paramètres de registre (réserve, canaux, tampon) et repli par défaut (M1b-01) | tables de cas |
@@ -158,14 +159,14 @@ Modules :
 | `adapter` | `StartDevice` : lit les paramètres (M1b-01), crée la table des câbles, enregistre les sous-périphériques ; objet `IAdapterPowerManagement` |
 | (hors crate) | le modèle objet COM générique est dans `crates/conduit-com`, les enveloppes PortCls dans `drivers/windows/portcls` (§3) |
 | `descriptors` | tables KS `static` des quatre filtres (§4.1), construites en `const`, invariants en assertions `const` |
-| `cable` | état partagé par câble : emplacements des flux rendu et capture courants sous le spin lock du câble, `StreamState` (état verrouillé d'un flux tel que la DPC le voit) ; M1a-08 : timer/DPC de copie |
+| `cable` | état partagé par câble : emplacements des flux rendu et capture courants sous le spin lock du câble, `StreamState` (état verrouillé d'un flux tel que le tick le voit), plan `Loopback` et compteurs ; `Cable::on_tick` fait la copie et les notifications (M1a-08, §5.3) |
 | `wave` | miniport `IMiniportWaveRT` (un par câble et par sens) : `NewStream` valide le format et crée le flux |
-| `stream` | flux rendu `RenderStream` (`IMiniportWaveRTStreamNotification`, M1a-07) : tampon MDL, position QPC, notifications ; M1a-08 : flux capture |
+| `stream` | flux `WaveStream` (`IMiniportWaveRTStreamNotification`), un seul type pour les deux sens (`cable::Direction`) : tampon MDL, position QPC, notifications ; sans timer propre depuis M1a-08 |
 | `topo` | miniport `IMiniportTopology` (un par câble et par sens) : nœuds volume/mute factices, jack |
 | `props` | gestionnaires de propriétés KS : `KSPROPERTY_JACK_DESCRIPTION`, `KSPROPERTY_AUDIO_*`, propriété privée de configuration (M1b-04) |
 | `clock` | lecture QPC (`KeQueryPerformanceCounter`), construction de la `VirtualClock` de `kmd-core` |
 | `sync` | `SpinLock<T>` sur `KSPIN_LOCK` (`KeAcquireSpinLockRaiseToDpc`/`KeReleaseSpinLock`), garde RAII qui restaure l'IRQL |
-| `timer` | `PeriodicTimer` : `KTIMER` + `KDPC` (`KeInitializeTimerEx`, `KeInitializeDpc`, `KeSetTimerEx`, `KeCancelTimer`, `KeFlushQueuedDpcs`) |
+| `timer` | `ExTimer` : timer haute résolution par câble (`ExAllocateTimer(EX_TIMER_HIGH_RESOLUTION)`, `ExSetTimer`, `ExCancelTimer`, `ExDeleteTimer`), rappel `EXT_CALLBACK` à `DISPATCH_LEVEL` |
 
 ## 3. Modèle objet COM en Rust
 
@@ -324,18 +325,20 @@ l'adaptateur ne conserve que l'état partagé des câbles (`cable::Cable`, §5.3
 **`static`** du pilote (construction `const`, section de données non paginée, vit jusqu'au
 déchargement : ni allocation, ni fuite de pool, ni `Drop` ; les cycles start/stop la
 réutilisent). Ses deux `Slot` (flux rendu et capture courants) sont des `AtomicPtr` ;
-M1a-08 fixera comment la DPC garantit la survie de l'état pointé.
+M1a-08 fixera comment le tick garantit la survie de l'état pointé.
 `PcRegisterAdapterPowerManagement` n'est pas appelé avant M1b-06. `NewStream` valide le
-format (`kmd-core::format::validate`) ; côté rendu il crée le flux (§5, M1a-07), côté
-capture il répond encore `STATUS_NOT_IMPLEMENTED` (M1a-08).
+format (`kmd-core::format::validate`) puis crée le flux, dans les deux sens (§5).
 
-Réalité M1a-07 : les emplacements du câble ne sont plus des `AtomicPtr` mais deux pointeurs
-sous un **spin lock du câble** (`Cable::attach`/`detach`/`slots`), car l'atomique seul ne
+Réalité M1a-08 : les emplacements du câble ne sont plus des `AtomicPtr` mais deux pointeurs
+sous un **spin lock du câble** (`Cable::attach`/`detach`/`state`), car l'atomique seul ne
 garantit pas la survie de l'état pointé. Contrat : le pointeur désigne le
 `SpinLock<StreamState>` logé dans l'objet COM du flux ; le flux se retire de l'emplacement
-avant sa destruction (dans son `Drop`, après avoir arrêté son timer) en prenant ce même
-verrou, donc tout lecteur qui tient la garde des emplacements a la garantie que le flux
-qu'elle désigne vit encore. Ordre de verrouillage fixe : **câble puis flux**.
+avant sa destruction (dans son `Drop`) en prenant ce même verrou, donc tout lecteur qui
+tient la garde des emplacements a la garantie que le flux qu'elle désigne vit encore.
+Ordre de verrouillage fixe : **câble puis flux** — et, entre les deux flux, rendu puis
+capture, seul `Cable::on_tick` prenant les deux. `StartDevice` appelle `Cable::start`, qui
+oublie les flux d'un cycle précédent et crée le timer haute résolution du câble (§5.3) ;
+`DriverUnload` appelle `cable::shutdown`, qui le supprime.
 
 ## 5. Horloge, positions, boucle locale
 
@@ -353,7 +356,7 @@ bytes  = (frames × frame_size) mod buffer_size
 `GetPosition` et `GetPresentationPosition` sont donc exacts à la trame près, sans
 dépendre d'un timer. Pause/reprise : on accumule les trames jouées avant la pause.
 
-Réalité M1a-07 (`stream::RenderStream`) : la fréquence QPC est lue une fois à
+Réalité M1a-08 (`stream::WaveStream`, les deux sens) : la fréquence QPC est lue une fois à
 `NewStream` (`clock::virtual_clock`, `VirtualClock` de `kmd-core`) ; `SetState(RUN)` fait
 `StreamPosition::run(qpc_now)`, `PAUSE`/`ACQUIRE` depuis `RUN` `pause(clock, qpc_now)`
 (accumulation), `STOP` `reset()` — le tampon est **conservé** à `STOP`, PortCls le libère
@@ -370,7 +373,7 @@ de la trame, arrondie à la taille demandée par le moteur audio dans les bornes
 `FreeAudioBuffer` (jamais avant l'arrêt du flux). Pas de partage de pages entre rendu
 et capture : les tailles et les formats des deux flux peuvent différer.
 
-Réalité M1a-07 : taille par `kmd-core::format::buffer_bytes` (sans notification) ou
+Réalité M1a-08 : taille par `kmd-core::format::buffer_bytes` (sans notification) ou
 `buffer_bytes_for_notifications` (arrondie en plus à un multiple de `count` trames, pour
 que chaque période de notification soit entière et que la fin du tampon soit une
 frontière) ; `AllocatePagesForMdl(high = i64::MAX, bytes)` — pas `0xFFFF_FFFF_FFFF_FFFF`,
@@ -384,46 +387,87 @@ libéré au `Drop` du flux (journalisé : ne doit pas arriver).
 ### 5.3 Boucle locale
 
 Un **timer noyau périodique par câble** (période 1 ms, timer `Ex*` haute résolution :
-`ExAllocateTimer` + `ExSetTimer(…, EX_TIMER_HIGH_RESOLUTION)`, rappel à `DISPATCH_LEVEL` ;
-`ExSetTimerResolution` n'est jamais touché, son effet est global), armé quand au moins un flux du câble est en
-`RUN`, désarmé sinon. À chaque DPC (`DISPATCH_LEVEL`, sous le spin lock du câble) :
+`ExAllocateTimer(…, EX_TIMER_HIGH_RESOLUTION)` + `ExSetTimer(timer, −10 000, 10 000, NULL)`
+— les deux valeurs en unités de 100 ns, contrairement à `KeSetTimerEx` —, rappel
+`EXT_CALLBACK` à `DISPATCH_LEVEL` ; `ExSetTimerResolution` n'est jamais touché, son effet
+est global), armé quand au moins un flux du câble est en `RUN` avec un tampon, désarmé
+sinon. À chaque tick (`DISPATCH_LEVEL`, sous le spin lock du câble puis celui de chaque
+flux, ordre fixe câble → rendu → capture) :
 
-1. calculer la position courante du rendu et de la capture ;
-2. copier du tampon rendu vers le tampon capture les trames comprises entre la
-   dernière position copiée et la position de rendu courante moins une marge d'une
-   période (`kmd-core::ring::copy`) ; convertir le format si les deux diffèrent ;
-3. si le rendu n'est pas en `RUN`, écrire du silence dans la capture (SPEC §5.3 :
-   « l'entrée sans producteur lit du silence ») ;
-4. si aucune capture n'est en `RUN`, ne rien copier (« la sortie sans lecteur est
+1. calculer la position absolue en trames du rendu (`R`) et de la capture (`C`) ;
+2. écrire dans le tampon de capture les trames **`[curseur, C + avance)`**, prises aux
+   trames de rendu correspondantes (`kmd-core::ring::copy_frames`, qui convertit le
+   format si les deux diffèrent) ; le curseur devient `C + avance` ;
+3. si le rendu n'est pas en `RUN`, écrire du silence dans la capture au lieu de la copie
+   (SPEC §5.3 : « l'entrée sans producteur lit du silence ») ;
+4. si aucune capture n'est en `RUN`, ne rien écrire (« la sortie sans lecteur est
    jetée ») ;
 5. signaler les événements de notification enregistrés par
-   `IMiniportWaveRTStreamNotification::RegisterNotificationEvent` quand une période de
-   notification est franchie.
+   `IMiniportWaveRTStreamNotification::RegisterNotificationEvent`, pour les **deux** flux,
+   quand une période de notification est franchie.
 
-Latence de traversée = période du moteur audio (10 ms en mode partagé) + marge de
-copie (1 à 2 ms). Le tampon interne « 2 × 10 ms » de SPEC §5.3 est la taille par défaut
-demandée au moteur, pas un tampon supplémentaire du pilote.
+**Écrire et lire en avance, pas en retrait.** Le moteur audio écrit le tampon de rendu
+*devant* la position de lecture `R` et, réveillé par la notification d'une frontière de
+période `R_b`, réécrit aussitôt les emplacements des trames `[R_b − période, R_b)` qu'il
+vient de jouer. Copier *derrière* `R` avec une marge (`R − 1 ms`) laisserait donc écraser
+chaque dernière milliseconde jouée avant sa copie. Symétriquement, une trame écrite dans
+la capture sous la position `C` arrive trop tard : le moteur lit *derrière* `C`. La copie
+travaille donc **en avance des deux positions** — `avance` = 2 ms
+(`kmd-core::loopback::LEAD_MS`, la période du tick plus sa gigue). Ces trames de rendu ont
+été écrites par le lecteur au moins une période plus tôt et ne seront réécrites qu'une
+fois jouées ; côté capture elles sont en place avant que `C` ne les atteigne, et leur
+emplacement a été lu une période plus tôt (tampon d'au moins deux périodes : c'est ce que
+le moteur demande). Tant que `avance` reste inférieure à une période de notification, elle
+ne touche jamais la moitié en cours d'écriture ou de lecture par le moteur.
 
-Réalité M1a-07 : le timer est **par flux rendu** (`timer::PeriodicTimer` dans
-`RenderStream`, `KTIMER` + `KDPC` initialisés une fois l'objet COM à son adresse
-définitive), armé quand le flux est en `RUN` avec un tampon à notification
-(`AllocateBufferWithNotification`, `count` ∈ {1, 2}) et au moins un événement enregistré
-(`RegisterNotificationEvent`, deux au plus par flux), désarmé sinon ; il ne fait que
-l'étape 5 : sous le spin lock du flux, position calculée par QPC, et `KeSetEvent` de
-chaque événement si une frontière de période (`bytes / count`) a été franchie depuis le
-dernier signal (`kmd-core::notify::Notifier`, sur la position absolue en trames : le
-bouclage n'est pas un cas particulier puisque le tampon est un multiple de la période).
-`Drop` du flux (dernier `Release`, `PASSIVE_LEVEL`) : `KeCancelTimer` +
-`KeFlushQueuedDpcs`, retrait de l'emplacement du câble, libération d'un tampon
-résiduel. **M1a-08 remonte ce timer au câble** (un seul timer, copie + notifications
-des deux flux) et y ajoute les étapes 1 à 4.
+**Décalage fixe.** Au premier tick où les deux flux sont en `RUN`, le plan mémorise
+`(R0, C0)` : la trame de capture `j` reçoit la trame de rendu `k = j − C0 + R0`, « même
+instant virtuel ». Les deux positions avancent au même rythme (même compteur de
+performance, même fréquence d'échantillonnage) : la latence en positions est constante et
+nulle. Le lien est oublié dès que l'un des deux flux quitte `RUN` et rétabli au retour ; il
+**survit** en revanche à un débordement.
 
-Décision (2026-09-06, sans attendre la VM) : un `KTIMER` de 1 ms n'a que la résolution de
-l'horloge système (15,6 ms par défaut) tant que personne ne l'élève, ce qui condamnerait
-les notifications d'un tampon de 10 ms ; `PeriodicTimer` utilise donc les timers `Ex*`
-haute résolution (`EX_TIMER_HIGH_RESOLUTION`, Windows 8.1+, ce que fait SYSVAD) dès
-M1a-08, avec `ExCancelTimer` puis `ExDeleteTimer` avant toute libération. `KeSetTimerEx`
-reste le repli si `ExAllocateTimer` échoue au démarrage (journalisé).
+**Débordement.** Si un tick a pris tant de retard que le bloc à écrire dépasse le plus
+petit des deux tampons, les trames sont irrécupérables (déjà réécrites d'un côté, déjà lues
+de l'autre) : rien n'est écrit, le curseur est resynchronisé sur `C + avance` et le
+compteur `overruns` est incrémenté. C'est un trou dans la capture, pas un décalage.
+
+Latence de traversée = période du moteur audio (10 ms en mode partagé) + avance de copie
+(2 ms). Le tampon interne « 2 × 10 ms » de SPEC §5.3 est la taille par défaut demandée au
+moteur, pas un tampon supplémentaire du pilote.
+
+Réalité M1a-08 : toute l'arithmétique est dans `kmd-core::loopback` (`Loopback::plan` :
+curseur, lien, `CopyOp`/`SilenceOp`/`overrun`), testée et vérifiée par proptest sans
+noyau — blocs contigus sans trou ni recouvrement, décalage constant, `count` borné par le
+plus petit tampon, aucune panique. `conduit-kmd` ne fait que lire des positions et déplacer
+des octets : `cable::Cable::on_tick` construit deux `StreamView`, applique le plan avec
+`ring::copy_frames` / `ring::silence` sur des tranches obtenues par
+`slice::from_raw_parts[_mut]` des mappages noyau des deux MDL (mémoire partagée avec le
+client : octets lus et écrits sans hypothèse d'atomicité, comme tout pilote WaveRT), puis
+appelle `KeSetEvent` pour les événements des flux dont une frontière de période est
+franchie (`kmd-core::notify::Notifier`, sur la position absolue en trames : le bouclage
+n'est pas un cas particulier puisque le tampon est un multiple de la période). Quatre
+compteurs atomiques par câble (ticks, trames copiées, silences, débordements) sont
+journalisés toutes les 1000 ticks — **en debug seulement** (`kmd_log!` est vide en
+release). Le flux (`stream::WaveStream`, un seul type pour les deux sens, distingués par
+`cable::Direction`) n'a plus de timer : après chaque transition il appelle
+`Cable::refresh_timer` **hors de son propre verrou** (ordre câble → flux), et son `Drop`
+se contente de `Cable::detach` — le spin lock du câble garantit qu'au retour aucun tick ne
+détient plus le pointeur, ce qui remplace le `KeFlushQueuedDpcs` de M1a-07.
+
+Décision (2026-09-06, révisée à la livraison de M1a-08, sans attendre la VM) : un `KTIMER`
+de 1 ms n'a que la résolution de l'horloge système (15,6 ms par défaut) tant que personne
+ne l'élève, ce qui condamnerait à la fois les notifications d'un tampon de 10 ms et la
+boucle locale (une avance de 2 ms serait dépassée à chaque tick, donc un débordement à
+chaque tick). Le câble utilise donc les timers `Ex*` haute résolution
+(`EX_TIMER_HIGH_RESOLUTION`, Windows 8.1+, ce que fait SYSVAD), créés au premier
+`StartDevice` et supprimés au `DriverUnload` par
+`ExDeleteTimer(timer, Cancel = TRUE, Wait = TRUE, NULL)`, qui attend la fin du tick en
+cours. **Pas de repli sur `KeSetTimerEx`** (le brief le laissait ouvert) : un échec
+d'`ExAllocateTimer` (pool épuisé) fait échouer `StartDevice` avec
+`STATUS_INSUFFICIENT_RESOURCES`, journalisé. Un câble qui s'énumère et ne délivre que des
+trous serait bien plus difficile à diagnostiquer qu'un adaptateur qui ne démarre pas
+(§7).
 
 ### 5.4 Formats
 
