@@ -539,7 +539,7 @@ testée d'abord avec le backend null, puis sur Windows.
   *Fait quand* : chaque action passe par l'IPC et se reflète dans l'OS (F-01, F-02, F-03).
 - [x] **M2-04** `feat(gui): patchbay, rendu des nœuds et ports`
   Canvas `iced`, disposition automatique, positions mémorisées.
-- [ ] **M2-05** `feat(gui): patchbay, liens par glisser-déposer et suppression`
+- [x] **M2-05** `feat(gui): patchbay, liens par glisser-déposer et suppression`
   *Fait quand* : lien créé/supprimé via IPC ; cycle refusé avec message (F-11, F-12).
 - [ ] **M2-06** `feat(gui): gains par lien et par nœud, muet`
 - [ ] **M2-07** `feat(gui): VU-mètres temps réel`

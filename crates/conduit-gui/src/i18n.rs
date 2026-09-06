@@ -97,6 +97,8 @@ textes! {
     NodeCable => "patchbay.node.cable", "Câble";
     NodeHardware => "patchbay.node.hardware", "Matériel";
     NodeUtility => "patchbay.node.utility", "Utilitaire";
+    PatchbayLinkRemove => "patchbay.link.remove", "Supprimer le lien";
+    PatchbayGenerator => "patchbay.generator", "Générateur de test";
 
     GraphDriver => "patchbay.driver", "Pilote de graphe";
     Quantum => "patchbay.quantum", "quantum";
@@ -109,6 +111,7 @@ textes! {
     UnitS => "unit.s", "s";
     UnitMin => "unit.min", "min";
     UnitH => "unit.h", "h";
+    UnitHz => "unit.hz", "Hz";
     UnitKhz => "unit.khz", "kHz";
     UnitDb => "unit.db", "dB";
     UnitPercent => "unit.percent", "%";
@@ -199,6 +202,34 @@ pub fn channels_changed(cable: &str, channels: u8) -> String {
     format!(
         "{cable} passe à {} : réactivation du câble, court silence.",
         channels_label(channels)
+    )
+}
+
+/// « Lien refusé : il créerait une boucle (« Conduit 1 » alimente déjà
+/// « Lecteur de musique »). »
+///
+/// Le lien irait de `source` vers `destination` ; il est refusé parce que
+/// `destination` alimente déjà `source`, directement ou par un détour. La
+/// phrase nomme les deux nœuds dans cet ordre-là : c'est le chemin qui existe
+/// déjà, pas celui qu'on demandait.
+pub fn lien_refuse_boucle(source: &str, destination: &str) -> String {
+    format!("Lien refusé : il créerait une boucle (« {destination} » alimente déjà « {source} »).")
+}
+
+/// « Lien supprimé entre « Lecteur de musique » et « Conduit 1 ». »
+pub fn lien_supprime(source: &str, destination: &str) -> String {
+    format!("Lien supprimé entre « {source} » et « {destination} ».")
+}
+
+/// « « Générateur de test » créé : sinus à 440 Hz, −12,0 dB. Reliez sa sortie
+/// à une entrée pour l'entendre. »
+///
+/// La fréquence et le niveau arrivent déjà mis en forme (voir
+/// [`crate::format`]).
+pub fn generateur_cree(nom: &str, frequence: &str, niveau: &str) -> String {
+    format!(
+        "« {nom} » créé : sinus à {frequence}, {niveau}. \
+         Reliez sa sortie à une entrée pour l'entendre."
     )
 }
 
@@ -295,6 +326,25 @@ mod tests {
         assert_eq!(
             channels_changed("Conduit 1", 1),
             "Conduit 1 passe à 1 canal : réactivation du câble, court silence."
+        );
+    }
+
+    /// Les notices du patchbay nomment les nœuds entre guillemets français.
+    #[test]
+    fn les_notices_du_patchbay_nomment_les_noeuds() {
+        assert_eq!(
+            lien_refuse_boucle("Lecteur de musique", "Conduit 1"),
+            "Lien refusé : il créerait une boucle \
+             (« Conduit 1 » alimente déjà « Lecteur de musique »)."
+        );
+        assert_eq!(
+            lien_supprime("Lecteur de musique", "Conduit 1"),
+            "Lien supprimé entre « Lecteur de musique » et « Conduit 1 »."
+        );
+        assert_eq!(
+            generateur_cree("Générateur de test", "440 Hz", "−12,0 dB"),
+            "« Générateur de test » créé : sinus à 440 Hz, −12,0 dB. \
+             Reliez sa sortie à une entrée pour l'entendre."
         );
     }
 

@@ -77,6 +77,11 @@ fn avec_unite(valeur: String, unite: Text) -> String {
     format!("{valeur}{INSECABLE}{}", i18n::t(unite))
 }
 
+/// Une fréquence en hertz, à l'entier : « 440 Hz ».
+pub fn hertz(hz: f32) -> String {
+    avec_unite(nombre(f64::from(hz), 0), Text::UnitHz)
+}
+
 /// Une durée en millisecondes, à la dixième : « 5,3 ms ».
 pub fn millisecondes(ms: f64) -> String {
     avec_unite(nombre(ms, 1), Text::UnitMs)
@@ -206,6 +211,9 @@ mod tests {
         assert_eq!(kilohertz(48_000), "48\u{a0}kHz");
         assert_eq!(kilohertz(96_000), "96\u{a0}kHz");
         assert_eq!(kilohertz(44_100), "44,1\u{a0}kHz");
+        // Un hertz s'écrit à l'entier, insécable devant son unité.
+        assert_eq!(hertz(440.0), "440\u{a0}Hz");
+        assert_eq!(hertz(1000.0), "1\u{202f}000\u{a0}Hz");
     }
 
     /// La durée de marche change d'unité à la minute puis à l'heure.

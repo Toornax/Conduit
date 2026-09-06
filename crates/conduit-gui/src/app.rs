@@ -8,9 +8,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use conduit_backend::{CableId, CableSpec};
-use conduit_core::types::ChannelCount;
+use conduit_core::graph::{LinkId, NodeId};
+use conduit_core::types::{ChannelCount, Db};
+use iced::keyboard::{self, key::Named};
 use iced::{Element, Subscription, Task};
 
+use conduit_protocol::api::InternalKind;
 use conduit_protocol::{Command, Notification};
 
 use crate::i18n::{self, Text};
@@ -18,7 +21,7 @@ use crate::ipc::{self, Requester};
 use crate::model::Mirror;
 use crate::preferences::Preferences;
 use crate::shell::{self, Tab};
-use crate::{cables, patchbay, theme, typo};
+use crate::{cables, format, patchbay, theme, typo};
 
 /// État de la connexion au démon.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -112,12 +115,16 @@ impl Notice {
 ///
 /// La GUI n'anticipe rien : la notice n'est écrite qu'au vu du `CableChanged`
 /// correspondant, jamais au moment du clic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Attente {
     /// Un `CableAdd` a été envoyé : le prochain câble annoncé est le sien.
     Creation,
     /// Un `CableRemove` a été envoyé pour ce câble.
     Suppression(CableId),
+    /// Un `Unlink` a été envoyé pour ce lien.
+    Delien(LinkId),
+    /// Un `AddInternal` a été envoyé sous ce nom.
+    Generateur(String),
 }
 
 /// Temps d'affichage d'une notice avant son effacement.
@@ -150,11 +157,14 @@ pub enum Message {
     CommitAlias,
     /// Change les canaux d'un câble (`CableSetChannels`).
     SetChannels(CableId, ChannelCount),
-    /// Geste de déplacement d'une carte du patchbay.
+    /// Geste de l'utilisateur sur la scène du patchbay.
     ///
-    /// Aucune commande n'en découle : la position d'une carte est un réglage
-    /// local d'affichage, elle ne passe pas par le protocole.
+    /// Déplacer une carte ou sélectionner un lien n'envoie rien : ce sont des
+    /// réglages locaux d'affichage. Tirer ou supprimer un lien, en revanche,
+    /// se termine en commande du protocole (voir [`patchbay::Effet`]).
     Patchbay(patchbay::Geste),
+    /// Crée un générateur de sinus de test (`AddInternal`).
+    AddGenerator,
     /// Préférences lues au démarrage.
     Preferences(Box<Preferences>),
     /// Écriture des préférences terminée ; son résultat n'a rien à annoncer.
@@ -345,11 +355,27 @@ impl App {
             }
             Message::Patchbay(geste) => {
                 // Le geste se réduit contre la disposition courante : c'est
-                // elle qui dit où la carte saisie se trouvait.
+                // elle qui dit où la carte saisie se trouvait, et contre les
+                // liens du miroir, qui disent ce qui est déjà branché.
                 let placements = patchbay::disposer(&self.mirror.nodes, &self.patchbay.positions);
-                if self.patchbay.reduire(geste, &placements) {
-                    return self.enregistrer_preferences();
-                }
+                let effet = self
+                    .patchbay
+                    .reduire(geste, &placements, &self.mirror.links);
+                return self.appliquer(effet);
+            }
+            Message::AddGenerator => {
+                // Le nom doit être libre : le démon refuse deux nœuds internes
+                // homonymes.
+                let name = patchbay::nom_de_generateur(&self.mirror.nodes);
+                self.attente = Some(Attente::Generateur(name.clone()));
+                self.request(Command::AddInternal {
+                    name,
+                    kind: InternalKind::Sine {
+                        frequency: patchbay::FREQUENCE_TEST,
+                        amplitude: patchbay::amplitude_test(),
+                        channels: patchbay::CANAUX_TEST,
+                    },
+                });
             }
             Message::Preferences(preferences) => {
                 // Les positions lues ne remplacent pas celles d'un
@@ -363,6 +389,49 @@ impl App {
             Message::ThemeSysteme(mode) => self.mode = mode,
         }
         Task::none()
+    }
+
+    /// Donne suite à ce qu'un geste du patchbay demande.
+    ///
+    /// Le refus de boucle est la seule décision prise sans le démon (F-12), et
+    /// c'est un refus : rien n'est ajouté ni retiré du miroir ici.
+    fn appliquer(&mut self, effet: patchbay::Effet) -> Task<Message> {
+        match effet {
+            patchbay::Effet::Rien => {}
+            patchbay::Effet::Enregistrer => return self.enregistrer_preferences(),
+            patchbay::Effet::Boucle { depuis, vers } => {
+                self.poser_notice(Notice::erreur(i18n::lien_refuse_boucle(
+                    &self.libelle_noeud(depuis),
+                    &self.libelle_noeud(vers),
+                )));
+                return self.minuteur();
+            }
+            patchbay::Effet::Commande(commande) => {
+                // La notice de suppression attend, comme les autres, la
+                // notification qui la confirme.
+                if let Command::Unlink { link } = &commande {
+                    self.attente = Some(Attente::Delien(*link));
+                }
+                self.request(commande);
+            }
+        }
+        Task::none()
+    }
+
+    /// Le libellé d'un nœud du miroir, ou son identifiant s'il a disparu.
+    fn libelle_noeud(&self, id: NodeId) -> String {
+        self.mirror
+            .node(id)
+            .map_or_else(|| id.to_string(), |n| n.label.clone())
+    }
+
+    /// Les libellés des deux extrémités d'un lien, s'il est encore au miroir.
+    fn extremites_du_lien(&self, id: LinkId) -> Option<(String, String)> {
+        let lien = self.mirror.link(id)?;
+        Some((
+            self.libelle_noeud(lien.link.src.node),
+            self.libelle_noeud(lien.link.dst.node),
+        ))
     }
 
     /// Écrit les positions du patchbay hors du fil de l'interface.
@@ -449,15 +518,29 @@ impl App {
     /// À appeler **avant** [`Mirror::apply`](crate::model::Mirror::apply) : la
     /// création se reconnaît à ce que le câble annoncé est inconnu du miroir.
     fn notice_attendue(&mut self, notification: &Notification) -> Option<Notice> {
-        let Notification::CableChanged { id, info } = notification else {
-            return None;
-        };
-        let texte = match (self.attente?, info) {
-            (Attente::Creation, Some(_)) if self.mirror.cable(*id).is_none() => {
+        let texte = match (self.attente.clone()?, notification) {
+            (Attente::Creation, Notification::CableChanged { id, info: Some(_) })
+                if self.mirror.cable(*id).is_none() =>
+            {
                 i18n::cable_created(&id.to_string())
             }
-            (Attente::Suppression(cible), None) if cible == *id => {
+            (Attente::Suppression(cible), Notification::CableChanged { id, info: None })
+                if cible == *id =>
+            {
                 i18n::cable_removed(&id.to_string())
+            }
+            // Le lien est encore au miroir : ses deux extrémités se nomment
+            // avant que la réduction ne l'efface.
+            (Attente::Delien(cible), Notification::LinkRemoved { id }) if cible == *id => {
+                let (source, destination) = self.extremites_du_lien(*id)?;
+                i18n::lien_supprime(&source, &destination)
+            }
+            (Attente::Generateur(nom), Notification::NodeAdded(node)) if node.label == nom => {
+                i18n::generateur_cree(
+                    &nom,
+                    &format::hertz(patchbay::FREQUENCE_TEST),
+                    &format::decibels(Db::new(patchbay::NIVEAU_TEST_DB)),
+                )
             }
             _ => return None,
         };
@@ -478,7 +561,28 @@ impl App {
         })
         .map(Message::Ipc);
         let systeme = iced::system::theme_changes().map(Message::ThemeSysteme);
-        Subscription::batch([demon, systeme])
+        Subscription::batch([demon, systeme, self.clavier()])
+    }
+
+    /// Le clavier de la vue Patchbay : Suppr et Retour arrière retirent le
+    /// lien sélectionné.
+    ///
+    /// L'abonnement est **borné à l'onglet** : la vue Câbles a des champs de
+    /// texte, où Retour arrière efface une lettre et ne supprime rien.
+    /// [`keyboard::listen`] ne rapporte de toute façon que les touches
+    /// qu'aucun widget n'a prises, mais l'onglet est une garantie qui ne
+    /// dépend pas de cette subtilité.
+    fn clavier(&self) -> Subscription<Message> {
+        if self.tab != Tab::Patchbay {
+            return Subscription::none();
+        }
+        keyboard::listen().filter_map(|evenement| match evenement {
+            keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(Named::Delete | Named::Backspace),
+                ..
+            } => Some(Message::Patchbay(patchbay::Geste::Supprimer)),
+            _ => None,
+        })
     }
 
     /// Fenêtre : la coquille (barre latérale, en-tête, notice) et, dedans, la
@@ -486,16 +590,34 @@ impl App {
     pub fn view(&self) -> Element<'_, Message> {
         let enabled = self.connection.is_ready();
         let graisse = theme::jetons(&self.theme()).graisse_texte;
-        let (action, contenu) = match self.tab {
+        let (actions, contenu) = match self.tab {
             Tab::Cables => (
-                Some(shell::action_primaire(
+                vec![shell::action_primaire(
                     Text::CablesAdd,
                     enabled.then_some(Message::AddCable),
-                )),
+                )],
                 cables::view(&self.mirror, &self.cables, enabled, graisse),
             ),
-            Tab::Patchbay => (None, patchbay::view(&self.mirror, &self.patchbay, graisse)),
-            Tab::Diagnostic => (None, shell::a_venir(Text::DiagnosticSoon, graisse)),
+            Tab::Patchbay => {
+                let mut actions = Vec::new();
+                // « Supprimer le lien » n'existe que s'il y a un lien à
+                // supprimer : la maquette ne montre pas d'action grisée ici.
+                if self.patchbay.lien_selectionne(&self.mirror.links).is_some() {
+                    actions.push(shell::action_lien(
+                        Text::PatchbayLinkRemove,
+                        enabled.then_some(Message::Patchbay(patchbay::Geste::Supprimer)),
+                    ));
+                }
+                actions.push(shell::action_secondaire(
+                    Text::PatchbayGenerator,
+                    enabled.then_some(Message::AddGenerator),
+                ));
+                (
+                    actions,
+                    patchbay::view(&self.mirror, &self.patchbay, graisse),
+                )
+            }
+            Tab::Diagnostic => (Vec::new(), shell::a_venir(Text::DiagnosticSoon, graisse)),
         };
         shell::fenetre(
             self.tab,
@@ -503,7 +625,7 @@ impl App {
             &self.mirror,
             self.notice.as_ref(),
             graisse,
-            action,
+            actions,
             contenu,
         )
     }
@@ -918,6 +1040,99 @@ mod tests {
         assert_eq!(
             a.patchbay().positions.get("internal:a"),
             Some(iced::Point::new(12.0, 34.0))
+        );
+    }
+
+    /// Tirer un lien d'une sortie vers une entrée envoie `Link` — et rien
+    /// n'apparaît au miroir avant que le démon ne l'annonce.
+    #[test]
+    fn tirer_un_lien_envoie_link_sans_rien_anticiper() {
+        use conduit_core::graph::{Direction, PortId};
+
+        let (mut a, mut rx) = connected();
+        a.apply_ipc(ipc::Event::Notified(Box::new(Notification::NodeAdded(
+            crate::model::fixtures::node(2, "c"),
+        ))));
+        let src = PortId::new(NodeId::new(1, 0), Direction::Output, 0);
+        let dst = PortId::new(NodeId::new(2, 0), Direction::Input, 0);
+        let _ = a.update(Message::Patchbay(patchbay::Geste::DebutLien(src)));
+        let _ = a.update(Message::Patchbay(patchbay::Geste::SurvolPort(Some(dst))));
+        let _ = a.update(Message::Patchbay(patchbay::Geste::FinLien));
+        assert_eq!(sent(&mut rx), Command::Link { src, dst });
+        assert_eq!(a.mirror().links.len(), 1, "aucun lien ajouté localement");
+    }
+
+    /// Un lien qui refermerait une boucle est refusé sur place (F-12) : le
+    /// démon n'en entend pas parler, et la notice nomme les deux nœuds.
+    #[test]
+    fn un_lien_qui_boucle_est_refuse_avec_une_notice_et_sans_commande() {
+        use conduit_core::graph::{Direction, PortId};
+
+        let (mut a, mut rx) = connected();
+        // Le chargement initial branche déjà « a » sur « b ».
+        let src = PortId::new(NodeId::new(1, 0), Direction::Output, 0);
+        let dst = PortId::new(NodeId::new(0, 0), Direction::Input, 0);
+        let _ = a.update(Message::Patchbay(patchbay::Geste::DebutLien(src)));
+        let _ = a.update(Message::Patchbay(patchbay::Geste::SurvolPort(Some(dst))));
+        let _ = a.update(Message::Patchbay(patchbay::Geste::FinLien));
+        assert!(rx.try_recv().is_err(), "le refus n'atteint pas le démon");
+        let notice = a.notice().expect("le refus se dit");
+        assert_eq!(
+            notice.texte,
+            "Lien refusé : il créerait une boucle (« a » alimente déjà « b »)."
+        );
+        assert!(notice.erreur, "un refus prend le filet garance");
+    }
+
+    /// Sélectionner un lien puis le supprimer envoie `Unlink` ; la notice,
+    /// elle, attend la notification qui la confirme.
+    #[test]
+    fn supprimer_un_lien_envoie_unlink_et_attend_la_notification() {
+        let (mut a, mut rx) = connected();
+        let lien = LinkId::new(0, 0);
+        let _ = a.update(Message::Patchbay(patchbay::Geste::Selection(Some(lien))));
+        let _ = a.update(Message::Patchbay(patchbay::Geste::Supprimer));
+        assert_eq!(sent(&mut rx), Command::Unlink { link: lien });
+        assert_eq!(a.mirror().links.len(), 1, "rien n'est retiré localement");
+        assert!(a.notice().is_none(), "rien n'est annoncé avant le démon");
+        let _ = a.update(Message::Ipc(ipc::Event::Notified(Box::new(
+            Notification::LinkRemoved { id: lien },
+        ))));
+        assert_eq!(
+            a.notice().map(|n| n.texte.as_str()),
+            Some("Lien supprimé entre « a » et « b ».")
+        );
+        assert!(a.mirror().links.is_empty());
+    }
+
+    /// Le générateur de test est un sinus à 440 Hz et à niveau prudent ; sa
+    /// notice attend, elle aussi, le `NodeAdded` du démon.
+    #[test]
+    fn le_generateur_de_test_est_un_sinus_prudent_annonce_par_le_demon() {
+        let (mut a, mut rx) = connected();
+        let _ = a.update(Message::AddGenerator);
+        let Command::AddInternal { name, kind } = sent(&mut rx) else {
+            panic!("un AddInternal était attendu");
+        };
+        assert_eq!(name, "Générateur de test");
+        assert_eq!(
+            kind,
+            InternalKind::Sine {
+                frequency: 440.0,
+                amplitude: patchbay::amplitude_test(),
+                channels: 2,
+            }
+        );
+        assert!(a.notice().is_none(), "rien n'est annoncé avant le démon");
+        let _ = a.update(Message::Ipc(ipc::Event::Notified(Box::new(
+            Notification::NodeAdded(crate::model::fixtures::node(9, "Générateur de test")),
+        ))));
+        assert_eq!(
+            a.notice().map(|n| n.texte.as_str()),
+            Some(
+                "« Générateur de test » créé : sinus à 440\u{a0}Hz, \u{2212}12,0\u{a0}dB. \
+                 Reliez sa sortie à une entrée pour l'entendre."
+            )
         );
     }
 

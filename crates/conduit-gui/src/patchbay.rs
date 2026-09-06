@@ -1,10 +1,11 @@
-//! Vue « Patchbay » : le graphe du démon en cartes déplaçables (M2-04).
+//! Vue « Patchbay » : le graphe du démon en cartes déplaçables et en liens
+//! (M2-04, M2-05).
 //!
 //! Un nœud du graphe est une **carte** : son libellé et une étiquette d'état
 //! en en-tête, puis ses ports — les entrées à gauche, les sorties à droite,
 //! chacun marqué d'une pastille d'or posée à cheval sur le bord de la carte.
-//! Les **liens** arrivent au commit suivant (M2-05), les **gains** à celui
-//! d'après (M2-06) : ce module pose la scène, sa disposition et sa mémoire.
+//! Un lien est une **courbe d'or** tirée d'une pastille de sortie à une
+//! pastille d'entrée. Les **gains** arrivent au commit suivant (M2-06).
 //!
 //! # Une scène hybride : un canevas dessous, de vraies cartes dessus
 //!
@@ -19,8 +20,8 @@
 //! glissière de gain de M2-06.
 //!
 //! Le canevas, lui, garde ce que les widgets ne savent pas faire : dessiner
-//! des courbes entre deux points quelconques (M2-05) et suivre le curseur
-//! pendant un déplacement. Il le peut parce que [`Stack`] distribue chaque
+//! des courbes entre deux points quelconques et suivre le curseur pendant un
+//! déplacement. Il le peut parce que [`Stack`] distribue chaque
 //! événement de haut en bas et ne s'arrête qu'à la première couche qui le
 //! **capture** : le [`mouse_area`] de l'en-tête capture la pression, mais
 //! laisse passer les mouvements et le relâchement, que le canevas voit donc
@@ -33,6 +34,28 @@
 //!
 //! [`Stack`]: iced::widget::Stack
 //!
+//! # Tirer un lien : la cible est celle que le widget dit
+//!
+//! Une pastille est entourée d'un [`mouse_area`] : la pression sur une sortie
+//! ouvre un [`Tirage`], l'entrée et la sortie du curseur sur une entrée
+//! nomment la cible. La cible n'est donc **jamais** devinée par un test
+//! d'intersection contre la géométrie recalculée : ce sont les bornes réelles
+//! du widget qui tranchent, et elles ne peuvent pas mentir.
+//!
+//! Pendant le tirage, la position du curseur est retenue dans l'état du
+//! canevas ([`Suivi`]) et non dans celui de l'application : le canevas se
+//! redessine seul ([`canvas::Action::request_redraw`]) sans qu'un message
+//! reconstruise la vue à chaque pixel.
+//!
+//! # Ce que la vue décide, et ce qu'elle ne décide pas
+//!
+//! Aucun lien n'est ajouté ni retiré localement : la scène ne montre que ce
+//! que le miroir contient, c'est-à-dire ce que le démon a annoncé. La seule
+//! décision prise ici est un **refus** — celui d'une boucle
+//! ([`cree_un_cycle`], F-12), d'un nœud vers lui-même ou d'un doublon exact —
+//! et refuser n'est pas anticiper. Le démon reste l'autorité : s'il refuse à
+//! son tour, c'est sa phrase qui s'affiche.
+//!
 //! # Le déplacement est un réglage local
 //!
 //! Déplacer une carte ne change rien au graphe : aucune commande n'est
@@ -44,12 +67,14 @@
 //!
 //! [`NodeKey`]: conduit_protocol::api::NodeKey
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use conduit_core::graph::Direction;
-use conduit_protocol::{NodeDescriptor, NodeState};
+use conduit_core::graph::{Direction, LinkId, NodeId, PortId};
+use conduit_protocol::api::NodeKey;
+use conduit_protocol::{Command, LinkDescriptor, NodeDescriptor, NodeState};
 use iced::font::Weight;
 use iced::mouse;
+use iced::widget::canvas::{LineCap, LineDash, LineJoin, Path, Stroke};
 use iced::widget::text::{LineHeight, Wrapping};
 use iced::widget::{
     canvas, column, container, mouse_area, pin, row, rule, scrollable, space, stack, text,
@@ -60,7 +85,7 @@ use serde::{Deserialize, Serialize};
 use crate::app::Message;
 use crate::i18n::{self, Text};
 use crate::model::Mirror;
-use crate::theme::{CORPS_INTERFACE, ESPACE_S, FILET};
+use crate::theme::{jetons, CORPS_INTERFACE, ESPACE_S, FILET};
 use crate::{style, typo};
 
 // --- Mesures de la maquette -------------------------------------------------
@@ -225,7 +250,8 @@ pub struct Placement {
 /// Point d'attache d'un port sur sa carte : le centre de sa pastille.
 ///
 /// Une entrée s'attache à gauche de la carte, une sortie à droite ; `index`
-/// est le rang du port dans sa colonne. M2-05 y accrochera les liens.
+/// est le rang du port dans sa colonne. C'est le point d'où partent et où
+/// arrivent les courbes de liens.
 pub fn ancre(placement: &Placement, direction: Direction, index: usize) -> Point {
     let x = match direction {
         Direction::Input => placement.position.x - DEBORDEMENT + PASTILLE / 2.0,
@@ -350,17 +376,262 @@ pub fn etendue(placements: &[Placement]) -> Size {
     Size::new(largeur, hauteur)
 }
 
+// --- Liens ------------------------------------------------------------------
+
+/// Épaisseur d'un lien au repos.
+const EPAISSEUR_LIEN: f32 = 1.5;
+/// Épaisseur du lien sélectionné.
+const EPAISSEUR_LIEN_CHOISI: f32 = 2.5;
+/// Part de l'écart horizontal reportée sur les points de contrôle.
+const TENSION: f32 = 0.5;
+/// Écart horizontal minimal des points de contrôle : sans lui, deux ports
+/// presque alignés donneraient un trait et non une courbe.
+const TENSION_MINIMALE: f32 = 50.0;
+/// Pointillés du lien en cours de tirage : 4 px de trait, 4 px de vide.
+const POINTILLES: [f32; 2] = [4.0, 4.0];
+/// Nombre d'intervalles échantillonnés sur une courbe pour le test de clic.
+const ECHANTILLONS: usize = 16;
+/// Distance au-delà de laquelle un clic ne touche plus une courbe.
+const SEUIL_CLIC: f32 = 6.0;
+
+/// Fréquence du générateur de test : le la du diapason.
+pub const FREQUENCE_TEST: f32 = 440.0;
+/// Niveau crête du générateur de test, en décibels pleine échelle.
+///
+/// Le générateur part vers de vraies enceintes : −12 dBFS laisse le sinus
+/// franchement audible sans faire sursauter qui a monté le volume. La pleine
+/// échelle serait un signal de test dangereux pour les oreilles comme pour les
+/// haut-parleurs.
+pub const NIVEAU_TEST_DB: f32 = -12.0;
+/// Canaux du générateur de test : stéréo, comme la plupart des entrées.
+pub const CANAUX_TEST: usize = 2;
+
+/// Amplitude crête du générateur de test, en gain linéaire (≈ 0,251).
+pub fn amplitude_test() -> f32 {
+    10.0_f32.powf(NIVEAU_TEST_DB / 20.0)
+}
+
+/// Un nom libre pour un nouveau générateur de test.
+///
+/// Le démon refuse deux nœuds internes de même nom : le second générateur
+/// s'appelle donc « Générateur de test 2 », et ainsi de suite.
+pub fn nom_de_generateur(noeuds: &[NodeDescriptor]) -> String {
+    let base = i18n::t(Text::PatchbayGenerator);
+    let pris = |nom: &str| {
+        let cle = NodeKey::internal(nom);
+        noeuds.iter().any(|n| n.key == cle)
+    };
+    if !pris(base) {
+        return base.to_string();
+    }
+    let mut rang = 2;
+    loop {
+        let nom = format!("{base} {rang}");
+        if !pris(&nom) {
+            return nom;
+        }
+        rang += 1;
+    }
+}
+
+/// Les deux points de contrôle de la courbe qui va de `a` à `b`.
+///
+/// Ils sortent **horizontalement** de chaque extrémité, d'une demi-largeur de
+/// l'écart horizontal et d'au moins `TENSION_MINIMALE` : le lien quitte la
+/// sortie vers la droite et entre par la gauche, quel que soit le sens dans
+/// lequel les deux cartes ont été rangées.
+pub fn controles(a: Point, b: Point) -> (Point, Point) {
+    let dx = ((b.x - a.x).abs() * TENSION).max(TENSION_MINIMALE);
+    (Point::new(a.x + dx, a.y), Point::new(b.x - dx, b.y))
+}
+
+/// Le point de la courbe de `a` à `b` au paramètre `t` ∈ [0, 1].
+pub fn point_de_courbe(a: Point, b: Point, t: f32) -> Point {
+    let (c1, c2) = controles(a, b);
+    let u = 1.0 - t;
+    let (w0, w1, w2, w3) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
+    Point::new(
+        w0 * a.x + w1 * c1.x + w2 * c2.x + w3 * b.x,
+        w0 * a.y + w1 * c1.y + w2 * c2.y + w3 * b.y,
+    )
+}
+
+/// Le chemin de la courbe qui va de `a` à `b`.
+fn chemin(a: Point, b: Point) -> Path {
+    let (c1, c2) = controles(a, b);
+    Path::new(|constructeur| {
+        constructeur.move_to(a);
+        constructeur.bezier_curve_to(c1, c2, b);
+    })
+}
+
+/// Distance d'un point au **segment** qui va de `a` à `b`.
+fn distance_au_segment(a: Point, b: Point, point: Point) -> f32 {
+    let segment = b - a;
+    let carre = segment.x * segment.x + segment.y * segment.y;
+    if carre <= f32::EPSILON {
+        return a.distance(point);
+    }
+    let t = (((point.x - a.x) * segment.x + (point.y - a.y) * segment.y) / carre).clamp(0.0, 1.0);
+    Point::new(a.x + t * segment.x, a.y + t * segment.y).distance(point)
+}
+
+/// Distance approchée d'un point à la courbe qui va de `a` à `b`.
+///
+/// La courbe est découpée en `ECHANTILLONS` segments et c'est la distance
+/// aux **segments** qui est mesurée, non aux seuls points d'échantillonnage :
+/// sur une courbe longue de plusieurs centaines de pixels, un point tous les
+/// vingt pixels laisserait un clic posé entre deux échantillons hors du seuil.
+/// Cela évite au passage de résoudre une équation de degré cinq.
+pub fn distance_a_la_courbe(a: Point, b: Point, point: Point) -> f32 {
+    let mut precedent = a;
+    let mut distance = f32::INFINITY;
+    for i in 1..=ECHANTILLONS {
+        let courant = point_de_courbe(a, b, i as f32 / ECHANTILLONS as f32);
+        distance = distance.min(distance_au_segment(precedent, courant, point));
+        precedent = courant;
+    }
+    distance
+}
+
+/// Un lien prêt à dessiner : ses deux extrémités dans le repère de la scène.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Courbe {
+    /// Le lien représenté.
+    pub lien: LinkId,
+    /// Point d'attache de la sortie.
+    pub depart: Point,
+    /// Point d'attache de l'entrée.
+    pub arrivee: Point,
+}
+
+/// Point d'attache d'un port, si son nœud est encore là et placé.
+pub fn ancre_de_port(
+    port: PortId,
+    noeuds: &[NodeDescriptor],
+    placements: &[Placement],
+) -> Option<Point> {
+    let rang = noeuds.iter().position(|n| n.id == port.node)?;
+    Some(ancre(
+        placements.get(rang)?,
+        port.direction,
+        port.index as usize,
+    ))
+}
+
+/// Les liens dessinables : ceux dont les deux extrémités ont un placement.
+///
+/// Un lien dont un nœud a disparu du miroir n'est pas dessiné, et ce n'est pas
+/// une erreur : la notification qui retire le lien peut arriver après celle qui
+/// retire le nœud.
+pub fn courbes(
+    links: &[LinkDescriptor],
+    noeuds: &[NodeDescriptor],
+    placements: &[Placement],
+) -> Vec<Courbe> {
+    links
+        .iter()
+        .filter_map(|lien| {
+            Some(Courbe {
+                lien: lien.link.id,
+                depart: ancre_de_port(lien.link.src, noeuds, placements)?,
+                arrivee: ancre_de_port(lien.link.dst, noeuds, placements)?,
+            })
+        })
+        .collect()
+}
+
+/// Le lien le plus proche du point cliqué, s'il passe à moins de
+/// `SEUIL_CLIC`.
+pub fn lien_le_plus_proche(courbes: &[Courbe], point: Point) -> Option<LinkId> {
+    courbes
+        .iter()
+        .map(|c| (c.lien, distance_a_la_courbe(c.depart, c.arrivee, point)))
+        .filter(|(_, distance)| *distance <= SEUIL_CLIC)
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(lien, _)| lien)
+}
+
+/// Vrai si lier `depuis` à `vers` fermerait une boucle (F-12).
+///
+/// Fonction **pure** : un parcours en profondeur du graphe des liens, parti de
+/// `vers`. Si `depuis` est atteint, c'est que le signal reviendrait sur ses
+/// pas ; un nœud vers lui-même est donc une boucle, lui aussi.
+///
+/// Le démon reste l'autorité : ce refus local évite un aller-retour et permet
+/// de nommer les deux nœuds, il ne remplace pas la vérification du moteur.
+pub fn cree_un_cycle(links: &[LinkDescriptor], depuis: NodeId, vers: NodeId) -> bool {
+    let mut vus = BTreeSet::new();
+    let mut pile = vec![vers];
+    while let Some(noeud) = pile.pop() {
+        if noeud == depuis {
+            return true;
+        }
+        if !vus.insert(noeud) {
+            continue;
+        }
+        pile.extend(
+            links
+                .iter()
+                .filter(|l| l.link.src.node == noeud)
+                .map(|l| l.link.dst.node),
+        );
+    }
+    false
+}
+
 // --- État -------------------------------------------------------------------
 
-/// Geste de déplacement d'une carte.
+/// Geste de l'utilisateur sur la scène.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Geste {
     /// L'en-tête d'une carte vient d'être pressé.
     Saisi(String),
     /// Le curseur a bougé, en coordonnées de la scène.
     Deplace(Point),
-    /// Le bouton est relâché.
+    /// Le bouton est relâché après le déplacement d'une carte.
     Relache,
+    /// Une pastille de sortie vient d'être pressée : un lien se tire.
+    DebutLien(PortId),
+    /// Le curseur entre sur une pastille d'entrée, ou la quitte.
+    SurvolPort(Option<PortId>),
+    /// Le bouton est relâché pendant le tirage d'un lien.
+    FinLien,
+    /// Un lien est choisi dans le canevas, ou le vide est cliqué.
+    Selection(Option<LinkId>),
+    /// Suppr ou Retour arrière : le lien sélectionné s'en va.
+    Supprimer,
+}
+
+/// Le lien en cours de tirage.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Tirage {
+    /// Port de sortie d'où part le lien.
+    pub source: PortId,
+    /// Port d'entrée survolé, s'il y en a un.
+    ///
+    /// C'est le **survol du widget** qui le remplit, pas un test
+    /// d'intersection : les bornes réelles de la pastille sont plus justes que
+    /// la géométrie que le canevas recalcule.
+    pub cible: Option<PortId>,
+}
+
+/// Ce qu'un geste demande à l'application, en plus de son effet local.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Effet {
+    /// Rien : le geste s'est joué entièrement dans l'état de la vue.
+    Rien,
+    /// Écrire les préférences : une carte a bougé.
+    Enregistrer,
+    /// Envoyer cette commande au démon.
+    Commande(Command),
+    /// Refuser le lien et le dire : il fermerait une boucle (F-12).
+    Boucle {
+        /// Nœud d'où le lien demandé partait.
+        depuis: NodeId,
+        /// Nœud où il allait, et qui alimente déjà `depuis`.
+        vers: NodeId,
+    },
 }
 
 /// La carte en cours de déplacement.
@@ -389,6 +660,13 @@ pub struct State {
     pub positions: Positions,
     /// Carte en cours de déplacement, s'il y en a une.
     pub saisie: Option<Saisie>,
+    /// Lien en cours de tirage, s'il y en a un.
+    pub tirage: Option<Tirage>,
+    /// Lien sélectionné, s'il y en a un.
+    ///
+    /// Il peut désigner un lien que le démon vient de retirer :
+    /// [`State::lien_selectionne`] ne le rend que s'il est encore là.
+    pub selection: Option<LinkId>,
 }
 
 impl State {
@@ -402,12 +680,28 @@ impl State {
         self.saisie.as_ref().is_some_and(|s| s.cle == cle)
     }
 
-    /// Réduit un geste. Rend vrai s'il faut écrire les préférences, c'est-à-
-    /// dire au relâchement d'une carte qui a bougé.
+    /// Vrai si un lien est en cours de tirage.
+    pub fn en_tirage(&self) -> bool {
+        self.tirage.is_some()
+    }
+
+    /// Le lien sélectionné, s'il existe encore dans le graphe.
+    pub fn lien_selectionne(&self, links: &[LinkDescriptor]) -> Option<LinkId> {
+        let id = self.selection?;
+        links.iter().any(|l| l.link.id == id).then_some(id)
+    }
+
+    /// Réduit un geste et dit ce qu'il demande à l'application.
     ///
-    /// Pure : aucune entrée/sortie, `placements` dit seulement où les cartes
-    /// se trouvent au moment de la saisie.
-    pub fn reduire(&mut self, geste: Geste, placements: &[Placement]) -> bool {
+    /// Pure : aucune entrée/sortie. `placements` dit où les cartes se
+    /// trouvaient au moment de la saisie, `links` ce que le démon a déjà
+    /// branché — le seul refus décidé ici est celui de la boucle.
+    pub fn reduire(
+        &mut self,
+        geste: Geste,
+        placements: &[Placement],
+        links: &[LinkDescriptor],
+    ) -> Effet {
         match geste {
             Geste::Saisi(cle) => {
                 if let Some(placement) = placements.iter().find(|p| p.cle == cle) {
@@ -435,50 +729,160 @@ impl State {
                 }
             }
             Geste::Relache => {
-                return self.saisie.take().is_some_and(|s| s.deplacee);
+                if self.saisie.take().is_some_and(|s| s.deplacee) {
+                    return Effet::Enregistrer;
+                }
+            }
+            Geste::DebutLien(source) => {
+                // Un lien part d'une sortie : une pression sur une entrée ne
+                // commence rien.
+                if source.direction == Direction::Output {
+                    self.tirage = Some(Tirage {
+                        source,
+                        cible: None,
+                    });
+                }
+            }
+            Geste::SurvolPort(cible) => {
+                if let Some(tirage) = &mut self.tirage {
+                    tirage.cible = cible.filter(|p| p.direction == Direction::Input);
+                }
+            }
+            Geste::FinLien => return self.finir_le_lien(links),
+            Geste::Selection(lien) => {
+                // Un second clic sur le même lien le désélectionne ; un clic à
+                // l'écart aussi.
+                self.selection = match lien {
+                    Some(id) if self.selection == Some(id) => None,
+                    autre => autre,
+                };
+            }
+            Geste::Supprimer => {
+                if let Some(link) = self.lien_selectionne(links) {
+                    return Effet::Commande(Command::Unlink { link });
+                }
             }
         }
-        false
+        Effet::Rien
+    }
+
+    /// Ce que le relâchement d'un tirage produit.
+    ///
+    /// Trois refus muets — le tirage lâché dans le vide, le nœud vers
+    /// lui-même, le doublon exact —, un refus qui se dit — la boucle —, et le
+    /// seul cas qui parle au démon.
+    fn finir_le_lien(&mut self, links: &[LinkDescriptor]) -> Effet {
+        let Some(tirage) = self.tirage.take() else {
+            return Effet::Rien;
+        };
+        let (source, Some(cible)) = (tirage.source, tirage.cible) else {
+            return Effet::Rien;
+        };
+        if source.node == cible.node {
+            return Effet::Rien;
+        }
+        if links
+            .iter()
+            .any(|l| l.link.src == source && l.link.dst == cible)
+        {
+            return Effet::Rien;
+        }
+        if cree_un_cycle(links, source.node, cible.node) {
+            return Effet::Boucle {
+                depuis: source.node,
+                vers: cible.node,
+            };
+        }
+        Effet::Commande(Command::Link {
+            src: source,
+            dst: cible,
+        })
     }
 }
 
 // --- Canevas ----------------------------------------------------------------
 
-/// Le canevas de la scène : sous les cartes, il ne dessine encore rien — les
-/// liens sont M2-05 — mais porte déjà l'interaction de déplacement.
+/// Ce que le canevas retient d'un tirage : la position du curseur, dans le
+/// repère de la scène.
+///
+/// Elle vit **ici** et non dans [`State`] : la suivre par message
+/// reconstruirait toute la vue à chaque pixel, alors qu'un
+/// [`canvas::Action::request_redraw`] suffit à redessiner la seule courbe qui
+/// bouge.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Suivi {
+    /// Dernière position connue du curseur, si le canevas en a vu une.
+    curseur: Option<Point>,
+}
+
+/// Le canevas de la scène : sous les cartes, il dessine les liens et porte
+/// l'interaction qui n'appartient à aucun widget.
 ///
 /// Il voit les mouvements et le relâchement que le [`mouse_area`] de l'en-tête
-/// ne capture pas, ce qui permet de continuer à suivre le curseur quand celui-
-/// ci sort de la carte.
-#[derive(Debug, Clone, Copy)]
+/// ou d'une pastille ne capture pas, ce qui permet de continuer à suivre le
+/// curseur quand celui-ci sort de la carte.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Graphe {
     /// Vrai pendant le déplacement d'une carte.
     deplacement: bool,
+    /// Vrai pendant le tirage d'un lien.
+    tirage: bool,
+    /// Point d'attache du port d'où le lien se tire, si son nœud est placé.
+    depart: Option<Point>,
+    /// Les liens dessinables, déjà résolus en points d'attache.
+    courbes: Vec<Courbe>,
+    /// Le lien sélectionné, s'il y en a un.
+    selection: Option<LinkId>,
 }
 
 impl canvas::Program<Message> for Graphe {
-    type State = ();
+    type State = Suivi;
 
     fn update(
         &self,
-        _etat: &mut (),
+        etat: &mut Suivi,
         evenement: &iced::Event,
         bornes: Rectangle,
-        _curseur: mouse::Cursor,
+        curseur: mouse::Cursor,
     ) -> Option<canvas::Action<Message>> {
-        if !self.deplacement {
-            return None;
-        }
         // La position de l'événement est celle de la fenêtre ; la scène a son
         // propre repère, qui commence au coin du canevas.
+        let scene = |position: &Point| *position - Vector::new(bornes.x, bornes.y);
         match evenement {
             iced::Event::Mouse(mouse::Event::CursorMoved { position }) => {
-                Some(canvas::Action::publish(Message::Patchbay(Geste::Deplace(
-                    *position - Vector::new(bornes.x, bornes.y),
-                ))))
+                if self.deplacement {
+                    Some(canvas::Action::publish(Message::Patchbay(Geste::Deplace(
+                        scene(position),
+                    ))))
+                } else if self.tirage {
+                    // Aucun message : le canevas se redessine seul.
+                    etat.curseur = Some(scene(position));
+                    Some(canvas::Action::request_redraw())
+                } else {
+                    None
+                }
             }
             iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                Some(canvas::Action::publish(Message::Patchbay(Geste::Relache)).and_capture())
+                let geste = if self.deplacement {
+                    Geste::Relache
+                } else if self.tirage {
+                    Geste::FinLien
+                } else {
+                    return None;
+                };
+                Some(canvas::Action::publish(Message::Patchbay(geste)).and_capture())
+            }
+            iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                if !self.deplacement && !self.tirage =>
+            {
+                // Le canevas est la couche du bas : la pression qui lui
+                // parvient n'a été prise ni par une carte ni par une pastille.
+                let point = curseur.position_in(bornes)?;
+                let choisi = lien_le_plus_proche(&self.courbes, point);
+                Some(
+                    canvas::Action::publish(Message::Patchbay(Geste::Selection(choisi)))
+                        .and_capture(),
+                )
             }
             _ => None,
         }
@@ -486,24 +890,64 @@ impl canvas::Program<Message> for Graphe {
 
     fn draw(
         &self,
-        _etat: &(),
-        _renderer: &Renderer,
-        _theme: &Theme,
-        _bornes: Rectangle,
+        etat: &Suivi,
+        renderer: &Renderer,
+        theme: &Theme,
+        bornes: Rectangle,
         _curseur: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
-        // Les liens arrivent en M2-05 : rien à dessiner pour l'instant.
-        Vec::new()
+        if self.courbes.is_empty() && self.depart.is_none() {
+            return Vec::new();
+        }
+        let j = jetons(theme);
+        let mut frame = canvas::Frame::new(renderer, bornes.size());
+        for courbe in &self.courbes {
+            let choisi = self.selection == Some(courbe.lien);
+            frame.stroke(
+                &chemin(courbe.depart, courbe.arrivee),
+                Stroke {
+                    style: canvas::Style::Solid(if choisi { j.accent_texte } else { j.or }),
+                    width: if choisi {
+                        EPAISSEUR_LIEN_CHOISI
+                    } else {
+                        EPAISSEUR_LIEN
+                    },
+                    line_cap: LineCap::Round,
+                    line_join: LineJoin::Round,
+                    line_dash: LineDash::default(),
+                },
+            );
+        }
+        // Le lien en cours de tirage : garance et pointillés, le temps de
+        // trouver une entrée.
+        if let (Some(depart), Some(curseur)) = (self.depart, etat.curseur) {
+            frame.stroke(
+                &chemin(depart, curseur),
+                Stroke {
+                    style: canvas::Style::Solid(j.garance),
+                    width: EPAISSEUR_LIEN,
+                    line_cap: LineCap::Round,
+                    line_join: LineJoin::Round,
+                    line_dash: LineDash {
+                        segments: &POINTILLES,
+                        offset: 0,
+                    },
+                },
+            );
+        }
+        vec![frame.into_geometry()]
     }
 
     fn mouse_interaction(
         &self,
-        _etat: &(),
+        _etat: &Suivi,
         _bornes: Rectangle,
         _curseur: mouse::Cursor,
     ) -> mouse::Interaction {
         if self.deplacement {
             mouse::Interaction::Grabbing
+        } else if self.tirage {
+            mouse::Interaction::Crosshair
         } else {
             mouse::Interaction::None
         }
@@ -533,11 +977,16 @@ pub fn view<'a>(mirror: &'a Mirror, state: &'a State, graisse: Weight) -> Elemen
 fn scene<'a>(mirror: &'a Mirror, state: &'a State, graisse: Weight) -> Element<'a, Message> {
     let placements = disposer(&mirror.nodes, &state.positions);
     let etendue = etendue(&placements);
-    let mut couches = stack![canvas(Graphe {
+    let graphe = Graphe {
         deplacement: state.deplacement(),
-    })
-    .width(etendue.width)
-    .height(etendue.height)];
+        tirage: state.en_tirage(),
+        depart: state
+            .tirage
+            .and_then(|t| ancre_de_port(t.source, &mirror.nodes, &placements)),
+        courbes: courbes(&mirror.links, &mirror.nodes, &placements),
+        selection: state.lien_selectionne(&mirror.links),
+    };
+    let mut couches = stack![canvas(graphe).width(etendue.width).height(etendue.height)];
     for (noeud, placement) in mirror.nodes.iter().zip(&placements) {
         let saisie = state.saisie_de(&placement.cle);
         couches = couches.push(
@@ -588,16 +1037,39 @@ fn carte<'a>(
         for index in 0..ports.len() {
             let centre = ancre(&coin, direction, index);
             couches = couches.push(
-                pin(container(space::horizontal())
-                    .width(PASTILLE)
-                    .height(PASTILLE)
-                    .style(style::pastille_voilee(|j| j.or, opacite)))
-                .x(centre.x - PASTILLE / 2.0)
-                .y(centre.y - PASTILLE / 2.0),
+                pin(pastille(noeud.id, direction, index, opacite))
+                    .x(centre.x - PASTILLE / 2.0)
+                    .y(centre.y - PASTILLE / 2.0),
             );
         }
     }
     couches.into()
+}
+
+/// La pastille d'un port : un point d'or, et la zone qui écoute la souris.
+///
+/// Une **sortie** commence un tirage à la pression ; une **entrée** se
+/// contente de dire qu'elle est survolée. C'est ce survol — les bornes réelles
+/// du widget — qui désigne la cible au relâchement, et non un test
+/// d'intersection contre la géométrie recalculée.
+fn pastille<'a>(
+    noeud: NodeId,
+    direction: Direction,
+    index: usize,
+    opacite: f32,
+) -> Element<'a, Message> {
+    let port = PortId::new(noeud, direction, index as u16);
+    let point = container(space::horizontal())
+        .width(PASTILLE)
+        .height(PASTILLE)
+        .style(style::pastille_voilee(|j| j.or, opacite));
+    let zone = match direction {
+        Direction::Output => mouse_area(point).on_press(Message::Patchbay(Geste::DebutLien(port))),
+        Direction::Input => mouse_area(point)
+            .on_enter(Message::Patchbay(Geste::SurvolPort(Some(port))))
+            .on_exit(Message::Patchbay(Geste::SurvolPort(None))),
+    };
+    zone.interaction(mouse::Interaction::Crosshair).into()
 }
 
 /// Le corps de la carte : l'en-tête saisissable, son filet, la grille des
@@ -717,9 +1189,8 @@ fn opacite(noeud: &NodeDescriptor) -> f32 {
 
 /// Le texte d'aide, en bas à gauche de la zone.
 ///
-/// Il annonce le glisser-déposer de M2-05 : la phrase reste, la vue sera
-/// complète au commit suivant. Il est posé **hors** du défilement, pour
-/// rester lisible quelle que soit la position de la scène.
+/// Il dit les trois gestes de la scène. Il est posé **hors** du défilement,
+/// pour rester lisible quelle que soit la position de la scène.
 fn aide<'a>(graisse: Weight) -> Element<'a, Message> {
     container(
         text(i18n::t(Text::PatchbayHint))
@@ -755,10 +1226,28 @@ mod tests {
     use super::*;
 
     use conduit_backend::{DeviceDirection, DeviceId, DeviceInfo};
-    use conduit_core::graph::NodeId;
+    use conduit_core::graph::{LinkInfo, NodeId};
     use conduit_core::node::PortSpec;
     use conduit_core::types::{Db, SampleRate};
-    use conduit_protocol::api::NodeKey;
+
+    /// Un identifiant de nœud, du rang donné.
+    fn id(rang: u32) -> NodeId {
+        NodeId::new(rang, 0)
+    }
+
+    /// Un lien du premier port de sortie de `src` au premier port d'entrée de
+    /// `dst`.
+    fn lien(rang: u32, src: NodeId, dst: NodeId) -> LinkDescriptor {
+        LinkDescriptor {
+            link: LinkInfo {
+                id: LinkId::new(rang, 0),
+                src: PortId::new(src, Direction::Output, 0),
+                dst: PortId::new(dst, Direction::Input, 0),
+            },
+            gain_db: Db::UNITY,
+            muted: false,
+        }
+    }
 
     /// Un nœud interne à `entrees` entrées et `sorties` sorties.
     fn noeud(nom: &str, entrees: usize, sorties: usize) -> NodeDescriptor {
@@ -989,26 +1478,40 @@ mod tests {
         let depart = placements[0].position;
         let mut state = State::default();
 
-        assert!(!state.reduire(Geste::Saisi("internal:a".into()), &placements));
+        assert_eq!(
+            state.reduire(Geste::Saisi("internal:a".into()), &placements, &[]),
+            Effet::Rien
+        );
         assert!(state.deplacement() && state.saisie_de("internal:a"));
         // Le premier mouvement ne fait que noter l'écart au curseur.
         let curseur = Point::new(depart.x + 30.0, depart.y + 12.0);
-        assert!(!state.reduire(Geste::Deplace(curseur), &placements));
+        assert_eq!(
+            state.reduire(Geste::Deplace(curseur), &placements, &[]),
+            Effet::Rien
+        );
         assert!(state.positions.is_empty(), "la carte n'a pas encore bougé");
         // Le suivant emmène la carte, écart conservé.
-        assert!(!state.reduire(
-            Geste::Deplace(Point::new(curseur.x + 100.0, curseur.y + 40.0)),
-            &placements
-        ));
+        assert_eq!(
+            state.reduire(
+                Geste::Deplace(Point::new(curseur.x + 100.0, curseur.y + 40.0)),
+                &placements,
+                &[]
+            ),
+            Effet::Rien
+        );
         assert_eq!(
             state.positions.get("internal:a"),
             Some(Point::new(depart.x + 100.0, depart.y + 40.0))
         );
         // Le relâchement ferme la saisie et demande l'écriture.
-        assert!(state.reduire(Geste::Relache, &placements));
+        assert_eq!(
+            state.reduire(Geste::Relache, &placements, &[]),
+            Effet::Enregistrer
+        );
         assert!(!state.deplacement());
-        assert!(
-            !state.reduire(Geste::Relache, &placements),
+        assert_eq!(
+            state.reduire(Geste::Relache, &placements, &[]),
+            Effet::Rien,
             "plus rien à écrire"
         );
     }
@@ -1019,9 +1522,9 @@ mod tests {
         let noeuds = vec![noeud("a", 0, 1)];
         let placements = disposer(&noeuds, &Positions::default());
         let mut state = State::default();
-        state.reduire(Geste::Saisi("internal:a".into()), &placements);
-        state.reduire(Geste::Deplace(placements[0].position), &placements);
-        state.reduire(Geste::Deplace(Point::new(-500.0, -500.0)), &placements);
+        state.reduire(Geste::Saisi("internal:a".into()), &placements, &[]);
+        state.reduire(Geste::Deplace(placements[0].position), &placements, &[]);
+        state.reduire(Geste::Deplace(Point::new(-500.0, -500.0)), &placements, &[]);
         assert_eq!(state.positions.get("internal:a"), Some(Point::ORIGIN));
     }
 
@@ -1030,11 +1533,266 @@ mod tests {
     #[test]
     fn un_geste_sans_carte_est_sans_effet() {
         let mut state = State::default();
-        assert!(!state.reduire(Geste::Saisi("internal:fantôme".into()), &[]));
+        assert_eq!(
+            state.reduire(Geste::Saisi("internal:fantôme".into()), &[], &[]),
+            Effet::Rien
+        );
         assert!(!state.deplacement());
-        assert!(!state.reduire(Geste::Deplace(Point::new(10.0, 10.0)), &[]));
+        assert_eq!(
+            state.reduire(Geste::Deplace(Point::new(10.0, 10.0)), &[], &[]),
+            Effet::Rien
+        );
         assert!(state.positions.is_empty());
-        assert!(!state.reduire(Geste::Relache, &[]));
+        assert_eq!(state.reduire(Geste::Relache, &[], &[]), Effet::Rien);
+    }
+
+    /// Les points de contrôle sortent horizontalement, d'au moins la tension
+    /// minimale.
+    #[test]
+    fn les_points_de_controle_sortent_a_l_horizontale() {
+        let a = Point::new(100.0, 50.0);
+        let b = Point::new(500.0, 200.0);
+        let (c1, c2) = controles(a, b);
+        assert_eq!(
+            c1.y, a.y,
+            "le contrôle de départ reste à la hauteur du port"
+        );
+        assert_eq!(c2.y, b.y);
+        let dx = (b.x - a.x).abs() * TENSION;
+        assert_eq!(c1.x, a.x + dx);
+        assert_eq!(c2.x, b.x - dx);
+        // Deux ports presque alignés gardent une vraie courbe.
+        let (c1, c2) = controles(a, Point::new(a.x + 4.0, a.y + 30.0));
+        assert_eq!(c1.x, a.x + TENSION_MINIMALE);
+        assert_eq!(c2.x, a.x + 4.0 - TENSION_MINIMALE);
+        // Un lien qui remonte le graphe garde le même sens de sortie.
+        let (c1, _) = controles(a, Point::new(a.x - 300.0, a.y));
+        assert!(c1.x > a.x);
+    }
+
+    /// La courbe part du port et y arrive ; son milieu passe entre les deux.
+    #[test]
+    fn la_courbe_joint_ses_deux_extremites() {
+        let a = Point::new(100.0, 50.0);
+        let b = Point::new(400.0, 250.0);
+        assert_eq!(point_de_courbe(a, b, 0.0), a);
+        assert_eq!(point_de_courbe(a, b, 1.0), b);
+        let milieu = point_de_courbe(a, b, 0.5);
+        assert!((milieu.x - (a.x + b.x) / 2.0).abs() < 0.01);
+        assert!((milieu.y - (a.y + b.y) / 2.0).abs() < 0.01);
+    }
+
+    /// Un clic sur la courbe la touche ; à 20 px, non.
+    #[test]
+    fn le_clic_ne_touche_la_courbe_que_de_pres() {
+        let a = Point::new(100.0, 50.0);
+        let b = Point::new(400.0, 250.0);
+        let sur = point_de_courbe(a, b, 0.3);
+        assert!(distance_a_la_courbe(a, b, sur) < 1.0);
+        let a_cote = Point::new(sur.x, sur.y + 20.0);
+        assert!(distance_a_la_courbe(a, b, a_cote) > SEUIL_CLIC);
+
+        let courbes = vec![Courbe {
+            lien: LinkId::new(7, 0),
+            depart: a,
+            arrivee: b,
+        }];
+        assert_eq!(lien_le_plus_proche(&courbes, sur), Some(LinkId::new(7, 0)));
+        assert_eq!(lien_le_plus_proche(&courbes, a_cote), None);
+        assert_eq!(lien_le_plus_proche(&[], sur), None);
+    }
+
+    /// Les courbes se calent sur les ancres, et un lien dont un nœud manque
+    /// n'est ni dessiné ni fatal.
+    #[test]
+    fn un_lien_sans_noeud_n_est_pas_dessine_et_ne_panique_pas() {
+        let noeuds = vec![noeud("a", 0, 1), noeud("b", 1, 0)];
+        let noeuds: Vec<NodeDescriptor> = noeuds
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut n)| {
+                n.id = id(i as u32);
+                n
+            })
+            .collect();
+        let placements = disposer(&noeuds, &Positions::default());
+        let liens = vec![lien(0, id(0), id(1)), lien(1, id(0), id(9))];
+        let dessinees = courbes(&liens, &noeuds, &placements);
+        assert_eq!(dessinees.len(), 1, "le lien vers un nœud absent est ignoré");
+        assert_eq!(dessinees[0].lien, LinkId::new(0, 0));
+        assert_eq!(
+            dessinees[0].depart,
+            ancre(&placements[0], Direction::Output, 0)
+        );
+        assert_eq!(
+            dessinees[0].arrivee,
+            ancre(&placements[1], Direction::Input, 0)
+        );
+        // Sans aucun placement, rien n'est dessiné et rien ne panique.
+        assert!(courbes(&liens, &noeuds, &[]).is_empty());
+    }
+
+    /// La boucle se voit directement, par un détour, ou pas du tout.
+    #[test]
+    fn le_cycle_se_lit_dans_le_graphe_des_liens() {
+        // Graphe vide : aucun lien ne boucle.
+        assert!(!cree_un_cycle(&[], id(0), id(1)));
+        // Direct : a → b existe, b → a boucle.
+        let direct = vec![lien(0, id(0), id(1))];
+        assert!(cree_un_cycle(&direct, id(1), id(0)));
+        assert!(!cree_un_cycle(&direct, id(0), id(1)));
+        // Indirect : a → b → c, c → a boucle.
+        let indirect = vec![lien(0, id(0), id(1)), lien(1, id(1), id(2))];
+        assert!(cree_un_cycle(&indirect, id(2), id(0)));
+        assert!(!cree_un_cycle(&indirect, id(0), id(2)));
+        // Un nœud vers lui-même est une boucle.
+        assert!(cree_un_cycle(&[], id(0), id(0)));
+        // Une branche parallèle n'est pas une boucle.
+        let fourche = vec![lien(0, id(0), id(1)), lien(1, id(0), id(2))];
+        assert!(!cree_un_cycle(&fourche, id(1), id(2)));
+    }
+
+    /// Le tirage complet : pression sur une sortie, survol d'une entrée,
+    /// relâchement — et la commande qui va avec.
+    #[test]
+    fn le_tirage_d_un_lien_se_reduit_en_trois_temps() {
+        let mut state = State::default();
+        let source = PortId::new(id(0), Direction::Output, 1);
+        let cible = PortId::new(id(1), Direction::Input, 0);
+
+        assert_eq!(
+            state.reduire(Geste::DebutLien(source), &[], &[]),
+            Effet::Rien
+        );
+        assert!(state.en_tirage());
+        assert_eq!(
+            state.reduire(Geste::SurvolPort(Some(cible)), &[], &[]),
+            Effet::Rien
+        );
+        assert_eq!(
+            state.reduire(Geste::FinLien, &[], &[]),
+            Effet::Commande(Command::Link {
+                src: source,
+                dst: cible
+            })
+        );
+        assert!(!state.en_tirage(), "le tirage se referme au relâchement");
+    }
+
+    /// Relâché dans le vide, ou tiré depuis une entrée, le lien ne dit rien.
+    #[test]
+    fn un_tirage_sans_cible_n_emet_rien() {
+        let mut state = State::default();
+        let source = PortId::new(id(0), Direction::Output, 0);
+        state.reduire(Geste::DebutLien(source), &[], &[]);
+        state.reduire(
+            Geste::SurvolPort(Some(PortId::new(id(1), Direction::Input, 0))),
+            &[],
+            &[],
+        );
+        // Le curseur quitte la pastille avant le relâchement.
+        state.reduire(Geste::SurvolPort(None), &[], &[]);
+        assert_eq!(state.reduire(Geste::FinLien, &[], &[]), Effet::Rien);
+        assert!(!state.en_tirage());
+        // Un relâchement sans tirage ne fait rien non plus.
+        assert_eq!(state.reduire(Geste::FinLien, &[], &[]), Effet::Rien);
+        // Une pastille d'entrée ne commence pas de tirage.
+        state.reduire(
+            Geste::DebutLien(PortId::new(id(0), Direction::Input, 0)),
+            &[],
+            &[],
+        );
+        assert!(!state.en_tirage());
+    }
+
+    /// Trois refus : le nœud vers lui-même, le doublon exact, et la boucle —
+    /// seule celle-ci se dit.
+    #[test]
+    fn les_liens_impossibles_sont_refuses_avant_le_demon() {
+        let liens = vec![lien(0, id(0), id(1))];
+        let mut state = State::default();
+
+        // Un nœud vers lui-même : muet.
+        let sortie = PortId::new(id(0), Direction::Output, 0);
+        state.reduire(Geste::DebutLien(sortie), &[], &liens);
+        state.reduire(
+            Geste::SurvolPort(Some(PortId::new(id(0), Direction::Input, 0))),
+            &[],
+            &liens,
+        );
+        assert_eq!(state.reduire(Geste::FinLien, &[], &liens), Effet::Rien);
+
+        // Le doublon exact : muet lui aussi.
+        state.reduire(Geste::DebutLien(sortie), &[], &liens);
+        state.reduire(
+            Geste::SurvolPort(Some(PortId::new(id(1), Direction::Input, 0))),
+            &[],
+            &liens,
+        );
+        assert_eq!(state.reduire(Geste::FinLien, &[], &liens), Effet::Rien);
+
+        // La boucle : refusée, et dite.
+        state.reduire(
+            Geste::DebutLien(PortId::new(id(1), Direction::Output, 0)),
+            &[],
+            &liens,
+        );
+        state.reduire(
+            Geste::SurvolPort(Some(PortId::new(id(0), Direction::Input, 0))),
+            &[],
+            &liens,
+        );
+        assert_eq!(
+            state.reduire(Geste::FinLien, &[], &liens),
+            Effet::Boucle {
+                depuis: id(1),
+                vers: id(0)
+            }
+        );
+    }
+
+    /// La sélection bascule, et Suppr retire le lien sélectionné.
+    #[test]
+    fn la_selection_bascule_et_suppr_retire_le_lien() {
+        let liens = vec![lien(0, id(0), id(1)), lien(1, id(1), id(2))];
+        let mut state = State::default();
+        // Sans sélection, Suppr n'émet rien.
+        assert_eq!(state.reduire(Geste::Supprimer, &[], &liens), Effet::Rien);
+
+        state.reduire(Geste::Selection(Some(LinkId::new(0, 0))), &[], &liens);
+        assert_eq!(state.lien_selectionne(&liens), Some(LinkId::new(0, 0)));
+        assert_eq!(
+            state.reduire(Geste::Supprimer, &[], &liens),
+            Effet::Commande(Command::Unlink {
+                link: LinkId::new(0, 0)
+            })
+        );
+        // Un second clic sur le même lien le désélectionne.
+        state.reduire(Geste::Selection(Some(LinkId::new(0, 0))), &[], &liens);
+        assert_eq!(state.lien_selectionne(&liens), None);
+        // Un clic à l'écart désélectionne aussi.
+        state.reduire(Geste::Selection(Some(LinkId::new(1, 0))), &[], &liens);
+        state.reduire(Geste::Selection(None), &[], &liens);
+        assert_eq!(state.lien_selectionne(&liens), None);
+        // Un lien que le démon a retiré n'est plus sélectionné.
+        state.reduire(Geste::Selection(Some(LinkId::new(1, 0))), &[], &liens);
+        assert_eq!(state.lien_selectionne(&[]), None);
+        assert_eq!(state.reduire(Geste::Supprimer, &[], &[]), Effet::Rien);
+    }
+
+    /// Le générateur de test prend un nom libre et un niveau prudent.
+    #[test]
+    fn le_generateur_de_test_prend_un_nom_libre() {
+        assert_eq!(nom_de_generateur(&[]), "Générateur de test");
+        let mut pris = noeud("Générateur de test", 0, 2);
+        pris.key = NodeKey::internal("Générateur de test");
+        assert_eq!(nom_de_generateur(&[pris.clone()]), "Générateur de test 2");
+        let mut second = pris.clone();
+        second.key = NodeKey::internal("Générateur de test 2");
+        assert_eq!(nom_de_generateur(&[pris, second]), "Générateur de test 3");
+        // −12 dBFS : audible sans danger pour de vraies enceintes.
+        assert!((amplitude_test() - 0.2512).abs() < 0.001);
+        assert!(amplitude_test() < 1.0);
     }
 
     /// La hauteur calculée est celle de la carte réellement composée.

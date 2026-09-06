@@ -2,7 +2,7 @@
 //! notice.
 //!
 //! Ce module ne connaît aucune vue : il pose le décor et reçoit de l'appelant
-//! le contenu de la vue courante et, s'il y en a une, son action principale.
+//! le contenu de la vue courante et ses actions d'en-tête, s'il y en a.
 //!
 //! Deux couches, comme partout dans ce crate :
 //!
@@ -19,14 +19,15 @@
 use conduit_protocol::{DriverStatus, EngineStatus};
 use iced::font::Weight;
 use iced::widget::text::LineHeight;
-use iced::widget::{button, column, container, row, rule, space, text};
+use iced::widget::{button, column, container, row, rule, space, stack, text};
 use iced::{Bottom, Center, Color, Element, Fill, Padding};
 
 use crate::app::{Connection, Message, Notice};
 use crate::i18n::{self, Text};
 use crate::model::Mirror;
 use crate::theme::{
-    CELADON, CORPS_INTERFACE, CORPS_META, ESPACE_L, ESPACE_S, ESPACE_XS, FILET, GARANCE, OR,
+    CELADON, CORPS_INTERFACE, CORPS_META, ESPACE_L, ESPACE_S, ESPACE_XL, ESPACE_XS, FILET, GARANCE,
+    OR,
 };
 use crate::{format, style, typo};
 
@@ -234,17 +235,20 @@ pub fn chiffres(mirror: &Mirror) -> (String, String) {
 /// `graisse` est la graisse du texte courant du mode
 /// ([`crate::theme::Jetons::graisse_texte`]) : `iced` fige la police au moment
 /// de la composition, alors que les couleurs, elles, sont choisies au rendu.
+///
+/// `actions` sont les actions de l'en-tête, dans l'ordre de lecture ; une vue
+/// peut n'en avoir aucune, ou en montrer une qui dépend de sa sélection.
 pub(crate) fn fenetre<'a>(
     onglet: Tab,
     connexion: &Connection,
     mirror: &Mirror,
     notice: Option<&'a Notice>,
     graisse: Weight,
-    action: Option<Element<'a, Message>>,
+    actions: Vec<Element<'a, Message>>,
     contenu: Element<'a, Message>,
 ) -> Element<'a, Message> {
     let mut page = column![
-        entete(onglet, mirror, graisse, action),
+        entete(onglet, mirror, graisse, actions),
         space::vertical().height(ECART_ENTETE),
         rule::horizontal(FILET).style(style::filet_or),
         space::vertical().height(ECART_CONTENU),
@@ -388,13 +392,13 @@ fn ligne_pastille<'a>(couleur: Color, libelle: String) -> Element<'a, Message> {
     .into()
 }
 
-/// L'en-tête du contenu : titre et sous-titre à gauche, action de la vue
-/// alignée en bas à droite.
+/// L'en-tête du contenu : titre et sous-titre à gauche, actions de la vue
+/// alignées en bas à droite.
 fn entete<'a>(
     onglet: Tab,
     mirror: &Mirror,
     graisse: Weight,
-    action: Option<Element<'a, Message>>,
+    actions: Vec<Element<'a, Message>>,
 ) -> Element<'a, Message> {
     let titres = column![
         text(onglet.label())
@@ -409,8 +413,8 @@ fn entete<'a>(
             .style(style::texte_en(|j| j.texte_2)),
     ]
     .width(Fill);
-    let mut ligne = row![titres].width(Fill).align_y(Bottom);
-    if let Some(action) = action {
+    let mut ligne = row![titres].spacing(ESPACE_XL).width(Fill).align_y(Bottom);
+    for action in actions {
         ligne = ligne.push(action);
     }
     ligne.into()
@@ -465,6 +469,56 @@ pub(crate) fn action_primaire<'a>(libelle: Text, message: Option<Message>) -> El
     .height(style::HAUTEUR_BOUTON)
     .padding(Padding::new(0.0).horizontal(style::PADDING_BOUTON))
     .style(style::bouton_primaire)
+    .into()
+}
+
+/// Une action d'appoint d'une vue, en bouton secondaire ; `message` absent la
+/// grise.
+pub(crate) fn action_secondaire<'a>(
+    libelle: Text,
+    message: Option<Message>,
+) -> Element<'a, Message> {
+    button(typo::petites_capitales(
+        i18n::t(libelle),
+        style::CORPS_BOUTON,
+    ))
+    .on_press_maybe(message)
+    .height(style::HAUTEUR_BOUTON)
+    .padding(Padding::new(0.0).horizontal(style::PADDING_BOUTON))
+    .style(style::bouton_secondaire)
+    .into()
+}
+
+/// Une action destructrice d'une vue, en lien souligné ; `message` absent la
+/// grise.
+///
+/// `iced` ne sait pas souligner un texte : le filet d'accent se compose sous
+/// le libellé (voir [`crate::style::lien`]). Le tout est centré dans la
+/// hauteur d'un bouton pour s'aligner sur les autres actions de l'en-tête.
+pub(crate) fn action_lien<'a>(libelle: Text, message: Option<Message>) -> Element<'a, Message> {
+    // Le filet est posé dans une couche **au-dessus** du libellé : un `rule`
+    // remplit son parent, et un `Stack` prend la taille de sa couche de base.
+    // C'est donc le libellé qui décide de la longueur du soulignement, et non
+    // la place restée libre dans l'en-tête.
+    let souligne = stack![
+        column![
+            typo::petites_capitales(i18n::t(libelle), style::CORPS_BOUTON),
+            space::vertical().height(ESPACE_XS + FILET),
+        ],
+        column![
+            space::vertical(),
+            rule::horizontal(FILET).style(style::filet_accent),
+        ]
+        .height(Fill),
+    ];
+    container(
+        button(souligne)
+            .on_press_maybe(message)
+            .padding(0)
+            .style(style::lien),
+    )
+    .height(style::HAUTEUR_BOUTON)
+    .align_y(Center)
     .into()
 }
 

@@ -21,17 +21,19 @@
 use std::path::PathBuf;
 
 use conduit_backend::{CableId, CableInfo, DeviceDirection, DeviceId, DeviceInfo};
-use conduit_core::graph::NodeId;
+use conduit_core::graph::{Direction, LinkId, LinkInfo, NodeId, PortId};
 use conduit_core::node::PortSpec;
 use conduit_core::types::{ChannelCount, Db, Quantum, SampleRate};
 use conduit_protocol::api::NodeKey;
 use conduit_protocol::{
-    DriverChoice, DriverStatus, EngineStatus, NodeDescriptor, NodeState, TimingSnapshot,
+    DriverChoice, DriverStatus, EngineStatus, LinkDescriptor, NodeDescriptor, NodeState,
+    TimingSnapshot,
 };
 
 use conduit_gui::app::{App, Message};
 use conduit_gui::ipc;
 use conduit_gui::model::Snapshot;
+use conduit_gui::patchbay::Geste;
 use conduit_gui::shell::Tab;
 use conduit_gui::{theme, typo};
 
@@ -102,6 +104,20 @@ fn peripherique(
     }
 }
 
+/// Un lien du premier port de sortie du nœud `src` à la première entrée de
+/// `dst`.
+fn lien(index: u32, src: u32, dst: u32) -> LinkDescriptor {
+    LinkDescriptor {
+        link: LinkInfo {
+            id: LinkId::new(index, 0),
+            src: PortId::new(NodeId::new(src, 0), Direction::Output, 0),
+            dst: PortId::new(NodeId::new(dst, 0), Direction::Input, 0),
+        },
+        gain_db: Db::UNITY,
+        muted: false,
+    }
+}
+
 /// Un chargement initial représentatif : le démon `null` avec ses deux câbles.
 fn chargement() -> Snapshot {
     Snapshot {
@@ -112,7 +128,7 @@ fn chargement() -> Snapshot {
             driver: DriverStatus::Internal,
             driver_choice: DriverChoice::Auto,
             nodes: 7,
-            links: 0,
+            links: 4,
             timing: TimingSnapshot::default(),
             xruns: 0,
             devices: vec![],
@@ -130,7 +146,9 @@ fn chargement() -> Snapshot {
             peripherique(5, "Haut-parleurs", 2, 0, NodeState::Driver, None),
             peripherique(6, "Interface Scarlett", 2, 2, NodeState::Suspended, None),
         ],
-        links: vec![],
+        // Les deux trajets que la maquette montre : la musique qui sort par
+        // les haut-parleurs, le micro qui entre en visioconférence.
+        links: vec![lien(0, 0, 2), lien(1, 2, 5), lien(2, 1, 3), lien(3, 3, 4)],
         // Représentatif des états qu'une ligne peut prendre : alias donné ou
         // absent, canaux au-delà de la stéréo, câble inactif.
         cables: vec![
@@ -205,5 +223,15 @@ fn apercus_des_vues() {
         Tab::Cables,
         &theme::sombre(),
         confirmation(),
+    );
+    // Le lien « Conduit 1 → Haut-parleurs » sélectionné : la courbe passe à
+    // l'accent du mode, et l'en-tête montre « Supprimer le lien ».
+    let selection = || vec![Message::Patchbay(Geste::Selection(Some(LinkId::new(1, 0))))];
+    rendre("patchbay-lien", Tab::Patchbay, &theme::clair(), selection());
+    rendre(
+        "patchbay-lien-sombre",
+        Tab::Patchbay,
+        &theme::sombre(),
+        selection(),
     );
 }
