@@ -185,10 +185,9 @@ pub fn onglet(actif: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
 /// Bouton de pas d'une grandeur — les « − » et « + » des canaux : carré,
 /// sans fond, cerné d'un filet de contour.
 ///
-/// Le libellé porte le texte courant et non le texte secondaire : ces boutons
-/// vivent sur une surface posée ([`ligne`]), où le texte secondaire ne passe
-/// que 4,3:1 (voir [`crate::theme::Jetons::texte_2`]). Le survol glisse vers
-/// l'accent lisible du mode, filet compris.
+/// Le libellé porte le texte courant : le nombre de canaux se lit, il ne
+/// s'efface pas. Le survol glisse vers l'accent lisible du mode, filet
+/// compris.
 pub fn bouton_pas(theme: &Theme, status: button::Status) -> button::Style {
     let j = jetons(theme);
     let survole = status == button::Status::Hovered;
@@ -206,9 +205,11 @@ pub fn bouton_pas(theme: &Theme, status: button::Status) -> button::Style {
 /// Bouton discret : ni fond, ni filet — la croix de suppression et les
 /// libellés d'appoint d'une ligne.
 ///
-/// Même raison que [`bouton_pas`] pour le texte courant plutôt que le texte
-/// secondaire. Le survol glisse vers l'accent lisible du mode : garance en
-/// clair, or en sombre, où la garance ne passe que 2,0:1.
+/// Le libellé porte le texte secondaire des surfaces posées
+/// ([`crate::theme::Jetons::texte_2_carte`]) : c'est une action d'appoint, elle
+/// s'efface devant le contenu de la ligne. Le survol glisse vers l'accent
+/// lisible du mode : garance en clair, or en sombre, où la garance ne passe que
+/// 2,0:1.
 pub fn bouton_discret(theme: &Theme, status: button::Status) -> button::Style {
     let j = jetons(theme);
     finir(
@@ -218,7 +219,8 @@ pub fn bouton_discret(theme: &Theme, status: button::Status) -> button::Style {
             text_color: if status == button::Status::Hovered {
                 j.accent_texte
             } else {
-                j.texte
+                // Discret : il vit dans une ligne, donc sur une surface posée.
+                j.texte_2_carte
             },
             border: Border::default(),
             ..button::Style::default()
@@ -396,30 +398,27 @@ fn trait_de(couleur: Color) -> rule::Style {
 }
 
 // --- Saisie -----------------------------------------------------------------
-
-/// Champ de saisie « souligné » : sans fond, cerné d'un filet sans rayon.
+/// Champ de saisie sans filet, souligné par un `rule` posé dessous.
 ///
-/// `iced` ne sait pas border un seul côté : le champ porte donc un filet
-/// complet de 1 px, sans rayon, qui joue le rôle du soulignement. Le filet
-/// glisse vers l'or au survol et vers la garance au focus.
-pub fn champ_souligne(theme: &Theme, status: text_input::Status) -> text_input::Style {
+/// La maquette veut un simple soulignement ; `iced` ne borde qu'un rectangle
+/// entier. Le champ est donc rendu nu et l'appelant pose le filet, ce qui lui
+/// permet au passage d'en changer la couleur selon l'édition en cours.
+pub fn champ_nu(theme: &Theme, status: text_input::Status) -> text_input::Style {
     let j = jetons(theme);
-    let couleur = match status {
-        text_input::Status::Active => j.contour,
-        text_input::Status::Hovered => j.or,
-        text_input::Status::Focused { .. } => j.garance,
-        text_input::Status::Disabled => opacifier(j.contour, OPACITE_DESACTIVE),
-    };
     let atone = matches!(status, text_input::Status::Disabled);
     text_input::Style {
         background: fond(Color::TRANSPARENT),
+        // Aucun filet : `iced` ne sait border qu'un rectangle entier, alors que
+        // le dessin veut un simple soulignement. Celui-ci est un `rule` posé
+        // sous le champ par l'appelant, dont la couleur suit l'édition en cours
+        // (voir `cables::alias`).
         border: Border {
-            color: couleur,
-            width: FILET,
+            color: Color::TRANSPARENT,
+            width: 0.0,
             radius: Radius::from(0.0),
         },
-        icon: j.texte_2,
-        placeholder: j.texte_2,
+        icon: j.texte_2_carte,
+        placeholder: j.texte_2_carte,
         value: if atone {
             opacifier(j.texte, OPACITE_DESACTIVE)
         } else {
@@ -617,9 +616,10 @@ mod tests {
             couples.push(("menu", menu.text_color, f));
             couples.push(("menu_selection", menu.selected_text_color, f));
         }
-        let champ = champ_souligne(theme, text_input::Status::Active);
-        couples.push(("champ.valeur", champ.value, j.surface));
-        couples.push(("champ.invite", champ.placeholder, j.surface));
+        // Le champ d'alias vit dans une ligne, donc sur une surface posée.
+        let champ = champ_nu(theme, text_input::Status::Active);
+        couples.push(("champ.valeur", champ.value, j.surface_2));
+        couples.push(("champ.invite", champ.placeholder, j.surface_2));
         couples
     }
 
@@ -721,7 +721,8 @@ mod tests {
                 notice_erreur(&theme).border,
                 liste_deroulante(&theme, pick_list::Status::Active).border,
                 menu_deroulant(&theme).border,
-                champ_souligne(&theme, text_input::Status::Active).border,
+                // `champ_nu` n'a délibérément aucun filet : son soulignement
+                // est un `rule` posé par l'appelant.
             ];
             for status in ETATS_OPAQUES {
                 bordures.push(bouton_primaire(&theme, status).border);

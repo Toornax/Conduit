@@ -53,8 +53,14 @@ pub const VOILE_D_OR: Color = Color::from_rgba8(0xB0, 0x8D, 0x3E, 0.35);
 
 /// Texte secondaire du mode clair.
 const TEXTE_2_CLAIR: Color = Color::from_rgb8(0x6B, 0x63, 0x53);
-/// Texte secondaire du mode sombre.
+/// Texte secondaire du mode sombre. Il passe 5,4:1 sur l'encre-2 : le même
+/// ton sert donc sur le fond de la fenêtre et sur les surfaces posées.
 const TEXTE_2_SOMBRE: Color = Color::from_rgb8(0x9A, 0x8F, 0x76);
+/// Texte secondaire du mode clair **sur une surface posée**. Le ton du fond de
+/// la fenêtre n'y passe que 4,32:1 ; celui-ci passe 4,67:1 tout en restant bien
+/// plus clair que le sépia du texte courant (8,9:1), ce qui garde la
+/// hiérarchie.
+const TEXTE_2_CARTE_CLAIR: Color = Color::from_rgb8(0x65, 0x5E, 0x4E);
 /// Contour du mode clair : sépia à 25 %.
 const CONTOUR_CLAIR: Color = Color::from_rgba8(0x3A, 0x34, 0x2C, 0.25);
 /// Contour du mode sombre : or à 25 %.
@@ -78,9 +84,16 @@ pub struct Jetons {
     pub titre: Color,
     /// Couleur du texte courant.
     pub texte: Color,
-    /// Couleur des métadonnées. **Réservée à [`surface`](Self::surface)** :
-    /// sur [`surface_2`](Self::surface_2) elle tombe à 4,3:1 en mode clair.
+    /// Couleur des métadonnées **sur [`surface`](Self::surface)**, le fond de
+    /// la fenêtre. Sur une surface posée, prendre
+    /// [`texte_2_carte`](Self::texte_2_carte) : ce ton-ci n'y passe que 4,3:1
+    /// en mode clair.
     pub texte_2: Color,
+    /// Couleur des métadonnées **sur [`surface_2`](Self::surface_2)**, les
+    /// cartes et les lignes de tableau. Identique à
+    /// [`texte_2`](Self::texte_2) en mode sombre, assombrie d'un cran en mode
+    /// clair pour passer le seuil AA.
+    pub texte_2_carte: Color,
     /// Couleur des filets et des bordures.
     pub contour: Color,
     /// Le fil d'or, invariant entre les deux modes.
@@ -108,6 +121,7 @@ pub const CLAIR: Jetons = Jetons {
     titre: ENCRE,
     texte: SEPIA,
     texte_2: TEXTE_2_CLAIR,
+    texte_2_carte: TEXTE_2_CARTE_CLAIR,
     contour: CONTOUR_CLAIR,
     or: OR,
     garance: GARANCE,
@@ -125,6 +139,7 @@ pub const SOMBRE: Jetons = Jetons {
     titre: GREGE,
     texte: GREGE,
     texte_2: TEXTE_2_SOMBRE,
+    texte_2_carte: TEXTE_2_SOMBRE,
     contour: CONTOUR_SOMBRE,
     or: OR,
     garance: GARANCE,

@@ -33,13 +33,15 @@ use conduit_backend::{CableId, CableInfo};
 use conduit_core::types::ChannelCount;
 use iced::font::Weight;
 use iced::widget::text::LineHeight;
-use iced::widget::{button, column, container, row, scrollable, space, text, text_input, tooltip};
+use iced::widget::{
+    button, column, container, row, rule, scrollable, space, text, text_input, tooltip,
+};
 use iced::{Center, Element, Fill, Length, Padding, Right};
 
 use crate::app::Message;
 use crate::i18n::{self, Text};
 use crate::model::Mirror;
-use crate::theme::{CORPS_INTERFACE, CORPS_META, CORPS_TEXTE, ESPACE_S, ESPACE_XS};
+use crate::theme::{CORPS_INTERFACE, CORPS_META, CORPS_TEXTE, ESPACE_S, ESPACE_XS, FILET};
 use crate::{style, typo};
 
 // --- Mesures de la maquette -------------------------------------------------
@@ -301,7 +303,8 @@ fn peripherique<'a>(id: CableId, graisse: Weight) -> Element<'a, Message> {
             text(i18n::t(Text::CableDuplex))
                 .size(CORPS_SOUS_LIGNE)
                 .line_height(LineHeight::Relative(INTERLIGNE_SERRE))
-                .font(typo::interface_graisse(graisse)),
+                .font(typo::interface_graisse(graisse))
+                .style(style::texte_en(|j| j.texte_2_carte)),
         ]
         .spacing(ECART_SOUS_LIGNE),
     ])
@@ -324,15 +327,28 @@ fn alias<'a>(
         Some((edite, saisie)) if *edite == id => saisie.as_str(),
         _ => cable.name.as_str(),
     };
+    // Le soulignement est un filet posé sous le champ : `iced` ne borde qu'un
+    // rectangle entier. Il passe à la couleur d'accent tant que la ligne est en
+    // cours d'édition, ce qui remplace l'anneau de focus perdu au passage.
+    let en_edition = matches!(&state.renaming, Some((edite, _)) if *edite == id);
+    let filet: fn(&iced::Theme) -> iced::widget::rule::Style = if en_edition {
+        style::filet_accent
+    } else {
+        style::filet
+    };
     container(
-        text_input(i18n::t(Text::CableAlias), valeur)
-            .on_input_maybe(enabled.then_some(move |saisie| Message::AliasEdited(id, saisie)))
-            .on_submit(Message::CommitAlias)
-            .size(CORPS_INTERFACE)
-            .font(typo::texte_a(graisse, CORPS_INTERFACE))
-            .padding(PADDING_CHAMP)
-            .style(style::champ_souligne)
-            .width(Fill),
+        column![
+            text_input(i18n::t(Text::CableAlias), valeur)
+                .on_input_maybe(enabled.then_some(move |saisie| Message::AliasEdited(id, saisie)))
+                .on_submit(Message::CommitAlias)
+                .size(CORPS_INTERFACE)
+                .font(typo::texte_a(graisse, CORPS_INTERFACE))
+                .padding(PADDING_CHAMP)
+                .style(style::champ_nu)
+                .width(Fill),
+            rule::horizontal(FILET).style(filet),
+        ]
+        .width(Fill),
     )
     .width(Length::FillPortion(PART_ALIAS))
     .into()
@@ -418,7 +434,7 @@ fn etat<'a>(cable: &'a CableInfo, graisse: Weight) -> Element<'a, Message> {
     let couleur: fn(&crate::theme::Jetons) -> iced::Color = if cable.active {
         |j| j.celadon
     } else {
-        |j| j.texte_2
+        |j| j.texte_2_carte
     };
     container(
         row![
@@ -428,7 +444,8 @@ fn etat<'a>(cable: &'a CableInfo, graisse: Weight) -> Element<'a, Message> {
                 .style(style::pastille_de(couleur)),
             text(i18n::t(libelle))
                 .size(CORPS_META)
-                .font(typo::texte_a(graisse, CORPS_META)),
+                .font(typo::texte_a(graisse, CORPS_META))
+                .style(style::texte_en(|j| j.texte_2_carte)),
         ]
         .spacing(ESPACE_S)
         .align_y(Center),
@@ -476,7 +493,8 @@ fn confirmation<'a>(
         button(
             text(i18n::t(libelle))
                 .size(CORPS_META)
-                .font(typo::texte_a(graisse, CORPS_META)),
+                .font(typo::texte_a(graisse, CORPS_META))
+                .style(style::texte_en(|j| j.texte_2_carte)),
         )
         .padding(ESPACE_XS)
         .on_press_maybe(message)
