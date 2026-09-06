@@ -60,7 +60,7 @@ Contient tout ce qui se raisonne et se teste sans noyau :
 |---|---|---|
 | `position` | horloge virtuelle : `frames_at(qpc_now, qpc_start, qpc_freq, rate)` en arithmétique 128 bits sans débordement ; conversion trames ↔ octets ↔ position cyclique | proptest (monotonie, pas de débordement à 2⁶³ ticks, exactitude à ±1 trame) |
 | `ring` | copie cyclique d'un tampon rendu vers un tampon capture entre deux positions, tailles différentes, avec conversion de format (M1a : float32 → float32, PCM16 → PCM16 ; M1b-05 : matrice complète) | proptest (aucune trame perdue ni dupliquée, wrap-around) |
-| `format` | validation d'un `KSDATAFORMAT_WAVEFORMATEXTENSIBLE` demandé contre la liste supportée ; taille de tampon jamais inférieure à la demande (refus au-delà de 100 ms, plancher à 1 ms), alignée sur la période de notification | tables de cas, proptest |
+| `format` | validation d'un `KSDATAFORMAT_WAVEFORMATEXTENSIBLE` demandé contre la liste supportée ; taille de tampon jamais inférieure à la demande (refus au-delà de 500 ms, plancher à 1 ms), alignée sur la période de notification | tables de cas, proptest |
 | `loopback` | plan de copie d'un tick (M1a-08) : `Loopback::plan(rendu, capture, avance)` → copie, silence, rien, ou débordement ; curseur et lien « même instant virtuel » entre les deux flux (§5.3) | tables de cas, proptest (blocs contigus sans trou ni recouvrement, décalage constant, bornes des tampons, jamais de panique) |
 | `notify` | périodes de notification (M1a-07) : `Notifier::advance(frames)` dit si une frontière de `buffer_frames / count` a été franchie depuis le dernier signal, sur la position absolue | tables de cas, proptest (cohérence avec la formulation cyclique en octets) |
 | `config` | structures `#[repr(C)]` de la propriété privée de configuration (M1b-04) et leur validation (`validate(&[u8]) -> Result<CableConfig, ConfigError>`) | fuzz (M1b-08), Miri |
@@ -504,8 +504,15 @@ de la trame, arrondie **vers le haut** à partir de la taille demandée par le m
 audio, remontée à 1 ms si elle est en dessous), et le mémorise dans l'état du câble. La
 taille rendue n'est **jamais** inférieure à la demande : « The actual size must be at
 least the requested size; otherwise, the Audio Session API (WASAPI) audio engine won't use
-the buffer, and stream creation will fail. » Une demande au-delà de 100 ms est donc
-**refusée** (`STATUS_UNSUCCESSFUL`, journalisé), pas écrêtée. Le tampon est libéré à
+the buffer, and stream creation will fail. » Une demande au-delà de 500 ms est donc
+**refusée** (`STATUS_UNSUCCESSFUL`, journalisé), pas écrêtée. Ce plafond est un
+garde-fou, pas une politique de latence : depuis que le dépassement fait échouer la
+création du flux au lieu d'écrêter, une borne serrée casserait des applications au lieu
+de raboter leur tampon — une station de travail audio en mode exclusif demande couramment
+200 ms, la stabilité y primant sur la latence. 500 ms couvrent toute demande réaliste et
+gardent la mémoire non paginée bornée : au pire absolu, 16 câbles (M1b-02) font 32 flux,
+et à 96 kHz sur 8 canaux en float32 (32 octets par trame) 500 ms font 1,5 Mio par flux,
+soit 48 Mio. Le tampon est libéré à
 `FreeAudioBuffer`, quand PortCls le demande. Pas de partage de pages entre rendu
 et capture : les tailles et les formats des deux flux peuvent différer.
 

@@ -133,7 +133,24 @@ pub fn validate(
 /// Durée minimale du tampon cyclique, en millisecondes (§5.2).
 pub const MIN_BUFFER_MS: u32 = 1;
 /// Durée maximale du tampon cyclique, en millisecondes (§5.2).
-pub const MAX_BUFFER_MS: u32 = 100;
+///
+/// **Garde-fou, pas politique de latence.** Tant que [`buffer_bytes`] écrêtait, cette
+/// borne exprimait une préférence : au-delà on rabotait, et le flux se créait quand
+/// même. Depuis que la fonction **refuse** au-delà (le contrat « jamais moins que
+/// demandé, ou rien »), elle est devenue une *condition d'échec de création de flux* —
+/// l'appelant traduit le refus en `STATUS_UNSUCCESSFUL`. Une borne serrée cesserait
+/// donc de raboter la latence pour casser des applications : à 100 ms, une station de
+/// travail audio en mode exclusif qui demande 200 ms de tampon — courant, la stabilité
+/// y prime sur la latence — ne pourrait plus ouvrir de flux du tout, là où elle
+/// fonctionnait auparavant, mal mais elle fonctionnait. La borne ne doit donc rejeter
+/// que l'absurde.
+///
+/// 500 ms couvrent toute demande réaliste avec de la marge, et gardent la mémoire non
+/// paginée bornée — c'est le seul point à ne pas perdre de vue. Au pire absolu : une
+/// réserve de 16 câbles (M1b-02) fait 32 flux ; à 96 kHz sur 8 canaux en float32
+/// (32 octets par trame), 500 ms font 48 000 trames, soit 1,5 Mio par flux et 48 Mio
+/// pour la réserve entière.
+pub const MAX_BUFFER_MS: u32 = 500;
 
 /// Taille du tampon cyclique à allouer pour `AllocateAudioBuffer`.
 ///
@@ -148,13 +165,14 @@ pub const MAX_BUFFER_MS: u32 = 100;
 /// `requested_bytes` (la taille demandée par le moteur audio) est arrondie **vers
 /// le haut** au multiple de `frame_bytes`, puis remontée à [`MIN_BUFFER_MS`] de son
 /// à `sample_rate` si elle est en dessous : le DPC (période 1 ms) ne saurait pas
-/// suivre un tampon plus court. Au-delà de [`MAX_BUFFER_MS`] — latence sans intérêt
-/// pour un câble virtuel, mémoire non paginée gaspillée — la demande est refusée
-/// plutôt qu'écrêtée.
+/// suivre un tampon plus court. Au-delà de [`MAX_BUFFER_MS`] — demande absurde, mémoire
+/// non paginée gaspillée — la demande est refusée plutôt qu'écrêtée.
 ///
 /// Renvoie `None` si `frame_bytes == 0`, si `sample_rate == 0`, si les bornes sont
-/// incohérentes (fréquence < 10 Hz), si la demande arrondie dépasse [`MAX_BUFFER_MS`]
-/// ou si la taille retenue ne tient pas dans un `u32`.
+/// incohérentes (`sample_rate == 1` : 1 ms arrondi vers le haut fait 1 trame, 500 ms
+/// arrondis vers le bas en font 0 — seule fréquence non nulle où le plancher passe
+/// au-dessus du plafond), si la demande arrondie dépasse [`MAX_BUFFER_MS`] ou si la
+/// taille retenue ne tient pas dans un `u32`.
 pub fn buffer_bytes(requested_bytes: u32, frame_bytes: u32, sample_rate: u32) -> Option<u32> {
     if frame_bytes == 0 || sample_rate == 0 {
         return None;
@@ -162,7 +180,7 @@ pub fn buffer_bytes(requested_bytes: u32, frame_bytes: u32, sample_rate: u32) ->
     let frame_bytes = u64::from(frame_bytes);
     let rate = u64::from(sample_rate);
     // ceil(rate × MIN_MS / 1000) et floor(rate × MAX_MS / 1000), en u64 : pas de
-    // débordement (u32 × 100 < 2^39).
+    // débordement (u32 × 500 < 2^32 × 2^9 = 2^41, et le + 999 du ceil reste loin de 2^64).
     let min_frames = rate
         .checked_mul(u64::from(MIN_BUFFER_MS))?
         .checked_add(999)?
@@ -170,6 +188,9 @@ pub fn buffer_bytes(requested_bytes: u32, frame_bytes: u32, sample_rate: u32) ->
     let max_frames = rate
         .checked_mul(u64::from(MAX_BUFFER_MS))?
         .checked_div(1_000)?;
+    // Encore atteignable, mais pour la seule fréquence de 1 Hz : min_frames = 1 et
+    // max_frames = 0. Dès 2 Hz max_frames ≥ 1 = min_frames (min_frames vaut 1 jusqu'à
+    // 1 000 Hz), et au-delà rate/2 domine largement rate/1000.
     if min_frames > max_frames {
         return None;
     }
@@ -325,7 +346,7 @@ mod tests {
     #[test]
     fn buffer_bytes_table() {
         // 48 kHz stéréo F32 : 8 octets/trame, plancher 48 trames (384 o), plafond
-        // 4 800 trames (38 400 o).
+        // 24 000 trames (192 000 o).
         assert_eq!(buffer_bytes(0, 8, 48_000), Some(384));
         assert_eq!(buffer_bytes(1, 8, 48_000), Some(384));
         assert_eq!(buffer_bytes(384, 8, 48_000), Some(384));
@@ -334,25 +355,30 @@ mod tests {
         // Arrondi vers le haut à la trame.
         assert_eq!(buffer_bytes(3_841, 8, 48_000), Some(3_848));
         assert_eq!(buffer_bytes(3_847, 8, 48_000), Some(3_848));
-        // Plafond 100 ms : la demande exacte passe.
-        assert_eq!(buffer_bytes(38_400, 8, 48_000), Some(38_400));
+        // 200 ms en mode exclusif : accepté, alors que l'ancien plafond de 100 ms aurait
+        // refusé la création du flux.
+        assert_eq!(buffer_bytes(76_800, 8, 48_000), Some(76_800));
+        // Plafond 500 ms : la demande exacte passe.
+        assert_eq!(buffer_bytes(192_000, 8, 48_000), Some(192_000));
         // Au-delà : refus, jamais un tampon plus petit que demandé. `AllocateAudioBuffer`
         // exige « at least the requested size » ; un écrêtage ferait échouer la création
         // du flux côté moteur audio, sans que le pilote sache pourquoi.
-        assert_eq!(buffer_bytes(38_401, 8, 48_000), None);
-        assert_eq!(buffer_bytes(38_408, 8, 48_000), None);
+        assert_eq!(buffer_bytes(192_001, 8, 48_000), None);
+        assert_eq!(buffer_bytes(192_008, 8, 48_000), None);
         assert_eq!(buffer_bytes(u32::MAX, 8, 48_000), None);
-        // 44,1 kHz I16 stéréo : 1 ms = 44,1 trames → 45 ; 100 ms = 4 410 trames.
+        // 44,1 kHz I16 stéréo : 1 ms = 44,1 trames → 45 ; 500 ms = 22 050 trames.
         assert_eq!(buffer_bytes(0, 4, 44_100), Some(180));
-        assert_eq!(buffer_bytes(17_640, 4, 44_100), Some(17_640));
-        assert_eq!(buffer_bytes(17_641, 4, 44_100), None);
+        assert_eq!(buffer_bytes(88_200, 4, 44_100), Some(88_200));
+        assert_eq!(buffer_bytes(88_201, 4, 44_100), None);
         assert_eq!(buffer_bytes(u32::MAX, 4, 44_100), None);
         // Cas invalides.
         assert_eq!(buffer_bytes(1_000, 0, 48_000), None);
         assert_eq!(buffer_bytes(1_000, 8, 0), None);
-        // 5 Hz : 1 ms = 1 trame (ceil) > 100 ms = 0 trame (floor).
-        assert_eq!(buffer_bytes(1_000, 8, 5), None);
-        // u32::MAX Hz : la demande maximale tient dans les 100 ms (429 496 729 trames)
+        // 1 Hz, seule fréquence non nulle aux bornes incohérentes : 1 ms = 1 trame (ceil)
+        // > 500 ms = 0 trame (floor). Dès 2 Hz la garde ne se déclenche plus.
+        assert_eq!(buffer_bytes(1_000, 8, 1), None);
+        assert_eq!(buffer_bytes(8, 8, 2), Some(8));
+        // u32::MAX Hz : la demande maximale tient dans les 500 ms (2 147 483 647 trames)
         // mais pas dans un u32 une fois multipliée par 32 octets ; la borne basse
         // (1 ms = 4 294 968 trames) tient encore.
         assert_eq!(buffer_bytes(u32::MAX, 32, u32::MAX), None);
@@ -381,26 +407,26 @@ mod tests {
         );
         // 44,1 kHz I16 : 1 ms = 45 trames → 46 avec deux notifications.
         assert_eq!(buffer_bytes_for_notifications(0, 4, 44_100, 2), Some(184));
-        // Plafond 100 ms = 4 800 trames, pair : inchangé.
+        // Plafond 500 ms = 24 000 trames, pair : inchangé.
         assert_eq!(
-            buffer_bytes_for_notifications(38_400, 8, 48_000, 2),
-            Some(38_400)
+            buffer_bytes_for_notifications(192_000, 8, 48_000, 2),
+            Some(192_000)
         );
-        // 44,1 kHz : 4 410 trames, pair.
+        // 44,1 kHz : 22 050 trames, pair.
         assert_eq!(
-            buffer_bytes_for_notifications(17_640, 4, 44_100, 2),
-            Some(17_640)
+            buffer_bytes_for_notifications(88_200, 4, 44_100, 2),
+            Some(88_200)
         );
         // Le refus de la borne haute est hérité de `buffer_bytes` : pas d'écrêtage ici
         // non plus.
-        assert_eq!(buffer_bytes_for_notifications(38_401, 8, 48_000, 2), None);
+        assert_eq!(buffer_bytes_for_notifications(192_001, 8, 48_000, 2), None);
         assert_eq!(buffer_bytes_for_notifications(u32::MAX, 8, 48_000, 2), None);
         assert_eq!(buffer_bytes_for_notifications(u32::MAX, 4, 44_100, 2), None);
-        // Seul l'alignement peut dépasser les 100 ms, d'au plus `count − 1` trames :
-        // 48 010 Hz, 4 octets/trame, plafond 4 801 trames (impair) → 4 802.
+        // Seul l'alignement peut dépasser les 500 ms, d'au plus `count − 1` trames :
+        // 48 010 Hz, 4 octets/trame, plafond 24 005 trames (impair) → 24 006.
         assert_eq!(
-            buffer_bytes_for_notifications(4_801 * 4, 4, 48_010, 2),
-            Some(4_802 * 4)
+            buffer_bytes_for_notifications(24_005 * 4, 4, 48_010, 2),
+            Some(24_006 * 4)
         );
         assert_eq!(buffer_bytes_for_notifications(3_840, 8, 48_000, 0), None);
         assert_eq!(buffer_bytes_for_notifications(3_840, 0, 48_000, 1), None);
@@ -432,7 +458,7 @@ mod tests {
 
         /// Contrat : **jamais moins que demandé, ou rien**. Le résultat est un multiple
         /// de `frame_bytes`, au moins la demande et au moins 1 ms ; une demande au-delà
-        /// de 100 ms est refusée, jamais rabotée.
+        /// de 500 ms est refusée, jamais rabotée.
         #[test]
         fn buffer_bytes_never_shrinks(
             requested in any::<u32>(),
@@ -441,11 +467,11 @@ mod tests {
         ) {
             let rate = u64::from(sample_rate);
             let min = rate.div_ceil(1_000);
-            let max = rate / 10;
+            let max = rate / 2;
             let requested_frames = u64::from(requested).div_ceil(u64::from(frame_bytes));
             match buffer_bytes(requested, frame_bytes, sample_rate) {
                 Some(bytes) => {
-                    prop_assert!(requested_frames <= max, "accepté au-delà de 100 ms");
+                    prop_assert!(requested_frames <= max, "accepté au-delà de 500 ms");
                     prop_assert_eq!(bytes % frame_bytes, 0);
                     prop_assert!(bytes >= requested, "moins que demandé : {bytes} < {requested}");
                     let frames = u64::from(bytes / frame_bytes);
@@ -456,7 +482,7 @@ mod tests {
                     // Dans ces plages, le seul refus possible est le dépassement du
                     // plafond (les bornes sont cohérentes et les tailles tiennent dans
                     // un u32).
-                    prop_assert!(requested_frames > max, "refus d'une demande sous les 100 ms");
+                    prop_assert!(requested_frames > max, "refus d'une demande sous les 500 ms");
                 }
             }
         }

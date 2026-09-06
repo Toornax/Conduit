@@ -24,7 +24,7 @@
 //!
 //! Un seul tampon par flux, alloué par `IPortWaveRTStream::AllocatePagesForMdl` (taille de
 //! `conduit_kmd_core::format::buffer_bytes[_for_notifications]` : multiple de la trame et
-//! de la période de notification, jamais inférieure à la demande — au-delà de 100 ms
+//! de la période de notification, jamais inférieure à la demande — au-delà de 500 ms
 //! l'allocation est refusée plutôt qu'écrêtée), mappé en mémoire noyau (`MmCached`) et mis
 //! à zéro ; libéré par `FreeAudioBuffer` / `FreeBufferWithNotification`, **sans condition
 //! d'état** : c'est PortCls qui décide du moment, le miniport libère. `SetState` ne touche
