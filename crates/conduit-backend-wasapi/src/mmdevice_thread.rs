@@ -23,6 +23,7 @@ use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 
 use crate::com::{platform_error, ComApartment};
 use crate::devices::{default_endpoint_id, describe_id, direction_from_flow, enumerate};
+use crate::exclusive::ExclusivePolicy;
 use crate::notify::{Notification, NotificationClient};
 use crate::open::Opened;
 
@@ -37,10 +38,12 @@ pub(crate) enum Command {
         direction: DeviceDirection,
         reply: mpsc::Sender<Result<Option<DeviceId>, BackendError>>,
     },
-    /// Ouvrir un flux partagé (objets WASAPI créés ici, consommés par le fil du flux).
+    /// Ouvrir un flux (objets WASAPI créés ici, consommés par le fil du flux).
+    /// `policy` décide du mode de partage (partagé par défaut).
     Open {
         id: DeviceId,
         format: StreamFormat,
+        policy: ExclusivePolicy,
         reply: mpsc::Sender<Result<Opened, BackendError>>,
     },
     /// Créer un abonnement aux événements.
@@ -153,8 +156,13 @@ impl State {
                     .map(|id| id.map(DeviceId::new));
                 let _ = reply.send(result);
             }
-            Command::Open { id, format, reply } => {
-                let _ = reply.send(crate::open::open(&self.enumerator, &id, format));
+            Command::Open {
+                id,
+                format,
+                policy,
+                reply,
+            } => {
+                let _ = reply.send(crate::open::open(&self.enumerator, &id, format, policy));
             }
             Command::Subscribe { reply } => {
                 let _ = reply.send(self.events.subscribe());

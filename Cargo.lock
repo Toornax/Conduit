@@ -295,6 +295,7 @@ dependencies = [
  "conduit-backend",
  "conduit-core",
  "conduit-engine",
+ "proptest",
  "windows",
  "windows-core",
 ]

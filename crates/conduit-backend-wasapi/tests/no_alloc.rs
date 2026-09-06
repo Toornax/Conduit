@@ -12,6 +12,12 @@
 //!
 //! Ce que Windows alloue de son côté (`HeapAlloc` dans le moteur audio) est hors
 //! de portée : seul le code Rust du backend est prouvé.
+//!
+//! Le cas **exclusif** (M1b-32) est couvert aussi : le rappel y écrit dans le
+//! tampon intermédiaire `f32`, que le fil convertit ensuite vers le format
+//! matériel (souvent du PCM 24 bits) — cette conversion supplémentaire ne doit pas
+//! davantage toucher à l'allocateur. Le test se saute si la carte par défaut
+//! refuse l'exclusif.
 
 #![cfg(windows)]
 
@@ -21,8 +27,8 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use conduit_backend::{Backend, DeviceDirection, StreamFormat};
-use conduit_backend_wasapi::WasapiBackend;
+use conduit_backend::{Backend, DeviceDirection, DeviceHandle, StreamFormat};
+use conduit_backend_wasapi::{ExclusivePolicy, ShareMode, WasapiBackend};
 use conduit_core::types::SampleRate;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 
@@ -88,11 +94,12 @@ fn arming_callback(calls: Arc<AtomicUsize>) -> conduit_backend::AudioCallback {
     })
 }
 
-fn run_one_second(direction: DeviceDirection) {
+fn run_one_second(direction: DeviceDirection, policy: ExclusivePolicy) {
     let _serial = SERIAL
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut backend = WasapiBackend::new().expect("WasapiBackend::new");
+    backend.set_exclusive_policy(policy);
     let Some(id) = backend.default_device(direction) else {
         eprintln!("test sauté : aucun périphérique de {direction} par défaut");
         return;
@@ -104,8 +111,21 @@ fn run_one_second(direction: DeviceDirection) {
         block_frames: 480,
     };
     let mut handle = backend
-        .open(&id, format, arming_callback(Arc::clone(&calls)))
+        .open_handle(&id, format, arming_callback(Arc::clone(&calls)))
         .expect("ouverture");
+    let mode = handle.share_mode();
+    if policy != ExclusivePolicy::Never && mode != ShareMode::Exclusive {
+        eprintln!(
+            "test sauté : le rendu par défaut refuse le mode exclusif ({})",
+            handle.exclusive_refusal().unwrap_or("sans raison donnée")
+        );
+        return;
+    }
+    eprintln!(
+        "{direction} en mode {mode}, {} octets par échantillon ({})",
+        handle.sample_type().bytes(),
+        handle.sample_type()
+    );
     VIOLATIONS.store(0, Ordering::Relaxed);
     handle.start().expect("démarrage");
     std::thread::sleep(Duration::from_secs(1));
@@ -116,17 +136,25 @@ fn run_one_second(direction: DeviceDirection) {
     assert!(n >= 10, "seulement {n} rappels en 1 s : rien à prouver");
     assert_eq!(
         violations, 0,
-        "{violations} allocation(s) ou libération(s) sur le fil du flux ({direction}) \
-         pendant {n} rappels"
+        "{violations} allocation(s) ou libération(s) sur le fil du flux ({direction}, \
+         mode {mode}) pendant {n} rappels"
     );
 }
 
 #[test]
 fn render_loop_does_not_allocate() {
-    run_one_second(DeviceDirection::Render);
+    run_one_second(DeviceDirection::Render, ExclusivePolicy::Never);
 }
 
 #[test]
 fn capture_loop_does_not_allocate() {
-    run_one_second(DeviceDirection::Capture);
+    run_one_second(DeviceDirection::Capture, ExclusivePolicy::Never);
+}
+
+/// M1b-32 : en mode exclusif, la conversion `f32` → format matériel a lieu **dans**
+/// le rappel, sur le fil du flux. Elle ne doit rien allouer non plus. Le test se
+/// saute si la carte par défaut refuse l'exclusif.
+#[test]
+fn exclusive_render_loop_does_not_allocate_either() {
+    run_one_second(DeviceDirection::Render, ExclusivePolicy::Preferred);
 }

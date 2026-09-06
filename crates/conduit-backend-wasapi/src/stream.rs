@@ -15,6 +15,18 @@
 //!   `input = &[f32]` (un tampon de zéros pré-alloué si `AUDCLNT_BUFFERFLAGS_SILENT`)
 //!   → `ReleaseBuffer`.
 //!
+//! En **mode exclusif** (M1b-32) la boucle change sur deux points. D'abord un
+//! réveil donne accès au **tampon entier** : `GetCurrentPadding` y rend toujours la
+//! taille du tampon (donc « aucune trame libre », ce qui ferait un flux muet) et
+//! `GetNextPacketSize` ne s'applique pas — d'où `Worker::whole_buffer`, qui
+//! court-circuite les deux et fait un `GetBuffer(buffer_frames)` par réveil, comme
+//! le prescrit Microsoft. Ensuite le tampon n'est pas forcément du float32 : il n'y
+//! a pas d'`AUTOCONVERTPCM` et le matériel impose souvent de l'entier. Le rappel
+//! voit toujours du `f32` — il écrit dans le tampon intermédiaire pré-alloué, que
+//! `convert::write_f32` verse ensuite dans le tampon WASAPI (et `convert::read_f32`
+//! alimente en capture). Toujours aucune allocation : le tampon intermédiaire est
+//! celui qui servait déjà de repli d'alignement.
+//!
 //! Une fois la boucle lancée, **aucune allocation ni verrou** (dev-guide §2) : les
 //! tampons intermédiaires sont alloués à l'ouverture, l'horloge est publiée par
 //! atomiques. `AUDCLNT_E_DEVICE_INVALIDATED` (ou `RESOURCES_INVALIDATED`) fait
@@ -59,14 +71,13 @@ use windows::Win32::Media::Audio::{
 
 use crate::clock::{hns_to_ns, read_position, ClockScale, ClockSource, Qpc};
 use crate::com::{platform_error, ComApartment, Event, Woken};
+use crate::convert::{self, SampleType};
+use crate::exclusive::ShareMode;
 use crate::open::{Opened, Service, StreamLatency, StreamObjects};
 
 /// Délai maximal entre deux réveils avant d'aller « toucher » le client : un
 /// périphérique disparu sans signaler son événement est ainsi détecté.
 const WAKE_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Octets d'un échantillon `f32`.
-const SAMPLE_BYTES: usize = core::mem::size_of::<f32>();
 
 /// État partagé entre la poignée et le fil du flux.
 #[derive(Debug, Default)]
@@ -129,8 +140,19 @@ struct Worker {
     channels: usize,
     /// Trames du tampon WASAPI : borne des trames d'un réveil.
     buffer_frames: usize,
-    /// Tampon intermédiaire (`buffer_frames × channels`), pré-alloué : repli
-    /// d'alignement en rendu, silence ou repli d'alignement en capture.
+    /// Format d'échantillon du tampon WASAPI.
+    sample: SampleType,
+    /// Le réveil donne accès au **tampon entier**, sans consulter
+    /// `GetCurrentPadding` ni `GetNextPacketSize` : c'est la sémantique du mode
+    /// exclusif événementiel, où `GetCurrentPadding` rend toujours la taille du
+    /// tampon (donc « zéro trame libre ») et où `GetNextPacketSize` ne s'applique
+    /// pas. En mode partagé, faux.
+    whole_buffer: bool,
+    /// Octets d'une trame du tampon WASAPI (`nBlockAlign`).
+    frame_bytes: usize,
+    /// Tampon intermédiaire (`buffer_frames × channels`), pré-alloué : conversion
+    /// de et vers le format matériel en mode exclusif, repli d'alignement en rendu,
+    /// silence ou repli d'alignement en capture.
     scratch: Vec<f32>,
     /// Compteur de performance : horodatages du repli et des échecs de `GetPosition`.
     qpc: Qpc,
@@ -177,6 +199,8 @@ pub struct WasapiHandle {
     clock: Option<AgileReference<IAudioClock>>,
     clock_scale: ClockScale,
     clock_source: ClockSource,
+    /// Pourquoi le mode exclusif a été refusé (politique `Preferred` seulement).
+    exclusive_refusal: Option<String>,
 }
 
 impl WasapiHandle {
@@ -186,6 +210,7 @@ impl WasapiHandle {
             info,
             format,
             objects,
+            exclusive_refusal,
         } = opened;
         let shared = Arc::new(StreamShared::default());
         let stop = Arc::new(Event::new(true)?);
@@ -195,6 +220,9 @@ impl WasapiHandle {
         let clock = objects.clock.clone();
         let clock_scale = objects.clock_scale;
         let clock_source = objects.clock_source;
+        let sample = objects.sample;
+        let frame_bytes = objects.frame_bytes.max(1);
+        let whole_buffer = objects.latency.path.share_mode() == ShareMode::Exclusive;
         let worker = Worker {
             device: info.id.clone(),
             objects,
@@ -203,6 +231,9 @@ impl WasapiHandle {
             stop: Arc::clone(&stop),
             channels,
             buffer_frames,
+            sample,
+            whole_buffer,
+            frame_bytes,
             scratch: vec![0.0; buffer_frames * channels],
             qpc,
             position: 0,
@@ -220,7 +251,36 @@ impl WasapiHandle {
             clock,
             clock_scale,
             clock_source,
+            exclusive_refusal,
         })
+    }
+
+    /// Mode de partage obtenu (hors trait `DeviceHandle`, qui est portable).
+    ///
+    /// [`ShareMode::Shared`] tant que la politique du backend n'a pas demandé
+    /// l'exclusif, ou qu'il a été refusé en [`ExclusivePolicy::Preferred`]
+    /// ([`Self::exclusive_refusal`] dit alors pourquoi).
+    ///
+    /// [`ExclusivePolicy::Preferred`]: crate::ExclusivePolicy::Preferred
+    pub fn share_mode(&self) -> ShareMode {
+        self.latency.path.share_mode()
+    }
+
+    /// Format d'échantillon du tampon WASAPI. Hors [`SampleType::F32`], le fil du
+    /// flux convertit lui-même à chaque rappel (mode exclusif seulement).
+    pub fn sample_type(&self) -> SampleType {
+        self.latency.path.sample_type()
+    }
+
+    /// Pourquoi le mode exclusif a été refusé, quand la politique était
+    /// [`ExclusivePolicy::Preferred`](crate::ExclusivePolicy::Preferred) et que le
+    /// flux est retombé en partagé. `None` si l'exclusif n'a pas été tenté ou qu'il
+    /// a réussi.
+    ///
+    /// Ce crate ne journalise rien lui-même (aucune dépendance de traçage) : c'est
+    /// à l'appelant — le démon, un test — de publier ce message.
+    pub fn exclusive_refusal(&self) -> Option<&str> {
+        self.exclusive_refusal.as_deref()
     }
 
     /// Latence et tailles de tampon telles que WASAPI les rapporte à l'ouverture
@@ -315,6 +375,7 @@ impl core::fmt::Debug for WasapiHandle {
             .field("device", &self.info.id)
             .field("format", &self.format)
             .field("latency", &self.latency)
+            .field("share_mode", &self.share_mode())
             .field("clock", &self.clock_source)
             .field("running", &self.is_running())
             .field(
@@ -503,7 +564,7 @@ fn run_inner(worker: &mut Worker) -> Result<(), BackendError> {
     // Un tampon de silence avant `Start` : le moteur ne lit jamais de données
     // indéterminées, et le premier réveil arrive une période plus tard.
     if let Resolved::Render(render) = &service {
-        prefill_silence(&client, render, worker.buffer_frames)
+        prefill_silence(&client, render, worker.buffer_frames, worker.whole_buffer)
             .map_err(|e| classify(worker, "IAudioRenderClient::GetBuffer (préremplissage)", &e))?;
     }
     // SAFETY: client initialisé, événement enregistré.
@@ -586,20 +647,25 @@ fn sample_clock(worker: &mut Worker, clock: Option<&IAudioClock>) -> (u64, u64) 
     }
 }
 
-/// Un réveil en rendu : remplir tout l'espace libre du tampon.
+/// Un réveil en rendu : remplir tout l'espace libre du tampon (le tampon **entier**
+/// en mode exclusif, voir [`Worker::whole_buffer`]).
 fn render_once(
     worker: &mut Worker,
     client: &IAudioClient,
     render: &IAudioRenderClient,
     audio_clock: Option<&IAudioClock>,
 ) -> Result<(), (&'static str, windows::core::Error)> {
-    // SAFETY: client démarré.
-    let padding = unsafe { client.GetCurrentPadding() }
-        .map_err(|e| ("IAudioClient::GetCurrentPadding", e))?;
-    let frames = worker
-        .buffer_frames
-        .saturating_sub(padding as usize)
-        .min(worker.buffer_frames);
+    let frames = if worker.whole_buffer {
+        worker.buffer_frames
+    } else {
+        // SAFETY: client démarré.
+        let padding = unsafe { client.GetCurrentPadding() }
+            .map_err(|e| ("IAudioClient::GetCurrentPadding", e))?;
+        worker
+            .buffer_frames
+            .saturating_sub(padding as usize)
+            .min(worker.buffer_frames)
+    };
     if frames == 0 {
         return Ok(());
     }
@@ -616,27 +682,34 @@ fn render_once(
         frames,
     };
     // SAFETY: `GetBuffer(frames)` a réussi : `ptr` pointe `frames × nBlockAlign`
-    // octets (`nBlockAlign = channels × 4` pour le format float32 négocié), à nous
-    // jusqu'à `ReleaseBuffer`. Aucun autre accès pendant ce temps.
-    let bytes = unsafe { core::slice::from_raw_parts_mut(ptr, samples * SAMPLE_BYTES) };
-    match bytemuck::try_cast_slice_mut::<u8, f32>(bytes) {
-        Ok(output) => {
+    // octets (`nBlockAlign = worker.frame_bytes`, celui du format négocié : float32
+    // en partagé, éventuellement entier en exclusif), à nous jusqu'à
+    // `ReleaseBuffer`. Aucun autre accès pendant ce temps.
+    let bytes = unsafe { core::slice::from_raw_parts_mut(ptr, frames * worker.frame_bytes) };
+    match (
+        worker.sample,
+        bytemuck::try_cast_slice_mut::<u8, f32>(bytes),
+    ) {
+        // Cas courant : le tampon WASAPI *est* du float32 aligné, le rappel y écrit
+        // directement.
+        (SampleType::F32, Ok(output)) => {
             let mut io = StreamIo {
                 input: None,
                 output: Some(output),
             };
             (worker.callback)(&mut io, &clock);
         }
-        Err(_) => {
-            // Tampon non aligné sur 4 octets (jamais vu avec WASAPI, mais rien ne
-            // l'interdit) : rendu dans le tampon intermédiaire, puis copie.
+        // Mode exclusif sur un matériel entier (conversion à notre charge), ou
+        // tampon non aligné sur 4 octets (jamais vu avec WASAPI, mais rien ne
+        // l'interdit) : rendu dans le tampon intermédiaire, puis conversion.
+        (sample, _) => {
             let scratch = &mut worker.scratch[..samples];
             let mut io = StreamIo {
                 input: None,
                 output: Some(scratch),
             };
             (worker.callback)(&mut io, &clock);
-            bytes.copy_from_slice(bytemuck::cast_slice(&worker.scratch[..samples]));
+            convert::write_f32(&worker.scratch[..samples], sample, bytes);
         }
     }
     // SAFETY: apparié au `GetBuffer` réussi ci-dessus, même nombre de trames.
@@ -653,11 +726,15 @@ fn capture_all(
     audio_clock: Option<&IAudioClock>,
 ) -> Result<(), (&'static str, windows::core::Error)> {
     loop {
-        // SAFETY: client démarré.
-        let packet = unsafe { capture.GetNextPacketSize() }
-            .map_err(|e| ("IAudioCaptureClient::GetNextPacketSize", e))?;
-        if packet == 0 {
-            return Ok(());
+        // En exclusif, `GetNextPacketSize` ne s'applique pas : un réveil = un
+        // tampon entier, obtenu directement par `GetBuffer`.
+        if !worker.whole_buffer {
+            // SAFETY: client démarré.
+            let packet = unsafe { capture.GetNextPacketSize() }
+                .map_err(|e| ("IAudioCaptureClient::GetNextPacketSize", e))?;
+            if packet == 0 {
+                return Ok(());
+            }
         }
         let mut ptr: *mut u8 = core::ptr::null_mut();
         let mut packet_frames = 0u32;
@@ -677,20 +754,26 @@ fn capture_all(
         if frames > 0 {
             let silent = flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0;
             let Worker {
-                callback, scratch, ..
+                callback,
+                scratch,
+                sample,
+                frame_bytes,
+                ..
             } = worker;
             let input: &[f32] = if silent || ptr.is_null() {
                 scratch[..samples].fill(0.0);
                 &scratch[..samples]
             } else {
                 // SAFETY: `GetBuffer` a réussi avec `packet_frames` trames à `ptr`,
-                // lisibles jusqu'à `ReleaseBuffer` ; `frames ≤ packet_frames`.
-                let bytes = unsafe { core::slice::from_raw_parts(ptr, samples * SAMPLE_BYTES) };
-                match bytemuck::try_cast_slice::<u8, f32>(bytes) {
-                    Ok(input) => input,
-                    Err(_) => {
-                        bytemuck::cast_slice_mut::<f32, u8>(&mut scratch[..samples])
-                            .copy_from_slice(bytes);
+                // lisibles jusqu'à `ReleaseBuffer` ; `frames ≤ packet_frames`, et
+                // une trame fait `frame_bytes` octets (format négocié).
+                let bytes = unsafe { core::slice::from_raw_parts(ptr, frames * *frame_bytes) };
+                match (*sample, bytemuck::try_cast_slice::<u8, f32>(bytes)) {
+                    (SampleType::F32, Ok(input)) => input,
+                    // Format matériel entier (exclusif) ou tampon non aligné :
+                    // conversion vers le tampon intermédiaire.
+                    (sample, _) => {
+                        convert::read_f32(bytes, sample, &mut scratch[..samples]);
                         &scratch[..samples]
                     }
                 }
@@ -705,18 +788,29 @@ fn capture_all(
         unsafe { capture.ReleaseBuffer(packet_frames) }
             .map_err(|e| ("IAudioCaptureClient::ReleaseBuffer", e))?;
         publish(worker, &clock, false);
+        if worker.whole_buffer {
+            // Exclusif : un seul tampon par réveil, pas de file de paquets.
+            return Ok(());
+        }
     }
 }
 
-/// Remplit l'espace libre du tampon de rendu de silence, avant `Start`.
+/// Remplit l'espace libre du tampon de rendu de silence, avant `Start` — le tampon
+/// **entier** en mode exclusif (`whole_buffer`), comme le prescrit Microsoft : la
+/// première salve doit être complète, l'événement ne se déclenche qu'ensuite.
 fn prefill_silence(
     client: &IAudioClient,
     render: &IAudioRenderClient,
     buffer_frames: usize,
+    whole_buffer: bool,
 ) -> Result<(), windows::core::Error> {
-    // SAFETY: client initialisé.
-    let padding = unsafe { client.GetCurrentPadding() }?;
-    let frames = buffer_frames.saturating_sub(padding as usize);
+    let frames = if whole_buffer {
+        buffer_frames
+    } else {
+        // SAFETY: client initialisé.
+        let padding = unsafe { client.GetCurrentPadding() }?;
+        buffer_frames.saturating_sub(padding as usize)
+    };
     if frames == 0 {
         return Ok(());
     }

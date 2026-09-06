@@ -428,8 +428,21 @@ signé par attestation, HLK audio passé, latence conforme à SPEC §5.6, endura
   réel par flux (rendu direct dans le tampon WASAPI, capture par paquets, sans
   allocation ni verrou — `tests/no_alloc.rs`), déconnexion propre sur
   `AUDCLNT_E_DEVICE_INVALIDATED`, `ClockInfo` par atomiques, `latency()` hors trait.
-- [ ] **M1b-32** `feat(wasapi): mode exclusif quand disponible`
+- [x] **M1b-32** `feat(wasapi): mode exclusif quand disponible`
   *Fait quand* : latence mesurée inférieure au mode partagé, repli automatique documenté.
+  *Mesuré* le 2026-09-06 sur les 5 endpoints de rendu du poste (`tests/exclusive.rs`, 48 kHz
+  stéréo) : tampon et période **144 trames = 3 ms** en exclusif contre **1 056 trames = 22 ms**
+  de tampon (période 480 = 10 ms) en partagé, soit sept fois moins, sur chacune des cinq.
+  Aucune n'accepte le float32 en exclusif : Realtek Digital Output (S/PDIF), G27QC A et E2351
+  (HDMI NVIDIA) prennent du PCM 24 dans un conteneur 32, l'Audeze Maxwell (USB, Chat et Game)
+  du PCM 24 compacté ; la conversion est donc à notre charge (module `convert`, sans allocation —
+  `tests/no_alloc.rs` couvre le cas). Politique opt-in `ExclusivePolicy` sur le backend
+  (`Never` par défaut, `Preferred` avec repli et raison conservée, `Required` avec
+  `UnsupportedFormat` explicite), gestion d'`AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED` (reprise unique
+  avec recréation du client — **non déclenchée** par ce matériel, couverte par des tests
+  unitaires seulement), tampon entier par réveil (`GetCurrentPadding` rend toujours le tampon
+  plein en exclusif événementiel), `IAudioClock` en trames/s sur ce chemin. Reste à vérifier sur
+  une carte **analogique** : le réalignement du tampon et le repli PCM 16.
 - [x] **M1b-33** `feat(wasapi): position d'horloge IAudioClock et intégration DLL`
   *Fait quand* : deux cartes réelles en même temps, dérive absorbée, xruns = 0 sur 1 h.
   *Vérifié* le 2026-09-05 : 1 h avec le moteur, G27QC A pilote et Realtek asynchrone, 720 006 cycles,

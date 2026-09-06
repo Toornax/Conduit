@@ -38,7 +38,11 @@ use crate::com::platform_error;
 ///
 /// Observé sur ce poste : `MixBytes` sur le chemin basse latence
 /// (`IAudioClient3`, 48 000 × 8 = 384 000), `StreamBytes` sur le chemin par
-/// conversion (44,1 kHz mono float32 : 44 100 × 4 = 176 400).
+/// conversion (44,1 kHz mono float32 : 44 100 × 4 = 176 400), et `Frames` en mode
+/// **exclusif** — 48 000 sur les cinq cartes de rendu du poste (M1b-32) : sans le
+/// moteur audio entre le pilote et nous, l'horloge compte en trames, plus en
+/// octets. [`ClockUnits::DeviceBytes`] existe pour le pilote qui compterait en
+/// octets d'un format matériel entier ; aucun ne l'a fait ici.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClockUnits {
     /// Trames par seconde du format de mixage ou du format livré
@@ -50,6 +54,11 @@ pub enum ClockUnits {
     /// Octets par seconde du format livré au rappel, float32 entrelacé
     /// (`fréquence == sample_rate × channels × 4`).
     StreamBytes,
+    /// Octets par seconde du **format matériel** du flux
+    /// (`fréquence == sample_rate × nBlockAlign` du tampon WASAPI) : le cas
+    /// nouveau du mode exclusif, où ce format n'est pas forcément du float32
+    /// (M1b-32). Confondu avec [`ClockUnits::StreamBytes`] quand il l'est.
+    DeviceBytes,
     /// Autre chose : converti par le rapport générique.
     Other,
 }
@@ -60,6 +69,7 @@ impl fmt::Display for ClockUnits {
             ClockUnits::Frames => "trames/s",
             ClockUnits::MixBytes => "octets/s du format de mixage",
             ClockUnits::StreamBytes => "octets/s du format livré",
+            ClockUnits::DeviceBytes => "octets/s du format matériel",
             ClockUnits::Other => "unités/s (rapport générique)",
         })
     }
@@ -103,14 +113,17 @@ pub(crate) struct ClockScale {
 
 impl ClockScale {
     /// Classe `frequency` par rapport au format de mixage (`mix_rate`,
-    /// `mix_block_align`) et au format livré (`sample_rate`, `channels` float32),
-    /// et construit la conversion vers `sample_rate`.
+    /// `mix_block_align`), au format livré (`sample_rate`, `channels` float32) et
+    /// au format **matériel** du tampon (`device_block_align`, qui ne diffère du
+    /// précédent qu'en mode exclusif sur un matériel entier), et construit la
+    /// conversion vers `sample_rate`.
     pub(crate) fn new(
         frequency: u64,
         sample_rate: u32,
         channels: u16,
         mix_rate: u32,
         mix_block_align: u16,
+        device_block_align: u16,
     ) -> (Self, ClockUnits) {
         let stream_block_align = u64::from(channels) * 4;
         let units = if frequency == u64::from(mix_rate) || frequency == u64::from(sample_rate) {
@@ -119,6 +132,8 @@ impl ClockScale {
             ClockUnits::MixBytes
         } else if frequency == u64::from(sample_rate) * stream_block_align {
             ClockUnits::StreamBytes
+        } else if frequency == u64::from(sample_rate) * u64::from(device_block_align) {
+            ClockUnits::DeviceBytes
         } else {
             ClockUnits::Other
         };
@@ -210,36 +225,59 @@ mod tests {
 
     #[test]
     fn frequency_is_classified_against_both_formats() {
-        let (scale, units) = ClockScale::new(48_000, 48_000, 2, 48_000, 8);
+        let (scale, units) = ClockScale::new(48_000, 48_000, 2, 48_000, 8, 8);
         assert_eq!(units, ClockUnits::Frames);
         assert_eq!(scale.frames(4_800), 4_800);
         // Trames/s du format livré (44,1 kHz demandé sur un mixage 48 kHz).
-        let (scale, units) = ClockScale::new(44_100, 44_100, 1, 48_000, 8);
+        let (scale, units) = ClockScale::new(44_100, 44_100, 1, 48_000, 8, 4);
         assert_eq!(units, ClockUnits::Frames);
         assert_eq!(scale.frames(4_410), 4_410);
 
         // Chemin basse latence observé : octets/s du mixage.
-        let (scale, units) = ClockScale::new(384_000, 48_000, 2, 48_000, 8);
+        let (scale, units) = ClockScale::new(384_000, 48_000, 2, 48_000, 8, 8);
         assert_eq!(units, ClockUnits::MixBytes);
         assert_eq!(scale.frames(384_000), 48_000);
         assert_eq!(scale.frames(8), 1);
 
         // Chemin par conversion observé : octets/s du format livré (mono float32).
-        let (scale, units) = ClockScale::new(176_400, 44_100, 1, 48_000, 8);
+        let (scale, units) = ClockScale::new(176_400, 44_100, 1, 48_000, 8, 4);
         assert_eq!(units, ClockUnits::StreamBytes);
         assert_eq!(scale.frames(176_400), 44_100);
         assert_eq!(scale.frames(4), 1);
 
-        let (scale, units) = ClockScale::new(10_000_000, 48_000, 2, 48_000, 8);
+        let (scale, units) = ClockScale::new(10_000_000, 48_000, 2, 48_000, 8, 8);
         assert_eq!(units, ClockUnits::Other);
         assert_eq!(scale.frames(10_000_000), 48_000);
+    }
+
+    /// M1b-32 : en exclusif, le tampon peut être en PCM 16 ou 24 bits ; une horloge
+    /// qui compte en octets de ce format-là n'est ni `MixBytes` ni `StreamBytes`.
+    #[test]
+    fn exclusive_hardware_bytes_are_their_own_case() {
+        // 48 kHz stéréo PCM16 : nBlockAlign = 4, donc 192 000 octets/s.
+        let (scale, units) = ClockScale::new(192_000, 48_000, 2, 48_000, 8, 4);
+        assert_eq!(units, ClockUnits::DeviceBytes);
+        assert_eq!(scale.frames(192_000), 48_000);
+        assert_eq!(scale.frames(4), 1);
+        // 48 kHz stéréo PCM 24 compacté : nBlockAlign = 6, donc 288 000 octets/s.
+        let (scale, units) = ClockScale::new(288_000, 48_000, 2, 48_000, 8, 6);
+        assert_eq!(units, ClockUnits::DeviceBytes);
+        assert_eq!(scale.frames(288_000), 48_000);
+        // En float32 le format matériel est celui du flux : `StreamBytes` l'emporte,
+        // la classification d'avant M1b-32 est inchangée.
+        let (_, units) = ClockScale::new(384_000, 48_000, 2, 44_100, 8, 8);
+        assert_eq!(units, ClockUnits::StreamBytes);
+        assert_eq!(
+            ClockUnits::DeviceBytes.to_string(),
+            "octets/s du format matériel"
+        );
     }
 
     #[test]
     fn positions_are_expressed_in_the_delivered_format() {
         // Mixage 48 kHz stéréo float (octets/s), flux livré en 44,1 kHz stéréo :
         // une seconde d'horloge vaut 44 100 trames livrées.
-        let (scale, units) = ClockScale::new(384_000, 44_100, 2, 48_000, 8);
+        let (scale, units) = ClockScale::new(384_000, 44_100, 2, 48_000, 8, 8);
         assert_eq!(units, ClockUnits::MixBytes);
         assert_eq!(scale.frames(384_000), 44_100);
         // Une heure sans déborder, et une position énorme non plus.
@@ -251,7 +289,7 @@ mod tests {
     #[test]
     fn identity_and_degenerate_frequencies() {
         assert_eq!(ClockScale::identity(48_000).frames(123), 123);
-        let (scale, _) = ClockScale::new(0, 48_000, 2, 48_000, 8);
+        let (scale, _) = ClockScale::new(0, 48_000, 2, 48_000, 8, 8);
         assert_eq!(scale.frames(7), 7 * 48_000);
         assert_eq!(ticks_to_ns(10_000_000, 10_000_000), 1_000_000_000);
         assert_eq!(ticks_to_ns(5, 0), 5_000_000_000);
