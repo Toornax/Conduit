@@ -13,12 +13,16 @@
     2. devgen /add /hardwareid "Root\ConduitCable"   (identifiant d'instance récupéré)
     3. attente de Get-PnpDevice -InstanceId … en état OK (délai borné)
     4. devgen /remove <id>
-    5. pnputil /delete-driver oemN.inf /uninstall /force   (oemN.inf via /enum-drivers)
-    6. aucun événement Kernel-PnP d'erreur ni BugCheck depuis le début
-  Tout devgen/pnputil qui échoue arrête le script avec sa sortie. À la fin, un
+    5. attente que le devnode ait VRAIMENT disparu (délai borné) — voir la course décrite
+       plus bas, qui produit des 0xC00000E5 sans que le pilote y soit pour rien
+    6. pnputil /delete-driver oemN.inf /uninstall /force   (oemN.inf via /enum-drivers)
+    7. aucun événement Kernel-PnP d'erreur ni BugCheck depuis le début
+  Tout devgen/pnputil qui échoue arrête le script avec sa sortie. En cas d'échec, un
   MEMORY.DMP ou un minidump plus récent que le début est rapatrié dans
-  drivers\windows\target\dumps\ et le script échoue. Sortie : itérations réussies et
-  durée moyenne d'un cycle. Ce script ne lance jamais pnputil ni devgen sur l'hôte.
+  drivers\windows\target\dumps\, avec les 500 dernières lignes de
+  C:\Windows\INF\setupapi.dev.log — le journal qui dit pourquoi une installation ou un
+  démarrage PnP a échoué. Sortie : itérations réussies et durée moyenne d'un cycle. Ce
+  script ne lance jamais pnputil ni devgen sur l'hôte.
 .PARAMETER Name
   Nom de la VM (ConduitTest).
 .PARAMETER Credential
@@ -31,6 +35,10 @@
   Profil Cargo du paquet par défaut : dev (target\debug) ou release.
 .PARAMETER StartTimeoutSeconds
   Délai maximal pour que le périphérique passe en état OK après devgen /add (30 s).
+.PARAMETER RemoveTimeoutSeconds
+  Délai maximal pour que le devnode disparaisse après devgen /remove, AVANT de supprimer
+  le paquet (30 s). Ne pas attendre est la course qui produit les 0xC00000E5 (voir le
+  commentaire du cycle).
 .EXAMPLE
   .\vm-cycle.ps1 -Name ConduitTest -Credential (Get-Credential test) -Count 100
 #>
@@ -41,7 +49,8 @@ param(
   [ValidateRange(1, 100000)][int]$Count = 100,
   [string]$Package,
   [ValidateSet("dev", "release")][string]$Profile = "dev",
-  [ValidateRange(5, 600)][int]$StartTimeoutSeconds = 30
+  [ValidateRange(5, 600)][int]$StartTimeoutSeconds = 30,
+  [ValidateRange(5, 600)][int]$RemoveTimeoutSeconds = 30
 )
 
 Set-StrictMode -Version Latest
@@ -58,6 +67,9 @@ $hardwareId = "Root\ConduitCable"
 $infName = "conduit_kmd.inf"
 $guestDir = "C:\ConduitTest"
 $dumpsDir = Join-Path $workspace "target\dumps"
+# Assez pour couvrir plusieurs installations PnP, assez peu pour rester lisible et pour
+# traverser PowerShell Direct sans peser.
+$setupapiTailLines = 500
 
 # Paquet du pilote (build.ps1) : tout doit y être avant de toucher à la VM.
 if (-not $Package) {
@@ -83,14 +95,15 @@ if (-not ($vms | Where-Object { $_.Name -eq $Name })) {
 
 # Fonctions redéfinies dans l'invité à partir de leur texte.
 $helpers = @("Invoke-NativeChecked", "ConvertFrom-DevgenAddOutput", "Find-PublishedInf",
-  "Test-ConduitGhostDevice") |
+  "Test-ConduitGhostDevice", "Test-DevnodeGone") |
   ForEach-Object { Get-FunctionSource -Name $_ }
 $helpers = $helpers -join "`n"
 
 # Un cycle complet, exécuté dans l'invité. Renvoie l'identifiant d'instance et les
 # oemN.inf supprimés ; lève une erreur détaillée sinon.
 $cycleBlock = {
-  param([string]$Helpers, [string]$GuestDir, [string]$InfName, [string]$HardwareId, [int]$StartTimeoutSeconds)
+  param([string]$Helpers, [string]$GuestDir, [string]$InfName, [string]$HardwareId,
+        [int]$StartTimeoutSeconds, [int]$RemoveTimeoutSeconds)
   Set-StrictMode -Version Latest
   $ErrorActionPreference = "Stop"
   . ([scriptblock]::Create($Helpers))
@@ -116,6 +129,40 @@ $cycleBlock = {
   }
 
   Invoke-NativeChecked $devgen @("/remove", $id) | Out-Null
+
+  # ATTENDRE QUE LE RETRAIT SOIT EFFECTIF avant de toucher au paquet. `devgen /remove` rend
+  # la main dès que la demande est déposée, pas quand PnP a fini de démonter le devnode.
+  #
+  # DIAGNOSTIQUÉ le 2026-09-06, traces à l'appui, sur une série de deux cycles dont le
+  # second a échoué :
+  #   Kernel-PnP 411 : L'appareil SWD\DEVGEN\{0c9acf52-…} a eu un problème de démarrage.
+  #   Problème : 0x0   État du problème : 0xC00000E5
+  # Le détail qui identifie la course : {0c9acf52-…} est l'appareil du cycle 1, PAS celui
+  # du cycle 2, et l'horodatage tombe à l'instant de son retrait. Les traces du pilote
+  # montrent un cycle 1 complet et propre, DriverUnload compris ; le cycle 2 n'a jamais
+  # chargé le pilote. Après l'échec, l'invité ne garde ni périphérique résiduel ni pilote
+  # publié. Le pilote est donc hors de cause : le script enchaînait `/enum-drivers` puis
+  # `/delete-driver … /uninstall /force` immédiatement après `/remove`, et PnP tentait un
+  # dernier démarrage sur le devnode mourant pendant qu'on lui retirait son paquet sous les
+  # pieds. C'est ce qui a produit l'échec au 33e cycle sur 100 la veille et au 2e ce
+  # soir-là : une course, dont la probabilité monte quand le débogueur ralentit l'invité.
+  #
+  # Le critère d'arrêt est STRUCTUREL (identifiant d'instance et booléen Present), jamais
+  # un libellé d'état traduit : voir Test-DevnodeGone. `-ErrorAction SilentlyContinue` sur
+  # Get-PnpDevice parce qu'un identifiant disparu y est une erreur (localisée), pas ici.
+  $deadline = (Get-Date).AddSeconds($RemoveTimeoutSeconds)
+  $gone = $false
+  do {
+    $remaining = @(Get-PnpDevice -InstanceId $id -ErrorAction SilentlyContinue)
+    if (Test-DevnodeGone -InstanceId $id -Devices $remaining) { $gone = $true; break }
+    Start-Sleep -Milliseconds 250
+  } while ((Get-Date) -lt $deadline)
+  if (-not $gone) {
+    throw ("Le devnode $id est toujours actif $RemoveTimeoutSeconds s après devgen /remove : " +
+      "le paquet n'est PAS supprimé, pour ne pas le retirer sous les pieds d'un devnode " +
+      "encore vivant (course Kernel-PnP 411 / 0xC00000E5). Augmenter -RemoveTimeoutSeconds " +
+      "si l'invité est simplement lent, sinon chercher ce qui retient le périphérique.")
+  }
 
   $enum = Invoke-NativeChecked pnputil @("/enum-drivers")
   $oems = @(Find-PublishedInf -Output $enum -OriginalName $InfName)
@@ -143,6 +190,20 @@ $eventsBlock = {
   $found |
     Where-Object { $_.Id -ne 1001 -or $_.ProviderName -match "BugCheck|SystemErrorReporting" } |
     ForEach-Object { "{0:s} {1} {2} : {3}" -f $_.TimeCreated, $_.ProviderName, $_.Id, ($_.Message -replace "\s+", " ") }
+}
+
+# Dernières lignes de setupapi.dev.log, le journal d'installation PnP de l'invité : c'est
+# lui qui dit POURQUOI une installation ou un démarrage a échoué (section [Device Install],
+# code de fin de chaque étape), là où le journal d'événements ne donne qu'un code. Il était
+# jusqu'ici perdu à chaque échec, alors qu'il ne coûte rien à rapatrier.
+$setupapiBlock = {
+  param([int]$Tail)
+  $ErrorActionPreference = "Stop"
+  $path = Join-Path $env:SystemRoot "INF\setupapi.dev.log"
+  if (-not (Test-Path -LiteralPath $path)) { return @() }
+  # Le fichier est tenu ouvert par PnP : une lecture peut échouer sans que ce soit une
+  # raison d'ajouter un échec à l'échec en cours.
+  return @(Get-Content -LiteralPath $path -Tail $Tail -ErrorAction SilentlyContinue)
 }
 
 # Vidages mémoire plus récents que $Since ; renvoie leurs chemins.
@@ -240,7 +301,7 @@ try {
   for ($i = 1; $i -le $Count; $i++) {
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $result = Invoke-Command -Session $session -ScriptBlock $cycleBlock `
-      -ArgumentList $helpers, $guestDir, $infName, $hardwareId, $StartTimeoutSeconds
+      -ArgumentList $helpers, $guestDir, $infName, $hardwareId, $StartTimeoutSeconds, $RemoveTimeoutSeconds
     $events = @(Invoke-Command -Session $session -ScriptBlock $eventsBlock -ArgumentList $guestStart)
     if ($events.Count -gt 0) {
       throw "Cycle $i : événements d'erreur dans l'invité :`n$($events -join "`n")"
@@ -252,18 +313,19 @@ try {
 } catch {
   $failure = $_
 } finally {
-  # Vidages : la session peut être morte (bug check) ; on en rouvre une, l'invité
-  # redémarre seul (AutoReboot) et l'on rapatrie ce qui est plus récent que le début.
+  # Vidages et journal PnP : la session peut être morte (bug check) ; on en rouvre une,
+  # l'invité redémarre seul (AutoReboot) et l'on rapatrie ce qui est plus récent que le
+  # début, plus setupapi.dev.log en cas d'échec.
   if ($guestStart) {
     try {
       if (-not $session -or $session.State -ne "Opened") {
-        Write-Host "Reconnexion à l'invité pour la collecte des vidages…"
+        Write-Host "Reconnexion à l'invité pour la collecte des vidages et du journal PnP…"
         $session = New-GuestSession -Name $Name -Credential $Credential
       }
+      $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
       $dumps = @(Invoke-Command -Session $session -ScriptBlock $dumpsBlock -ArgumentList $guestStart)
       if ($dumps.Count -gt 0) {
         New-Item -ItemType Directory -Force -Path $dumpsDir | Out-Null
-        $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
         foreach ($dump in $dumps) {
           $dest = Join-Path $dumpsDir ("{0}_{1}" -f $stamp, (Split-Path -Leaf $dump))
           Write-Host "Vidage $dump → $dest"
@@ -271,9 +333,24 @@ try {
         }
         if (-not $failure) { $failure = "Vidage(s) mémoire produit(s) pendant les cycles : $($dumps -join ', ')" }
       }
+      # Journal d'installation PnP, à côté des vidages, dès qu'il y a eu un échec (y
+      # compris un échec né d'un vidage : le test vient donc APRÈS la collecte ci-dessus).
+      if ($failure) {
+        $lines = @(Invoke-Command -Session $session -ScriptBlock $setupapiBlock -ArgumentList $setupapiTailLines)
+        if ($lines.Count -gt 0) {
+          New-Item -ItemType Directory -Force -Path $dumpsDir | Out-Null
+          $dest = Join-Path $dumpsDir ("{0}_setupapi.dev.log" -f $stamp)
+          # -Encoding explicite : Set-Content écrit sinon dans la page de codes ANSI, et le
+          # journal contient des chemins et des noms accentués.
+          Set-Content -LiteralPath $dest -Value $lines -Encoding UTF8
+          Write-Host "Journal PnP (dernières $($lines.Count) lignes de setupapi.dev.log) → $dest"
+        } else {
+          Write-Host "setupapi.dev.log introuvable ou illisible dans l'invité : rien à rapatrier."
+        }
+      }
     } catch {
       if (-not $failure) { $failure = $_ }
-      else { $Host.UI.WriteErrorLine("collecte des vidages impossible : $_") }
+      else { $Host.UI.WriteErrorLine("collecte des vidages et du journal PnP impossible : $_") }
     }
   }
   if ($session) { Remove-PSSession $session -ErrorAction SilentlyContinue }

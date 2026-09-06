@@ -249,17 +249,22 @@ plus long qu'un simple redémarrage. Le transport réseau (`-DebugTransport net`
 
 **Filtre de traces** : `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Debug Print
 Filter`, valeur `DEFAULT` (DWord) à `0xF`, **créée si la clé n'existe pas** — c'est le cas
-sur une installation neuve. Sans elle, seules les lignes de niveau *erreur* d'un pilote
-tiers traversent : les traces `kmd_log!` restent invisibles, et ce silence ressemble trait
-pour trait à un pilote qui ne démarre pas. Posée en registre, elle vaut dès l'amorçage,
-donc pour `DriverEntry` — contrairement à `ed nt!Kd_IHVDRIVER_Mask 0xf`, qui ne vaut que
-pour la séance de débogage en cours.
+sur une installation neuve. `DEFAULT` et non `IHVDRIVER` : `kmd_log!` passe par `DbgPrint`,
+donc par le composant `DPFLTR_DEFAULT_ID` (§4). Sans ce filtre, seules les lignes de niveau
+*erreur* traversent : les traces `kmd_log!` restent invisibles, et ce silence ressemble
+trait pour trait à un pilote qui ne démarre pas. Posée en registre, la valeur vaut dès
+l'amorçage, donc pour `DriverEntry`, avant même que le débogueur puisse agir.
+
+Elle **ne suffit pourtant pas** : mesuré le 2026-09-06, une séance est restée muette alors
+que la valeur valait déjà `0xFFFFFFFF` dans l'invité, et seul le `ed nt!Kd_DEFAULT_Mask 0xf`
+joué à la connexion a débloqué les traces. Les deux sont nécessaires, aucun ne remplace
+l'autre — le détail de la mesure est en §4.
 
 ### 3.3 Cycle de chargement (M1a-02) : `vm-cycle.ps1`
 
 ```powershell
 .\drivers\windows\tools\build.ps1                                            # paquet target\debug\conduit_kmd_package
-.\drivers\windows\tools\vm-cycle.ps1 -Name ConduitTest -Credential $cred -Count 100   # [-Package <dossier>] [-Profile dev|release]
+.\drivers\windows\tools\vm-cycle.ps1 -Name ConduitTest -Credential $cred -Count 100   # [-Package <dossier>] [-Profile dev|release] [-StartTimeoutSeconds 30] [-RemoveTimeoutSeconds 30]
 ```
 
 Le script copie le paquet et `devgen.exe` (WDK de l'hôte, version de `versions.json`)
@@ -277,9 +282,11 @@ les mesures en dédoublant les instances ; rien d'autre n'est touché, cette VM 
 3. attente de `Get-PnpDevice -InstanceId <id>` en état `OK` (30 s au plus, sinon échec
    avec le code de problème) ;
 4. `devgen /remove <id>` : `IRP_MN_REMOVE_DEVICE`, l'objet de périphérique disparaît ;
-5. `pnputil /delete-driver oemN.inf /uninstall /force` (`oemN.inf` retrouvé par
+5. **attente que le devnode ait vraiment disparu** (`-RemoveTimeoutSeconds`, 30 s par
+   défaut) — voir « la course du `0xC00000E5` » ci-dessous ;
+6. `pnputil /delete-driver oemN.inf /uninstall /force` (`oemN.inf` retrouvé par
    `pnputil /enum-drivers`) : le service est supprimé et le `.sys` déchargé ;
-6. vérification qu'aucun événement `Kernel-PnP` de niveau erreur ni `BugCheck`
+7. vérification qu'aucun événement `Kernel-PnP` de niveau erreur ni `BugCheck`
    (1001, 6008) n'est apparu dans l'invité depuis le début.
 
 Tout `devgen`/`pnputil` dont le code de retour n'est pas 0 arrête le script avec sa
@@ -288,6 +295,38 @@ reconnecte), un `C:\Windows\MEMORY.DMP` ou un `C:\Windows\Minidump\*.dmp` plus r
 le début est rapatrié dans `drivers\windows\target\dumps\` et le script **échoue**.
 Sortie : cycles réussis et durée moyenne, minimale et maximale d'un cycle. Le critère de
 M1a-02 est `vm-cycle : 100 cycles sans erreur.`
+
+**En cas d'échec, le journal d'installation PnP est rapatrié aussi** : les 500 dernières
+lignes de `C:\Windows\INF\setupapi.dev.log` de l'invité, dans
+`drivers\windows\target\dumps\<horodatage>_setupapi.dev.log`. C'est lui qui dit *pourquoi*
+une installation ou un démarrage PnP a échoué (chaque étape et son code de fin), là où le
+journal d'événements ne donne qu'un code ; il était perdu à chaque échec jusqu'ici.
+
+#### La course du `0xC00000E5` (mesurée, corrigée le 2026-09-06)
+
+Sur une série de deux cycles, le second a échoué :
+
+```
+Kernel-PnP 411 : L'appareil SWD\DEVGEN\{0c9acf52-…} a eu un problème de démarrage.
+Problème : 0x0   État du problème : 0xC00000E5
+```
+
+**Le signe distinctif** : `{0c9acf52-…}` est l'appareil du cycle **1**, pas celui du cycle
+2, et l'horodatage tombe à l'instant de son retrait. Les traces du pilote montraient un
+cycle 1 complet et propre, `DriverUnload` compris ; le cycle 2 n'avait jamais chargé le
+pilote, et l'invité ne gardait après coup ni périphérique résiduel ni paquet publié.
+
+Le pilote était donc hors de cause. Le script enchaînait `devgen /remove` puis
+immédiatement `pnputil /enum-drivers` et `/delete-driver … /uninstall /force`, sans
+attendre que le retrait soit effectif : PnP tentait un dernier démarrage sur le devnode
+mourant pendant qu'on lui retirait son paquet sous les pieds, et le journalisait en
+erreur. C'est ce qui a produit l'échec au 33ᵉ cycle sur 100 la veille et au 2ᵉ le
+lendemain — une course, dont la probabilité monte quand le débogueur ralentit l'invité.
+
+L'étape 5 attend donc la disparition du devnode avant l'étape 6. Le critère est
+**structurel** — l'instance n'est plus rendue par `Get-PnpDevice -InstanceId <id>`, ou
+n'y figure plus qu'en périphérique non présent (`Present`, un **booléen**) — jamais le
+libellé `Status`, qui est traduit.
 
 À la main, dans la VM, les mêmes commandes se tapent depuis `C:\ConduitTest` :
 
@@ -447,6 +486,16 @@ attaché à `\\.\pipe\conduitdbg`.
 > canal**, puis seulement `Start-VM`. Ce n'est plus une consigne à retenir, c'est un
 > comportement.
 
+**La règle vaut aussi pour un rattachement** (mesuré le 2026-09-06). `vm-debug.ps1` *sans*
+`-StartVM` sur une VM déjà en marche écrit `Opened \\.\pipe\conduitdbg` puis reste
+**indéfiniment** sur `Waiting to reconnect...` : la connexion ne s'établit jamais, et les
+commandes initiales (`-c`) ne sont donc jamais jouées non plus. `resets=0,reconnect` fait
+patienter le débogueur *avant* un démarrage, il ne rattrape pas un invité déjà parti.
+L'aide du script annonçait le contraire (« VM déjà démarrée : kd se raccroche ») : c'était
+faux, et corrigé. Le script avertit maintenant avant de lancer `kd` quand la VM tourne et
+que `-StartVM` n'a pas été passé — sans interdire le cas, tenir le canal face à un invité
+figé gardant son intérêt.
+
 À la main, dans cet ordre et pas un autre :
 
 ```powershell
@@ -456,11 +505,33 @@ Start-VM -Name ConduitTest
 ```
 
 `resets=0,reconnect` est ce qui rend cet ordre praticable : le débogueur tient le canal
-sans lâcher tant que la VM n'a pas démarré, et se raccroche à chaque redémarrage de
-l'invité. `vm-debug.ps1` journalise tout (`-logo`, sous
-`drivers\windows\target\debug-logs\`), joue `ed nt!Kd_IHVDRIVER_Mask 0xf` puis `g` à la
-connexion (le masque de traces, aussi posé en registre par `vm-prepare.ps1`), et avec
-`-Follow` suit le journal en mettant en évidence les lignes du pilote.
+sans lâcher tant que la VM n'a pas démarré, et se raccroche aux redémarrages **suivants**
+de l'invité — mais pas à une machine partie avant lui. `vm-debug.ps1` journalise tout (`-logo`, sous
+`drivers\windows\target\debug-logs\`), joue `ed nt!Kd_DEFAULT_Mask 0xf`,
+`ed nt!Kd_IHVDRIVER_Mask 0xf` puis `g` à la connexion, et avec `-Follow` suit le journal
+en mettant en évidence les lignes du pilote.
+
+#### Le masque de traces : `DEFAULT`, et il en faut **deux** (mesuré le 2026-09-06)
+
+Avec les seules commandes d'origine (`ed nt!Kd_IHVDRIVER_Mask 0xf`), une séance complète —
+débogueur connecté dès l'amorçage, 100 cycles de chargement — n'a rendu **aucune** trace
+du pilote, alors que les `DbgPrint` d'autres composants passaient. En ajoutant
+`ed nt!Kd_DEFAULT_Mask 0xf`, la séance suivante a immédiatement rendu les dix traces
+attendues (`DriverEntry`, `AddDevice`, `StartDevice`, les quatre `Init`, `DriverUnload`…).
+
+La raison est dans le code : `kmd_log!` ([`conduit-kmd/src/log.rs`](../drivers/windows/conduit-kmd/src/log.rs))
+passe par `wdk::println!`, qui appelle **`DbgPrint`** — donc le composant
+`DPFLTR_DEFAULT_ID`, jamais `DPFLTR_IHVDRIVER_ID`, qui exigerait un `DbgPrintEx` explicite.
+Le masque à ouvrir est `Kd_DEFAULT_Mask` ; `Kd_IHVDRIVER_Mask` est conservé derrière, sans
+coût, pour un éventuel `DbgPrintEx` futur.
+
+Second constat de la même séance : la valeur de registre `Debug Print Filter\DEFAULT`
+valait **déjà `0xFFFFFFFF`** dans l'invité pendant que la séance restait muette. Elle n'a
+donc **pas suffi à elle seule** ; c'est le `ed` joué au moment de la connexion qui a
+débloqué les traces. **Les deux sont nécessaires et aucun ne remplace l'autre** : la valeur
+de registre (§3.2) vaut dès l'amorçage, avant que le débogueur puisse agir ; le `ed` vaut
+pour la séance en cours. C'est un constat de mesure, pas une théorie : ne retirer ni l'un
+ni l'autre sans le remesurer.
 
 Commandes utiles dans la fenêtre de `kd.exe` : `!analyze -v` après un bug check,
 `!verifier 3` pour l'état de Driver Verifier, `lm m conduit*` pour vérifier que le module
@@ -498,8 +569,9 @@ fichier de la VM vers l'hôte. L'ouvrir dans WinDbg (`.sympath` sur le dossier d
 | `vm-prepare.ps1` : « testsigning n'est pas actif après redémarrage » | Secure Boot encore actif sur la VM : `Set-VMFirmware -VMName ConduitTest -EnableSecureBoot Off` (VM arrêtée), puis relancer le script. |
 | `vm-run-console.ps1` : « Aucune session console interactive » | Voulu. Ouvrir `vmconnect` **en mode session de base** (pas étendue, qui redirige l'audio vers l'hôte), ouvrir une session Windows à l'écran avec le compte du `-Credential`, attendre le bureau, relancer. Sans cela la mesure tournerait dans la session 0 et serait silencieuse sans erreur (§3.4 bis). |
 | `vm-run-console.ps1` : « Le compte ouvert à la console est … mais -Credential désigne … » | La tâche `/it` ne se déclenche que pour l'utilisateur ouvert à la console. Le compte réel de la VM est `nathan`, pas `test` : passer le bon `-Credential`. |
-| Le débogueur ne se connecte jamais au canal nommé | La VM a démarré **avant** le débogueur. Arrêter la VM, relancer `vm-debug.ps1 -StartVM`, qui impose l'ordre. Vérifier aussi le port COM : `Get-VMComPort -VMName ConduitTest` doit montrer `\\.\pipe\conduitdbg` (attaché par `vm-prepare.ps1`, VM arrêtée). |
-| Aucune trace `kmd_log!` alors que le pilote démarre | Filtre de traces absent : `Debug Print Filter\DEFAULT = 0xF` (§3.2), ou `ed nt!Kd_IHVDRIVER_Mask 0xf` dans le débogueur pour la séance en cours. Vérifier aussi le profil : `kmd_log!` n'existe qu'en `dev`. |
+| `kd` reste sur `Waiting to reconnect...` après `Opened \\.\pipe\…` | La VM a démarré **avant** le débogueur — y compris quand `vm-debug.ps1` a été lancé sans `-StartVM` sur une VM déjà en marche, cas mesuré comme sans issue (§4). Arrêter la VM, relancer `vm-debug.ps1 -StartVM`, qui impose l'ordre. Vérifier aussi le port COM : `Get-VMComPort -VMName ConduitTest` doit montrer `\\.\pipe\conduitdbg` (attaché par `vm-prepare.ps1`, VM arrêtée). |
+| Aucune trace `kmd_log!` alors que le pilote démarre | Masque de traces **`DEFAULT`**, pas `IHVDRIVER` (§4) : `ed nt!Kd_DEFAULT_Mask 0xf` dans le débogueur, **et** `Debug Print Filter\DEFAULT = 0xF` en registre (§3.2) — les deux, l'un ne remplace pas l'autre. Vérifier aussi le profil : `kmd_log!` n'existe qu'en `dev`. |
+| `vm-cycle.ps1` : `Kernel-PnP 411`, état `0xC00000E5` sur l'appareil du cycle **précédent** | La course du retrait (§3.3), pas le pilote. Attendue et corrigée depuis ; si elle réapparaît, augmenter `-RemoveTimeoutSeconds`. Le journal `<horodatage>_setupapi.dev.log` rapatrié avec les vidages dit ce que PnP a tenté. |
 | `vm-prepare.ps1` : « Set-VMComPort exige une VM ARRÊTÉE » | L'invité ne s'est pas éteint (mise à jour en cours, invité figé). `Stop-VM -Name ConduitTest`, puis relancer le script. |
 | `vm-cycle.ps1` : « Le périphérique … n'est pas passé en état OK », problème 10 ou 28 | 10 : `StartDevice` ou PortCls a échoué (journal `kmd_log!`, événement Kernel-PnP 411). 28 : l'INF ne correspond pas (`pnputil /enum-drivers` dans la VM, certificat importé ?). |
 

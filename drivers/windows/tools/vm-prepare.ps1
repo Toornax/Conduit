@@ -101,14 +101,22 @@ try {
       Invoke-NativeChecked bcdedit @("/dbgsettings", "net", "hostip:$HostIp", "port:$DebugPort", "key:$DebugKey") | Out-Null
     }
 
-    # Filtre de traces du noyau. Depuis Windows Vista, DbgPrint et DbgPrintEx d'un pilote
-    # tiers (composant DPFLTR_IHVDRIVER_ID) sont filtrés par défaut : SEULES les lignes de
-    # niveau erreur passent, et les traces kmd_log! du pilote restent invisibles — un
-    # silence qui ressemble trait pour trait à un pilote qui ne démarre pas, et qui a déjà
-    # coûté cher. DEFAULT = 0xF ouvre les quatre niveaux (erreur, avertissement, trace,
-    # information) pour tous les composants, dès l'amorçage et pour tous les démarrages
-    # suivants — contrairement à `ed nt!Kd_IHVDRIVER_Mask 0xf`, qui ne vaut que pour la
-    # session de débogage en cours et arrive trop tard pour DriverEntry.
+    # Filtre de traces du noyau. Depuis Windows Vista, DbgPrint et DbgPrintEx sont filtrés
+    # par défaut : SEULES les lignes de niveau erreur passent, et les traces kmd_log! du
+    # pilote restent invisibles — un silence qui ressemble trait pour trait à un pilote qui
+    # ne démarre pas, et qui a déjà coûté cher. DEFAULT = 0xF ouvre les quatre niveaux
+    # (erreur, avertissement, trace, information) dès l'amorçage — donc pour DriverEntry —
+    # et pour tous les démarrages suivants. DEFAULT et non IHVDRIVER : kmd_log! passe par
+    # `wdk::println!`, donc par DbgPrint, donc par le composant DPFLTR_DEFAULT_ID (voir
+    # conduit-kmd\src\log.rs, et le paramètre -InitialCommands de vm-debug.ps1).
+    #
+    # CETTE VALEUR NE SUFFIT PAS À ELLE SEULE, et n'est pas non plus remplaçable par la
+    # commande du débogueur : mesuré le 2026-09-06, une séance complète est restée muette
+    # alors que la valeur valait DÉJÀ 0xFFFFFFFF dans l'invité, et c'est le
+    # `ed nt!Kd_DEFAULT_Mask 0xf` joué à la connexion par vm-debug.ps1 qui a débloqué les
+    # traces. Les DEUX sont nécessaires : le registre vaut dès l'amorçage, avant que le
+    # débogueur puisse agir ; le `ed` vaut pour la séance en cours. Constat de mesure, pas
+    # théorie : ne retirer ni l'un ni l'autre sans le remesurer.
     # La clé n'existe pas sur une installation neuve : la créer.
     Write-Host "  Debug Print Filter : DEFAULT = 0xF (les DbgPrint du pilote passent)"
     $filter = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Debug Print Filter"
@@ -192,7 +200,9 @@ if ($serial) {
   Write-Host "  Clé : $DebugKey   (à conserver ; WinDbg → Attach to kernel → Net)"
   Write-Host "  Équivalent : windbg -k net:port=$DebugPort,key=$DebugKey"
 }
-Write-Host "  Traces du pilote : Debug Print Filter DEFAULT = 0xF (les kmd_log! passent)"
+Write-Host "  Traces du pilote : Debug Print Filter DEFAULT = 0xF (dès l'amorçage) ; il faut"
+Write-Host "  AUSSI le « ed nt!Kd_DEFAULT_Mask 0xf » que vm-debug.ps1 joue à la connexion —"
+Write-Host "  mesuré : le registre seul ne suffit pas, aucun des deux ne remplace l'autre."
 Write-Host "  Retour à l'état propre : Restore-VMCheckpoint -VMName $Name -Name $checkpoint -Confirm:`$false"
 Write-Host ""
 Write-Host "SUITE — attacher le débogueur noyau :"

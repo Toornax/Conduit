@@ -18,6 +18,8 @@
     Get-ConsoleSessionDecision            | lectures CIM dans l'invité (vm-run-console.ps1)
     Get-ConsoleRunScript, Get-TaskRunAsUser | schtasks dans l'invité (vm-run-console.ps1)
     Test-ConduitGhostDevice               | Get-PnpDevice dans l'invité (vm-cycle.ps1)
+    Test-DevnodeGone                      | Get-PnpDevice dans l'invité (vm-cycle.ps1)
+    Get-DebuggerAttachWarning             | Get-VM (vm-debug.ps1)
 #>
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -436,7 +438,8 @@ function Get-KdCommandLine {
     Fonction pure : c'est la partie de vm-debug.ps1 qui se teste sans Hyper-V ni WDK.
     `resets=0,reconnect` est ce qui rend l'ordre « débogueur d'abord, machine ensuite »
     praticable : le débogueur tient le canal et ne lâche pas tant que la VM n'a pas
-    démarré, puis se raccroche à chaque redémarrage de l'invité.
+    démarré, puis se raccroche aux redémarrages SUIVANTS de l'invité. Il ne rattrape pas
+    pour autant une machine partie avant lui : voir Get-DebuggerAttachWarning.
   .PARAMETER KdPath
     Chemin de kd.exe (ou windbg.exe : mêmes options).
   .PARAMETER Pipe
@@ -465,6 +468,58 @@ function Get-KdCommandLine {
     ArgumentString = ($quoted -join " ")
     CommandLine    = "$(Format-NativeArgument -Value $KdPath) $($quoted -join " ")"
   }
+}
+
+function Get-DebuggerAttachWarning {
+  <#
+  .SYNOPSIS
+    Avertissement à donner AVANT de lancer kd sur une VM déjà démarrée sans -StartVM : la
+    connexion n'aboutira très probablement pas. Chaîne vide dans tous les autres cas.
+  .DESCRIPTION
+    Fonction pure (l'état de la VM est lu à part), pour que le texte soit testable sans
+    Hyper-V.
+
+    MESURÉ le 2026-09-06, et non déduit : `vm-debug.ps1` sans -StartVM sur une VM en
+    marche écrit « Opened \\.\pipe\conduitdbg » puis reste INDÉFINIMENT sur « Waiting to
+    reconnect... ». La connexion ne s'établit jamais, et les commandes initiales (-c) ne
+    sont donc jamais jouées non plus. La règle « le débogueur doit tenir le canal avant
+    que la machine démarre » vaut donc AUSSI pour un rattachement : `resets=0,reconnect`
+    fait patienter le débogueur avant un démarrage, il ne rattrape pas un invité déjà
+    parti. L'aide du script annonçait le contraire jusqu'à cette mesure.
+
+    Le cas n'est pas interdit pour autant : rattacher un invité figé après un plantage
+    reste utile, ne serait-ce que pour tenir le canal jusqu'au redémarrage suivant. On
+    avertit, on ne bloque pas.
+  .PARAMETER State
+    État de la VM tel que rendu par Get-VM (énumération VMState : Running, Off, Paused…).
+    Le NOM d'un membre d'énumération .NET n'est pas traduit, contrairement aux libellés du
+    gestionnaire Hyper-V : la comparaison porte sur ce nom, jamais sur un affichage — même
+    choix que Wait-VMOff. Vide ou $null quand l'état n'a pas pu être lu : aucun
+    avertissement alors, faute de savoir.
+  .PARAMETER StartVM
+    Vrai quand -StartVM a été passé : le script impose alors l'ordre lui-même, rien à dire.
+  .PARAMETER Name
+    Nom de la VM, cité dans le message.
+  #>
+  param(
+    [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$State,
+    [Parameter(Mandatory)][bool]$StartVM,
+    [Parameter(Mandatory)][AllowEmptyString()][string]$Name
+  )
+  if ($StartVM) { return "" }
+  $value = if ($null -eq $State) { "" } else { $State.Trim() }
+  if ($value -ine "Running") { return "" }
+  return @(
+    "La VM « $Name » est DÉMARRÉE et -StartVM n'a pas été passé : la connexion du"
+    "débogueur n'aboutira très probablement pas."
+    "Mesuré le 2026-09-06 : sur une VM déjà en marche, kd ouvre bien le canal"
+    "(« Opened … ») puis reste indéfiniment sur « Waiting to reconnect... » ; la connexion"
+    "ne s'établit jamais, et les commandes initiales (-c) ne sont donc jamais jouées."
+    "La règle « le débogueur doit tenir le canal AVANT que la machine démarre » vaut aussi"
+    "pour un rattachement."
+    "Remède : relancer avec -StartVM, qui arrête la VM, place le débogueur, puis démarre."
+    "On poursuit quand même : rattacher un invité figé après un plantage peut se justifier."
+  ) -join "`n"
 }
 
 function Test-SameAccount {
@@ -698,6 +753,60 @@ function Test-ConduitGhostDevice {
   return $false
 }
 
+function Test-DevnodeGone {
+  <#
+  .SYNOPSIS
+    Vrai si le devnode $InstanceId a bien disparu de l'inventaire PnP fourni : soit il n'y
+    figure plus du tout, soit il n'y figure qu'en périphérique NON PRÉSENT (fantôme).
+  .DESCRIPTION
+    Fonction pure, aussi envoyée telle quelle dans l'invité (voir Get-FunctionSource) par
+    vm-cycle.ps1 — elle ne référence donc AUCUNE variable de module. L'inventaire est lu à
+    part (Get-PnpDevice -InstanceId … dans l'invité), pour que la décision soit testable
+    sans VM.
+
+    À QUOI ELLE SERT (mesuré le 2026-09-06, voir vm-cycle.ps1) : `devgen /remove` rend la
+    main avant que PnP ait fini de démonter le devnode. Enchaîner tout de suite
+    `pnputil /delete-driver … /uninstall /force` retire le paquet sous les pieds d'un
+    devnode encore vivant, et PnP journalise un dernier démarrage raté (Kernel-PnP 411,
+    état 0xC00000E5). Cette fonction dit quand l'attente peut cesser.
+
+    DÉCISION STRUCTURELLE, JAMAIS UN LIBELLÉ : on compare des identifiants d'instance
+    (chaînes ASCII engendrées par PnP, jamais traduites) et on lit `Present`, un BOOLÉEN —
+    contrairement à `Status`, qui est du texte traduit (« OK », « Erreur », « Inconnu »).
+    Le cas normal après un retrait est la disparition pure et simple ; on accepte aussi le
+    fantôme, parce qu'un devnode non présent n'est plus un devnode que PnP démarre, et
+    parce que l'invité en laisse parfois un derrière lui.
+  .PARAMETER InstanceId
+    Identifiant d'instance attendu disparu (SWD\DEVGEN\{…}). Vide ou $null : rien à
+    attendre, donc vrai.
+  .PARAMETER Devices
+    Ce que Get-PnpDevice a rendu : des objets portant InstanceId et Present. Liste vide,
+    $null ou entrées incomplètes acceptées (un périphérique retiré ne rend plus rien).
+  #>
+  param(
+    [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$InstanceId,
+    [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][object[]]$Devices
+  )
+  $wanted = if ($null -eq $InstanceId) { "" } else { $InstanceId.Trim() }
+  if ($wanted -eq "") { return $true }
+  foreach ($device in @($Devices)) {
+    if ($null -eq $device) { continue }
+    $properties = $device.PSObject.Properties
+    if ($properties.Match("InstanceId").Count -eq 0) { continue }
+    $id = [string]$device.InstanceId
+    if ($null -eq $id) { $id = "" }
+    # Les identifiants d'instance ne sont pas sensibles à la casse (« SWD\ » et « swd\ »
+    # désignent le même énumérateur) : la comparaison l'ignore, comme partout ailleurs.
+    if ($id.Trim() -ine $wanted) { continue }
+    $present = $true
+    if ($properties.Match("Present").Count -gt 0 -and $null -ne $device.Present) {
+      $present = [bool]$device.Present
+    }
+    if ($present) { return $false }
+  }
+  return $true
+}
+
 function Get-WdkRoot {
   <#
   .SYNOPSIS
@@ -840,7 +949,8 @@ Export-ModuleMember -Function Test-Elevated, Test-SidPresent, Get-TokenSid,
   Test-HyperVOperator, Get-HyperVAccessHint, Get-HyperVAccessMessage, Assert-HyperVAccess,
   Test-AccessDeniedError, Invoke-HyperVChecked, New-DebugKey, Test-DebugKey,
   Invoke-NativeChecked, Get-FunctionSource, ConvertFrom-DevgenAddOutput, Find-PublishedInf,
-  Get-CycleSummary, Get-NamedPipeName, Get-KdCommandLine, Get-AccountName, Test-SameAccount,
+  Get-CycleSummary, Get-NamedPipeName, Get-KdCommandLine, Get-DebuggerAttachWarning,
+  Get-AccountName, Test-SameAccount,
   Get-TaskRunAsUser, Get-ConsoleSessionDecision, Get-ConsoleRunScript, Test-ConduitGhostDevice,
-  Get-WdkRoot, Get-DevgenPath, Get-KdPath, Get-DefaultSwitchHostIp, Wait-VMHeartbeat,
+  Test-DevnodeGone, Get-WdkRoot, Get-DevgenPath, Get-KdPath, Get-DefaultSwitchHostIp, Wait-VMHeartbeat,
   Wait-VMReboot, Wait-VMOff, New-GuestSession

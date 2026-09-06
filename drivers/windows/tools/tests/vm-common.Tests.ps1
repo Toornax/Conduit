@@ -550,7 +550,8 @@ Describe "Surface exportée : débogage série et session console" {
   It "exporte les fonctions pures des nouveaux scripts" {
     foreach ($name in @("Get-NamedPipeName", "Get-KdCommandLine", "Get-AccountName",
                         "Test-SameAccount", "Get-TaskRunAsUser", "Get-ConsoleSessionDecision",
-                        "Get-ConsoleRunScript", "Test-ConduitGhostDevice")) {
+                        "Get-ConsoleRunScript", "Test-ConduitGhostDevice", "Test-DevnodeGone",
+                        "Get-DebuggerAttachWarning")) {
       $module.ExportedFunctions.ContainsKey($name) | Should Be $true
     }
   }
@@ -561,5 +562,101 @@ Describe "Surface exportée : débogage série et session console" {
   }
   It "n'exporte pas l'aide interne de citation" {
     $module.ExportedFunctions.ContainsKey("Format-NativeArgument") | Should Be $false
+  }
+}
+
+Describe "Test-DevnodeGone" {
+  $id = "SWD\DEVGEN\{0c9acf52-1234-4a0b-9c3d-000000000001}"
+  $autre = "SWD\DEVGEN\{0c9acf52-1234-4a0b-9c3d-000000000002}"
+
+  It "voit disparu un identifiant absent de l'inventaire" {
+    (Test-DevnodeGone -InstanceId $id -Devices @()) | Should Be $true
+    (Test-DevnodeGone -InstanceId $id -Devices $null) | Should Be $true
+  }
+  It "voit encore là un périphérique présent qui porte cet identifiant" {
+    (Test-DevnodeGone -InstanceId $id -Devices @(
+      [pscustomobject]@{ InstanceId = $id; Present = $true })) | Should Be $false
+  }
+  It "accepte un fantôme (Present à faux) comme disparu" {
+    # Un devnode non présent n'est plus un devnode que PnP démarre : la course est finie.
+    (Test-DevnodeGone -InstanceId $id -Devices @(
+      [pscustomobject]@{ InstanceId = $id; Present = $false })) | Should Be $true
+  }
+  It "ne décide JAMAIS sur le libellé Status, qui est traduit" {
+    # Present (booléen) prime ; Status ne doit avoir aucune influence, dans un sens comme
+    # dans l'autre — c'est tout l'objet de cette fonction.
+    (Test-DevnodeGone -InstanceId $id -Devices @(
+      [pscustomobject]@{ InstanceId = $id; Present = $true; Status = "Erreur" })) | Should Be $false
+    (Test-DevnodeGone -InstanceId $id -Devices @(
+      [pscustomobject]@{ InstanceId = $id; Present = $false; Status = "OK" })) | Should Be $true
+  }
+  It "ignore les périphériques qui portent un autre identifiant" {
+    (Test-DevnodeGone -InstanceId $id -Devices @(
+      [pscustomobject]@{ InstanceId = $autre; Present = $true },
+      [pscustomobject]@{ InstanceId = "ROOT\MEDIA\0001"; Present = $true })) | Should Be $true
+  }
+  It "ignore la casse et les espaces de l'identifiant" {
+    (Test-DevnodeGone -InstanceId $id -Devices @(
+      [pscustomobject]@{ InstanceId = $id.ToLower(); Present = $true })) | Should Be $false
+    (Test-DevnodeGone -InstanceId " $id " -Devices @(
+      [pscustomobject]@{ InstanceId = "$id`t"; Present = $true })) | Should Be $false
+  }
+  It "tient pour PRÉSENT un objet sans propriété Present (prudence : on n'invente rien)" {
+    (Test-DevnodeGone -InstanceId $id -Devices @(
+      [pscustomobject]@{ InstanceId = $id })) | Should Be $false
+    (Test-DevnodeGone -InstanceId $id -Devices @(
+      [pscustomobject]@{ InstanceId = $id; Present = $null })) | Should Be $false
+  }
+  It "supporte les entrées nulles ou sans identifiant" {
+    (Test-DevnodeGone -InstanceId $id -Devices @($null, [pscustomobject]@{ Present = $true })) | Should Be $true
+    (Test-DevnodeGone -InstanceId $id -Devices @(
+      $null,
+      [pscustomobject]@{ InstanceId = $id; Present = $true })) | Should Be $false
+  }
+  It "n'attend rien d'un identifiant vide" {
+    (Test-DevnodeGone -InstanceId "" -Devices @()) | Should Be $true
+    (Test-DevnodeGone -InstanceId $null -Devices @()) | Should Be $true
+  }
+  It "reste utilisable une fois transportée dans l'invité (aucune variable de module)" {
+    # vm-cycle.ps1 l'envoie par Get-FunctionSource : elle doit se suffire à elle-même.
+    $sb = [scriptblock]::Create((Get-FunctionSource -Name Test-DevnodeGone) +
+      "`nTest-DevnodeGone -InstanceId 'SWD\DEVGEN\{1}' -Devices @()")
+    (& $sb) | Should Be $true
+  }
+}
+
+Describe "Get-DebuggerAttachWarning" {
+  $nom = "ConduitTest"
+
+  It "avertit quand la VM tourne et que -StartVM n'est pas passé" {
+    $message = Get-DebuggerAttachWarning -State "Running" -StartVM $false -Name $nom
+    [string]::IsNullOrEmpty($message) | Should Be $false
+    $message.Contains($nom) | Should Be $true
+  }
+  It "dit ce qui a été mesuré et le remède" {
+    $message = Get-DebuggerAttachWarning -State "Running" -StartVM $false -Name $nom
+    $message.Contains("Waiting to reconnect") | Should Be $true
+    $message.Contains("-StartVM") | Should Be $true
+  }
+  It "ne dit rien quand -StartVM impose déjà l'ordre" {
+    (Get-DebuggerAttachWarning -State "Running" -StartVM $true -Name $nom) | Should Be ""
+  }
+  It "ne dit rien sur une VM qui ne tourne pas" {
+    foreach ($etat in @("Off", "Paused", "Saved", "Starting")) {
+      (Get-DebuggerAttachWarning -State $etat -StartVM $false -Name $nom) | Should Be ""
+    }
+  }
+  It "ne dit rien quand l'état n'a pas pu être lu" {
+    (Get-DebuggerAttachWarning -State "" -StartVM $false -Name $nom) | Should Be ""
+    (Get-DebuggerAttachWarning -State $null -StartVM $false -Name $nom) | Should Be ""
+  }
+  It "compare le NOM du membre d'énumération, casse et espaces indifférents" {
+    # VMState est une énumération .NET : son nom n'est pas traduit, contrairement aux
+    # libellés du gestionnaire Hyper-V. C'est ce nom que l'on compare, jamais un affichage.
+    [string]::IsNullOrEmpty((Get-DebuggerAttachWarning -State " running " -StartVM $false -Name $nom)) | Should Be $false
+    [string]::IsNullOrEmpty((Get-DebuggerAttachWarning -State "RUNNING" -StartVM $false -Name $nom)) | Should Be $false
+  }
+  It "accepte un nom de VM vide" {
+    [string]::IsNullOrEmpty((Get-DebuggerAttachWarning -State "Running" -StartVM $false -Name "")) | Should Be $false
   }
 }

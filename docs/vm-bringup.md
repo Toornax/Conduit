@@ -95,11 +95,24 @@ moyenne. Aucun vidage rapatrié dans `drivers\windows\target\dumps\`.
 2. *`ExAllocateTimer` échoue au démarrage* → `STATUS_INSUFFICIENT_RESOURCES`, le
    périphérique ne démarre pas (M1a-08, décision assumée : pas de repli). Regarder le
    journal `DbgPrint`.
-3. *Écran bleu au chargement* : attacher le débogueur AVANT de démarrer la VM
+3. *La course du retrait, `Kernel-PnP 411` avec l'état `0xC00000E5`* : **son signe
+   distinctif est que l'événement désigne l'appareil du cycle PRÉCÉDENT**, à l'instant de
+   son retrait, alors que le cycle en cours n'a jamais chargé le pilote. C'est PnP qui
+   tente un dernier démarrage sur le devnode mourant pendant que `pnputil /delete-driver`
+   lui retire son paquet sous les pieds — le pilote est hors de cause. Mesurée et corrigée
+   le 2026-09-06 (attente de la disparition du devnode avant la suppression du paquet,
+   `-RemoveTimeoutSeconds`, §3.3 de driver-dev.md) ; si elle réapparaît sur un invité lent
+   ou ralenti par le débogueur, augmenter ce délai. Ne pas soupçonner le pilote avant
+   d'avoir comparé l'identifiant de l'appareil à celui du cycle en cours.
+4. *Écran bleu au chargement* : attacher le débogueur AVANT de démarrer la VM
    (`vm-debug.ps1 -StartVM`, §4 de driver-dev.md), puis `!analyze -v`.
    Un bug check `0xE0000001` est **notre** gestionnaire de panique : le message Rust est
    dans les paramètres, et c'est un bogue de logique, pas de noyau.
-4. *Fuite entre les cycles* : `!poolused` sur les tags `Cndt`, ils doivent revenir à zéro.
+5. *Fuite entre les cycles* : `!poolused` sur les tags `Cndt`, ils doivent revenir à zéro.
+
+En cas d'échec, regarder aussi `drivers\windows\target\dumps\<horodatage>_setupapi.dev.log` :
+le script y rapatrie les 500 dernières lignes du journal d'installation PnP de l'invité,
+qui dit ce que PnP a tenté et pourquoi il a échoué.
 
 ## 3. M1a-06 et M1a-09 — les endpoints apparaissent et portent le bon nom
 

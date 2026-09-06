@@ -13,11 +13,17 @@
   lance kd.exe, ATTEND qu'il tienne le canal, puis seulement démarre la machine. L'ordre
   n'est plus une consigne mais un comportement.
 
+  Cette règle vaut AUSSI pour un rattachement : sans -StartVM, sur une VM déjà en marche,
+  la connexion ne s'établit pas (mesuré ; voir Get-DebuggerAttachWarning dans
+  vm-common.psm1). Le script le dit avant de lancer kd, mais laisse faire : tenir le canal
+  face à un invité figé garde son intérêt.
+
   kd.exe est lancé dans sa propre fenêtre (c'est une console interactive : on y tape
   `!analyze -v`, `lm m conduit*`, Ctrl+Inter pour interrompre l'invité) et journalise tout
-  dans -LogPath. Les commandes initiales lèvent le masque de traces puis relâchent
-  l'invité, pour que les kmd_log! du pilote apparaissent tout de suite ; le masque est
-  aussi posé en registre par vm-prepare.ps1, qui lui vaut dès l'amorçage.
+  dans -LogPath. Les commandes initiales lèvent les masques de traces puis relâchent
+  l'invité, pour que les kmd_log! du pilote apparaissent tout de suite ; le masque DEFAULT
+  est aussi posé en registre par vm-prepare.ps1, qui lui vaut dès l'amorçage. LES DEUX SONT
+  NÉCESSAIRES, l'un n'est pas un substitut de l'autre (voir -InitialCommands).
 
   Ce script ne touche jamais au débogage de l'hôte : il ne lance ni bcdedit, ni verifier.
 .PARAMETER Name
@@ -31,14 +37,15 @@
 .PARAMETER Follow
   Suit le journal dans cette fenêtre, en mettant en évidence les lignes du pilote.
 .PARAMETER InitialCommands
-  Commandes jouées par kd à la connexion. Par défaut : ouverture du masque de traces des
-  pilotes tiers (Kd_IHVDRIVER_Mask) puis `g`, qui relâche l'invité.
+  Commandes jouées par kd à la connexion. Par défaut : ouverture des masques de traces
+  Kd_DEFAULT_Mask PUIS Kd_IHVDRIVER_Mask, puis `g`, qui relâche l'invité. C'est le masque
+  DEFAULT qui porte nos traces — voir le commentaire du paramètre plus bas.
 .PARAMETER HoldTimeoutSeconds
   Délai maximal d'attente que le débogueur tienne le canal (30 s).
 .EXAMPLE
   .\vm-debug.ps1 -StartVM -Follow
 .EXAMPLE
-  .\vm-debug.ps1 -Pipe \\.\pipe\conduitdbg      # VM déjà démarrée : kd se raccroche (reconnect)
+  .\vm-debug.ps1 -Pipe \\.\pipe\conduitdbg   # VM ÉTEINTE : la démarrer une fois kd en place
 #>
 [CmdletBinding()]
 param(
@@ -47,7 +54,27 @@ param(
   [string]$LogPath,
   [switch]$StartVM,
   [switch]$Follow,
-  [string[]]$InitialCommands = @("ed nt!Kd_IHVDRIVER_Mask 0xf", "g"),
+  # Kd_DEFAULT_Mask D'ABORD, et c'est lui qui compte : kmd_log!
+  # (drivers\windows\conduit-kmd\src\log.rs) passe par `wdk::println!`, qui appelle
+  # **DbgPrint** — donc le composant DPFLTR_DEFAULT_ID, jamais DPFLTR_IHVDRIVER_ID, qui
+  # exigerait un DbgPrintEx explicite. Kd_IHVDRIVER_Mask est conservé derrière, sans coût,
+  # pour un éventuel DbgPrintEx futur.
+  #
+  # MESURÉ le 2026-09-06, pas déduit : avec les seules commandes d'origine
+  # (`ed nt!Kd_IHVDRIVER_Mask 0xf`), une séance complète — débogueur connecté dès
+  # l'amorçage, 100 cycles de chargement — n'a rendu AUCUNE trace du pilote, alors que les
+  # DbgPrint d'autres composants passaient. Avec `ed nt!Kd_DEFAULT_Mask 0xf` en plus, la
+  # séance suivante a immédiatement rendu les dix traces attendues (DriverEntry, AddDevice,
+  # StartDevice, les quatre Init, DriverUnload…).
+  #
+  # Autre constat de la même séance : la valeur de registre « Debug Print Filter\DEFAULT »
+  # valait DÉJÀ 0xFFFFFFFF dans l'invité pendant que la séance restait muette. Elle n'a
+  # donc pas suffi à elle seule ; c'est le `ed` joué à la connexion qui a débloqué les
+  # traces. Les DEUX sont nécessaires et aucun ne remplace l'autre : la valeur de registre
+  # (posée par vm-prepare.ps1) vaut dès l'amorçage, avant que le débogueur puisse agir ;
+  # le `ed` vaut pour la séance en cours. Constat de mesure, pas théorie : ne pas retirer
+  # l'un des deux sans le remesurer.
+  [string[]]$InitialCommands = @("ed nt!Kd_DEFAULT_Mask 0xf", "ed nt!Kd_IHVDRIVER_Mask 0xf", "g"),
   [ValidateRange(5, 600)][int]$HoldTimeoutSeconds = 30
 )
 
@@ -96,6 +123,21 @@ if ($StartVM) {
     Invoke-HyperVChecked -What "arrêt de la VM" -Script { Stop-VM -Name $Name -Force }
     Wait-VMOff -Name $Name
   }
+}
+
+# Rattachement à une VM déjà démarrée : mesuré inopérant (Get-DebuggerAttachWarning). On
+# le dit AVANT de lancer kd, pour que personne n'attende une connexion qui ne viendra pas.
+# L'état est lu au mieux : sans -StartVM ce script n'exige pas les droits Hyper-V (ni même
+# qu'Hyper-V soit présent), et une lecture refusée ne doit pas empêcher de déboguer.
+if (-not $StartVM) {
+  $vmState = ""
+  try {
+    $vmState = [string](Get-VM -Name $Name -ErrorAction Stop).State
+  } catch {
+    $vmState = ""
+  }
+  $attachWarning = Get-DebuggerAttachWarning -State $vmState -StartVM $false -Name $Name
+  if ($attachWarning) { Write-Warning $attachWarning }
 }
 
 $kd = Get-KdCommandLine -KdPath $kdPath -Pipe $Pipe -LogPath $LogPath -InitialCommands $InitialCommands
@@ -160,6 +202,8 @@ if (-not $StartVM) {
   Write-Host "La VM n'a pas été démarrée par ce script. Si elle est éteinte, la démarrer"
   Write-Host "MAINTENANT (le débogueur tient déjà le canal) : Start-VM -Name $Name"
   Write-Host "— ou relancer avec -StartVM, qui enchaîne l'ordre tout seul."
+  Write-Host "Si elle tourne DÉJÀ, la connexion n'aboutira probablement pas (mesuré) : kd"
+  Write-Host "restera sur « Waiting to reconnect... ». Il faut alors -StartVM."
 }
 
 if ($Follow) {
