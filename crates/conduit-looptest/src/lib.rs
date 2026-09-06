@@ -19,7 +19,8 @@
 //!
 //! Organisation : [`analysis`] fait tout le calcul (sans plateforme, testé à
 //! fond), [`pass`] enchaîne préparation, découpe du préambule et verdict,
-//! [`report`] met en forme, [`loopback`] (Windows) pilote les vrais flux WASAPI
+//! [`report`] met en forme, `loopback` (Windows seulement, d'où le nom en code
+//! et non en lien : il ne se résoudrait pas ailleurs) pilote les vrais flux WASAPI
 //! par `conduit-backend-wasapi` — WASAPI n'est pas réécrit ici.
 
 #![forbid(unsafe_code)]

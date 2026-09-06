@@ -181,7 +181,8 @@ impl Daemon {
     }
 
     /// Tourne jusqu'au signal d'arrêt (Ctrl-C / SIGTERM), et sous Windows jusqu'à la
-    /// fermeture de session (`WM_ENDSESSION`, voir [`session_end`]).
+    /// fermeture de session (`WM_ENDSESSION`, voir le module `session_end` —
+    /// en code et non en lien : il n'existe que sous Windows).
     pub async fn run_until_signal(self) {
         #[cfg(windows)]
         {
