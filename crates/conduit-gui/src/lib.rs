@@ -11,7 +11,8 @@
 //! - [`typo`] : les trois familles embarquées et les capitales espacées ;
 //! - [`style`] : les closures de style des widgets `iced` ;
 //! - [`mod@format`] : mise en forme française des grandeurs affichées ;
-//! - [`view`] et [`cables`] : décor de la fenêtre et vue « Câbles » ;
+//! - [`shell`] et [`cables`] : coquille de la fenêtre (barre latérale,
+//!   en-tête, bandeau de notice) et vue « Câbles » ;
 //! - [`model`] : miroir de l'état du démon, alimenté par réduction pure des
 //!   notifications ;
 //! - [`ipc`] : connexion, chargement initial, boucle d'événements et
@@ -33,10 +34,10 @@ pub mod format;
 pub mod i18n;
 pub mod ipc;
 pub mod model;
+pub mod shell;
 pub mod style;
 pub mod theme;
 pub mod typo;
-pub mod view;
 
 pub use app::run;
 

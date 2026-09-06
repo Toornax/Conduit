@@ -20,10 +20,12 @@
 
 use iced::border::Radius;
 use iced::widget::overlay::menu;
-use iced::widget::{button, container, pick_list, rule, scrollable, slider, text_input};
+use iced::widget::{button, container, pick_list, rule, scrollable, slider, text, text_input};
 use iced::{Background, Border, Color, Shadow, Theme};
 
-use crate::theme::{jetons, CIBLE_TACTILE, FILET, OPACITE_DESACTIVE, OPACITE_PRESSE, RAYON};
+use crate::theme::{
+    jetons, Jetons, CIBLE_TACTILE, FILET, OPACITE_DESACTIVE, OPACITE_PRESSE, RAYON,
+};
 
 // --- Outils -----------------------------------------------------------------
 
@@ -64,6 +66,9 @@ pub const HAUTEUR_BOUTON: f32 = CIBLE_TACTILE;
 
 /// Padding horizontal d'un bouton.
 pub const PADDING_BOUTON: f32 = 28.0;
+
+/// Corps du libellé d'un bouton : Inter 13 px, en capitales espacées.
+pub const CORPS_BOUTON: f32 = 13.0;
 
 /// Applique la baisse d'opacité des états pressé et désactivé.
 fn finir(status: button::Status, mut style: button::Style) -> button::Style {
@@ -155,6 +160,28 @@ pub fn lien(theme: &Theme, status: button::Status) -> button::Style {
     )
 }
 
+/// Onglet de la barre latérale : ni fond, ni filet, ni rayon — le libellé
+/// seul, souligné d'un filet d'or par la vue quand l'onglet est actif.
+///
+/// L'onglet actif porte l'accent lisible du mode (garance en clair, or en
+/// sombre) ; l'inactif porte le texte courant et glisse vers l'accent au
+/// survol.
+pub fn onglet(actif: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        let j = jetons(theme);
+        let accent = actif || status == button::Status::Hovered;
+        finir(
+            status,
+            button::Style {
+                background: None,
+                text_color: if accent { j.accent_texte } else { j.texte },
+                border: Border::default(),
+                ..button::Style::default()
+            },
+        )
+    }
+}
+
 // --- Surfaces ---------------------------------------------------------------
 
 /// Fond de la fenêtre.
@@ -214,6 +241,31 @@ pub fn pastille(couleur: Color) -> impl Fn(&Theme) -> container::Style {
             width: 0.0,
             radius: Radius::from(CIBLE_TACTILE),
         },
+        ..container::Style::default()
+    }
+}
+
+// --- Encres -----------------------------------------------------------------
+
+/// Couleur d'un texte, choisie parmi les jetons du mode.
+///
+/// La closure de style est le seul endroit où le thème est connu :
+/// `text(…).style(`[`texte_en`]`(|j| j.titre))` suit donc le mode sans que la
+/// vue ait à le lire.
+pub fn texte_en(choix: fn(&Jetons) -> Color) -> impl Fn(&Theme) -> text::Style {
+    move |theme| text::Style {
+        color: Some(choix(jetons(theme))),
+    }
+}
+
+/// Conteneur qui n'impose qu'une couleur de texte, sans fond ni filet.
+///
+/// Sert aux capitales espacées : [`crate::typo::petites_capitales`] compose
+/// une `Row` de `text` qui ne portent pas de couleur, et un conteneur la leur
+/// donne (`iced` propage `text_color` à ce qu'il contient).
+pub fn encre_de(choix: fn(&Jetons) -> Color) -> impl Fn(&Theme) -> container::Style {
+    move |theme| container::Style {
+        text_color: Some(choix(jetons(theme))),
         ..container::Style::default()
     }
 }
@@ -428,6 +480,20 @@ mod tests {
                 couples.push((quoi, s.text_color, derriere));
             }
         }
+        for actif in [false, true] {
+            let style = onglet(actif);
+            for status in ETATS_OPAQUES {
+                // Un onglet n'a pas de fond : il se lit sur la barre latérale.
+                couples.push(("onglet", style(theme, status).text_color, j.surface));
+            }
+        }
+        for choix in [
+            ("encre.titre", j.titre),
+            ("encre.texte", j.texte),
+            ("encre.texte_2", j.texte_2),
+        ] {
+            couples.push((choix.0, choix.1, j.surface));
+        }
         let conteneurs: [StyleConteneur; 4] = [
             ("surface", surface),
             ("carte", carte),
@@ -571,6 +637,40 @@ mod tests {
             assert_eq!(eteint.text_color.a, actif.text_color.a * OPACITE_DESACTIVE);
             // Ni échelle, ni ombre : seule l'opacité bouge.
             assert_eq!(presse.border.radius, actif.border.radius);
+        }
+    }
+
+    /// L'onglet actif porte l'accent du mode, l'inactif le texte courant, et
+    /// ni l'un ni l'autre de fond ou de filet.
+    #[test]
+    fn l_onglet_actif_porte_l_accent() {
+        for theme in themes() {
+            let j = jetons(&theme);
+            let actif = onglet(true)(&theme, button::Status::Active);
+            let inactif = onglet(false)(&theme, button::Status::Active);
+            assert_eq!(actif.text_color, j.accent_texte);
+            assert_eq!(inactif.text_color, j.texte);
+            assert!(actif.background.is_none() && inactif.background.is_none());
+            assert_eq!(actif.border.width, 0.0);
+            // Le survol d'un onglet inactif glisse vers l'accent.
+            assert_eq!(
+                onglet(false)(&theme, button::Status::Hovered).text_color,
+                j.accent_texte
+            );
+        }
+    }
+
+    /// Les encres nommées rendent bien le jeton demandé.
+    #[test]
+    fn les_encres_rendent_le_jeton_demande() {
+        for theme in themes() {
+            let j = jetons(&theme);
+            assert_eq!(texte_en(|j| j.titre)(&theme).color, Some(j.titre));
+            assert_eq!(encre_de(|j| j.texte_2)(&theme).text_color, Some(j.texte_2));
+            // Une encre ne pose ni fond ni filet.
+            let encre = encre_de(|j| j.texte)(&theme);
+            assert!(encre.background.is_none());
+            assert_eq!(encre.border.width, 0.0);
         }
     }
 

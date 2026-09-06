@@ -8,8 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use conduit_backend::{CableId, CableSpec};
-use iced::widget::{column, container};
-use iced::{Element, Fill, Subscription, Task};
+use iced::{Element, Subscription, Task};
 
 use conduit_protocol::Command;
 
@@ -17,7 +16,7 @@ use crate::cables::{self, Channels};
 use crate::i18n::{self, Text};
 use crate::ipc::{self, Requester};
 use crate::model::Mirror;
-use crate::view::{self, Tab};
+use crate::shell::{self, Tab};
 use crate::{theme, typo};
 
 /// État de la connexion au démon.
@@ -77,6 +76,39 @@ impl Connection {
     }
 }
 
+/// Notice éphémère affichée sous l'en-tête.
+///
+/// Le message du démon dit déjà quoi faire (ADR-006) : il est affiché tel
+/// quel, sans reformulation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    /// Texte affiché.
+    pub texte: String,
+    /// Vrai pour une erreur : le bandeau prend alors le filet garance.
+    pub erreur: bool,
+}
+
+impl Notice {
+    /// Une notice d'erreur.
+    pub fn erreur(texte: impl Into<String>) -> Self {
+        Self {
+            texte: texte.into(),
+            erreur: true,
+        }
+    }
+
+    /// Une notice d'information.
+    pub fn info(texte: impl Into<String>) -> Self {
+        Self {
+            texte: texte.into(),
+            erreur: false,
+        }
+    }
+}
+
+/// Temps d'affichage d'une notice avant son effacement.
+pub const DUREE_NOTICE: Duration = Duration::from_millis(4_500);
+
 /// Message de l'application.
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -84,8 +116,11 @@ pub enum Message {
     Ipc(ipc::Event),
     /// Change d'onglet.
     Tab(Tab),
-    /// Ferme la bannière d'erreur.
-    DismissError,
+    /// Affiche une notice, qui s'effacera d'elle-même.
+    Notice(Notice),
+    /// Fin du minuteur de la notice de génération donnée ; une notice plus
+    /// récente n'est pas effacée.
+    NoticeExpiree(u32),
     /// Nom saisi pour le câble à créer.
     NewCableName(String),
     /// Canaux choisis pour le câble à créer.
@@ -120,7 +155,8 @@ pub struct App {
     mirror: Mirror,
     tab: Tab,
     cables: cables::State,
-    error: Option<String>,
+    notice: Option<Notice>,
+    generation: u32,
     mode: iced::theme::Mode,
 }
 
@@ -134,7 +170,8 @@ impl App {
             mirror: Mirror::default(),
             tab: Tab::default(),
             cables: cables::State::default(),
-            error: None,
+            notice: None,
+            generation: 0,
             mode: iced::theme::Mode::default(),
         }
     }
@@ -173,9 +210,9 @@ impl App {
         &self.cables
     }
 
-    /// Dernière erreur renvoyée par le démon, affichée en bannière.
-    pub fn error(&self) -> Option<&str> {
-        self.error.as_deref()
+    /// Notice affichée sous l'en-tête, s'il y en a une.
+    pub fn notice(&self) -> Option<&Notice> {
+        self.notice.as_ref()
     }
 
     /// Mode clair ou sombre annoncé par le système.
@@ -191,10 +228,10 @@ impl App {
         theme::selon(self.mode)
     }
 
-    /// Met une commande en file et efface la bannière d'erreur : le résultat
-    /// arrivera par notification, ou par une nouvelle erreur.
+    /// Met une commande en file et efface la notice courante : le résultat
+    /// arrivera par notification, ou par une nouvelle notice.
     fn request(&mut self, command: Command) {
-        self.error = None;
+        self.notice = None;
         if let Some(requester) = &self.requester {
             requester.send(command);
         }
@@ -209,12 +246,29 @@ impl App {
     /// tâche asynchrone.
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Ipc(event) => self.apply_ipc(event),
+            Message::Ipc(event) => {
+                let avant = self.generation;
+                self.apply_ipc(event);
+                // Une notice posée par l'événement a besoin de son minuteur.
+                if self.generation != avant {
+                    return self.minuteur();
+                }
+            }
             Message::Tab(tab) => {
                 self.tab = tab;
                 self.cables.close_dialogs();
             }
-            Message::DismissError => self.error = None,
+            Message::Notice(notice) => {
+                self.poser_notice(notice);
+                return self.minuteur();
+            }
+            Message::NoticeExpiree(generation) => {
+                // Le minuteur d'une notice remplacée ne doit pas effacer la
+                // suivante : seule la génération courante s'efface.
+                if self.generation == generation {
+                    self.notice = None;
+                }
+            }
             Message::NewCableName(name) => self.cables.new_name = name,
             Message::NewCableChannels(channels) => self.cables.new_channels = channels,
             Message::AddCable => {
@@ -268,6 +322,22 @@ impl App {
         Task::none()
     }
 
+    /// Pose une notice et ouvre une génération : le minuteur de la notice
+    /// précédente devient sans effet.
+    fn poser_notice(&mut self, notice: Notice) {
+        self.notice = Some(notice);
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Le minuteur qui effacera la notice courante au bout de
+    /// [`DUREE_NOTICE`], si elle est encore la plus récente.
+    fn minuteur(&self) -> Task<Message> {
+        let generation = self.generation;
+        Task::perform(attendre_la_notice(), move |()| {
+            Message::NoticeExpiree(generation)
+        })
+    }
+
     /// Réduction d'un événement IPC (sans entrée/sortie : testable seul).
     pub fn apply_ipc(&mut self, event: ipc::Event) {
         match event {
@@ -276,7 +346,7 @@ impl App {
             ipc::Event::Ready { server, snapshot } => {
                 self.mirror.reset(*snapshot);
                 self.cables.close_dialogs();
-                self.error = None;
+                self.notice = None;
                 self.connection = Connection::Ready { server };
             }
             ipc::Event::Lost { reason, retry_in } => {
@@ -285,7 +355,7 @@ impl App {
             // L'état ne suit que les notifications : aucun optimisme local.
             ipc::Event::Notified(notification) => self.mirror.apply(&notification),
             // Le message du démon dit déjà quoi faire (ADR-006).
-            ipc::Event::Failed(message) => self.error = Some(message),
+            ipc::Event::Failed(message) => self.poser_notice(Notice::erreur(message)),
         }
     }
 
@@ -305,26 +375,41 @@ impl App {
         Subscription::batch([demon, systeme])
     }
 
-    /// Fenêtre : barre de navigation, état de la connexion, bannière
-    /// d'erreur éventuelle, puis la page de l'onglet courant.
+    /// Fenêtre : la coquille (barre latérale, en-tête, notice) et, dedans, la
+    /// vue de l'onglet courant.
     pub fn view(&self) -> Element<'_, Message> {
-        let mut page = column![
-            view::navigation(self.tab),
-            view::status_line(&self.connection, &self.socket),
-        ]
-        .spacing(10)
-        .width(Fill);
-        if let Some(error) = &self.error {
-            page = page.push(view::banner(error));
-        }
         let enabled = self.connection.is_ready();
-        page = page.push(match self.tab {
-            Tab::Cables => cables::view(&self.mirror, &self.cables, enabled),
-            Tab::Patchbay => view::placeholder(Text::PatchbaySoon),
-            Tab::Diagnostic => view::placeholder(Text::DiagnosticSoon),
-        });
-        container(page).padding(16).width(Fill).height(Fill).into()
+        let graisse = theme::jetons(&self.theme()).graisse_texte;
+        let (action, contenu) = match self.tab {
+            Tab::Cables => (
+                Some(shell::action_primaire(
+                    Text::CablesAdd,
+                    enabled.then_some(Message::AddCable),
+                )),
+                cables::view(&self.mirror, &self.cables, enabled),
+            ),
+            Tab::Patchbay => (None, shell::a_venir(Text::PatchbaySoon, graisse)),
+            Tab::Diagnostic => (None, shell::a_venir(Text::DiagnosticSoon, graisse)),
+        };
+        shell::fenetre(
+            self.tab,
+            &self.connection,
+            &self.mirror,
+            self.notice.as_ref(),
+            graisse,
+            action,
+            contenu,
+        )
     }
+}
+
+/// Attend le temps d'affichage d'une notice.
+///
+/// Le minuteur n'est armé qu'au premier `poll` : `tokio::time::sleep` exige un
+/// réacteur, dont les tests de réduction n'ont pas besoin puisqu'ils laissent
+/// la tâche sans l'exécuter.
+async fn attendre_la_notice() {
+    tokio::time::sleep(DUREE_NOTICE).await;
 }
 
 /// Puits d'événements de la `Subscription` d'`iced`.
@@ -515,22 +600,42 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_command_shows_a_banner_until_the_next_action() {
+    fn a_refused_command_shows_a_notice_until_the_next_action() {
         let (mut a, mut rx) = connected();
-        assert!(a.error().is_none());
+        assert!(a.notice().is_none());
         a.apply_ipc(ipc::Event::Failed(
             "limite de 8 câbles atteinte : supprimez un câble".into(),
         ));
-        assert!(a.error().unwrap().contains("supprimez un câble"));
-        let _ = a.update(Message::DismissError);
-        assert!(a.error().is_none());
+        let notice = a.notice().expect("une commande refusée pose une notice");
+        assert!(notice.texte.contains("supprimez un câble"));
+        assert!(notice.erreur, "une commande refusée est une erreur");
+        let _ = a.update(Message::NoticeExpiree(a.generation));
+        assert!(a.notice().is_none());
         a.apply_ipc(ipc::Event::Failed("câble inconnu".into()));
         let _ = a.update(Message::AddCable);
-        assert!(
-            a.error().is_none(),
-            "une nouvelle action efface la bannière"
-        );
+        assert!(a.notice().is_none(), "une nouvelle action efface la notice");
         let _ = sent(&mut rx);
+    }
+
+    /// Le compteur de génération : une notice neuve survit au minuteur de
+    /// celle qu'elle a remplacée.
+    #[test]
+    fn a_new_notice_survives_the_previous_timer() {
+        let (mut a, _rx) = connected();
+        a.apply_ipc(ipc::Event::Failed("première".into()));
+        let ancienne = a.generation;
+        let _ = a.update(Message::Notice(Notice::info("seconde")));
+        assert_eq!(a.notice().unwrap().texte, "seconde");
+        assert!(!a.notice().unwrap().erreur);
+        assert_ne!(a.generation, ancienne, "une notice ouvre une génération");
+        let _ = a.update(Message::NoticeExpiree(ancienne));
+        assert_eq!(
+            a.notice().map(|n| n.texte.as_str()),
+            Some("seconde"),
+            "le minuteur de l'ancienne notice n'efface pas la neuve"
+        );
+        let _ = a.update(Message::NoticeExpiree(a.generation));
+        assert!(a.notice().is_none(), "son propre minuteur l'efface");
     }
 
     /// Le thème suit le mode annoncé par le système, sans jamais rendre

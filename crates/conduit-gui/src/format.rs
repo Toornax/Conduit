@@ -113,6 +113,32 @@ pub fn xruns(compte: u64) -> String {
     }
 }
 
+/// Une fréquence d'échantillonnage en kilohertz : « 48 kHz », « 44,1 kHz ».
+///
+/// La décimale n'apparaît que si elle porte de l'information.
+pub fn kilohertz(hz: u32) -> String {
+    let decimales = usize::from(hz % 1_000 != 0);
+    avec_unite(nombre(f64::from(hz) / 1_000.0, decimales), Text::UnitKhz)
+}
+
+/// Une durée de marche, à l'unité qui se lit : « 45 s », « 12 min »,
+/// « 3 h 05 ».
+///
+/// Au-delà de l'heure, les minutes sont écrites sur deux chiffres, comme une
+/// heure de la journée.
+pub fn duree_de_marche(secondes: u64) -> String {
+    match secondes {
+        s if s < 60 => avec_unite(entier(s), Text::UnitS),
+        s if s < 3_600 => avec_unite(entier(s / 60), Text::UnitMin),
+        s => format!(
+            "{}{INSECABLE}{}{INSECABLE}{:02}",
+            entier(s / 3_600),
+            i18n::t(Text::UnitH),
+            (s % 3_600) / 60
+        ),
+    }
+}
+
 /// Latence estimée d'un nœud, en millisecondes : deux quanta, soit
 /// `2 × quantum / fréquence`.
 ///
@@ -172,6 +198,26 @@ mod tests {
         assert_eq!(xruns(0), "aucun xrun");
         assert_eq!(xruns(1), "1\u{a0}xrun");
         assert_eq!(xruns(1234), "1\u{202f}234\u{a0}xruns");
+    }
+
+    /// Les kilohertz ne portent une décimale que si elle dit quelque chose.
+    #[test]
+    fn les_frequences_sont_ecrites_en_kilohertz() {
+        assert_eq!(kilohertz(48_000), "48\u{a0}kHz");
+        assert_eq!(kilohertz(96_000), "96\u{a0}kHz");
+        assert_eq!(kilohertz(44_100), "44,1\u{a0}kHz");
+    }
+
+    /// La durée de marche change d'unité à la minute puis à l'heure.
+    #[test]
+    fn la_duree_de_marche_change_d_unite() {
+        assert_eq!(duree_de_marche(0), "0\u{a0}s");
+        assert_eq!(duree_de_marche(45), "45\u{a0}s");
+        assert_eq!(duree_de_marche(59), "59\u{a0}s");
+        assert_eq!(duree_de_marche(60), "1\u{a0}min");
+        assert_eq!(duree_de_marche(750), "12\u{a0}min");
+        assert_eq!(duree_de_marche(3_600), "1\u{a0}h\u{a0}00");
+        assert_eq!(duree_de_marche(11_100), "3\u{a0}h\u{a0}05");
     }
 
     /// Deux quanta, et rien d'autre.
