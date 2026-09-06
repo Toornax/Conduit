@@ -203,6 +203,7 @@ fn render_devices(backend: &WasapiBackend) -> Vec<DeviceInfo> {
 /// Le test qui documente le matériel : chaque carte de rendu, en partagé puis en
 /// exclusif souhaité. Passe quel que soit ce que le matériel accepte.
 #[test]
+#[ignore = "prend les cartes en mode exclusif, ce qui évince les autres applications : à lancer à la main (-- --ignored)"]
 fn every_render_device_reports_what_exclusive_gives() {
     let _serial = SERIAL
         .lock()
@@ -341,6 +342,7 @@ fn never_is_the_default_and_always_shares() {
 /// Sur un matériel qui refuse déjà l'exclusif tout court, la même erreur tombe pour
 /// une autre raison, et c'est aussi ce qu'on veut vérifier : le message.
 #[test]
+#[ignore = "prend les cartes en mode exclusif, ce qui évince les autres applications : à lancer à la main (-- --ignored)"]
 fn required_on_a_device_already_taken_says_why() {
     let _serial = SERIAL
         .lock()
