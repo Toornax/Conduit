@@ -193,6 +193,41 @@ boucle sans panique : `is_running()` devient faux, `stop()` rend `Disconnected`,
 `Stop` puis `Reset`) : aucun rappel n'est en cours au retour ; `Drop` appelle
 `stop()` puis libère les objets COM sous un appartement MTA temporaire.
 
+**Capture en écho** (`loopback`). `WasapiBackend::open_loopback(id, format, rappel)`
+ouvre un endpoint de **rendu** avec `AUDCLNT_STREAMFLAGS_LOOPBACK` : le flux ne
+l'alimente pas, il **prélève le mélange** que le moteur audio vient d'y écrire,
+avant que le pilote du périphérique ne le consomme. C'est un `IAudioCaptureClient`
+que `GetService` rend, et le rappel reçoit des trames d'entrée ; la poignée garde le
+`DeviceInfo` de l'endpoint de rendu, et `latency().path` est un `InitPath::Loopback`.
+Méthode **hors du trait `Backend`**, comme `set_exclusive_policy` : le trait est
+portable et ne doit pas gagner une notion Windows.
+
+L'écho n'existe **qu'en mode partagé** — `Initialize` refuse l'indicateur en
+`AUDCLNT_SHAREMODE_EXCLUSIVE`, et c'est cohérent : un flux exclusif court-circuite
+précisément le moteur dont l'écho prélève le mélange, il n'y aurait rien à prendre.
+La combinaison est refusée **avant** tout appel COM (`check_shared`), tout comme un
+écho demandé sur un endpoint de capture (`check_render`). Deux chemins de format,
+calqués sur le partagé ordinaire : format demandé = format de mixage (float32, mêmes
+canaux, même fréquence) → `Initialize` avec le bloc de `GetMixFormat` et les seuls
+`EVENTCALLBACK | LOOPBACK`, aucune conversion ; sinon `AUTOCONVERTPCM |
+SRC_DEFAULT_QUALITY` en plus, et un refus nomme le format de mixage à demander.
+Période par défaut du moteur : `InitializeSharedAudioStream` ne prend pas
+d'indicateur d'écho, la basse latence n'est pas disponible ici.
+
+*À quoi cela sert.* C'est l'outil qui **coupe en deux une chaîne muette**, et il vaut
+d'abord pour le pilote : sur un câble virtuel dont la capture n'entend pas le rendu,
+il tranche ce qu'aucune inspection du pilote ne tranche. Signal entendu en écho → le
+moteur délivre, le défaut est en aval, dans l'échange de données du pilote. Écho
+silencieux → rien n'arrive jusqu'au pilote, qui est hors de cause, et le défaut est
+en amont (volume de l'endpoint, coupure, format par défaut, mode exclusif tenu par un
+autre programme). Deux réserves à garder en tête : l'écho prélève **tout** le
+mélange, donc aussi ce que jouent les autres applications, et le **volume de
+l'endpoint s'y applique** (mesuré sur le poste : un sinus demandé à 0,05 ressort à
+0,034 sur la sortie HDMI G27QC) — une amplitude basse en écho ne condamne personne.
+`tests/loopback.rs` exerce les trois cas sur les cartes de la machine ; le premier
+**émet un son** (1,5 s à 2 % d'amplitude sur le rendu par défaut) parce qu'on ne peut
+pas prouver qu'un écho prélève un mélange sans rien mélanger.
+
 **Mode exclusif** (`exclusive` + `convert`, M1b-32). En exclusif, le flux **prend le
 périphérique pour lui seul** : le moteur audio de Windows est court-circuité, plus
 aucune autre application n'y joue. C'est pourquoi c'est un **opt-in par backend**,
@@ -333,19 +368,34 @@ ressort-il intact de la capture ?** Il joue un sinus sur un endpoint de rendu,
 enregistre l'endpoint de capture, et mesure. Par défaut les deux endpoints sont les
 deux côtés du câble `Conduit 1` : c'est le pilote qui est testé, pas la carte son.
 Il ne réécrit pas WASAPI, il appelle `conduit-backend-wasapi`
-(`WasapiBackend::{new, devices, open}`, `DeviceHandle::{start, stop}`).
+(`WasapiBackend::{new, devices, open, open_loopback}`, `DeviceHandle::{start, stop}`).
 
 ```sh
 cargo run -p conduit-looptest -- --list                    # les endpoints vus par WASAPI
 cargo run -p conduit-looptest -- --repeat 10               # le critère de la ROADMAP
 cargo run -p conduit-looptest -- --json --repeat 10        # sortie machine
 cargo run -p conduit-looptest -- --self-test               # test de l'outil, sans périphérique
+cargo run -p conduit-looptest -- --loopback                # écho : le moteur délivre-t-il ?
 ```
+
+`--loopback` répond à **l'autre moitié** de la question, celle qu'on oublie de poser
+quand une boucle est muette : *le moteur audio délivre-t-il seulement quelque chose
+vers l'endpoint ?* Au lieu d'ouvrir l'endpoint de capture, l'outil ouvre celui de
+`--render` en **écho** (§ 4 quater) et prélève le mélange **avant** le pilote. Le
+sinus retrouvé met le moteur hors de cause et laisse le pilote seul suspect ; un écho
+silencieux fait exactement l'inverse. Le message de fin dit laquelle des deux
+conclusions s'applique — c'est là toute la valeur du mode, un chiffre seul ne
+diagnostiquerait rien. Trois conséquences pratiques : le flux prend le **format de
+mixage** de l'endpoint (ni `--rate` ni `--channels` ne s'appliquent, l'outil le dit),
+l'écho s'arrête **avant** le rendu (sans quoi la queue de silence de l'arrêt
+compterait comme un trou), et le mélange contient ce que jouent les autres
+applications — à fermer pour une mesure propre. `--loopback` est incompatible avec
+`--capture`, `--no-capture` et `--self-test`.
 
 Options utiles : `--render`/`--capture` (identifiant exact ou fragment de nom, ou
 `none`), `--freq`, `--rate`, `--channels`, `--seconds`, `--block`, `--amplitude`,
 `--skip-ms` (marge jetée après la détection du signal), `--phase-tolerance`,
-`--no-capture` (joue seulement). **Codes de retour** : `0` toutes les passes
+`--no-capture` (joue seulement), `--loopback` (capture en écho). **Codes de retour** : `0` toutes les passes
 passent, `1` au moins une échoue (le pilote est en cause), `2` l'environnement ne
 permet pas le test (endpoint absent, backend indisponible, options incohérentes,
 système autre que Windows) — c'est la distinction qui compte en CI.
@@ -377,7 +427,10 @@ compteur atomique de trames — la seule façon d'écrire depuis un fil temps r�
 boucle parfaite rendrait (préambule silencieux puis sinus) et le fait passer par la
 même analyse ; `--inject-glitch [trame]` en retire une trame et doit faire sortir
 en 1. Les tests d'intégration `tests/binary.rs` lancent ces trois cas sur la machine
-de développement, sans pilote et sans émettre de son.
+de développement, sans pilote. Un seul y **émet un son** : celui qui valide
+`--loopback` sur le rendu par défaut (1,5 s à 2 % d'amplitude) — il vérifie que le
+sinus est bien retrouvé dans l'écho et que l'outil en tire la bonne conclusion, pas
+le verdict de la passe, puisque le mélange peut contenir autre chose.
 
 ## 4 sexies. Cycle de vie du démon
 

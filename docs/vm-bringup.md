@@ -145,6 +145,30 @@ l'étape suivante directement).
 **Attendu** : le son enregistré est celui joué. Compteurs du câble : les trames copiées
 croissent d'environ 48 000 par seconde, les débordements restent à zéro.
 
+**Si la capture n'entend rien, la première mesure à prendre est la capture en écho**,
+avant toute inspection du pilote :
+
+```powershell
+conduit-looptest --render "Conduit 1" --loopback --seconds 2 --amplitude 0.05
+```
+
+Elle ouvre l'endpoint de **rendu** en écho (WASAPI loopback) et prélève le mélange
+**avant** qu'il n'atteigne le pilote. Elle coupe le problème en deux, et l'outil imprime
+laquelle des deux conclusions s'applique :
+
+- **le sinus est entendu en écho** → le moteur audio délivre bien vers le câble ; le
+  défaut est dans l'échange de données du pilote (copie rendu → capture, avance de copie,
+  positions du tampon cyclique). Continuer avec les points de doute ci-dessous ;
+- **l'écho est silencieux** → rien n'arrive jusqu'au pilote, qui est donc hors de cause :
+  chercher en amont (volume de l'endpoint, endpoint désactivé, format par défaut, un autre
+  programme en mode exclusif). Inspecter le pilote à ce stade serait du temps perdu.
+
+Deux réserves : l'écho prélève tout le mélange, donc aussi ce que jouent les autres
+applications (les fermer), et le volume de l'endpoint s'y applique — une amplitude basse
+n'accuse personne. La même commande sur une **vraie carte son** (`--render "Haut-parleurs"`)
+sert de témoin : elle doit passer, sinon c'est l'hôte ou la VM qu'il faut regarder, pas
+Conduit.
+
 **Points de doute connus, dans l'ordre** :
 
 1. *L'avance de copie de 2 ms* est le pari central de la conception. Trop courte, le

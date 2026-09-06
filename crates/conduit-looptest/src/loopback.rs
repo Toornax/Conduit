@@ -2,7 +2,14 @@
 //! capture qui enregistre ce qui revient.
 //!
 //! Rien n'est réécrit de WASAPI : tout passe par `conduit-backend-wasapi`
-//! (`WasapiBackend::new`, `devices`, `open`, `DeviceHandle::{start, stop}`).
+//! (`WasapiBackend::new`, `devices`, `open`, `open_loopback`,
+//! `DeviceHandle::{start, stop}`).
+//!
+//! En **capture d'écho** (`--loopback`), l'endpoint de capture n'est pas ouvert du
+//! tout : le second flux est un écho de l'endpoint de **rendu** lui-même, qui
+//! prélève le mélange du moteur audio **avant** le pilote. Le flux est alors ouvert
+//! au **format de mixage** de cet endpoint — c'est exactement ce que le moteur
+//! mélange, sans conversion — et le sinus est joué à ce format-là.
 //!
 //! Le rappel de capture **n'alloue pas et ne verrouille pas** : l'enregistrement
 //! vit dans un tableau d'`AtomicU32` réservé à l'ouverture (un `f32` par case, par
@@ -19,7 +26,9 @@ use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
 
-use conduit_backend::{Backend, DeviceDirection, DeviceInfo, StreamFormat, StreamIo};
+use conduit_backend::{
+    AudioCallback, Backend, DeviceDirection, DeviceHandle, DeviceInfo, StreamFormat, StreamIo,
+};
 use conduit_backend_wasapi::WasapiBackend;
 use conduit_core::types::SampleRate;
 
@@ -95,6 +104,9 @@ pub struct Session {
     backend: WasapiBackend,
     render: DeviceInfo,
     capture: Option<DeviceInfo>,
+    /// Vrai en `--loopback` : la capture est un écho de `render`, pas un endpoint
+    /// à part.
+    loopback: bool,
     format: StreamFormat,
     spec: SineSpec,
     seconds: f64,
@@ -113,7 +125,7 @@ impl Session {
         })?;
         let devices = enumerate(&backend)?;
         let render = choose(&devices, DeviceDirection::Render, args.render.as_deref())?;
-        let capture = if args.capture_disabled() {
+        let capture = if args.loopback || args.capture_disabled() {
             None
         } else {
             Some(choose(
@@ -122,22 +134,74 @@ impl Session {
                 args.capture.as_deref(),
             )?)
         };
+        // En écho, le format n'est pas négociable : c'est celui que le moteur
+        // mélange vers cet endpoint. Le demander tel quel évite toute conversion
+        // sur le chemin qu'on est justement en train de mettre en doute.
+        let (rate, channels) = if args.loopback {
+            (render.sample_rate, render.channels)
+        } else {
+            (rate, args.channels)
+        };
+        let spec = SineSpec {
+            sample_rate: rate.hz(),
+            channels,
+            ..args.spec()
+        };
+        if !(spec.freq_hz > 0.0 && spec.freq_hz < rate.as_f64() / 2.0) {
+            return Err(format!(
+                "--freq {} doit être dans ]0, {}[ Hz : la capture en écho impose le format de \
+                 mixage de « {} », soit {} Hz",
+                spec.freq_hz,
+                rate.as_f64() / 2.0,
+                render.name,
+                rate.hz()
+            ));
+        }
         Ok(Self {
             backend,
             render,
             capture,
+            loopback: args.loopback,
             format: StreamFormat {
                 sample_rate: rate,
-                channels: args.channels,
+                channels,
                 block_frames: args.block,
             },
-            spec: args.spec(),
+            spec,
             seconds: args.seconds,
         })
     }
 
-    /// Décrit les endpoints retenus.
+    /// Sinus tel qu'il sera joué **et** analysé : en écho, sa fréquence
+    /// d'échantillonnage et son nombre de canaux sont ceux du mixage de l'endpoint
+    /// de rendu, pas ceux demandés en ligne de commande.
+    pub fn spec(&self) -> SineSpec {
+        self.spec
+    }
+
+    /// Vrai si un enregistrement est fait (capture ordinaire ou écho).
+    fn records(&self) -> bool {
+        self.loopback || self.capture.is_some()
+    }
+
+    /// Décrit les endpoints retenus et ce qui est mesuré.
     pub fn description(&self) -> String {
+        if self.loopback {
+            return format!(
+                "rendu   : {} ({})\n\
+                 capture : écho de ce même endpoint de rendu (WASAPI loopback)\n\
+                 format  : {} Hz, {} canal/canaux — le format de mixage du moteur pour cet \
+                 endpoint\n\
+                 mesuré  : ce que le moteur audio de Windows délivre vers cet endpoint, prélevé \
+                 AVANT le pilote.\n\
+                 \x20         Le mélange contient aussi ce que jouent les autres applications : \
+                 fermez-les pour une mesure propre.",
+                self.render.name,
+                self.render.id,
+                self.format.sample_rate.hz(),
+                self.format.channels,
+            );
+        }
         format!(
             "rendu   : {} ({})\ncapture : {}",
             self.render.name,
@@ -152,7 +216,8 @@ impl Session {
     /// Joue le sinus et enregistre ce qui revient : une passe.
     ///
     /// La capture démarre **avant** le rendu, pour ne pas manquer l'attaque ; le
-    /// préambule qu'elle enregistre est jeté à l'analyse.
+    /// préambule qu'elle enregistre est jeté à l'analyse. En écho, « la capture »
+    /// est l'écho de l'endpoint de rendu.
     ///
     /// # Erreurs
     ///
@@ -160,32 +225,37 @@ impl Session {
     /// échoue, ou si le tampon d'enregistrement a débordé.
     pub fn record(&mut self) -> Result<Vec<f32>, String> {
         let channels = self.format.channels;
-        let capacity = if self.capture.is_some() {
+        let capacity = if self.records() {
             ((self.seconds + RECORD_MARGIN_S) * self.format.sample_rate.as_f64()).ceil() as usize
         } else {
             0
         };
         let recorder = Recorder::new(capacity, channels);
 
-        let mut capture = match &self.capture {
-            Some(info) => {
-                let sink = Arc::clone(&recorder);
-                Some(
-                    self.backend
-                        .open(
-                            &info.id,
-                            self.format,
-                            Box::new(move |io: &mut StreamIo<'_>, _| {
-                                if let Some(input) = io.input {
-                                    sink.push(input);
-                                }
-                                io.silence_output();
-                            }),
-                        )
-                        .map_err(|e| format!("ouverture de la capture « {} » : {e}", info.name))?,
-                )
+        let sink = Arc::clone(&recorder);
+        let sink: AudioCallback = Box::new(move |io: &mut StreamIo<'_>, _| {
+            if let Some(input) = io.input {
+                sink.push(input);
             }
-            None => None,
+            io.silence_output();
+        });
+        let mut capture: Option<Box<dyn DeviceHandle>> = if self.loopback {
+            Some(Box::new(
+                self.backend
+                    .open_loopback(&self.render.id, self.format, sink)
+                    .map_err(|e| {
+                        format!("ouverture de l'écho de « {} » : {e}", self.render.name)
+                    })?,
+            ))
+        } else {
+            match &self.capture {
+                Some(info) => Some(
+                    self.backend
+                        .open(&info.id, self.format, sink)
+                        .map_err(|e| format!("ouverture de la capture « {} » : {e}", info.name))?,
+                ),
+                None => None,
+            }
         };
 
         let spec = self.spec;
@@ -212,12 +282,26 @@ impl Session {
             .start()
             .map_err(|e| format!("démarrage du rendu : {e}"))?;
         sleep(Duration::from_secs_f64(self.seconds));
-        render.stop().map_err(|e| format!("arrêt du rendu : {e}"))?;
-        if let Some(capture) = capture.as_mut() {
-            sleep(DRAIN);
-            capture
-                .stop()
-                .map_err(|e| format!("arrêt de la capture : {e}"))?;
+        if self.loopback {
+            // En écho, l'enregistrement s'arrête **avant** le rendu. Il n'y a aucun
+            // délai de pilote à drainer — le mélange est prélevé là où le moteur
+            // vient de l'écrire —, et laisser tourner l'écho après l'arrêt du rendu
+            // n'ajouterait qu'une queue de silence, que l'analyse compterait à juste
+            // titre comme un trou.
+            if let Some(capture) = capture.as_mut() {
+                capture
+                    .stop()
+                    .map_err(|e| format!("arrêt de l'écho : {e}"))?;
+            }
+            render.stop().map_err(|e| format!("arrêt du rendu : {e}"))?;
+        } else {
+            render.stop().map_err(|e| format!("arrêt du rendu : {e}"))?;
+            if let Some(capture) = capture.as_mut() {
+                sleep(DRAIN);
+                capture
+                    .stop()
+                    .map_err(|e| format!("arrêt de la capture : {e}"))?;
+            }
         }
 
         if recorder.overflow.load(Ordering::Relaxed) {

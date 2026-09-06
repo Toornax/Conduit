@@ -39,11 +39,13 @@ pub(crate) enum Command {
         reply: mpsc::Sender<Result<Option<DeviceId>, BackendError>>,
     },
     /// Ouvrir un flux (objets WASAPI créés ici, consommés par le fil du flux).
-    /// `policy` décide du mode de partage (partagé par défaut).
+    /// `policy` décide du mode de partage (partagé par défaut) ; `loopback`
+    /// demande une capture d'écho sur un endpoint de rendu (module `loopback`).
     Open {
         id: DeviceId,
         format: StreamFormat,
         policy: ExclusivePolicy,
+        loopback: bool,
         reply: mpsc::Sender<Result<Opened, BackendError>>,
     },
     /// Créer un abonnement aux événements.
@@ -160,9 +162,16 @@ impl State {
                 id,
                 format,
                 policy,
+                loopback,
                 reply,
             } => {
-                let _ = reply.send(crate::open::open(&self.enumerator, &id, format, policy));
+                let _ = reply.send(crate::open::open(
+                    &self.enumerator,
+                    &id,
+                    format,
+                    policy,
+                    loopback,
+                ));
             }
             Command::Subscribe { reply } => {
                 let _ = reply.send(self.events.subscribe());

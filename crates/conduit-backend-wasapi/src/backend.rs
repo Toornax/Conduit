@@ -110,6 +110,55 @@ impl WasapiBackend {
         format: StreamFormat,
         callback: AudioCallback,
     ) -> Result<WasapiHandle, BackendError> {
+        self.open_any(id, format, callback, false)
+    }
+
+    /// Ouvre un endpoint de **rendu** en **capture d'écho**
+    /// (`AUDCLNT_STREAMFLAGS_LOOPBACK`, module `loopback`).
+    ///
+    /// Le flux prélève le mélange que le moteur audio de Windows écrit vers cet
+    /// endpoint, **avant** que le pilote du périphérique ne le consomme, et se
+    /// comporte pour le reste comme une capture ordinaire : le rappel reçoit des
+    /// trames d'entrée (`StreamIo::input`), jamais de sortie.
+    ///
+    /// C'est **l'outil de diagnostic** d'une chaîne muette : entendre le signal en
+    /// écho prouve que le moteur délivre et met la moitié amont hors de cause ; un
+    /// écho silencieux prouve l'inverse et disculpe le pilote.
+    ///
+    /// Méthode **hors du trait [`Backend`]**, comme
+    /// [`Self::set_exclusive_policy`] : le trait est portable (PipeWire,
+    /// CoreAudio) et ne doit pas gagner une notion propre à Windows.
+    ///
+    /// La poignée rendue porte toujours le [`DeviceInfo`] de l'endpoint de rendu
+    /// (`direction` = rendu, c'est bien ce qu'il est) ; son
+    /// [`WasapiHandle::latency`] rend un [`InitPath::Loopback`].
+    ///
+    /// # Erreurs
+    ///
+    /// [`BackendError::NotFound`] si l'endpoint n'existe pas ou n'est pas actif ;
+    /// [`BackendError::UnsupportedFormat`] si l'endpoint est une **capture**, si la
+    /// politique du backend demande le mode **exclusif** (incompatible avec l'écho)
+    /// ou si le moteur refuse le format demandé — le message nomme alors le format
+    /// de mixage à demander ; [`BackendError::Platform`] sinon.
+    ///
+    /// [`InitPath::Loopback`]: crate::InitPath::Loopback
+    pub fn open_loopback(
+        &mut self,
+        id: &DeviceId,
+        format: StreamFormat,
+        callback: AudioCallback,
+    ) -> Result<WasapiHandle, BackendError> {
+        self.open_any(id, format, callback, true)
+    }
+
+    /// Corps commun de [`Self::open_handle`] et [`Self::open_loopback`].
+    fn open_any(
+        &mut self,
+        id: &DeviceId,
+        format: StreamFormat,
+        callback: AudioCallback,
+        loopback: bool,
+    ) -> Result<WasapiHandle, BackendError> {
         let id = id.clone();
         let policy = self.policy;
         let opened = self.request(
@@ -117,9 +166,14 @@ impl WasapiBackend {
                 id,
                 format,
                 policy,
+                loopback,
                 reply,
             },
-            "ouverture",
+            if loopback {
+                "ouverture en écho"
+            } else {
+                "ouverture"
+            },
         )??;
         WasapiHandle::new(opened, callback)
     }

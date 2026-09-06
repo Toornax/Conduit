@@ -54,6 +54,36 @@ pub fn summary_line(passes: &[Pass]) -> String {
     )
 }
 
+/// Ce que signifie une capture en écho **qui entend** le sinus (`--loopback`).
+///
+/// C'est là toute la valeur du mode : le résultat brut ne vaut que par ce qu'il
+/// permet de conclure, et la conclusion porte sur la moitié de la chaîne qu'on
+/// n'était pas en train de regarder.
+pub fn loopback_heard() -> String {
+    "Ce que cela signifie : le moteur audio de Windows délivre bien un mélange vers\n\
+     cet endpoint de rendu. La moitié « application → moteur audio » de la chaîne\n\
+     est donc hors de cause. Si la capture du câble n'entend toujours rien, le\n\
+     défaut est en aval de ce point : l'échange de données du pilote (copie\n\
+     rendu → capture, positions du tampon cyclique, avance de copie).\n\
+     À nuancer : l'écho prélève le mélange, donc aussi ce que jouent les autres\n\
+     applications, et le volume de l'endpoint s'y applique — une amplitude basse\n\
+     ne condamne rien à elle seule."
+        .to_string()
+}
+
+/// Ce que signifie une capture en écho **silencieuse** (`--loopback`).
+pub fn loopback_silent() -> String {
+    "Ce que cela signifie : rien n'arrive jusqu'à cet endpoint de rendu. Le pilote\n\
+     est hors de cause — il ne peut pas copier ce que le moteur audio ne lui donne\n\
+     pas. Le défaut est en amont, à chercher dans cet ordre : volume de l'endpoint\n\
+     et du mélangeur (muet ?), endpoint désactivé ou débranché, format par défaut\n\
+     du périphérique (Paramètres > Son > Propriétés > Avancé), un autre programme\n\
+     qui tient le périphérique en mode exclusif, ou le service audio en peine.\n\
+     Vérification utile : relancer sans --loopback sur une vraie carte son, pour\n\
+     voir si le rendu sort ailleurs."
+        .to_string()
+}
+
 /// Document JSON complet (`--json`).
 pub fn json_document(spec: &SineSpec, passes: &[Pass]) -> Value {
     let ok = passes.iter().filter(|p| p.verdict.ok).count();
@@ -119,6 +149,24 @@ mod tests {
         let line = pass_lines(&une_passe(Some(24_000)), 1);
         assert!(line.contains("→ ÉCHEC"), "{line}");
         assert!(line.contains("\n    - continuité"), "{line}");
+    }
+
+    #[test]
+    fn les_deux_lectures_de_l_echo_nomment_le_coupable() {
+        let entendu = loopback_heard();
+        assert!(entendu.contains("délivre bien"), "{entendu}");
+        assert!(entendu.contains("pilote"), "{entendu}");
+        let silence = loopback_silent();
+        assert!(silence.contains("rien n'arrive"), "{silence}");
+        assert!(silence.contains("hors de cause"), "{silence}");
+        assert!(silence.contains("volume"), "{silence}");
+        // Aucune ligne trop longue pour un terminal étroit : le message doit rester
+        // lisible là où on l'utilise, une console de VM.
+        for texte in [&entendu, &silence] {
+            for ligne in texte.lines() {
+                assert!(ligne.chars().count() <= 80, "ligne trop longue : {ligne}");
+            }
+        }
     }
 
     #[test]

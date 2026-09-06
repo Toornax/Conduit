@@ -24,6 +24,13 @@
 //!    moteur, `block_frames` effectif = cette période en trames à la fréquence
 //!    demandée. On y retombe aussi si le chemin 1 échoue (période verrouillée par
 //!    un autre client, pilote sans `IAudioClient3`).
+//! 3. **Écho** — sur demande explicite ([`WasapiBackend::open_loopback`], module
+//!    `loopback`) : l'endpoint est un endpoint de **rendu**, mais le flux prélève
+//!    le mélange du moteur au lieu de l'alimenter
+//!    (`AUDCLNT_STREAMFLAGS_LOOPBACK`, mode partagé obligatoire). C'est un
+//!    `IAudioCaptureClient` qui en sort, et le rappel reçoit des trames d'entrée.
+//!
+//! [`WasapiBackend::open_loopback`]: crate::WasapiBackend::open_loopback
 //!
 //! L'horloge du flux (`IAudioClock`, module `clock`) est obtenue ici aussi :
 //! `GetService(IAudioClock)` puis `GetFrequency`, classée par rapport au format de
@@ -96,6 +103,14 @@ pub enum InitPath {
     },
     /// `IAudioClient::Initialize` avec conversion automatique, période par défaut.
     Converted,
+    /// `IAudioClient::Initialize` en **capture d'écho** sur un endpoint de rendu
+    /// (`AUDCLNT_STREAMFLAGS_LOOPBACK`, module `loopback`), période par défaut du
+    /// moteur. Toujours partagé, toujours du float32.
+    Loopback {
+        /// Vrai si le format demandé n'était pas celui du mixage et que
+        /// `AUTOCONVERTPCM` a été demandé en plus.
+        converted: bool,
+    },
     /// `IAudioClient::Initialize` en mode **exclusif** (M1b-32) : le périphérique
     /// n'est plus partagé, la période est la minimale du pilote, et le format
     /// matériel n'est pas forcément celui du rappel.
@@ -117,7 +132,7 @@ impl InitPath {
     /// Mode de partage de ce chemin.
     pub fn share_mode(self) -> ShareMode {
         match self {
-            Self::LowLatency { .. } | Self::Converted => ShareMode::Shared,
+            Self::LowLatency { .. } | Self::Converted | Self::Loopback { .. } => ShareMode::Shared,
             Self::Exclusive { .. } => ShareMode::Exclusive,
         }
     }
@@ -126,9 +141,14 @@ impl InitPath {
     /// matériel entier.
     pub fn sample_type(self) -> SampleType {
         match self {
-            Self::LowLatency { .. } | Self::Converted => SampleType::F32,
+            Self::LowLatency { .. } | Self::Converted | Self::Loopback { .. } => SampleType::F32,
             Self::Exclusive { sample, .. } => sample,
         }
+    }
+
+    /// Vrai si le flux est une capture d'écho sur un endpoint de rendu.
+    pub fn is_loopback(self) -> bool {
+        matches!(self, Self::Loopback { .. })
     }
 }
 
@@ -197,12 +217,15 @@ pub(crate) struct Opened {
 /// Ouvre un flux sur l'endpoint `id`. À appeler depuis le fil MMDevice.
 ///
 /// `policy` décide du mode de partage : partagé par défaut, exclusif tenté ou exigé
-/// selon [`ExclusivePolicy`].
+/// selon [`ExclusivePolicy`]. `loopback` demande une **capture d'écho** sur un
+/// endpoint de rendu (module `loopback`) : partagé obligatoire, service de capture
+/// au lieu du service de rendu.
 pub(crate) fn open(
     enumerator: &IMMDeviceEnumerator,
     id: &DeviceId,
     format: StreamFormat,
     policy: ExclusivePolicy,
+    loopback: bool,
 ) -> Result<Opened, BackendError> {
     let device =
         find_active(enumerator, id.as_str())?.ok_or_else(|| BackendError::NotFound(id.clone()))?;
@@ -220,36 +243,50 @@ pub(crate) fn open(
         }
     };
     let info = describe(&device, &Defaults::query(enumerator)?)?;
+    if loopback {
+        // Refusés avant tout appel COM : un écho ne se prend que sur un endpoint de
+        // rendu, et seulement en mode partagé (module `loopback`).
+        crate::loopback::check_render(id, info.direction)?;
+        crate::loopback::check_shared(id, policy)?;
+    }
     let event = Event::new(false)?;
 
     let client = activate_client(&device)?;
     let mix = mix_format(&client)?;
     let mask = mix.parsed.mask_for(channels);
 
-    // Chemin 0 : mode exclusif, uniquement si la politique le demande.
-    let exclusive = policy
-        .tries_exclusive()
-        .then(|| try_exclusive(&device, channels, format.sample_rate, mask));
-    let (client, path, block_frames, exclusive_refusal) = match exclusive {
-        Some(Ok(init)) => {
-            let path = InitPath::Exclusive {
-                sample: init.sample,
-                period_hns: init.period_hns,
-                period_frames: init.period_frames,
-                realigned: init.realigned,
-            };
-            (init.client, path, init.period_frames as usize, None)
+    let (client, path, block_frames, exclusive_refusal) = if loopback {
+        // Chemin 3 : écho. `check_shared` a déjà écarté l'exclusif, il n'y a rien à
+        // négocier — le mélange du moteur, tel quel.
+        let (client, path, block_frames) =
+            crate::loopback::initialize(&device, id, &client, &mix, channels, format, mask)?;
+        (client, path, block_frames, None)
+    } else {
+        // Chemin 0 : mode exclusif, uniquement si la politique le demande.
+        let exclusive = policy
+            .tries_exclusive()
+            .then(|| try_exclusive(&device, channels, format.sample_rate, mask));
+        match exclusive {
+            Some(Ok(init)) => {
+                let path = InitPath::Exclusive {
+                    sample: init.sample,
+                    period_hns: init.period_hns,
+                    period_frames: init.period_frames,
+                    realigned: init.realigned,
+                };
+                (init.client, path, init.period_frames as usize, None)
+            }
+            // `Required` : plutôt une erreur explicite qu'un flux partagé qu'on n'a
+            // pas demandé.
+            Some(Err(reason)) if policy == ExclusivePolicy::Required => {
+                return Err(required_error(id, &reason))
+            }
+            // `Preferred` : repli en partagé, la raison voyage jusqu'à la poignée.
+            Some(Err(reason)) => shared(&device, id, &client, &mix, channels, format, mask)
+                .map(|(client, path, block)| (client, path, block, Some(reason)))?,
+            None => shared(&device, id, &client, &mix, channels, format, mask)
+                .map(|(client, path, block)| (client, path, block, None))?,
         }
-        // `Required` : plutôt une erreur explicite qu'un flux partagé qu'on n'a pas
-        // demandé.
-        Some(Err(reason)) if policy == ExclusivePolicy::Required => {
-            return Err(required_error(id, &reason))
-        }
-        // `Preferred` : repli en partagé, la raison voyage jusqu'à la poignée.
-        Some(Err(reason)) => shared(&device, id, &client, &mix, channels, format, mask)
-            .map(|(client, path, block)| (client, path, block, Some(reason)))?,
-        None => shared(&device, id, &client, &mix, channels, format, mask)
-            .map(|(client, path, block)| (client, path, block, None))?,
     };
     let sample = path.sample_type();
     let frame_bytes = sample.frame_bytes(usize::from(channels));
@@ -265,19 +302,19 @@ pub(crate) fn open(
     let latency_hns = unsafe { client.GetStreamLatency() }
         .map_err(|e| platform_error("IAudioClient::GetStreamLatency", &e))?;
 
-    let service = match info.direction {
-        DeviceDirection::Render => {
-            // SAFETY: client initialisé en rendu.
-            let render: IAudioRenderClient = unsafe { client.GetService() }
-                .map_err(|e| platform_error("IAudioClient::GetService(IAudioRenderClient)", &e))?;
-            Service::Render(agile(&render, "IAudioRenderClient")?)
-        }
-        DeviceDirection::Capture => {
-            // SAFETY: client initialisé en capture.
-            let capture: IAudioCaptureClient = unsafe { client.GetService() }
-                .map_err(|e| platform_error("IAudioClient::GetService(IAudioCaptureClient)", &e))?;
-            Service::Capture(agile(&capture, "IAudioCaptureClient")?)
-        }
+    // En écho, l'endpoint est un endpoint de **rendu** mais le flux se comporte en
+    // capture : c'est `IAudioCaptureClient` qu'il faut, pas `IAudioRenderClient`.
+    let capture_side = loopback || info.direction == DeviceDirection::Capture;
+    let service = if capture_side {
+        // SAFETY: client initialisé en capture (ou en écho).
+        let capture: IAudioCaptureClient = unsafe { client.GetService() }
+            .map_err(|e| platform_error("IAudioClient::GetService(IAudioCaptureClient)", &e))?;
+        Service::Capture(agile(&capture, "IAudioCaptureClient")?)
+    } else {
+        // SAFETY: client initialisé en rendu.
+        let render: IAudioRenderClient = unsafe { client.GetService() }
+            .map_err(|e| platform_error("IAudioClient::GetService(IAudioRenderClient)", &e))?;
+        Service::Render(agile(&render, "IAudioRenderClient")?)
     };
 
     let (clock, clock_scale, clock_source) = audio_clock(
@@ -488,7 +525,7 @@ fn agile<T: Interface>(interface: &T, what: &str) -> Result<AgileReference<T>, B
 
 /// `AUDCLNT_E_UNSUPPORTED_FORMAT` devient [`BackendError::UnsupportedFormat`], le
 /// reste [`BackendError::Platform`].
-fn unsupported_or_platform(
+pub(crate) fn unsupported_or_platform(
     id: &DeviceId,
     call: &str,
     error: &windows::core::Error,

@@ -32,6 +32,14 @@
 //! trames du format livré, horodatage `QueryPerformanceCounter` commun à tous les
 //! flux du processus (`ClockSource`).
 //!
+//! La **capture en écho** (module `loopback`) est la troisième façon d'ouvrir un
+//! flux : `WasapiBackend::open_loopback` ouvre un endpoint de **rendu** avec
+//! `AUDCLNT_STREAMFLAGS_LOOPBACK` et prélève le mélange du moteur audio avant que
+//! le pilote ne le consomme. Le flux se comporte alors comme une capture. C'est
+//! l'outil qui coupe en deux une chaîne muette : le signal entendu en écho met le
+//! moteur hors de cause, un écho silencieux met le pilote hors de cause. L'écho
+//! n'existe qu'en mode partagé.
+//!
 //! Le **mode exclusif** (M1b-32, module `exclusive`) est un réglage du backend,
 //! `Never` par défaut : le flux prend alors le périphérique pour lui seul, au
 //! format que le matériel accepte — souvent de l'entier, que le fil du flux
@@ -81,6 +89,8 @@ mod convert;
 mod devices;
 #[cfg(windows)]
 mod exclusive;
+#[cfg(windows)]
+mod loopback;
 #[cfg(windows)]
 mod mmdevice_thread;
 #[cfg(windows)]

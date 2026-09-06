@@ -1,13 +1,21 @@
 //! Le binaire `conduit-looptest` sur la machine de développement (M1a-10).
 //!
-//! Aucun de ces tests ne demande le pilote Conduit ni n'émet de son : `--list`
-//! ne fait qu'énumérer, `--self-test` n'ouvre aucun périphérique. La vraie boucle
+//! Aucun de ces tests ne demande le pilote Conduit : `--list` ne fait
+//! qu'énumérer, `--self-test` n'ouvre aucun périphérique. La vraie boucle
 //! (`conduit-looptest --repeat 10`) se lance à la main dans la VM, une fois le
 //! pilote installé.
+//!
+//! Une exception : [`echo_du_rendu_par_defaut_entend_le_sinus`] **émet un son**,
+//! très bas (2 % d'amplitude) et bref — c'est le seul moyen de prouver que le mode
+//! `--loopback` prélève bien le mélange du moteur. Il se saute s'il n'y a pas
+//! d'endpoint de rendu par défaut.
 
 #![cfg(windows)]
 
 use std::process::Command;
+
+use conduit_backend::{Backend, DeviceDirection};
+use conduit_backend_wasapi::WasapiBackend;
 
 /// Lance le binaire et rend (code de retour, stdout, stderr).
 fn run(args: &[&str]) -> (Option<i32>, String, String) {
@@ -75,4 +83,50 @@ fn options_incoherentes_donnent_le_code_environnement() {
     let (code, _, err) = run(&["--self-test", "--amplitude", "3"]);
     assert_eq!(code, Some(2), "{err}");
     assert!(err.contains("--amplitude"), "{err}");
+}
+
+#[test]
+fn echo_et_capture_se_contredisent() {
+    let (code, _, err) = run(&["--loopback", "--capture", "Conduit 1"]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("--capture"), "{err}");
+}
+
+/// **Émet un son** : 1,5 s de sinus à 2 % d'amplitude sur le rendu par défaut.
+///
+/// Le verdict de la passe n'est pas ce qui est vérifié — l'écho prélève *tout* le
+/// mélange, donc aussi ce que jouent les autres applications, ce qui peut faire
+/// échouer la continuité de phase ou l'amplitude sans rien dire du pilote. Ce qui
+/// est vérifié, c'est la seule chose que le mode promet : le sinus a été
+/// **retrouvé** dans l'écho, et l'outil en tire la bonne conclusion.
+#[test]
+fn echo_du_rendu_par_defaut_entend_le_sinus() {
+    let backend = match WasapiBackend::new() {
+        Ok(backend) => backend,
+        Err(e) => {
+            eprintln!("test sauté : backend WASAPI indisponible ({e})");
+            return;
+        }
+    };
+    let Some(id) = backend.default_device(DeviceDirection::Render) else {
+        eprintln!("test sauté : aucun périphérique de rendu par défaut");
+        return;
+    };
+    drop(backend);
+
+    let (code, out, err) = run(&[
+        "--render",
+        id.as_str(),
+        "--loopback",
+        "--seconds",
+        "1.5",
+        "--amplitude",
+        "0.02",
+    ]);
+    assert_ne!(code, Some(2), "l'écho n'a pas pu être mesuré :\n{out}{err}");
+    assert!(out.contains("écho de ce même endpoint"), "{out}");
+    assert!(
+        out.contains("le moteur audio de Windows délivre bien"),
+        "le sinus n'a pas été retrouvé dans l'écho :\n{out}{err}"
+    );
 }

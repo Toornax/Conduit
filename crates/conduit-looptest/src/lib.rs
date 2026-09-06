@@ -11,7 +11,15 @@
 //! conduit-looptest --list               # les endpoints vus par WASAPI
 //! conduit-looptest --json --repeat 10   # sortie machine
 //! conduit-looptest --self-test          # test de l'outil, sans périphérique
+//! conduit-looptest --loopback           # capture en écho : le moteur délivre-t-il ?
 //! ```
+//!
+//! `--loopback` répond à l'autre moitié de la question. Au lieu d'ouvrir un
+//! endpoint de capture, l'outil ouvre l'endpoint de **rendu** en écho
+//! (`AUDCLNT_STREAMFLAGS_LOOPBACK`) et prélève le mélange **avant** qu'il
+//! n'atteigne le pilote. Le sinus entendu en écho met le moteur audio hors de
+//! cause et laisse le pilote seul suspect ; un écho silencieux fait l'inverse.
+//! C'est la première mesure à prendre quand une capture n'entend pas un rendu.
 //!
 //! Codes de retour : `0` toutes les passes passent, `1` au moins une échoue,
 //! `2` l'environnement ne permet pas le test (endpoints absents, backend
@@ -66,6 +74,15 @@ enum Source<'a> {
 
 #[cfg(windows)]
 impl Source<'_> {
+    /// Sinus joué **et** analysé. Une session peut l'imposer : en `--loopback`,
+    /// c'est le format de mixage de l'endpoint de rendu qui décide.
+    fn spec(&self, args: &cli::Args) -> analysis::SineSpec {
+        match self {
+            Source::Simulated => args.spec(),
+            Source::Live(session) => session.spec(),
+        }
+    }
+
     /// Une passe d'enregistrement.
     fn record(&mut self, args: &cli::Args) -> Result<Vec<f32>, String> {
         match self {
@@ -121,14 +138,20 @@ pub fn run(args: &cli::Args) -> Result<ExitCode, String> {
 /// Enchaîne les passes, les affiche et rend le code de retour.
 #[cfg(windows)]
 fn run_passes(args: &cli::Args, mut source: Source<'_>) -> Result<ExitCode, String> {
-    let spec = args.spec();
+    let spec = source.spec(args);
     let options = args.analysis_options();
     let tolerances = args.tolerances();
-    let skip = args.skip_frames();
+    let skip = args.skip_frames_at(spec.sample_rate);
     let mut passes = Vec::with_capacity(args.repeat);
     for index in 1..=args.repeat {
         let recording = source.record(args)?;
-        let pass = pass::evaluate(index, &recording, &spec, &options, &tolerances, skip)?;
+        let pass = match pass::evaluate(index, &recording, &spec, &options, &tolerances, skip) {
+            Ok(pass) => pass,
+            // En écho, l'absence de signal n'est pas un accident d'environnement :
+            // c'est **la** réponse que le mode sert à obtenir. On la commente.
+            Err(e) if args.loopback => return Err(format!("{e}\n\n{}", report::loopback_silent())),
+            Err(e) => return Err(e),
+        };
         if !args.json {
             println!("{}", report::pass_lines(&pass, args.repeat));
         }
@@ -144,6 +167,11 @@ fn run_passes(args: &cli::Args, mut source: Source<'_>) -> Result<ExitCode, Stri
         );
     } else {
         println!("{}", report::summary_line(&passes));
+        // Le sinus a été retrouvé dans l'écho (sinon `evaluate` aurait échoué plus
+        // haut) : c'est le verdict qui compte ici, pas la qualité de la boucle.
+        if args.loopback {
+            println!("\n{}", report::loopback_heard());
+        }
     }
     Ok(if all_ok {
         ExitCode::SUCCESS

@@ -49,6 +49,11 @@ pub struct Args {
     /// Joue seulement, sans ouvrir la capture (équivaut à `--capture none`).
     #[arg(long = "no-capture")]
     pub no_capture: bool,
+    /// Capture en écho : au lieu d'ouvrir l'endpoint de capture, prélève le
+    /// mélange sur l'endpoint de `--render` lui-même, avant le pilote. Dit si le
+    /// moteur audio délivre quelque chose.
+    #[arg(long)]
+    pub loopback: bool,
     /// Sortie JSON.
     #[arg(long)]
     pub json: bool,
@@ -92,7 +97,14 @@ impl Args {
 
     /// Trames de signal jetées après la détection du début.
     pub fn skip_frames(&self) -> usize {
-        (self.skip_ms.max(0.0) * f64::from(self.rate) / 1000.0).round() as usize
+        self.skip_frames_at(self.rate)
+    }
+
+    /// Comme [`Self::skip_frames`], mais à la fréquence réellement obtenue : en
+    /// `--loopback` le flux prend le format de mixage de l'endpoint, qui n'est pas
+    /// forcément `--rate`.
+    pub fn skip_frames_at(&self, rate: u32) -> usize {
+        (self.skip_ms.max(0.0) * f64::from(rate) / 1000.0).round() as usize
     }
 
     /// Trames d'une passe.
@@ -152,6 +164,28 @@ impl Args {
         }
         if self.phase_tolerance <= 0.0 {
             return Err("--phase-tolerance doit être strictement positive".to_string());
+        }
+        if self.loopback {
+            if self.capture.is_some() {
+                return Err(
+                    "--loopback prélève le mélange sur l'endpoint de --render : --capture n'a \
+                     rien à désigner. Retirez-le (ou retirez --loopback pour la boucle \
+                     habituelle)"
+                        .to_string(),
+                );
+            }
+            if self.no_capture {
+                return Err(
+                    "--loopback est une capture : --no-capture le contredit. Gardez l'un des deux"
+                        .to_string(),
+                );
+            }
+            if self.self_test {
+                return Err(
+                    "--loopback demande un vrai endpoint de rendu : --self-test n'en ouvre aucun"
+                        .to_string(),
+                );
+            }
         }
         Ok(rate)
     }
@@ -226,6 +260,28 @@ mod tests {
             parse(&["--inject-glitch", "1234"]).glitch_frame(),
             Some(1_234)
         );
+    }
+
+    #[test]
+    fn echo_incompatible_avec_capture_et_self_test() {
+        assert!(parse(&["--loopback"]).validate().is_ok());
+        for (args, attendu) in [
+            (vec!["--loopback", "--capture", "Conduit 1"], "--capture"),
+            (vec!["--loopback", "--capture", "none"], "--capture"),
+            (vec!["--loopback", "--no-capture"], "--no-capture"),
+            (vec!["--loopback", "--self-test"], "--self-test"),
+        ] {
+            let err = parse(&args).validate().expect_err(&format!("{args:?}"));
+            assert!(err.contains(attendu), "{err}");
+        }
+    }
+
+    #[test]
+    fn les_trames_jetees_suivent_la_frequence_effective() {
+        let a = parse(&["--skip-ms", "100"]);
+        assert_eq!(a.skip_frames(), 4_800);
+        assert_eq!(a.skip_frames_at(44_100), 4_410);
+        assert_eq!(a.skip_frames_at(96_000), 9_600);
     }
 
     #[test]
