@@ -340,9 +340,20 @@ const fn filter<const P: usize, const C: usize>(
 
 /// `KSCATEGORY_AUDIO`, adressable (les broches pointent la catégorie).
 static CATEGORY_AUDIO: GUID = KSCATEGORY_AUDIO;
-/// `KSNODETYPE_SPEAKER`, catégorie de la broche endpoint rendu.
+/// `KSNODETYPE_SPEAKER`. **Plus utilisé** : conservé pour mémoire et pour le jour où
+/// Windows cessera d'imposer le nom des endpoints haut-parleur (voir
+/// [`CATEGORY_LINE_CONNECTOR`] et driver-design.md §4.2).
+#[allow(dead_code)]
 static CATEGORY_SPEAKER: GUID = KSNODETYPE_SPEAKER;
-/// `KSNODETYPE_LINE_CONNECTOR`, catégorie de la broche endpoint capture.
+/// `KSNODETYPE_LINE_CONNECTOR`, catégorie des **deux** broches endpoint.
+///
+/// Mesuré dans la VM le 2026-09-06, avec la même construction des deux côtés à la seule
+/// catégorie près : la broche capture (`LINE_CONNECTOR`) donne l'endpoint « Conduit 1 »,
+/// la broche rendu (`SPEAKER`) donne « Haut-parleurs ». Le générateur d'endpoints impose
+/// donc bien le nom des sorties haut-parleur, comme le laissait craindre la
+/// documentation. Avec seize câbles, seize « Haut-parleurs » indistinguables : le rendu
+/// passe lui aussi en connecteur de ligne, au prix de l'icône et du rang de sélection par
+/// défaut. C'est le repli prévu par driver-design.md §4.2.
 static CATEGORY_LINE_CONNECTOR: GUID = KSNODETYPE_LINE_CONNECTOR;
 /// GUID de nom des broches endpoint du câble 0, adressable : `KsPinDescriptor.Name` en
 /// prend l'adresse et PortCls la conserve (§4.2). L'INF associe ce même GUID à
@@ -388,10 +399,14 @@ const WAVE_RENDER_PINS: [PCPIN_DESCRIPTOR; PIN_COUNT] = [
     system_pin(KSPIN_DATAFLOW::KSPIN_DATAFLOW_IN),
     bridge_pin(KSPIN_DATAFLOW::KSPIN_DATAFLOW_OUT),
 ];
-/// Broches de `TopoRender` : bridge (entrée) puis endpoint haut-parleur (sortie).
+/// Broches de `TopoRender` : bridge (entrée) puis endpoint (sortie).
+///
+/// L'endpoint est un **connecteur de ligne** et non un haut-parleur : voir
+/// [`CATEGORY_LINE_CONNECTOR`], c'est la seule catégorie qui laisse le pilote nommer son
+/// endpoint.
 const TOPO_RENDER_PINS: [PCPIN_DESCRIPTOR; PIN_COUNT] = [
     bridge_pin(KSPIN_DATAFLOW::KSPIN_DATAFLOW_IN),
-    endpoint_pin(KSPIN_DATAFLOW::KSPIN_DATAFLOW_OUT, &CATEGORY_SPEAKER),
+    endpoint_pin(KSPIN_DATAFLOW::KSPIN_DATAFLOW_OUT, &CATEGORY_LINE_CONNECTOR),
 ];
 /// Broches de `WaveCapture` : bridge (entrée) puis système (sortie).
 const WAVE_CAPTURE_PINS: [PCPIN_DESCRIPTOR; PIN_COUNT] = [
