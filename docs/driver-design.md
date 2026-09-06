@@ -388,10 +388,17 @@ libéré au `Drop` du flux (journalisé : ne doit pas arriver).
 
 Un **timer noyau périodique par câble** (période 1 ms, timer `Ex*` haute résolution :
 `ExAllocateTimer(…, EX_TIMER_HIGH_RESOLUTION)` + `ExSetTimer(timer, −10 000, 10 000, NULL)`
-— les deux valeurs en unités de 100 ns, contrairement à `KeSetTimerEx` —, rappel
-`EXT_CALLBACK` à `DISPATCH_LEVEL` ; `ExSetTimerResolution` n'est jamais touché, son effet
-est global), armé quand au moins un flux du câble est en `RUN` avec un tampon, désarmé
-sinon. À chaque tick (`DISPATCH_LEVEL`, sous le spin lock du câble puis celui de chaque
+— les deux valeurs en unités de 100 ns, contrairement à `KeSetTimerEx` dont la période est
+en millisecondes ; **confirmé sur la documentation Microsoft d'`ExSetTimer` le 2026-09-06**,
+inutile de le revérifier —, rappel `EXT_CALLBACK` à `DISPATCH_LEVEL` ;
+`ExSetTimerResolution` n'est jamais touché, son effet est global), armé quand au moins un
+flux du câble est en `RUN` avec un tampon, désarmé sinon. Deux contraintes de la même
+documentation : l'échéance d'un timer haute résolution **doit** être relative (négative),
+sous peine de bug check ; et une période plus courte que le tic d'horloge système par
+défaut (15,6 ms) maintient l'horloge système au taux maximal tant que le timer tourne,
+donc une consommation accrue. C'est assumé (le moteur audio de Windows fait de même quand
+un flux joue, et notre timer ne tourne que câble actif), à revoir si l'autonomie sur
+batterie devient un sujet (SPEC §6). À chaque tick (`DISPATCH_LEVEL`, sous le spin lock du câble puis celui de chaque
 flux, ordre fixe câble → rendu → capture) :
 
 1. calculer la position absolue en trames du rendu (`R`) et de la capture (`C`) ;
