@@ -23,11 +23,26 @@ Version 0.1 — 2026-09-05. Découpage de chaque jalon de `SPEC.md` §9 en tâch
 
 Ordre général : M0 et M1a en parallèle, puis M1b, M2, M3, M4, M5.
 
-**État au 2026-09-05** : M0 clos (tag `v0.1.0-core`, `nix flake check` vert, 211 tests).
-M1a (pilote Windows) exige un poste Windows avec WDK : en son absence, le travail se
-poursuit sur M3 (Linux/PipeWire) puis M2 (GUI), conformément à la consigne « si Windows
-bloque, parties Linux/macOS ». **Reprise Windows le 2026-09-05** : conception du pilote
-dans [docs/driver-design.md](docs/driver-design.md), ADR-012 (workspace noyau séparé).
+**État au 2026-09-06.** M0 clos (tag `v0.1.0-core`, `nix flake check` vert, 211 tests).
+Le poste Windows est en place depuis le 2026-09-05 (WDK 26100, LLVM 17.0.6, `cargo-wdk`) :
+M1a et la partie Windows de M1b ont avancé en parallèle.
+
+- **M1a** : les onze tâches de code sont écrites et vérifiées hors noyau (bindings,
+  modèle COM, adaptateur, flux, boucle locale, INF, outil de mesure). Quatre sont
+  cochées ; **sept attendent d'être chargées dans une VM** (M1a-02, 05, 06, 07, 08, 09,
+  10), faute d'ISO Windows 11. Leur séquence de validation, résultats attendus et
+  diagnostics : [docs/vm-bringup.md](docs/vm-bringup.md).
+- **M1b.C** : M1b-30, 32, 33 et 35 cochées ; le démon charge WASAPI par défaut sous
+  Windows et tourne sans xrun (1 h, deux cartes, 720 006 cycles). M1b-31 attend la boucle
+  par câble, donc le pilote.
+- **M1b.A, M1b.B, M1b.D** : bloquées par la même VM (le helper et le MSI supposent la
+  propriété de configuration du pilote validée).
+- Conception et décisions de la reprise : [docs/driver-design.md](docs/driver-design.md),
+  [docs/windows-drivers-rs.md](docs/windows-drivers-rs.md), ADR-012 (workspace noyau
+  séparé) et ADR-013 (démon démarré à l'ouverture de session, pas un service).
+
+**Prochaine action, hors code** : obtenir une ISO Windows 11 et dérouler
+[docs/vm-bringup.md](docs/vm-bringup.md).
 
 ---
 
@@ -292,6 +307,12 @@ allocation dans le fil audio, CI verte partout, couverture ≥ 80 % sur `core` e
 
 Objectif : prouver qu'un pilote PortCls/WaveRT en Rust est faisable. Délai borné (à fixer,
 proposition : trois semaines de travail effectif). Porte de décision en M1a-12.
+
+**Le code est écrit ; il n'a jamais été chargé.** Les sept tâches portant une ligne
+*État* se valident en une seule session de VM, dans l'ordre donné par
+[docs/vm-bringup.md](docs/vm-bringup.md), qui donne aussi le résultat attendu et l'arbre
+de diagnostic de chacune. Deux jours de travail effectif au 2026-09-06, à comparer au
+délai borné lors de la porte M1a-12.
 
 - [x] **M1a-01** `chore(driver): environnement de build WDK et windows-drivers-rs`
   Hors Nix (SPEC §5.11). Extension de `packaging/windows/setup-env.ps1` (WDK 26100, LLVM
