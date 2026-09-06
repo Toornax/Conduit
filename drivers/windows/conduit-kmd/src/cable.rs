@@ -295,9 +295,14 @@ impl fmt::Debug for CableState {
 }
 
 /// Compteurs de la boucle locale, hors verrou (journalisation et diagnostic).
+///
+/// Remis à zéro à chaque [`Cable::start`] : le pilote ne se décharge pas entre deux
+/// cycles de périphérique, et une trace qui additionnerait les cycles précédents ferait
+/// croire à une image obsolète du pilote (plusieurs heures perdues ainsi le 2026-09-06).
+/// Une trace qui ment coûte plus cher qu'une trace absente.
 #[derive(Debug)]
 struct Counters {
-    /// Ticks du timer du câble depuis le chargement.
+    /// Ticks du timer du câble depuis le dernier `StartDevice`.
     ticks: AtomicU64,
     /// Trames copiées du rendu vers la capture.
     copied: AtomicU64,
@@ -316,6 +321,17 @@ impl Counters {
             overruns: AtomicU64::new(0),
             silenced: AtomicU64::new(0),
         }
+    }
+
+    /// Remet les quatre compteurs à zéro (nouveau cycle de périphérique).
+    ///
+    /// IRQL : `PASSIVE_LEVEL`, timer arrêté : aucun tick ne peut incrémenter en
+    /// parallèle, `Relaxed` suffit.
+    fn reset(&self) {
+        self.ticks.store(0, Ordering::Relaxed);
+        self.copied.store(0, Ordering::Relaxed);
+        self.overruns.store(0, Ordering::Relaxed);
+        self.silenced.store(0, Ordering::Relaxed);
     }
 }
 
@@ -358,8 +374,8 @@ impl Cable {
 
     /// Prépare le câble pour un `StartDevice` : oublie les flux et le plan de la boucle
     /// (les broches sont fermées avant tout arrêt du périphérique, les emplacements
-    /// devraient déjà être vides — journalisé sinon), puis crée le timer haute
-    /// résolution s'il ne l'est pas déjà.
+    /// devraient déjà être vides — journalisé sinon), remet les compteurs à zéro, puis
+    /// crée le timer haute résolution s'il ne l'est pas déjà.
     ///
     /// Échec de `ExAllocateTimer` (pool épuisé) : `STATUS_INSUFFICIENT_RESOURCES`,
     /// **sans repli** sur `KeSetTimerEx`. Décision documentée dans
@@ -383,6 +399,10 @@ impl Cable {
             // `armed` repart à faux : le timer d'un cycle précédent (qui devrait déjà
             // être désarmé, les broches étant fermées) doit l'être vraiment.
             self.timer.stop();
+            // Les compteurs aussi : le pilote reste chargé d'un cycle à l'autre, et une
+            // trace qui cumulerait les ticks des cycles précédents ferait croire à une
+            // image obsolète du pilote.
+            self.counters.reset();
         }
         let context: PVOID = ptr::from_ref(self).cast_mut().cast();
         // SAFETY: `self` est le `static` `CABLE_0` : le contexte reste valide jusqu'au
@@ -603,7 +623,7 @@ impl Cable {
     fn shutdown(&self) {
         self.timer.delete();
         kmd_log!(
-            "câble {} : timer supprimé après {} ticks ({} trames copiées, {} silences, {} débordements)",
+            "câble {} : timer supprimé après {} ticks depuis le dernier StartDevice ({} trames copiées, {} silences, {} débordements)",
             self.index,
             self.counters.ticks.load(Ordering::Relaxed),
             self.counters.copied.load(Ordering::Relaxed),

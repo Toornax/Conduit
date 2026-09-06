@@ -24,9 +24,11 @@
 //!
 //! Un seul tampon par flux, alloué par `IPortWaveRTStream::AllocatePagesForMdl` (taille de
 //! `conduit_kmd_core::format::buffer_bytes[_for_notifications]` : multiple de la trame et
-//! de la période de notification, bornée 1–100 ms), mappé en mémoire noyau (`MmCached`) et
-//! mis à zéro ; libéré par `FreeAudioBuffer` / `FreeBufferWithNotification`, jamais avant
-//! l'arrêt du flux. `KSSTATE_STOP` conserve le tampon : PortCls le libère lui-même.
+//! de la période de notification, jamais inférieure à la demande — au-delà de 100 ms
+//! l'allocation est refusée plutôt qu'écrêtée), mappé en mémoire noyau (`MmCached`) et mis
+//! à zéro ; libéré par `FreeAudioBuffer` / `FreeBufferWithNotification`, **sans condition
+//! d'état** : c'est PortCls qui décide du moment, le miniport libère. `SetState` ne touche
+//! pas au tampon — `KSSTATE_STOP` le conserve, en attendant que PortCls le rende.
 //!
 //! # Position
 //!
@@ -167,9 +169,13 @@ impl WaveStream {
         let rate = self.format.sample_rate;
         let bytes = match notification_count {
             None => buffer_bytes(requested_bytes, self.frame_bytes, rate),
-            // Aucune borne sur le nombre de périodes : le moteur en demande couramment
-            // plus de deux, et SYSVAD n'exige que la divisibilité de la taille. Une borne
-            // arbitraire ici faisait échouer le mode événementiel sans laisser de trace.
+            // La documentation d'`AllocateBufferWithNotification` annonce « Valid values
+            // are 1 or 2 », et nous n'avons jamais rien observé d'autre — l'absence
+            // d'observation ne se cite pas comme une mesure. Nous restons pourtant
+            // permissifs comme SYSVAD, qui n'exige que la divisibilité de la taille :
+            // une borne arbitraire ici faisait échouer le mode événementiel sans laisser
+            // la moindre trace, et refuser plus que ce que le contrat impose n'a rien
+            // rapporté.
             Some(count) => {
                 buffer_bytes_for_notifications(requested_bytes, self.frame_bytes, rate, count)
             }
@@ -185,11 +191,7 @@ impl WaveStream {
         };
         // `frame_bytes ≠ 0` (disposition valide) et `bytes` en est un multiple.
         let Some(frames) = bytes.checked_div(self.frame_bytes) else {
-            kmd_log!(
-                "{}{}::Allocate refusé : trame nulle",
-                self.name(),
-                self.n
-            );
+            kmd_log!("{}{}::Allocate refusé : trame nulle", self.name(), self.n);
             return Err(STATUS_UNSUCCESSFUL);
         };
         let notifier = match notification_count {
@@ -318,22 +320,34 @@ impl WaveStream {
         }
     }
 
-    /// Libère le tampon rendu par PortCls, si le flux est à l'arrêt.
+    /// Libère le tampon rendu par PortCls, **quel que soit l'état du flux**.
+    ///
+    /// La documentation de `FreeAudioBuffer` / `FreeBufferWithNotification` ne pose
+    /// aucune condition d'état : quand PortCls appelle, il considère la MDL rendue et le
+    /// miniport libère. Conditionner la libération à `KSSTATE_STOP` laissait deux dégâts :
+    /// le tampon restait inscrit dans l'état, donc `allocate` refusait toute réallocation
+    /// avec `STATUS_INVALID_DEVICE_REQUEST` — flux définitivement inutilisable — et la
+    /// propriété de la MDL divergeait (rendue pour PortCls, gardée jusqu'au `Drop` pour
+    /// nous). Un appel hors `KSSTATE_STOP` reste journalisé : la trace est intéressante,
+    /// la garde ne l'était pas.
     ///
     /// IRQL : `PASSIVE_LEVEL`.
     fn free(&self, mdl: PMDL, size: u32) {
         let (taken, ks_state) = {
             let mut state = self.shared.lock();
-            if state.state != KSSTATE::KSSTATE_STOP {
-                (None, state.state)
-            } else {
-                let taken = state.buffer.take();
-                state.notifier = None;
-                (taken, state.state)
-            }
+            let taken = state.buffer.take();
+            state.notifier = None;
+            (taken, state.state)
         };
         // Hors du verrou du flux (ordre câble puis flux).
         self.cable.refresh_timer();
+        if ks_state != KSSTATE::KSSTATE_STOP {
+            kmd_log!(
+                "{}{}::FreeAudioBuffer hors arrêt : état {ks_state} (tampon libéré quand même)",
+                self.name(),
+                self.n
+            );
+        }
         match taken {
             Some(buffer) => {
                 if !ptr::eq(buffer.mdl, mdl) || buffer.bytes != size {
@@ -356,7 +370,7 @@ impl WaveStream {
             }
             None => {
                 kmd_log!(
-                    "{}{}::FreeAudioBuffer ignoré : état {ks_state}, MDL {mdl:p} (tampon conservé jusqu'à la fermeture)",
+                    "{}{}::FreeAudioBuffer : aucun tampon inscrit, MDL {mdl:p}/{size} (double libération ?)",
                     self.name(),
                     self.n
                 );

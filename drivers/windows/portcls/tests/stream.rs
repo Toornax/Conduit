@@ -20,8 +20,8 @@ mod common;
 
 use std::mem::offset_of;
 use std::ptr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use common::{
     FAUX_MDL, FauxPortStream, This, faux_port_stream, query_interface, refcount, release, vtbl_de,
@@ -143,6 +143,94 @@ fn flux(port: &ComPtr<IPortWaveRTStreamVtbl, FauxPortStream>) -> (Flux, Arc<Atom
         },
         dropped,
     )
+}
+
+/// `STATUS_INVALID_DEVICE_REQUEST` : le refus d'un second `AllocateAudioBuffer` sur un
+/// flux qui tient déjà un tampon (`wdk-sys` n'est pas lié ici).
+const STATUS_INVALID_DEVICE_REQUEST: NtStatus = 0xC000_0010_u32 as i32;
+
+/// Flux qui modélise la **propriété du tampon** telle que le miniport du pilote
+/// (`conduit-kmd::stream::WaveStream`) la tient : un seul tampon à la fois, second
+/// `AllocateAudioBuffer` refusé tant que le premier n'est pas rendu, et libération
+/// **inconditionnelle** à `FreeAudioBuffer` — la documentation de la méthode ne pose
+/// aucune condition d'état, PortCls considère la MDL rendue dès l'appel.
+///
+/// `conduit-kmd` n'est pas testable en mode utilisateur (il lie `wdk-sys`, cf.
+/// `tools/check.ps1`) : ce double transcrit son contrat et le fait exercer par le vrai
+/// chemin, vtable et faux `IPortWaveRTStream` compris.
+struct FluxTampon {
+    port: PortWaveRTStream,
+    /// Dernier état KS reçu par `SetState`.
+    ks_state: AtomicU32,
+    /// Tampon courant (MDL, taille), `None` entre deux allocations.
+    buffer: Mutex<Option<(PMDL, u32)>>,
+    /// `FreeAudioBuffer` reçus alors que le flux n'était pas à l'arrêt : tracé, jamais
+    /// motif de refus.
+    frees_hors_arret: AtomicU32,
+}
+
+// SAFETY: `PMDL` n'est ici qu'un entier opaque (`FAUX_MDL`), jamais déréférencé, et il
+// ne sort pas du `Mutex`.
+unsafe impl Send for FluxTampon {}
+// SAFETY: idem, tout l'état mutable est derrière un `Mutex` ou un atomique.
+unsafe impl Sync for FluxTampon {}
+
+impl FluxTampon {
+    fn new(port: &ComPtr<IPortWaveRTStreamVtbl, FauxPortStream>) -> Self {
+        let port_ref = unsafe { conduit_com::ComRef::from_raw_add_ref(port.as_raw().cast()) };
+        Self {
+            port: PortWaveRTStream::from_ref(port_ref),
+            ks_state: AtomicU32::new(KSSTATE::KSSTATE_STOP as u32),
+            buffer: Mutex::new(None),
+            frees_hors_arret: AtomicU32::new(0),
+        }
+    }
+}
+
+impl MiniportWaveRTStream for FluxTampon {
+    fn set_state(&self, state: KSSTATE::Type) -> NtStatus {
+        // `SetState` ne touche pas au tampon, dans un sens comme dans l'autre.
+        self.ks_state.store(state as u32, Ordering::SeqCst);
+        STATUS_SUCCESS
+    }
+
+    fn position(&self) -> Result<u32, NtStatus> {
+        Ok(0)
+    }
+
+    fn allocate_audio_buffer(&self, requested_bytes: u32) -> Result<AudioBuffer, NtStatus> {
+        let mut courant = self.buffer.lock().unwrap();
+        if courant.is_some() {
+            return Err(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let actual = requested_bytes.div_ceil(8) * 8;
+        let mdl = self
+            .port
+            .allocate_pages_for_mdl(physical_address(i64::MAX), actual as usize)?;
+        *courant = Some((mdl, actual));
+        Ok(AudioBuffer {
+            mdl,
+            actual_bytes: actual,
+            offset_from_first_page: 0,
+            cache_type: _MEMORY_CACHING_TYPE::MmCached,
+        })
+    }
+
+    fn free_audio_buffer(&self, mdl: PMDL, size: u32) {
+        // Aucune garde d'état : quand PortCls appelle, le miniport libère. Conditionner
+        // la reprise à `KSSTATE_STOP` laisserait le tampon inscrit et le flux
+        // définitivement incapable de réallouer.
+        let repris = self.buffer.lock().unwrap().take();
+        if self.ks_state.load(Ordering::SeqCst) != KSSTATE::KSSTATE_STOP as u32 {
+            self.frees_hors_arret.fetch_add(1, Ordering::SeqCst);
+        }
+        let Some((mdl_inscrite, taille)) = repris else {
+            return;
+        };
+        assert_eq!(mdl_inscrite, mdl, "PortCls rend la MDL inscrite");
+        assert_eq!(taille, size, "PortCls rend la taille allouée");
+        unsafe { self.port.free_pages_from_mdl(mdl) }.unwrap();
+    }
 }
 
 /// Flux qui accepte `SetFormat` et refuse `AllocateAudioBuffer`.
@@ -434,6 +522,70 @@ fn allocate_audio_buffer_ecrit_les_quatre_sorties_depuis_audio_buffer() {
 
     assert_eq!(release(this), 0);
     assert_eq!(port.refcount(), 1);
+}
+
+/// `FreeAudioBuffer` en `KSSTATE_RUN` libère quand même, et le flux peut **réallouer**.
+///
+/// C'est le test qui manquait : conditionner la reprise du tampon à `KSSTATE_STOP`
+/// rendait le flux définitivement inutilisable (toute allocation suivante refusée par
+/// `STATUS_INVALID_DEVICE_REQUEST`), tout en laissant PortCls croire la MDL rendue.
+#[test]
+fn free_audio_buffer_libere_hors_arret_et_laisse_reallouer() {
+    let port = faux_port_stream();
+    let this = new_stream_object(FluxTampon::new(&port)).into_raw();
+    let me =
+        unsafe { conduit_com::ComObject::<IMiniportWaveRTStreamVtbl, FluxTampon>::inner(this) };
+
+    // 1. Allocation initiale (10 ms à 48 kHz stéréo F32).
+    let mut s = sorties_empoisonnees();
+    assert_eq!(appel_allocate(this, 3_840, &mut s), STATUS_SUCCESS);
+    assert_eq!(s.actual, 3_840);
+    assert_eq!(port.allocs.load(Ordering::SeqCst), 1);
+
+    // Un seul tampon par flux : le second appel est refusé sans toucher au port.
+    let mut s_bis = sorties_empoisonnees();
+    assert_eq!(
+        appel_allocate(this, 3_840, &mut s_bis),
+        STATUS_INVALID_DEVICE_REQUEST
+    );
+    assert_eq!(port.allocs.load(Ordering::SeqCst), 1);
+
+    // 2. Le moteur démarre le flux.
+    assert_eq!(appel_set_state(this, KSSTATE::KSSTATE_RUN), STATUS_SUCCESS);
+
+    // 3. PortCls rend le tampon **en marche** : la documentation de `FreeAudioBuffer`
+    //    ne pose aucune condition d'état.
+    unsafe { vt(this).FreeAudioBuffer.unwrap()(this, s.mdl, s.actual) };
+    assert_eq!(
+        port.frees.load(Ordering::SeqCst),
+        1,
+        "les pages sont rendues au port, pas gardées jusqu'au Drop"
+    );
+    assert_eq!(
+        me.frees_hors_arret.load(Ordering::SeqCst),
+        1,
+        "l'état inattendu est tracé, pas opposé à PortCls"
+    );
+    assert!(
+        me.buffer.lock().unwrap().is_none(),
+        "le tampon est repris dans l'état du flux"
+    );
+
+    // 4. Réallocation : c'est elle que la garde « uniquement à KSSTATE_STOP » interdisait
+    //    définitivement.
+    let mut s2 = sorties_empoisonnees();
+    assert_eq!(appel_allocate(this, 3_840, &mut s2), STATUS_SUCCESS);
+    assert_eq!(port.allocs.load(Ordering::SeqCst), 2);
+    assert_eq!(s2.actual, 3_840);
+
+    // 5. Arrêt puis libération normale : même chemin, sans trace d'état inattendu.
+    assert_eq!(appel_set_state(this, KSSTATE::KSSTATE_STOP), STATUS_SUCCESS);
+    unsafe { vt(this).FreeAudioBuffer.unwrap()(this, s2.mdl, s2.actual) };
+    assert_eq!(port.frees.load(Ordering::SeqCst), 2);
+    assert_eq!(me.frees_hors_arret.load(Ordering::SeqCst), 1);
+
+    assert_eq!(release(this), 0);
+    assert_eq!(port.refcount(), 1, "le Drop du flux rend le port");
 }
 
 #[test]

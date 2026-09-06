@@ -60,7 +60,7 @@ Contient tout ce qui se raisonne et se teste sans noyau :
 |---|---|---|
 | `position` | horloge virtuelle : `frames_at(qpc_now, qpc_start, qpc_freq, rate)` en arithmétique 128 bits sans débordement ; conversion trames ↔ octets ↔ position cyclique | proptest (monotonie, pas de débordement à 2⁶³ ticks, exactitude à ±1 trame) |
 | `ring` | copie cyclique d'un tampon rendu vers un tampon capture entre deux positions, tailles différentes, avec conversion de format (M1a : float32 → float32, PCM16 → PCM16 ; M1b-05 : matrice complète) | proptest (aucune trame perdue ni dupliquée, wrap-around) |
-| `format` | validation d'un `KSDATAFORMAT_WAVEFORMATEXTENSIBLE` demandé contre la liste supportée ; taille de tampon bornée, alignée sur la période de notification | tables de cas, proptest |
+| `format` | validation d'un `KSDATAFORMAT_WAVEFORMATEXTENSIBLE` demandé contre la liste supportée ; taille de tampon jamais inférieure à la demande (refus au-delà de 100 ms, plancher à 1 ms), alignée sur la période de notification | tables de cas, proptest |
 | `loopback` | plan de copie d'un tick (M1a-08) : `Loopback::plan(rendu, capture, avance)` → copie, silence, rien, ou débordement ; curseur et lien « même instant virtuel » entre les deux flux (§5.3) | tables de cas, proptest (blocs contigus sans trou ni recouvrement, décalage constant, bornes des tampons, jamais de panique) |
 | `notify` | périodes de notification (M1a-07) : `Notifier::advance(frames)` dit si une frontière de `buffer_frames / count` a été franchie depuis le dernier signal, sur la position absolue | tables de cas, proptest (cohérence avec la formulation cyclique en octets) |
 | `config` | structures `#[repr(C)]` de la propriété privée de configuration (M1b-04) et leur validation (`validate(&[u8]) -> Result<CableConfig, ConfigError>`) | fuzz (M1b-08), Miri |
@@ -500,9 +500,13 @@ par `FreeAudioBuffer`. Les transitions non voisines sont tolérées (SYSVAD) et 
 
 `AllocateAudioBuffer` : le miniport alloue un tampon **par flux** avec
 `IPortWaveRTStream::AllocatePagesForMdl` (non paginé, contigu ou non, taille = multiple
-de la trame, arrondie à la taille demandée par le moteur audio dans les bornes
-[1 ms ; 100 ms]), et le mémorise dans l'état du câble. Le tampon est libéré à
-`FreeAudioBuffer` (jamais avant l'arrêt du flux). Pas de partage de pages entre rendu
+de la trame, arrondie **vers le haut** à partir de la taille demandée par le moteur
+audio, remontée à 1 ms si elle est en dessous), et le mémorise dans l'état du câble. La
+taille rendue n'est **jamais** inférieure à la demande : « The actual size must be at
+least the requested size; otherwise, the Audio Session API (WASAPI) audio engine won't use
+the buffer, and stream creation will fail. » Une demande au-delà de 100 ms est donc
+**refusée** (`STATUS_UNSUCCESSFUL`, journalisé), pas écrêtée. Le tampon est libéré à
+`FreeAudioBuffer`, quand PortCls le demande. Pas de partage de pages entre rendu
 et capture : les tailles et les formats des deux flux peuvent différer.
 
 Réalité M1a-08 : taille par `kmd-core::format::buffer_bytes` (sans notification) ou
@@ -513,8 +517,13 @@ qui serait −1 dans le `QuadPart` signé —, contrôle de `GetPhysicalPagesCou
 partielle → `STATUS_INSUFFICIENT_RESOURCES`), `MapAllocatedPages(MmCached)` pour obtenir la
 base noyau, tampon mis à zéro, `OffsetFromFirstPage = 0`. Un seul tampon par flux (second
 appel → `STATUS_INVALID_DEVICE_REQUEST`). `FreeAudioBuffer` démappe puis
-`FreePagesFromMdl`, **uniquement à `KSSTATE_STOP`** ; sinon le tampon est conservé et
-libéré au `Drop` du flux (journalisé : ne doit pas arriver).
+`FreePagesFromMdl`, **sans condition d'état** : la documentation n'en pose aucune, et
+PortCls considère la MDL rendue dès l'appel. Un appel hors `KSSTATE_STOP` est journalisé
+mais libère quand même — le conditionner à l'arrêt laissait le tampon inscrit dans l'état
+du flux, donc toute réallocation refusée (`STATUS_INVALID_DEVICE_REQUEST`) et le flux
+définitivement inutilisable, la MDL étant par ailleurs considérée comme rendue par
+PortCls. Le `Drop` du flux libère un tampon qui traînerait encore (journalisé : ne doit
+pas arriver).
 
 ### 5.3 Boucle locale
 
@@ -588,7 +597,10 @@ franchie (`kmd-core::notify::Notifier`, sur la position absolue en trames : le b
 n'est pas un cas particulier puisque le tampon est un multiple de la période). Quatre
 compteurs atomiques par câble (ticks, trames copiées, silences, débordements) sont
 journalisés toutes les 1000 ticks — **en debug seulement** (`kmd_log!` est vide en
-release). Le flux (`stream::WaveStream`, un seul type pour les deux sens, distingués par
+release) — et **remis à zéro par `Cable::start`**, à chaque `StartDevice` : le pilote ne
+se décharge pas entre deux cycles de périphérique, et des compteurs cumulés font lire une
+trace de cycle neuf comme une trace de cycle ancien (c'est ce qui a fait conclure à tort à
+une image obsolète du pilote le 2026-09-06). Le flux (`stream::WaveStream`, un seul type pour les deux sens, distingués par
 `cable::Direction`) n'a plus de timer : après chaque transition il appelle
 `Cable::refresh_timer` **hors de son propre verrou** (ordre câble → flux), et son `Drop`
 se contente de `Cable::detach` — le spin lock du câble garantit qu'au retour aucun tick ne
