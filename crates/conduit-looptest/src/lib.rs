@@ -12,6 +12,8 @@
 //! conduit-looptest --json --repeat 10   # sortie machine
 //! conduit-looptest --self-test          # test de l'outil, sans périphérique
 //! conduit-looptest --loopback           # capture en écho : le moteur délivre-t-il ?
+//! conduit-looptest --list --show-volume # les endpoints, volume et coupure compris
+//! conduit-looptest --set-volume 0.5 --unmute   # règle, affiche, et sort
 //! ```
 //!
 //! `--loopback` répond à l'autre moitié de la question. Au lieu d'ouvrir un
@@ -21,15 +23,24 @@
 //! cause et laisse le pilote seul suspect ; un écho silencieux fait l'inverse.
 //! C'est la première mesure à prendre quand une capture n'entend pas un rendu.
 //!
+//! **Le volume de l'endpoint est vérifié avant chaque mesure.** Un endpoint coupé
+//! ou à zéro rend la boucle muette, et ce silence-là est indiscernable d'un pilote
+//! en panne : l'outil le relève, le dit, et nomme l'option qui corrige
+//! (`--set-volume`, `--unmute`). Pour la même raison, le diagnostic d'une mesure
+//! sans signal imprime la **session Windows** du processus : dans la session des
+//! services (session 0), il n'y a pas d'audio d'utilisateur et la mesure n'a aucun
+//! sens.
+//!
 //! Codes de retour : `0` toutes les passes passent, `1` au moins une échoue,
 //! `2` l'environnement ne permet pas le test (endpoints absents, backend
 //! indisponible, options incohérentes, système autre que Windows).
 //!
 //! Organisation : [`analysis`] fait tout le calcul (sans plateforme, testé à
 //! fond), [`pass`] enchaîne préparation, découpe du préambule et verdict,
-//! [`report`] met en forme, `loopback` (Windows seulement, d'où le nom en code
-//! et non en lien : il ne se résoudrait pas ailleurs) pilote les vrais flux WASAPI
-//! par `conduit-backend-wasapi` — WASAPI n'est pas réécrit ici.
+//! [`report`] et [`volume`] mettent en forme (sans plateforme non plus : les
+//! messages comptent autant que la mesure), `loopback` (Windows seulement, d'où le
+//! nom en code et non en lien : il ne se résoudrait pas ailleurs) pilote les vrais
+//! flux WASAPI par `conduit-backend-wasapi` — WASAPI n'est pas réécrit ici.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -40,6 +51,7 @@ pub mod cli;
 pub mod loopback;
 pub mod pass;
 pub mod report;
+pub mod volume;
 
 use std::process::ExitCode;
 
@@ -110,7 +122,11 @@ impl Source<'_> {
 pub fn run(args: &cli::Args) -> Result<ExitCode, String> {
     let rate = args.validate()?;
     if args.list {
-        print!("{}", loopback::list()?);
+        print!("{}", loopback::list(args.show_volume)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    if args.adjusts_volume() {
+        print!("{}", loopback::adjust_volume(args)?);
         return Ok(ExitCode::SUCCESS);
     }
     if args.self_test {
@@ -128,6 +144,18 @@ pub fn run(args: &cli::Args) -> Result<ExitCode, String> {
     let mut session = loopback::Session::open(args, rate)?;
     if !args.json {
         println!("{}", session.description());
+    }
+    // Avant toute mesure : un endpoint coupé ou à zéro rend la boucle muette, et le
+    // silence qui en résulte est indiscernable d'un pilote en panne. L'avertissement
+    // part sur la sortie d'erreur, pour rester visible même en `--json`.
+    let levels = session.levels();
+    if args.show_volume && !args.json {
+        if let Some(block) = volume::levels_block(&levels) {
+            println!("{block}");
+        }
+    }
+    for warning in volume::warnings(&levels) {
+        eprintln!("{warning}");
     }
     if args.capture_disabled() {
         return play_only(args, &mut session);
@@ -147,10 +175,7 @@ fn run_passes(args: &cli::Args, mut source: Source<'_>) -> Result<ExitCode, Stri
         let recording = source.record(args)?;
         let pass = match pass::evaluate(index, &recording, &spec, &options, &tolerances, skip) {
             Ok(pass) => pass,
-            // En écho, l'absence de signal n'est pas un accident d'environnement :
-            // c'est **la** réponse que le mode sert à obtenir. On la commente.
-            Err(e) if args.loopback => return Err(format!("{e}\n\n{}", report::loopback_silent())),
-            Err(e) => return Err(e),
+            Err(e) => return Err(no_signal_report(args, &e)),
         };
         if !args.json {
             println!("{}", report::pass_lines(&pass, args.repeat));
@@ -178,6 +203,32 @@ fn run_passes(args: &cli::Args, mut source: Source<'_>) -> Result<ExitCode, Stri
     } else {
         ExitCode::from(EXIT_FAILED)
     })
+}
+
+/// Le message d'une passe inexploitable, augmenté de ce qui explique un silence.
+///
+/// Le diagnostic n'est joint qu'à une **absence de signal** : c'est le seul cas où
+/// la question « pourquoi rien ? » se pose. Un enregistrement trop court est un
+/// réglage à corriger, et une liste de causes possibles n'y ferait que du bruit.
+///
+/// S'y ajoutent, dans l'ordre où on les vérifie : la lecture de l'écho quand c'est
+/// lui qui n'a rien entendu, puis la **session Windows** — un test lancé dans la
+/// session des services n'a pas l'audio de l'utilisateur, et la mesure n'y a aucun
+/// sens. Le volume, lui, a déjà été relevé et signalé avant la passe.
+#[cfg(windows)]
+fn no_signal_report(args: &cli::Args, error: &pass::Unusable) -> String {
+    if !error.is_no_signal() {
+        return error.message().to_string();
+    }
+    let mut out = error.message().to_string();
+    if args.loopback {
+        out.push_str(&format!("\n\n{}", report::loopback_silent()));
+    }
+    out.push_str(&format!(
+        "\n\n{}",
+        report::session_note(conduit_backend_wasapi::current_session_id())
+    ));
+    out
 }
 
 /// `--no-capture` : on joue, on vérifie seulement que la lecture ne casse pas.

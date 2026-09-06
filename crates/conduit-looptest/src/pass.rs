@@ -31,13 +31,49 @@ pub struct Pass {
     pub verdict: Verdict,
 }
 
+/// Pourquoi une passe n'a pas pu être jugée : ce n'est pas un échec du pilote,
+/// mais un enregistrement inexploitable.
+///
+/// Le cas est **typé** et non un simple message, parce que l'appelant en fait deux
+/// choses différentes : [`Unusable::NoSignal`] est celui qui appelle un diagnostic
+/// (volume de l'endpoint, session Windows, écho), l'autre est une simple erreur de
+/// réglage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unusable {
+    /// Rien n'a été entendu du tout : la question devient « pourquoi ? ».
+    NoSignal(String),
+    /// Il ne reste pas assez de trames après la découpe du préambule.
+    TooShort(String),
+}
+
+impl Unusable {
+    /// Vrai pour [`Unusable::NoSignal`] : le cas qui mérite un diagnostic.
+    pub fn is_no_signal(&self) -> bool {
+        matches!(self, Self::NoSignal(_))
+    }
+
+    /// Le message destiné à l'utilisateur.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::NoSignal(message) | Self::TooShort(message) => message,
+        }
+    }
+}
+
+impl core::fmt::Display for Unusable {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for Unusable {}
+
 /// Découpe le préambule de `recording` puis analyse et juge.
 ///
 /// # Erreurs
 ///
-/// Rend un message en français si aucun signal n'a été trouvé ou s'il ne reste
-/// pas assez de trames : c'est un problème d'environnement, pas un échec du
-/// pilote.
+/// [`Unusable`] si aucun signal n'a été trouvé ou s'il ne reste pas assez de
+/// trames : c'est un problème d'environnement, pas un échec du pilote.
 pub fn evaluate(
     index: usize,
     recording: &[f32],
@@ -45,26 +81,26 @@ pub fn evaluate(
     options: &AnalysisOptions,
     tolerances: &Tolerances,
     skip_frames: usize,
-) -> Result<Pass, String> {
+) -> Result<Pass, Unusable> {
     let channels = spec.channels.max(1);
     let captured_frames = recording.len() / channels;
     let onset_level = (spec.amplitude * ONSET_RATIO).max(options.silence_threshold() * 4.0) as f32;
     let onset =
         analysis::first_signal_frame(recording, channels, onset_level).ok_or_else(|| {
-            format!(
+            Unusable::NoSignal(format!(
                 "passe {index} : aucun signal au-dessus de {} dans les {captured_frames} trames \
                  capturées — la capture n'entend pas le rendu (les deux endpoints sont-ils les \
-                 deux côtés du même câble ? volume de l'endpoint à zéro ?)",
+                 deux côtés du même câble ?)",
                 analysis::fr(f64::from(onset_level), 4)
-            )
+            ))
         })?;
     let start = onset + skip_frames;
     if captured_frames.saturating_sub(start) < MIN_ANALYSED_FRAMES {
-        return Err(format!(
+        return Err(Unusable::TooShort(format!(
             "passe {index} : {} trames utiles seulement après la découpe du préambule \
              ({start} jetées sur {captured_frames}) — allongez --seconds ou baissez --skip-ms",
             captured_frames.saturating_sub(start)
-        ));
+        )));
     }
     let region = &recording[start * channels..captured_frames * channels];
     let analysis = analysis::analyze_with(region, spec, options);
@@ -176,7 +212,8 @@ mod tests {
             4_800,
         )
         .expect_err("silence");
-        assert!(err.contains("aucun signal"), "{err}");
+        assert!(err.is_no_signal(), "{err:?}");
+        assert!(err.message().contains("aucun signal"), "{err}");
     }
 
     #[test]
@@ -192,7 +229,10 @@ mod tests {
             4_800,
         )
         .expect_err("trop court");
-        assert!(err.contains("trames utiles"), "{err}");
+        // Un enregistrement trop court est un réglage à corriger, pas un silence à
+        // diagnostiquer : la distinction décide de ce que l'outil imprime ensuite.
+        assert!(!err.is_no_signal(), "{err:?}");
+        assert!(err.message().contains("trames utiles"), "{err}");
     }
 
     #[test]

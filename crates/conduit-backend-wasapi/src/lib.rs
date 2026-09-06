@@ -40,6 +40,15 @@
 //! moteur hors de cause, un écho silencieux met le pilote hors de cause. L'écho
 //! n'existe qu'en mode partagé.
 //!
+//! Le **volume d'un endpoint** (module `volume`) est la quatrième chose que ce
+//! crate sait faire d'un `IMMDevice` : `EndpointVolumeControl` l'active en
+//! `IAudioEndpointVolume` et lit ou écrit le volume maître scalaire (0 à 1) et la
+//! coupure. Un volume nul ou un endpoint coupé explique à lui seul toute chaîne
+//! muette, écho compris : c'est la première hypothèse à écarter avant d'accuser le
+//! pilote. Le module `session` répond à la deuxième question de la même enquête —
+//! le processus tourne-t-il seulement dans une session qui a de l'audio ? Ni l'un
+//! ni l'autre n'entre dans le trait `Backend`, portable.
+//!
 //! Le **mode exclusif** (M1b-32, module `exclusive`) est un réglage du backend,
 //! `Never` par défaut : le flux prend alors le périphérique pour lui seul, au
 //! format que le matériel accepte — souvent de l'entier, que le fil du flux
@@ -98,7 +107,11 @@ mod notify;
 #[cfg(windows)]
 mod open;
 #[cfg(windows)]
+mod session;
+#[cfg(windows)]
 mod stream;
+#[cfg(windows)]
+mod volume;
 
 #[cfg(windows)]
 pub use backend::WasapiBackend;
@@ -113,4 +126,8 @@ pub use exclusive::{aligned_period_hns, ExclusivePolicy, ShareMode};
 #[cfg(windows)]
 pub use open::{choose_period, EnginePeriods, InitPath, StreamLatency};
 #[cfg(windows)]
+pub use session::{current_session_id, SERVICES_SESSION};
+#[cfg(windows)]
 pub use stream::{ClockStats, WasapiHandle};
+#[cfg(windows)]
+pub use volume::{EndpointVolume, EndpointVolumeControl};

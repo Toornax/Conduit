@@ -37,6 +37,36 @@ fn liste_les_endpoints() {
     assert!(out.contains("endpoint(s) actif(s)"), "{out}");
 }
 
+/// `--list --show-volume` ne change **rien** : il ne fait que lire.
+#[test]
+fn liste_les_volumes_sans_rien_changer() {
+    let (code, out, err) = run(&["--list", "--show-volume"]);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("endpoint(s) actif(s)"), "{out}");
+    // Sur une machine sans aucune carte, il n'y a rien à décrire : on n'exige la
+    // ligne de volume que s'il y a au moins un endpoint.
+    if out.contains("      id ") {
+        assert!(out.contains("      volume "), "{out}");
+    }
+}
+
+/// Aucun test ne doit **écrire** un volume sur la machine qui lance la suite : les
+/// réglages ne sont éprouvés que par leurs refus. L'écriture est testée là où elle
+/// peut être restaurée, dans `conduit-backend-wasapi/tests/volume.rs`.
+#[test]
+fn un_volume_hors_bornes_donne_le_code_environnement() {
+    let (code, _, err) = run(&["--set-volume=1.5"]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("--set-volume"), "{err}");
+}
+
+#[test]
+fn regler_le_volume_sans_endpoint_est_refuse() {
+    let (code, _, err) = run(&["--self-test", "--unmute"]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("--self-test"), "{err}");
+}
+
 #[test]
 fn self_test_passe() {
     let (code, out, err) = run(&["--self-test", "--seconds", "1"]);
