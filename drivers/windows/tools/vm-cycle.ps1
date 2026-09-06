@@ -174,20 +174,39 @@ try {
     Set-StrictMode -Version Latest
     $ErrorActionPreference = "Stop"
     . ([scriptblock]::Create($Helpers))
-    $cer = Join-Path $GuestDir "package\WDRLocalTestCert.cer"
-    foreach ($store in @("Root", "TrustedPublisher")) {
-      Import-Certificate -FilePath $cer -CertStoreLocation "Cert:\LocalMachine\$store" | Out-Null
-    }
-    # Restes d'une exécution interrompue : périphériques Root\ConduitCable, paquets oemN.inf.
-    $leftovers = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.HardwareID -contains $HardwareId })
-    foreach ($dev in $leftovers) {
-      Write-Host "  retrait du périphérique restant $($dev.InstanceId)"
-      Invoke-NativeChecked pnputil @("/remove-device", $dev.InstanceId) | Out-Null
-    }
-    $enum = Invoke-NativeChecked pnputil @("/enum-drivers")
-    foreach ($oem in @(Find-PublishedInf -Output $enum -OriginalName $InfName)) {
-      Write-Host "  suppression du paquet restant $oem"
-      Invoke-NativeChecked pnputil @("/delete-driver", $oem, "/uninstall", "/force") | Out-Null
+    # Chaque étape annonce ce qu'elle tente : un refus d'accès nu, sans nom d'opération,
+    # est ininterprétable à distance (constaté le 2026-09-06).
+    $etape = "import du certificat de test"
+    try {
+      $cer = Join-Path $GuestDir "package\WDRLocalTestCert.cer"
+      # `certutil -addstore`, pas `Import-Certificate` : sur une machine neuve le magasin
+      # TrustedPublisher n'existe pas encore (aucun éditeur jamais approuvé) et le
+      # fournisseur Cert: échoue alors en « accès refusé » au lieu de le créer, tandis que
+      # Root, lui, existe toujours et passe. Vérifié dans la VM le 2026-09-06 :
+      # Root OK / TrustedPublisher UnauthorizedAccessException, en session pourtant élevée.
+      # certutil crée le magasin au besoin ; c'est aussi la méthode de la documentation WDK.
+      foreach ($store in @("Root", "TrustedPublisher")) {
+        $etape = "import du certificat de test dans $store"
+        Invoke-NativeChecked certutil @("-addstore", "-f", $store, $cer) | Out-Null
+      }
+
+      # Restes d'une exécution interrompue : périphériques Root\ConduitCable, paquets oemN.inf.
+      $etape = "inventaire des périphériques restants"
+      $leftovers = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.HardwareID -contains $HardwareId })
+      foreach ($dev in $leftovers) {
+        Write-Host "  retrait du périphérique restant $($dev.InstanceId)"
+        $etape = "retrait du périphérique restant $($dev.InstanceId)"
+        Invoke-NativeChecked pnputil @("/remove-device", $dev.InstanceId) | Out-Null
+      }
+      $etape = "inventaire des paquets de pilote publiés"
+      $enum = Invoke-NativeChecked pnputil @("/enum-drivers")
+      foreach ($oem in @(Find-PublishedInf -Output $enum -OriginalName $InfName)) {
+        Write-Host "  suppression du paquet restant $oem"
+        $etape = "suppression du paquet restant $oem"
+        Invoke-NativeChecked pnputil @("/delete-driver", $oem, "/uninstall", "/force") | Out-Null
+      }
+    } catch {
+      throw "Préparation de l'invité, échec pendant « $etape » : $($_.Exception.Message)"
     }
   }
 
