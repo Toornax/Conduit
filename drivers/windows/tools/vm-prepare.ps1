@@ -167,6 +167,11 @@ try {
   $state = Invoke-Command -Session $session -ScriptBlock {
     (bcdedit /enum "{current}" | Out-String)
   }
+  # « Yes » et non « Oui » : bcdedit traduit ses en-têtes et la description de l'entrée,
+  # mais **pas** les noms d'éléments ni les valeurs booléennes. Vérifié le 2026-09-06 sur
+  # la VM ConduitTest, installée en français (`locale fr-FR`), qui rend bien
+  # « testsigning             Yes ». Ce n'est donc pas une exception à la règle du dépôt
+  # sur les textes traduits : ne pas « corriger » ce motif sans le remesurer.
   if ($state -notmatch "testsigning\s+Yes") {
     throw "testsigning n'est pas actif après redémarrage (Secure Boot encore actif ?) :`n$state"
   }
