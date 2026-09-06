@@ -15,14 +15,18 @@ publish = false
 [dependencies]
 conduit-com = { path = "../../../crates/conduit-com" }
 portcls-sys = { path = "../portcls-sys", features = ["com"] }
+# Uniquement pour `wdk::println!` (→ `DbgPrint`) de la macro de trace `pc_log!` : lie le
+# noyau, donc réservé à la feature `kernel` (le crate se teste en mode utilisateur).
+wdk = { workspace = true, optional = true }
 
 # `kernel` : enveloppes des fonctions `Pc*` de `portcls.sys` (`adapter::new_port`,
 # `register_subdevice`, `register_physical_connection`), symboles que seul le pilote lie
-# (`conduit-kmd/build.rs`). Activée par `conduit-kmd` ; hors feature, le crate reste
-# testable en mode utilisateur sans symbole non résolu.
+# (`conduit-kmd/build.rs`), et traces de débogage (`pc_log!`, actives seulement en profil
+# `dev`). Activée par `conduit-kmd` ; hors feature, le crate reste testable en mode
+# utilisateur sans symbole non résolu.
 [features]
 default = []
-kernel = []
+kernel = ["dep:wdk"]
 
 [lints]
 workspace = true

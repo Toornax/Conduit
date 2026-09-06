@@ -48,6 +48,8 @@ macro_rules! interfaces_com {
                 ("IMiniportWaveRTVtbl", 8),
                 ("IMiniportWaveRTStreamVtbl", 11),
                 ("IMiniportWaveRTStreamNotificationVtbl", 15),
+                ("IMiniportWaveRTInputStreamVtbl", 4),
+                ("IMiniportWaveRTOutputStreamVtbl", 6),
                 ("IMiniportTopologyVtbl", 6),
                 ("IAdapterPowerManagementVtbl", 6),
                 ("IPortVtbl", 6),
@@ -72,6 +74,8 @@ interfaces_com! {
     IMiniportWaveRT / IMiniportWaveRTVtbl,
     IMiniportWaveRTStream / IMiniportWaveRTStreamVtbl,
     IMiniportWaveRTStreamNotification / IMiniportWaveRTStreamNotificationVtbl,
+    IMiniportWaveRTInputStream / IMiniportWaveRTInputStreamVtbl,
+    IMiniportWaveRTOutputStream / IMiniportWaveRTOutputStreamVtbl,
     IMiniportTopology / IMiniportTopologyVtbl,
     IAdapterPowerManagement / IAdapterPowerManagementVtbl,
     IPort / IPortVtbl,
@@ -207,6 +211,85 @@ fn ordre_des_slots_iminiportwavertstream() {
         size_of::<IMiniportWaveRTStreamNotificationVtbl>(),
         15 * SLOT
     );
+}
+
+/// Ordre des slots du **mode paquets** (`portcls.h` 26100, sous `NTDDI_WINTHRESHOLD`).
+///
+/// `IMiniportWaveRTInputStream` dérive de `IUnknown` seul : trois slots hérités puis
+/// `GetReadPacket(ULONG *PacketNumber, DWORD *Flags, ULONG64 *PerformanceCounterValue,
+/// BOOL *MoreData)`, soit quatre slots en tout.
+///
+/// `IMiniportWaveRTOutputStream` dérive elle aussi de `IUnknown` seul : trois slots
+/// hérités puis `SetWritePacket(ULONG PacketNumber, DWORD Flags, ULONG EosPacketLength)`,
+/// `GetOutputStreamPresentationPosition(KSAUDIO_PRESENTATION_POSITION *)` et
+/// `GetPacketCount(ULONG *)`, soit six slots.
+///
+/// Ni l'une ni l'autre n'est une extension de `IMiniportWaveRTStream` : leur slot 3 n'est
+/// pas `SetFormat`. Un flux qui répond aux deux familles a donc plusieurs vtables
+/// (`portcls::packet`).
+#[test]
+fn ordre_des_slots_du_mode_paquets() {
+    let entree = [
+        (
+            "QueryInterface",
+            offset_of!(IMiniportWaveRTInputStreamVtbl, QueryInterface),
+        ),
+        ("AddRef", offset_of!(IMiniportWaveRTInputStreamVtbl, AddRef)),
+        (
+            "Release",
+            offset_of!(IMiniportWaveRTInputStreamVtbl, Release),
+        ),
+        (
+            "GetReadPacket",
+            offset_of!(IMiniportWaveRTInputStreamVtbl, GetReadPacket),
+        ),
+    ];
+    for (i, (nom, offset)) in entree.iter().enumerate() {
+        assert_eq!(*offset, i * SLOT, "slot {i} = {nom}");
+    }
+    assert_eq!(size_of::<IMiniportWaveRTInputStreamVtbl>(), 4 * SLOT);
+
+    let sortie = [
+        (
+            "QueryInterface",
+            offset_of!(IMiniportWaveRTOutputStreamVtbl, QueryInterface),
+        ),
+        (
+            "AddRef",
+            offset_of!(IMiniportWaveRTOutputStreamVtbl, AddRef),
+        ),
+        (
+            "Release",
+            offset_of!(IMiniportWaveRTOutputStreamVtbl, Release),
+        ),
+        (
+            "SetWritePacket",
+            offset_of!(IMiniportWaveRTOutputStreamVtbl, SetWritePacket),
+        ),
+        (
+            "GetOutputStreamPresentationPosition",
+            offset_of!(
+                IMiniportWaveRTOutputStreamVtbl,
+                GetOutputStreamPresentationPosition
+            ),
+        ),
+        (
+            "GetPacketCount",
+            offset_of!(IMiniportWaveRTOutputStreamVtbl, GetPacketCount),
+        ),
+    ];
+    for (i, (nom, offset)) in sortie.iter().enumerate() {
+        assert_eq!(*offset, i * SLOT, "slot {i} = {nom}");
+    }
+    assert_eq!(size_of::<IMiniportWaveRTOutputStreamVtbl>(), 6 * SLOT);
+
+    // `KSAUDIO_PRESENTATION_POSITION` : deux `UINT64` (position en blocs, QPC).
+    assert_eq!(size_of::<KSAUDIO_PRESENTATION_POSITION>(), 16);
+    assert_eq!(
+        offset_of!(KSAUDIO_PRESENTATION_POSITION, u64PositionInBlocks),
+        0
+    );
+    assert_eq!(offset_of!(KSAUDIO_PRESENTATION_POSITION, u64QPCPosition), 8);
 }
 
 /// `IPortClsVersion` corrigé à la main (`fixups`) : `GetVersion` au slot 3.

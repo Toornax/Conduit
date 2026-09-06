@@ -24,14 +24,17 @@ use conduit_com::{ComInterface, ComVtable, Guid, IID_IUNKNOWN};
 
 use crate::{
     GUID, IAdapterPowerManagement, IAdapterPowerManagementVtbl, IID_IAdapterPowerManagement,
-    IID_IMiniport, IID_IMiniportTopology, IID_IMiniportWaveRT, IID_IMiniportWaveRTStream,
+    IID_IMiniport, IID_IMiniportTopology, IID_IMiniportWaveRT, IID_IMiniportWaveRTInputStream,
+    IID_IMiniportWaveRTOutputStream, IID_IMiniportWaveRTStream,
     IID_IMiniportWaveRTStreamNotification, IID_IPort, IID_IPortTopology, IID_IPortWaveRT,
     IID_IPortWaveRTStream, IID_IRegistryKey, IID_IResourceList, IMiniport, IMiniportTopology,
-    IMiniportTopologyVtbl, IMiniportVtbl, IMiniportWaveRT, IMiniportWaveRTStream,
-    IMiniportWaveRTStreamNotification, IMiniportWaveRTStreamNotificationVtbl,
-    IMiniportWaveRTStreamVtbl, IMiniportWaveRTVtbl, IPort, IPortTopology, IPortTopologyVtbl,
-    IPortVtbl, IPortWaveRT, IPortWaveRTStream, IPortWaveRTStreamVtbl, IPortWaveRTVtbl,
-    IRegistryKey, IRegistryKeyVtbl, IResourceList, IResourceListVtbl, IUnknown, IUnknownVtbl,
+    IMiniportTopologyVtbl, IMiniportVtbl, IMiniportWaveRT, IMiniportWaveRTInputStream,
+    IMiniportWaveRTInputStreamVtbl, IMiniportWaveRTOutputStream, IMiniportWaveRTOutputStreamVtbl,
+    IMiniportWaveRTStream, IMiniportWaveRTStreamNotification,
+    IMiniportWaveRTStreamNotificationVtbl, IMiniportWaveRTStreamVtbl, IMiniportWaveRTVtbl, IPort,
+    IPortTopology, IPortTopologyVtbl, IPortVtbl, IPortWaveRT, IPortWaveRTStream,
+    IPortWaveRTStreamVtbl, IPortWaveRTVtbl, IRegistryKey, IRegistryKeyVtbl, IResourceList,
+    IResourceListVtbl, IUnknown, IUnknownVtbl,
 };
 
 /// `GUID` généré → `conduit_com::Guid`, champ par champ (`const`, pour les tables `IIDS`).
@@ -91,6 +94,18 @@ interface_com!(IMiniportWaveRTStream / IMiniportWaveRTStreamVtbl : IID_IMiniport
 interface_com!(
     IMiniportWaveRTStreamNotification / IMiniportWaveRTStreamNotificationVtbl :
     IID_IMiniportWaveRTStreamNotification [IID_IMiniportWaveRTStream]
+);
+// Mode paquets (Windows 10 1507 et suivants, `NTDDI_WINTHRESHOLD`) : deux interfaces
+// **indépendantes**, dérivées de `IUnknown` seul et non de `IMiniportWaveRTStream` (leur
+// vtable n'en est pas une extension : slot 3 = `GetReadPacket` / `SetWritePacket`). Un
+// flux qui les expose est donc un objet à plusieurs vtables (`portcls::packet`).
+interface_com!(
+    IMiniportWaveRTInputStream / IMiniportWaveRTInputStreamVtbl :
+    IID_IMiniportWaveRTInputStream []
+);
+interface_com!(
+    IMiniportWaveRTOutputStream / IMiniportWaveRTOutputStreamVtbl :
+    IID_IMiniportWaveRTOutputStream []
 );
 interface_com!(
     IAdapterPowerManagement / IAdapterPowerManagementVtbl : IID_IAdapterPowerManagement []
