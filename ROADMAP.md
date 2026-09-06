@@ -537,7 +537,7 @@ testée d'abord avec le backend null, puis sur Windows.
   *Fait quand* : tests de réduction d'état pour chaque événement.
 - [x] **M2-03** `feat(gui): vue Câbles (liste, ajouter, supprimer, renommer, canaux)`
   *Fait quand* : chaque action passe par l'IPC et se reflète dans l'OS (F-01, F-02, F-03).
-- [ ] **M2-04** `feat(gui): patchbay, rendu des nœuds et ports`
+- [x] **M2-04** `feat(gui): patchbay, rendu des nœuds et ports`
   Canvas `iced`, disposition automatique, positions mémorisées.
 - [ ] **M2-05** `feat(gui): patchbay, liens par glisser-déposer et suppression`
   *Fait quand* : lien créé/supprimé via IPC ; cycle refusé avec message (F-11, F-12).

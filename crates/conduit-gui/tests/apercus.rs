@@ -20,8 +20,9 @@
 
 use std::path::PathBuf;
 
-use conduit_backend::{CableId, CableInfo, DeviceId};
+use conduit_backend::{CableId, CableInfo, DeviceDirection, DeviceId, DeviceInfo};
 use conduit_core::graph::NodeId;
+use conduit_core::node::PortSpec;
 use conduit_core::types::{ChannelCount, Db, Quantum, SampleRate};
 use conduit_protocol::api::NodeKey;
 use conduit_protocol::{
@@ -49,19 +50,55 @@ fn cable(id: u32, nom: &str, canaux: u8, actif: bool) -> CableInfo {
     }
 }
 
-/// Un nœud de démonstration.
-fn noeud(index: u32, nom: &str, etat: NodeState) -> NodeDescriptor {
+/// Un nœud interne de démonstration : ni périphérique, ni câble.
+fn noeud(index: u32, nom: &str, entrees: usize, sorties: usize) -> NodeDescriptor {
     NodeDescriptor {
         id: NodeId::new(index, 0),
         key: NodeKey::Internal { name: nom.into() },
         label: nom.into(),
         type_name: "null".into(),
-        inputs: vec![],
-        outputs: vec![],
-        state: etat,
+        inputs: PortSpec::layout(entrees),
+        outputs: PortSpec::layout(sorties),
+        state: NodeState::Internal,
         gain_db: Db::UNITY,
         muted: false,
         device: None,
+    }
+}
+
+/// Un nœud adossé à un périphérique du système ; `cable` en fait un côté d'un
+/// câble Conduit.
+fn peripherique(
+    index: u32,
+    nom: &str,
+    entrees: usize,
+    sorties: usize,
+    etat: NodeState,
+    cable: Option<u32>,
+) -> NodeDescriptor {
+    let id = DeviceId::new(format!("null:{}", nom.to_lowercase().replace(' ', "-")));
+    NodeDescriptor {
+        key: NodeKey::Device {
+            backend: "null".into(),
+            id: id.clone(),
+        },
+        state: etat,
+        device: Some(DeviceInfo {
+            id,
+            name: nom.into(),
+            direction: if entrees == 0 {
+                DeviceDirection::Capture
+            } else {
+                DeviceDirection::Render
+            },
+            channels: entrees.max(sorties),
+            sample_rate: SampleRate::HZ_48000,
+            sample_rates: vec![],
+            default_block: 480,
+            is_default: false,
+            cable: cable.map(CableId),
+        }),
+        ..noeud(index, nom, entrees, sorties)
     }
 }
 
@@ -74,7 +111,7 @@ fn chargement() -> Snapshot {
             quantum: Quantum::DEFAULT,
             driver: DriverStatus::Internal,
             driver_choice: DriverChoice::Auto,
-            nodes: 4,
+            nodes: 7,
             links: 0,
             timing: TimingSnapshot::default(),
             xruns: 0,
@@ -82,9 +119,16 @@ fn chargement() -> Snapshot {
             position: 48_000 * 3_600 * 3,
             cycles: 0,
         },
+        // Représentatif de ce qu'une carte peut être : les cinq étiquettes,
+        // les trois colonnes de rôle, un nœud sans entrée et un sans sortie.
         nodes: vec![
-            noeud(0, "Conduit 1", NodeState::Active),
-            noeud(1, "Conduit 2", NodeState::Active),
+            noeud(0, "Lecteur de musique", 0, 2),
+            peripherique(1, "Micro USB", 0, 1, NodeState::Active, None),
+            peripherique(2, "Conduit 1", 2, 2, NodeState::Active, Some(1)),
+            peripherique(3, "Conduit 2", 1, 1, NodeState::Active, Some(2)),
+            noeud(4, "Visioconférence", 2, 2),
+            peripherique(5, "Haut-parleurs", 2, 0, NodeState::Driver, None),
+            peripherique(6, "Interface Scarlett", 2, 2, NodeState::Suspended, None),
         ],
         links: vec![],
         // Représentatif des états qu'une ligne peut prendre : alias donné ou

@@ -13,12 +13,12 @@ use iced::{Element, Subscription, Task};
 
 use conduit_protocol::{Command, Notification};
 
-use crate::cables;
 use crate::i18n::{self, Text};
 use crate::ipc::{self, Requester};
 use crate::model::Mirror;
+use crate::preferences::Preferences;
 use crate::shell::{self, Tab};
-use crate::{theme, typo};
+use crate::{cables, patchbay, theme, typo};
 
 /// État de la connexion au démon.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -150,6 +150,15 @@ pub enum Message {
     CommitAlias,
     /// Change les canaux d'un câble (`CableSetChannels`).
     SetChannels(CableId, ChannelCount),
+    /// Geste de déplacement d'une carte du patchbay.
+    ///
+    /// Aucune commande n'en découle : la position d'une carte est un réglage
+    /// local d'affichage, elle ne passe pas par le protocole.
+    Patchbay(patchbay::Geste),
+    /// Préférences lues au démarrage.
+    Preferences(Box<Preferences>),
+    /// Écriture des préférences terminée ; son résultat n'a rien à annoncer.
+    PreferencesEcrites,
     /// Mode clair ou sombre annoncé par le système, au démarrage puis à chaque
     /// changement.
     ThemeSysteme(iced::theme::Mode),
@@ -164,6 +173,7 @@ pub struct App {
     mirror: Mirror,
     tab: Tab,
     cables: cables::State,
+    patchbay: patchbay::State,
     notice: Option<Notice>,
     attente: Option<Attente>,
     generation: u32,
@@ -180,6 +190,7 @@ impl App {
             mirror: Mirror::default(),
             tab: Tab::default(),
             cables: cables::State::default(),
+            patchbay: patchbay::State::default(),
             notice: None,
             attente: None,
             generation: 0,
@@ -187,12 +198,20 @@ impl App {
         }
     }
 
-    /// Construit l'état initial et la tâche de démarrage : demander au système
-    /// son mode clair ou sombre.
+    /// Construit l'état initial et les tâches de démarrage : demander au
+    /// système son mode clair ou sombre, et relire les préférences.
+    ///
+    /// La lecture du fichier est faite dans une tâche : `new` reste pur, et
+    /// les tests n'ouvrent jamais le fichier de l'utilisateur.
     pub fn boot(socket: PathBuf) -> (Self, Task<Message>) {
         (
             Self::new(socket),
-            iced::system::theme().map(Message::ThemeSysteme),
+            Task::batch([
+                iced::system::theme().map(Message::ThemeSysteme),
+                Task::perform(lire_les_preferences(), |preferences| {
+                    Message::Preferences(Box::new(preferences))
+                }),
+            ]),
         )
     }
 
@@ -219,6 +238,11 @@ impl App {
     /// État d'édition de la vue Câbles.
     pub fn cables(&self) -> &cables::State {
         &self.cables
+    }
+
+    /// État d'affichage de la vue Patchbay.
+    pub fn patchbay(&self) -> &patchbay::State {
+        &self.patchbay
     }
 
     /// Notice affichée sous l'en-tête, s'il y en a une.
@@ -319,9 +343,38 @@ impl App {
                 )));
                 return self.minuteur();
             }
+            Message::Patchbay(geste) => {
+                // Le geste se réduit contre la disposition courante : c'est
+                // elle qui dit où la carte saisie se trouvait.
+                let placements = patchbay::disposer(&self.mirror.nodes, &self.patchbay.positions);
+                if self.patchbay.reduire(geste, &placements) {
+                    return self.enregistrer_preferences();
+                }
+            }
+            Message::Preferences(preferences) => {
+                // Les positions lues ne remplacent pas celles d'un
+                // déplacement déjà commencé : la lecture arrive au démarrage,
+                // avant tout geste.
+                if self.patchbay.positions.is_empty() {
+                    self.patchbay.positions = preferences.patchbay;
+                }
+            }
+            Message::PreferencesEcrites => {}
             Message::ThemeSysteme(mode) => self.mode = mode,
         }
         Task::none()
+    }
+
+    /// Écrit les positions du patchbay hors du fil de l'interface.
+    ///
+    /// `update` ne touche jamais au disque : l'écriture part dans une tâche,
+    /// et son résultat n'est rien à annoncer — une écriture manquée fait
+    /// seulement repartir la disposition automatiquement.
+    fn enregistrer_preferences(&self) -> Task<Message> {
+        let positions = self.patchbay.positions.clone();
+        Task::perform(ecrire_les_preferences(positions), |()| {
+            Message::PreferencesEcrites
+        })
     }
 
     /// Envoie l'alias en cours de saisie, s'il en vaut la peine.
@@ -441,7 +494,7 @@ impl App {
                 )),
                 cables::view(&self.mirror, &self.cables, enabled, graisse),
             ),
-            Tab::Patchbay => (None, shell::a_venir(Text::PatchbaySoon, graisse)),
+            Tab::Patchbay => (None, patchbay::view(&self.mirror, &self.patchbay, graisse)),
             Tab::Diagnostic => (None, shell::a_venir(Text::DiagnosticSoon, graisse)),
         };
         shell::fenetre(
@@ -463,6 +516,24 @@ impl App {
 /// la tâche sans l'exécuter.
 async fn attendre_la_notice() {
     tokio::time::sleep(DUREE_NOTICE).await;
+}
+
+/// Lit le fichier de préférences hors du fil de l'interface.
+async fn lire_les_preferences() -> Preferences {
+    tokio::task::spawn_blocking(crate::preferences::lire)
+        .await
+        .unwrap_or_default()
+}
+
+/// Écrit le fichier de préférences hors du fil de l'interface.
+///
+/// L'échec n'est pas une erreur d'interface : il est journalisé et oublié.
+async fn ecrire_les_preferences(positions: patchbay::Positions) {
+    let ecriture =
+        tokio::task::spawn_blocking(move || crate::preferences::ecrire(&positions)).await;
+    if let Ok(Err(erreur)) = ecriture {
+        tracing::warn!(%erreur, "préférences d'interface non écrites");
+    }
 }
 
 /// Puits d'événements de la `Subscription` d'`iced`.
@@ -795,6 +866,59 @@ mod tests {
         assert_eq!(a.socket(), &socket);
         assert_eq!(*a.connection(), Connection::Starting);
         assert_eq!(a.mode(), iced::theme::Mode::None);
+    }
+
+    /// Déplacer une carte du patchbay est un réglage local : aucune commande
+    /// ne part, seule la position retenue change.
+    #[test]
+    fn moving_a_patchbay_card_sends_no_command() {
+        let (mut a, mut rx) = connected();
+        let cle = a.mirror().nodes[0].key.to_string();
+        let placements = patchbay::disposer(&a.mirror().nodes, &a.patchbay().positions);
+        let depart = placements[0].position;
+
+        let _ = a.update(Message::Patchbay(patchbay::Geste::Saisi(cle.clone())));
+        let _ = a.update(Message::Patchbay(patchbay::Geste::Deplace(depart)));
+        let _ = a.update(Message::Patchbay(patchbay::Geste::Deplace(
+            depart + iced::Vector::new(60.0, 20.0),
+        )));
+        assert_eq!(
+            a.patchbay().positions.get(&cle),
+            Some(depart + iced::Vector::new(60.0, 20.0))
+        );
+        let _ = a.update(Message::Patchbay(patchbay::Geste::Relache));
+        assert!(!a.patchbay().deplacement());
+        assert!(
+            rx.try_recv().is_err(),
+            "le patchbay n'envoie aucune commande"
+        );
+    }
+
+    /// Les préférences lues au démarrage garnissent le patchbay, mais
+    /// n'écrasent pas un déplacement déjà fait.
+    #[test]
+    fn the_preferences_seed_the_patchbay_without_overwriting_it() {
+        let (mut a, _rx) = connected();
+        let mut positions = patchbay::Positions::default();
+        positions.set("internal:a", iced::Point::new(12.0, 34.0));
+        let _ = a.update(Message::Preferences(Box::new(Preferences {
+            patchbay: positions,
+        })));
+        assert_eq!(
+            a.patchbay().positions.get("internal:a"),
+            Some(iced::Point::new(12.0, 34.0))
+        );
+        // Une seconde lecture — la fenêtre a déjà des positions — ne remplace
+        // rien.
+        let mut tardives = patchbay::Positions::default();
+        tardives.set("internal:a", iced::Point::new(0.0, 0.0));
+        let _ = a.update(Message::Preferences(Box::new(Preferences {
+            patchbay: tardives,
+        })));
+        assert_eq!(
+            a.patchbay().positions.get("internal:a"),
+            Some(iced::Point::new(12.0, 34.0))
+        );
     }
 
     #[test]

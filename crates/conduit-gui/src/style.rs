@@ -289,6 +289,41 @@ pub fn ligne(theme: &Theme) -> container::Style {
     }
 }
 
+/// Zone bordée : un simple filet de contour au rayon commun, sans fond.
+///
+/// Elle délimite une aire de travail — la scène du patchbay — sans la poser
+/// sur une surface : les cartes qui s'y promènent, elles, sont posées.
+pub fn zone(theme: &Theme) -> container::Style {
+    container::Style {
+        border: filet_de(jetons(theme).contour),
+        ..container::Style::default()
+    }
+}
+
+/// Opacité d'une carte de nœud suspendu : le nœud existe encore, ses liens
+/// aussi, mais son périphérique est absent — la carte s'efface sans
+/// disparaître.
+pub const OPACITE_SUSPENDU: f32 = 0.5;
+
+/// Carte d'un nœud du patchbay : la surface posée de [`carte`], cernée d'un
+/// filet **d'or** quand le nœud pilote le graphe.
+///
+/// `opacite` voile l'ensemble — fond, filet et texte — pour un nœud suspendu
+/// ([`OPACITE_SUSPENDU`]) ; elle vaut 1 partout ailleurs. `iced` n'a pas de
+/// widget d'opacité : le voile se fait donc dans les couleurs.
+pub fn carte_noeud(pilote: bool, opacite: f32) -> impl Fn(&Theme) -> container::Style {
+    move |theme| {
+        let j = jetons(theme);
+        let filet = if pilote { j.or } else { j.contour };
+        container::Style {
+            text_color: Some(opacifier(j.texte, opacite)),
+            background: Some(fond(opacifier(j.surface_2, opacite))),
+            border: filet_de(opacifier(filet, opacite)),
+            ..container::Style::default()
+        }
+    }
+}
+
 /// Rayon d'une barre de niveau : la seule exception au rayon commun, une
 /// barre de 4 px de haut ne peut pas porter un rayon de 8.
 pub const RAYON_BARRE: f32 = 2.0;
@@ -337,7 +372,16 @@ pub fn pastille(couleur: Color) -> impl Fn(&Theme) -> container::Style {
 /// Sert aux états qui n'ont pas de matière invariante : l'état inactif d'un
 /// câble, par exemple, prend le texte secondaire du mode.
 pub fn pastille_de(choix: fn(&Jetons) -> Color) -> impl Fn(&Theme) -> container::Style {
-    move |theme| pastille(choix(jetons(theme)))(theme)
+    pastille_voilee(choix, 1.0)
+}
+
+/// Pastille des jetons du mode, voilée du même facteur que la carte qui la
+/// porte (voir [`carte_noeud`]).
+pub fn pastille_voilee(
+    choix: fn(&Jetons) -> Color,
+    opacite: f32,
+) -> impl Fn(&Theme) -> container::Style {
+    move |theme| pastille(opacifier(choix(jetons(theme)), opacite))(theme)
 }
 
 // --- Encres -----------------------------------------------------------------
@@ -348,8 +392,14 @@ pub fn pastille_de(choix: fn(&Jetons) -> Color) -> impl Fn(&Theme) -> container:
 /// `text(…).style(`[`texte_en`]`(|j| j.titre))` suit donc le mode sans que la
 /// vue ait à le lire.
 pub fn texte_en(choix: fn(&Jetons) -> Color) -> impl Fn(&Theme) -> text::Style {
+    texte_voile(choix, 1.0)
+}
+
+/// Couleur d'un texte, voilée du même facteur que la carte qui le porte (voir
+/// [`carte_noeud`]).
+pub fn texte_voile(choix: fn(&Jetons) -> Color, opacite: f32) -> impl Fn(&Theme) -> text::Style {
     move |theme| text::Style {
-        color: Some(choix(jetons(theme))),
+        color: Some(opacifier(choix(jetons(theme)), opacite)),
     }
 }
 
@@ -359,8 +409,17 @@ pub fn texte_en(choix: fn(&Jetons) -> Color) -> impl Fn(&Theme) -> text::Style {
 /// une `Row` de `text` qui ne portent pas de couleur, et un conteneur la leur
 /// donne (`iced` propage `text_color` à ce qu'il contient).
 pub fn encre_de(choix: fn(&Jetons) -> Color) -> impl Fn(&Theme) -> container::Style {
+    encre_voilee(choix, 1.0)
+}
+
+/// Conteneur qui n'impose qu'une couleur de texte, voilée du même facteur que
+/// la carte qui le porte (voir [`carte_noeud`]).
+pub fn encre_voilee(
+    choix: fn(&Jetons) -> Color,
+    opacite: f32,
+) -> impl Fn(&Theme) -> container::Style {
     move |theme| container::Style {
-        text_color: Some(choix(jetons(theme))),
+        text_color: Some(opacifier(choix(jetons(theme)), opacite)),
         ..container::Style::default()
     }
 }
@@ -616,6 +675,15 @@ mod tests {
             couples.push(("menu", menu.text_color, f));
             couples.push(("menu_selection", menu.selected_text_color, f));
         }
+        // La carte d'un nœud du patchbay : son libellé, son étiquette d'état
+        // et le nom de ses ports se lisent sur la surface posée.
+        for (quoi, encre) in [
+            ("noeud.titre", j.titre),
+            ("noeud.etiquette", j.accent_texte),
+            ("noeud.port", j.texte_2_carte),
+        ] {
+            couples.push((quoi, encre, j.surface_2));
+        }
         // Le champ d'alias vit dans une ligne, donc sur une surface posée.
         let champ = champ_nu(theme, text_input::Status::Active);
         couples.push(("champ.valeur", champ.value, j.surface_2));
@@ -688,6 +756,8 @@ mod tests {
                 barre_rail(&theme),
                 barre_remplie(&theme),
                 notice_info(&theme),
+                carte_noeud(false, 1.0)(&theme),
+                carte_noeud(true, OPACITE_SUSPENDU)(&theme),
             ] {
                 assert_eq!(style.shadow, Shadow::default());
                 assert!(matches!(

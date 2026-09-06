@@ -65,8 +65,6 @@ textes! {
     TabCables => "tab.cables", "Câbles";
     TabPatchbay => "tab.patchbay", "Patchbay";
     TabDiagnostic => "tab.diagnostic", "Diagnostic";
-    PatchbaySoon => "tab.patchbay.soon",
-        "Le patchbay arrive au prochain jalon : nœuds, ports et liens par glisser-déposer.";
     DiagnosticSoon => "tab.diagnostic.soon",
         "La page de diagnostic arrive plus tard : xruns, latence, pilote et export de rapport.";
 
@@ -90,6 +88,15 @@ textes! {
     CableActive => "cables.active", "Actif";
     CableInactive => "cables.inactive", "Inactif";
     CableRemoveConfirm => "cables.remove.confirm", "Supprimer ?";
+
+    PatchbayHint => "patchbay.hint",
+        "Glissez d'une sortie (droite) vers une entrée (gauche) pour lier · cliquez un lien pour le sélectionner · Suppr pour le retirer";
+    PatchbayEmpty => "patchbay.empty", "Aucun nœud dans le graphe.";
+    NodeDriver => "patchbay.node.driver", "Pilote";
+    NodeSuspended => "patchbay.node.suspended", "Suspendu";
+    NodeCable => "patchbay.node.cable", "Câble";
+    NodeHardware => "patchbay.node.hardware", "Matériel";
+    NodeUtility => "patchbay.node.utility", "Utilitaire";
 
     GraphDriver => "patchbay.driver", "Pilote de graphe";
     Quantum => "patchbay.quantum", "quantum";
