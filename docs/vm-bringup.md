@@ -311,20 +311,22 @@ la libération du timer au déchargement.
 
 ## 8. M1a-12 — la porte de décision
 
-Rédiger `docs/adr/014-resultat-du-spike-pilote-rust.md` (le numéro 009 annoncé par la
-ROADMAP est déjà pris par une autre décision : le corriger dans la ROADMAP). Les quatre
-questions posées au spike, et ce que la session aura répondu :
+Rédiger `docs/adr/015-resultat-du-spike-pilote-rust.md`. Les quatre questions posées au
+spike, et ce que les séances des 6 et 7 septembre 2026 y ont répondu :
 
 1. `windows-drivers-rs` compile-t-il un pilote PortCls sans nightly ni correctif ?
-   **Déjà répondu oui** sur l'hôte, en Rust stable.
-2. Les vtables COM tiennent-elles ? **Déjà répondu oui** pour les dispositions, vérifiées
-   par un second compilateur ; l'exécution reste à confirmer aux étapes 3 et 4.
+   **Oui**, en Rust stable, sur l'hôte comme en intégration continue.
+2. Les vtables COM tiennent-elles ? **Oui**, et pas seulement en disposition : à
+   l'exécution, `PcNewPort` et `PcRegisterSubdevice` réussissent, Windows construit deux
+   endpoints « Conduit 1 », et l'audio traverse le câble — dix passes sur dix.
 3. Lecture et boucle stables une heure sous Driver Verifier ? Étape 7.
 4. Coût réel comparé au délai borné ? À chiffrer d'après l'historique Git.
 
-Succès sur les quatre → M1b en Rust. Échec sur 3 dans le délai → décision de repli C++,
-qui conserve `conduit-kmd-core`, `conduit-com`, `portcls-sys` et le helper.
-
+**Condition de repli.** Un échec sur 1 ou 2 dirait que Rust n'est pas viable pour ce
+pilote : repli C++ dérivé de SYSVAD, en conservant `conduit-kmd-core`, `conduit-com`,
+`portcls-sys` et le helper. Un échec sur 3 ne dit rien de la langue — c'est un défaut de
+notre code, à corriger en Rust — et ne devient un motif de repli que s'il résiste dans le
+délai borné, ce que tranche la question 4.
 ## Après la porte
 
 M1b.A reprend dans la VM (réserve de 16 câbles, jack, propriété de configuration,

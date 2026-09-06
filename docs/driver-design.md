@@ -710,10 +710,15 @@ Aucun pilote de test ne se charge sur la machine de développement.
 ## 9. Ce que le spike doit trancher (entrées d'ADR-015 / M1a-12)
 
 1. `windows-drivers-rs` compile-t-il un WDM PortCls sans nightly et sans patch ?
-2. Les vtables manuelles passent-elles les tests d'offsets et PortCls accepte-t-il les
-   objets (`PcNewPort` + `RegisterSubdevice` réussissent, endpoints visibles) ?
+2. Les vtables manuelles passent-elles les tests d'offsets, et PortCls accepte-t-il les
+   objets à l'exécution (`PcNewPort` + `PcRegisterSubdevice` réussissent, endpoints
+   visibles, audio transporté) ?
 3. Lecture et boucle locale stables 1 h sous Driver Verifier ?
-4. Coût réel : jours passés par tâche, comparés au délai borné.
+4. Coût réel : jours passés, comparés au délai borné.
 
-Succès sur les quatre → M1b en Rust. Échec sur 1 ou 2 dans le délai → ADR de repli
-C++/SYSVAD ; `conduit-kmd-core` et le helper sont conservés tels quels.
+**Condition de repli.** Un échec sur 1 ou 2 dirait que Rust n'est pas viable pour ce
+pilote : repli C++ dérivé de SYSVAD, en conservant `conduit-kmd-core`, `conduit-com`,
+`portcls-sys` et le helper. Un échec sur 3 ne dit rien de la langue — c'est un défaut de
+notre code, à corriger en Rust — et ne devient un motif de repli que s'il résiste dans le
+délai borné, ce que tranche la question 4. Le détail de la porte est en
+[vm-bringup.md](vm-bringup.md) §8, qui porte la même formulation.
