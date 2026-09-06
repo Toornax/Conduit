@@ -21,7 +21,11 @@
           || (
             builtins.match ".*\\.(md|json|toml|ps1|conf)$" path != null
             && builtins.match ".*/target/.*" path == null
-          );
+          )
+          # Ressources de la GUI (polices embarquées par `include_bytes!` et
+          # leurs licences) : `filterCargoSources` ne garde que les sources
+          # Rust, la compilation échouerait dans le bac à sable Nix.
+          || builtins.match ".*/crates/conduit-gui/assets/.*" path != null;
       };
       commonArgs = {
         inherit src;

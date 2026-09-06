@@ -69,6 +69,18 @@ textes! {
     CableInactive => "cables.inactive", "inactif";
     CableRemoveConfirm => "cables.remove.confirm", "Supprimer ce câble ?";
 
+    ThemeLight => "theme.light", "Sericæ clair";
+    ThemeDark => "theme.dark", "Sericæ sombre";
+
+    UnitMs => "unit.ms", "ms";
+    UnitDb => "unit.db", "dB";
+    UnitPercent => "unit.percent", "%";
+    UnitRatio => "unit.ratio", "×";
+    Silence => "unit.silence", "−∞";
+    Xrun => "diag.xrun", "xrun";
+    Xruns => "diag.xruns", "xruns";
+    NoXrun => "diag.xrun.none", "aucun xrun";
+
     Add => "action.add", "Ajouter";
     Remove => "action.remove", "Supprimer";
     Rename => "action.rename", "Renommer";

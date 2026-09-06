@@ -7,6 +7,10 @@
 //! Organisation :
 //!
 //! - [`i18n`] : table des textes affichés (une seule langue pour l'instant) ;
+//! - [`theme`] : jetons de couleur et thèmes « Sericæ » clair et sombre ;
+//! - [`typo`] : les trois familles embarquées et les capitales espacées ;
+//! - [`style`] : les closures de style des widgets `iced` ;
+//! - [`mod@format`] : mise en forme française des grandeurs affichées ;
 //! - [`view`] et [`cables`] : décor de la fenêtre et vue « Câbles » ;
 //! - [`model`] : miroir de l'état du démon, alimenté par réduction pure des
 //!   notifications ;
@@ -15,6 +19,9 @@
 //! - [`app`] : architecture Elm d'`iced` (`Message`, `update`, `view`,
 //!   `subscription`).
 //!
+//! Le design system est décrit dans `docs/design-system.md` ; les polices
+//! embarquées et leur licence, dans l'ADR-014.
+//!
 //! Le binaire s'appelle `conduit`.
 
 #![forbid(unsafe_code)]
@@ -22,9 +29,13 @@
 
 pub mod app;
 pub mod cables;
+pub mod format;
 pub mod i18n;
 pub mod ipc;
 pub mod model;
+pub mod style;
+pub mod theme;
+pub mod typo;
 pub mod view;
 
 pub use app::run;

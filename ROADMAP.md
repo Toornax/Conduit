@@ -548,7 +548,12 @@ testée d'abord avec le backend null, puis sur Windows.
 - [ ] **M2-09** `feat(gui): icône de zone de notification et menu rapide`
   *Fait quand* : état OK / xruns / pilote absent visible, ouverture de la fenêtre au clic.
 - [ ] **M2-10** `feat(gui): démarrage du démon si absent`
-- [ ] **M2-11** `feat(gui): thème clair/sombre, traductions fr et en`
+- [x] **M2-11a** `feat(gui): thème clair/sombre`
+  Design system « Sericæ » : jetons, polices embarquées, styles de widgets, formatage français.
+  *Fait quand* : la fenêtre suit le mode du système, contraste WCAG AA vérifié par test
+  (`docs/design-system.md`, ADR-014).
+- [ ] **M2-11b** `feat(gui): traductions fr et en (fluent)`
+  La table `i18n.rs` devient un catalogue `fluent` ; la langue suit celle du système.
 - [ ] **M2-12** `feat(gui): repli logiciel tiny-skia`
   *Fait quand* : fonctionne dans une VM sans GPU.
 - [ ] **M2-12b** `chore(nix): package conduit-gui avec wrapper des bibliothèques graphiques`

@@ -18,6 +18,7 @@ use crate::i18n::{self, Text};
 use crate::ipc::{self, Requester};
 use crate::model::Mirror;
 use crate::view::{self, Tab};
+use crate::{theme, typo};
 
 /// État de la connexion au démon.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -105,6 +106,9 @@ pub enum Message {
     CommitRename,
     /// Change les canaux d'un câble (`CableSetChannels`).
     SetChannels(CableId, Channels),
+    /// Mode clair ou sombre annoncé par le système, au démarrage puis à chaque
+    /// changement.
+    ThemeSysteme(iced::theme::Mode),
 }
 
 /// État complet de l'application.
@@ -117,6 +121,7 @@ pub struct App {
     tab: Tab,
     cables: cables::State,
     error: Option<String>,
+    mode: iced::theme::Mode,
 }
 
 impl App {
@@ -130,7 +135,17 @@ impl App {
             tab: Tab::default(),
             cables: cables::State::default(),
             error: None,
+            mode: iced::theme::Mode::default(),
         }
+    }
+
+    /// Construit l'état initial et la tâche de démarrage : demander au système
+    /// son mode clair ou sombre.
+    pub fn boot(socket: PathBuf) -> (Self, Task<Message>) {
+        (
+            Self::new(socket),
+            iced::system::theme().map(Message::ThemeSysteme),
+        )
     }
 
     /// Socket surveillé.
@@ -161,6 +176,19 @@ impl App {
     /// Dernière erreur renvoyée par le démon, affichée en bannière.
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
+    }
+
+    /// Mode clair ou sombre annoncé par le système.
+    pub fn mode(&self) -> iced::theme::Mode {
+        self.mode
+    }
+
+    /// Thème « Sericæ » correspondant au mode du système.
+    ///
+    /// Renvoyer un thème et non `None` est indispensable : `None` ferait
+    /// retomber `iced` sur ses thèmes intégrés.
+    pub fn theme(&self) -> iced::Theme {
+        theme::selon(self.mode)
     }
 
     /// Met une commande en file et efface la bannière d'erreur : le résultat
@@ -235,6 +263,7 @@ impl App {
                 id,
                 channels: channels.into(),
             }),
+            Message::ThemeSysteme(mode) => self.mode = mode,
         }
         Task::none()
     }
@@ -265,13 +294,15 @@ impl App {
     /// La subscription est identifiée par le chemin du socket : elle survit à
     /// tous les redessins et n'est relancée que si le socket change.
     pub fn subscription(&self) -> Subscription<Message> {
-        Subscription::run_with(self.socket.clone(), |socket: &PathBuf| {
+        let demon = Subscription::run_with(self.socket.clone(), |socket: &PathBuf| {
             let socket = socket.clone();
             iced::stream::channel(64, async move |output| {
                 ipc::run(socket, output).await;
             })
         })
-        .map(Message::Ipc)
+        .map(Message::Ipc);
+        let systeme = iced::system::theme_changes().map(Message::ThemeSysteme);
+        Subscription::batch([demon, systeme])
     }
 
     /// Fenêtre : barre de navigation, état de la connexion, bannière
@@ -305,12 +336,26 @@ impl ipc::EventSink for iced::futures::channel::mpsc::Sender<ipc::Event> {
 }
 
 /// Ouvre la fenêtre principale et tourne jusqu'à sa fermeture.
+///
+/// Les quatre fichiers de police du thème « Sericæ » sont embarqués dans le
+/// binaire et chargés ici (ADR-014) ; Inter est la police par défaut.
 pub fn run(socket: PathBuf) -> iced::Result {
-    iced::application(move || App::new(socket.clone()), App::update, App::view)
+    iced::application(move || App::boot(socket.clone()), App::update, App::view)
         .title(App::title)
         .subscription(App::subscription)
+        .theme(App::theme)
+        .font(typo::POLICE_FRAUNCES)
+        .font(typo::POLICE_INTER)
+        .font(typo::POLICE_SPECTRAL)
+        .font(typo::POLICE_SPECTRAL_LIGHT)
+        .default_font(typo::defaut())
+        .window_size(FENETRE)
+        .centered()
         .run()
 }
+
+/// Taille de la fenêtre à la première ouverture, en points logiques.
+pub const FENETRE: (f32, f32) = (1120.0, 720.0);
 
 #[cfg(test)]
 mod tests {
@@ -486,6 +531,32 @@ mod tests {
             "une nouvelle action efface la bannière"
         );
         let _ = sent(&mut rx);
+    }
+
+    /// Le thème suit le mode annoncé par le système, sans jamais rendre
+    /// `None` — qui ferait retomber `iced` sur ses thèmes intégrés.
+    #[test]
+    fn the_theme_follows_the_system_mode() {
+        let (mut a, _rx) = connected();
+        assert_eq!(a.mode(), iced::theme::Mode::None);
+        assert!(!a.theme().extended_palette().is_dark);
+        let _ = a.update(Message::ThemeSysteme(iced::theme::Mode::Dark));
+        assert_eq!(a.mode(), iced::theme::Mode::Dark);
+        assert!(a.theme().extended_palette().is_dark);
+        assert_eq!(*crate::theme::jetons(&a.theme()), crate::theme::SOMBRE);
+        let _ = a.update(Message::ThemeSysteme(iced::theme::Mode::Light));
+        assert!(!a.theme().extended_palette().is_dark);
+    }
+
+    /// `boot` construit le même état que `new`, plus la tâche d'interrogation
+    /// du système.
+    #[test]
+    fn boot_starts_from_the_same_state_as_new() {
+        let socket = PathBuf::from("/tmp/conduitd.sock");
+        let (a, _task) = App::boot(socket.clone());
+        assert_eq!(a.socket(), &socket);
+        assert_eq!(*a.connection(), Connection::Starting);
+        assert_eq!(a.mode(), iced::theme::Mode::None);
     }
 
     #[test]

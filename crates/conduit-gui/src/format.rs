@@ -1,0 +1,188 @@
+//! Mise en forme française des grandeurs affichées.
+//!
+//! Trois conventions, tenues partout :
+//!
+//! - **virgule décimale** (`5,3` et non `5.3`) ;
+//! - **espace insécable** avant l'unité ([`INSECABLE`]) et **espace insécable
+//!   fine** entre les groupes de milliers ([`FINE`]), pour qu'un nombre ne se
+//!   coupe jamais en fin de ligne ;
+//! - **signe moins typographique** ([`MOINS`], U+2212) et non le trait d'union.
+//!
+//! Les unités elles-mêmes viennent d'[`crate::i18n`] : aucune chaîne affichée
+//! n'est écrite ici.
+//!
+//! Les chiffres n'ont pas de variante tabulaire (`tnum` est inaccessible depuis
+//! `iced`) : l'alignement d'une colonne de nombres s'obtient en fixant la
+//! largeur de la cellule, `text(millisecondes(x)).width(72).align_x(Right)`.
+
+use conduit_core::types::Db;
+
+use crate::i18n::{self, Text};
+
+/// Espace insécable (U+00A0), entre un nombre et son unité.
+pub const INSECABLE: char = '\u{00a0}';
+/// Espace insécable fine (U+202F), entre les groupes de milliers.
+pub const FINE: char = '\u{202f}';
+/// Signe moins typographique (U+2212).
+pub const MOINS: char = '\u{2212}';
+
+/// Groupe les chiffres par trois depuis la droite, séparés par [`FINE`].
+fn grouper(chiffres: &str) -> String {
+    let mut groupe = String::with_capacity(chiffres.len() + chiffres.len() / 3);
+    let reste = chiffres.len() % 3;
+    for (i, c) in chiffres.chars().enumerate() {
+        if i > 0 && i % 3 == reste {
+            groupe.push(FINE);
+        }
+        groupe.push(c);
+    }
+    groupe
+}
+
+/// Un nombre à la française : virgule décimale, milliers groupés, signe moins
+/// typographique.
+///
+/// Un zéro arrondi ne porte jamais de signe (`-0,04` à une décimale donne
+/// `0,0` et non `−0,0`).
+pub fn nombre(valeur: f64, decimales: usize) -> String {
+    if !valeur.is_finite() {
+        return i18n::t(Text::Silence).to_string();
+    }
+    let rendu = format!("{:.*}", decimales, valeur.abs());
+    let (entiere, fraction) = match rendu.split_once('.') {
+        Some((e, f)) => (e, Some(f)),
+        None => (rendu.as_str(), None),
+    };
+    let nul =
+        entiere.chars().all(|c| c == '0') && fraction.is_none_or(|f| f.chars().all(|c| c == '0'));
+    let mut sortie = String::new();
+    if valeur.is_sign_negative() && !nul {
+        sortie.push(MOINS);
+    }
+    sortie.push_str(&grouper(entiere));
+    if let Some(fraction) = fraction {
+        sortie.push(',');
+        sortie.push_str(fraction);
+    }
+    sortie
+}
+
+/// Un entier à la française : milliers groupés par [`FINE`].
+pub fn entier(valeur: u64) -> String {
+    grouper(&valeur.to_string())
+}
+
+/// Une valeur et son unité, séparées d'une espace insécable.
+fn avec_unite(valeur: String, unite: Text) -> String {
+    format!("{valeur}{INSECABLE}{}", i18n::t(unite))
+}
+
+/// Une durée en millisecondes, à la dixième : « 5,3 ms ».
+pub fn millisecondes(ms: f64) -> String {
+    avec_unite(nombre(ms, 1), Text::UnitMs)
+}
+
+/// Un gain en décibels, à la dixième, signé : « +3,0 dB », « −12,0 dB »,
+/// « −∞ dB » pour le silence.
+pub fn decibels(db: Db) -> String {
+    if db.is_silent() {
+        return avec_unite(i18n::t(Text::Silence).to_string(), Text::UnitDb);
+    }
+    let valeur = f64::from(db.get());
+    let rendu = nombre(valeur, 1);
+    let signe = if valeur > 0.0 { "+" } else { "" };
+    avec_unite(format!("{signe}{rendu}"), Text::UnitDb)
+}
+
+/// Une fraction en pourcentage entier : `0.425` donne « 43 % ».
+pub fn pourcentage(fraction: f32) -> String {
+    avec_unite(nombre(f64::from(fraction) * 100.0, 0), Text::UnitPercent)
+}
+
+/// Un rapport, à la centième : « 1,50 × ».
+pub fn ratio(valeur: f64) -> String {
+    avec_unite(nombre(valeur, 2), Text::UnitRatio)
+}
+
+/// Un décompte de xruns : « aucun xrun », « 1 xrun », « 1 234 xruns ».
+pub fn xruns(compte: u64) -> String {
+    match compte {
+        0 => i18n::t(Text::NoXrun).to_string(),
+        1 => format!("1{INSECABLE}{}", i18n::t(Text::Xrun)),
+        n => format!("{}{INSECABLE}{}", entier(n), i18n::t(Text::Xruns)),
+    }
+}
+
+/// Latence estimée d'un nœud, en millisecondes : deux quanta, soit
+/// `2 × quantum / fréquence`.
+///
+/// Une fréquence nulle — un nœud dont le format n'est pas encore négocié —
+/// donne 0.
+pub fn latence_estimee_ms(quantum: u32, frequence: u32) -> f64 {
+    if frequence == 0 {
+        return 0.0;
+    }
+    2.0 * f64::from(quantum) / f64::from(frequence) * 1000.0
+}
+
+/// La latence estimée, mise en forme : « 5,3 ms ».
+pub fn latence_estimee(quantum: u32, frequence: u32) -> String {
+    millisecondes(latence_estimee_ms(quantum, frequence))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Virgule décimale, milliers groupés, signe moins typographique.
+    #[test]
+    fn les_nombres_sont_ecrits_a_la_francaise() {
+        assert_eq!(nombre(5.34, 1), "5,3");
+        assert_eq!(nombre(5.36, 1), "5,4");
+        assert_eq!(nombre(1234.5, 1), "1\u{202f}234,5");
+        assert_eq!(nombre(1234567.0, 0), "1\u{202f}234\u{202f}567");
+        assert_eq!(nombre(-12.0, 1), "\u{2212}12,0");
+        // Un zéro arrondi ne porte pas de signe.
+        assert_eq!(nombre(-0.04, 1), "0,0");
+        assert_eq!(entier(1_000), "1\u{202f}000");
+        assert_eq!(entier(999), "999");
+    }
+
+    /// L'unité est collée au nombre par une espace insécable.
+    #[test]
+    fn l_unite_est_liee_au_nombre() {
+        assert_eq!(millisecondes(5.333), "5,3\u{a0}ms");
+        assert_eq!(pourcentage(0.425), "43\u{a0}%");
+        assert_eq!(pourcentage(1.0), "100\u{a0}%");
+        assert_eq!(ratio(1.5), "1,50\u{a0}×");
+    }
+
+    /// Les gains sont signés ; le silence s'écrit « −∞ dB ».
+    #[test]
+    fn les_gains_sont_signes_et_le_silence_est_infini() {
+        assert_eq!(decibels(Db::UNITY), "0,0\u{a0}dB");
+        assert_eq!(decibels(Db::new(3.0)), "+3,0\u{a0}dB");
+        assert_eq!(decibels(Db::new(-12.0)), "\u{2212}12,0\u{a0}dB");
+        assert_eq!(decibels(Db::NEG_INF), "\u{2212}∞\u{a0}dB");
+    }
+
+    /// Le décompte de xruns s'accorde en nombre.
+    #[test]
+    fn les_xruns_s_accordent_en_nombre() {
+        assert_eq!(xruns(0), "aucun xrun");
+        assert_eq!(xruns(1), "1\u{a0}xrun");
+        assert_eq!(xruns(1234), "1\u{202f}234\u{a0}xruns");
+    }
+
+    /// Deux quanta, et rien d'autre.
+    #[test]
+    fn la_latence_estimee_vaut_deux_quanta() {
+        assert!((latence_estimee_ms(128, 48_000) - 5.3333).abs() < 1e-3);
+        assert!((latence_estimee_ms(256, 48_000) - 10.6666).abs() < 1e-3);
+        assert!((latence_estimee_ms(48, 48_000) - 2.0).abs() < 1e-9);
+        // Format non négocié : pas de division par zéro.
+        assert_eq!(latence_estimee_ms(128, 0), 0.0);
+        assert_eq!(latence_estimee(128, 48_000), "5,3\u{a0}ms");
+        assert_eq!(latence_estimee(128, 0), "0,0\u{a0}ms");
+    }
+}
