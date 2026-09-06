@@ -5,37 +5,42 @@
 //! release** : aucune chaîne de format ni appel au débogueur ne subsiste dans le binaire
 //! livré. WPP n'est pas disponible côté Rust ; M1b évaluera `EtwWrite`.
 //!
-//! # Pourquoi le niveau « erreur » pour des traces qui n'en sont pas
+//! # Pourquoi `DPFLTR_DEFAULT_ID` au niveau « erreur »
 //!
-//! Les traces partent par `DbgPrintEx(DPFLTR_IHVAUDIO_ID, DPFLTR_ERROR_LEVEL, …)` : elles
-//! s'annoncent donc comme des *erreurs* alors que la plupart ne sont que de l'avancement.
-//! C'est délibéré. Le masque d'un composant est un champ de bits, et **seul
-//! `DPFLTR_ERROR_LEVEL` (niveau 0, bit 0) est armé par défaut**, pour tous les composants.
-//! Une trace émise à ce niveau arrive **sans configuration** : ni valeur de registre, ni
-//! commande du débogueur. Toute autre sévérité exige d'élargir le masque avant de voir
-//! quoi que ce soit. C'est ce que font les exemples du WDK, SYSVAD compris.
+//! Les traces partent par `DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_ERROR_LEVEL, …)` : elles
+//! s'annoncent donc comme des *erreurs* alors que la plupart ne sont que de l'avancement,
+//! et sous le composant « par défaut » alors que Conduit est un pilote audio. Les deux
+//! choix sont délibérés, et tous deux sont le fruit d'une mesure et non d'une lecture de
+//! la documentation.
 //!
-//! Le motif est une soirée de trois séances de débogage noyau (2026-09-06/07), débogueur
-//! série connecté dès l'amorçage à chaque fois, avec l'implémentation précédente
-//! (`wdk::println!`, donc `DbgPrint`, donc le composant `DPFLTR_DEFAULT_ID` au niveau
-//! `DPFLTR_INFO_LEVEL`, qui n'est pas dans le masque par défaut) :
+//! Le masque d'un composant est un champ de bits, et `DPFLTR_ERROR_LEVEL` en est le bit 0.
+//! On lit couramment que ce bit serait armé par défaut pour tous les composants ; **c'est
+//! faux**. Seul le masque de `DPFLTR_DEFAULT_ID` vaut `0x1` au démarrage : les autres,
+//! `DPFLTR_IHVAUDIO_ID` compris, valent **zéro**, et rien n'en sort — pas même une erreur.
 //!
-//! | Séance | Commandes initiales de kd | Registre | Traces du pilote |
-//! |---|---|---|---|
-//! | 1 | `ed nt!Kd_IHVDRIVER_Mask 0xf` | `DEFAULT` et `IHVAUDIO` à `0xFFFFFFFF` | aucune sur 100 cycles |
-//! | 2 | + `ed nt!Kd_DEFAULT_Mask 0xf` | idem | 10 traces, cycle 1 |
-//! | 3 | identiques à la séance 2 | idem | aucune sur 100 cycles |
+//! Mesuré le 2026-09-07, à conditions par ailleurs identiques (même machine, même
+//! séquence, débogueur série connecté dès l'amorçage, valeurs de registre `DEFAULT` et
+//! `IHVAUDIO` toutes deux à `0xFFFFFFFF`) :
 //!
-//! La livraison au niveau « information » s'est donc révélée **intermittente à
-//! configuration identique**, et sa cause n'a pas été identifiée : la séance 3 interdit de
-//! conclure que le masque `DEFAULT` était le facteur. Plutôt que de continuer à chercher,
-//! on supprime la dépendance. Une sévérité juste et un journal vide valent moins qu'une
-//! trace qui arrive toujours.
+//! | Composant émetteur | Niveau | Traces reçues |
+//! |---|---|---|
+//! | `DPFLTR_IHVAUDIO_ID` | erreur | **aucune**, deux séances |
+//! | `DPFLTR_DEFAULT_ID` | erreur | reçues |
 //!
-//! Composant `DPFLTR_IHVAUDIO_ID` (79) et non `DPFLTR_IHVDRIVER_ID` (77) : Conduit est un
-//! pilote **audio** (PortCls/WaveRT), et c'est le composant que le WDK réserve à ce cas.
-//! Le choix ne change rien à la livraison — le bit 0 est armé partout — mais il classe nos
-//! lignes correctement le jour où l'on élargit un masque pour observer autre chose.
+//! Le composant « par défaut » est donc le seul qui livre sans configuration préalable.
+//! C'est ce qui compte : une trace qui arrive toujours vaut mieux qu'une classification
+//! juste et un journal vide. Élargir un masque reste possible pour observer autre chose,
+//! mais nos traces n'en dépendent plus.
+//!
+//! # Ce qui reste une question ouverte
+//!
+//! Le débogueur cesse de recevoir la moindre sortie **après le premier chargement du
+//! pilote** qui suit l'amorçage : les chargements ultérieurs ne produisent plus rien dans
+//! son journal, alors que le pilote fonctionne (les cycles passent) et que kd reste
+//! vivant et tient le canal. Cause non identifiée au 2026-09-07. Conséquence pratique :
+//! ne pas compter sur le débogueur pour surveiller une séance longue — le critère d'une
+//! campagne (Driver Verifier, cycles répétés) reste l'absence de vidage, que
+//! `vm-cycle.ps1` vérifie sans lui.
 //!
 //! # Sûreté
 //!
@@ -83,7 +88,7 @@ mod sink {
     use core::fmt::{self, Write as _};
 
     use wdk_sys::{
-        _DPFLTR_TYPE::DPFLTR_IHVAUDIO_ID, CHAR, DPFLTR_ERROR_LEVEL, ULONG, ntddk::DbgPrintEx,
+        _DPFLTR_TYPE::DPFLTR_DEFAULT_ID, CHAR, DPFLTR_ERROR_LEVEL, ULONG, ntddk::DbgPrintEx,
     };
 
     /// Préfixe de toutes nos lignes, pour les repérer dans le flot du débogueur.
@@ -104,9 +109,9 @@ mod sink {
     /// Place laissée au texte formaté, préfixe compris.
     const TEXT_CAPACITY: usize = MAX_TXN.saturating_sub(TAIL);
 
-    /// Composant annoncé à `DbgPrintEx` : `DPFLTR_IHVAUDIO_ID` vaut 79, la conversion vers
+    /// Composant annoncé à `DbgPrintEx` : `DPFLTR_DEFAULT_ID` vaut 101, la conversion vers
     /// `ULONG` est exacte.
-    const COMPONENT: ULONG = DPFLTR_IHVAUDIO_ID as ULONG;
+    const COMPONENT: ULONG = DPFLTR_DEFAULT_ID as ULONG;
 
     /// Tampon de pile où `core::fmt` écrit le message, avant l'unique appel au débogueur.
     struct StackWriter {
