@@ -7,3 +7,6 @@
 /result-*
 /target
 /drivers/windows/target/
+
+# Images d'installation des VM de test (plusieurs Go, jamais versionnées)
+*.iso
