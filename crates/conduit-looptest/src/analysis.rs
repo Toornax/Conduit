@@ -367,6 +367,21 @@ pub fn first_signal_frame(samples: &[f32], channels: usize, threshold: f32) -> O
         .position(|frame| frame.iter().any(|s| s.abs() >= threshold))
 }
 
+/// **Dernière** trame où le signal dépasse `threshold`, s'il y en a une.
+///
+/// Symétrique de [`first_signal_frame`], et pour la même raison : un enregistrement
+/// n'est propre ni à son début ni à sa fin. Le rendu s'arrête avant la capture, qui
+/// enregistre encore un silence de queue — mesuré à 83 ms, 93 ms et 102 ms pour des
+/// passes de 6 s, 3 s et 2 s dans la VM le 2026-09-06, donc une **durée fixe**, pas une
+/// proportion. Analysée, cette queue se lit comme un trou et une rupture de phase, et
+/// fait échouer le verdict alors que l'audio traversait parfaitement le câble.
+pub fn last_signal_frame(samples: &[f32], channels: usize, threshold: f32) -> Option<usize> {
+    let channels = channels.max(1);
+    samples
+        .chunks_exact(channels)
+        .rposition(|frame| frame.iter().any(|s| s.abs() >= threshold))
+}
+
 // --- Interne -----------------------------------------------------------------
 
 /// Moyenne des canaux, en `f64` : l'analyse travaille sur ce signal mono.

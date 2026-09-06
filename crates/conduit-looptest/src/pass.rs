@@ -25,6 +25,8 @@ pub struct Pass {
     pub captured_frames: usize,
     /// Trames jetées au début (préambule + marge `--skip-ms`).
     pub skipped_frames: usize,
+    /// Trames jetées à la fin (queue de silence après l'arrêt du rendu).
+    pub trimmed_frames: usize,
     /// Mesures.
     pub analysis: Analysis,
     /// Verdict.
@@ -59,20 +61,37 @@ pub fn evaluate(
             )
         })?;
     let start = onset + skip_frames;
-    if captured_frames.saturating_sub(start) < MIN_ANALYSED_FRAMES {
+
+    // Borne de fin, symétrique du préambule : le rendu s'arrête avant la capture, qui
+    // enregistre encore un silence de queue de durée fixe (voir `last_signal_frame`).
+    // Sans cette découpe, la queue se lit comme un trou et une rupture de phase, et fait
+    // échouer des passes dont l'audio était parfait — constaté dans la VM le 2026-09-06.
+    // La garde de 5 ms écarte en plus la décroissance partielle de la dernière trame utile.
+    let tail_guard = (spec.sample_rate as usize / 200).max(1);
+    let end = analysis::last_signal_frame(recording, channels, onset_level)
+        .map_or(captured_frames, |last| {
+            last.saturating_add(1).saturating_sub(tail_guard)
+        })
+        .min(captured_frames)
+        .max(start);
+
+    if end.saturating_sub(start) < MIN_ANALYSED_FRAMES {
         return Err(format!(
-            "passe {index} : {} trames utiles seulement après la découpe du préambule \
-             ({start} jetées sur {captured_frames}) — allongez --seconds ou baissez --skip-ms",
-            captured_frames.saturating_sub(start)
+            "passe {index} : {} trames utiles seulement après la découpe du préambule et de \
+             la queue ({start} jetées au début, {} à la fin, sur {captured_frames}) — \
+             allongez --seconds ou baissez --skip-ms",
+            end.saturating_sub(start),
+            captured_frames.saturating_sub(end)
         ));
     }
-    let region = &recording[start * channels..captured_frames * channels];
+    let region = &recording[start * channels..end * channels];
     let analysis = analysis::analyze_with(region, spec, options);
     let verdict = analysis::verify(&analysis, spec, tolerances);
     Ok(Pass {
         index,
         captured_frames,
         skipped_frames: start,
+        trimmed_frames: captured_frames.saturating_sub(end),
         analysis,
         verdict,
     })
@@ -135,8 +154,39 @@ mod tests {
         assert!(pass.skipped_frames.abs_diff(2_400 + 4_800) <= 8);
         assert_eq!(
             pass.analysis.frames,
-            pass.captured_frames - pass.skipped_frames
+            pass.captured_frames - pass.skipped_frames - pass.trimmed_frames
         );
+        // Signal jusqu'au dernier échantillon : seule la garde de 5 ms est retirée, plus
+        // au plus une demi-période de sinus, la dernière trame au-dessus du seuil
+        // précédant la vraie fin d'autant (1,1 ms à 440 Hz).
+        assert!(
+            pass.trimmed_frames < 48_000 / 100,
+            "{}",
+            pass.trimmed_frames
+        );
+    }
+
+    /// La queue de silence que la vraie capture enregistre après l'arrêt du rendu ne
+    /// doit plus faire échouer la passe : c'est ce qui faisait échouer dix passes sur
+    /// dix dans la VM le 2026-09-06, alors que l'audio traversait parfaitement.
+    #[test]
+    fn queue_de_silence_ignoree() {
+        let spec = spec();
+        let mut recording = simulate(&spec, 48_000, 2_400, None);
+        // 100 ms de silence en fin d'enregistrement, la durée mesurée dans la VM.
+        recording.extend(core::iter::repeat_n(0.0f32, 4_800 * spec.channels));
+        let pass = evaluate(
+            1,
+            &recording,
+            &spec,
+            &AnalysisOptions::default(),
+            &Tolerances::default(),
+            4_800,
+        )
+        .expect("évaluation");
+        assert!(pass.verdict.ok, "{:?}", pass.verdict.reasons);
+        assert!(pass.analysis.gaps.is_empty(), "{:?}", pass.analysis.gaps);
+        assert!(pass.trimmed_frames >= 4_800, "{}", pass.trimmed_frames);
     }
 
     #[test]
