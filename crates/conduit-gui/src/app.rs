@@ -8,11 +8,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use conduit_backend::{CableId, CableSpec};
+use conduit_core::types::ChannelCount;
 use iced::{Element, Subscription, Task};
 
-use conduit_protocol::Command;
+use conduit_protocol::{Command, Notification};
 
-use crate::cables::{self, Channels};
+use crate::cables;
 use crate::i18n::{self, Text};
 use crate::ipc::{self, Requester};
 use crate::model::Mirror;
@@ -106,6 +107,19 @@ impl Notice {
     }
 }
 
+/// Ce que l'interface attend d'une commande déjà envoyée, pour nommer le
+/// câble dans la notice que la notification posera.
+///
+/// La GUI n'anticipe rien : la notice n'est écrite qu'au vu du `CableChanged`
+/// correspondant, jamais au moment du clic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attente {
+    /// Un `CableAdd` a été envoyé : le prochain câble annoncé est le sien.
+    Creation,
+    /// Un `CableRemove` a été envoyé pour ce câble.
+    Suppression(CableId),
+}
+
 /// Temps d'affichage d'une notice avant son effacement.
 pub const DUREE_NOTICE: Duration = Duration::from_millis(4_500);
 
@@ -121,11 +135,8 @@ pub enum Message {
     /// Fin du minuteur de la notice de génération donnée ; une notice plus
     /// récente n'est pas effacée.
     NoticeExpiree(u32),
-    /// Nom saisi pour le câble à créer.
-    NewCableName(String),
-    /// Canaux choisis pour le câble à créer.
-    NewCableChannels(Channels),
-    /// Crée le câble décrit par le formulaire (`CableAdd`).
+    /// Crée un câble stéréo sans nom (`CableAdd`) : le démon le nomme, et
+    /// l'utilisateur lui donne ensuite un alias dans sa ligne.
     AddCable,
     /// Demande confirmation avant de supprimer un câble.
     AskRemove(CableId),
@@ -133,14 +144,12 @@ pub enum Message {
     CancelDialog,
     /// Supprime un câble, confirmation faite (`CableRemove`).
     RemoveCable(CableId),
-    /// Passe un câble en édition de nom.
-    StartRename(CableId),
-    /// Nom saisi pendant le renommage.
-    RenameEdited(String),
-    /// Applique le renommage en cours (`CableRename`).
-    CommitRename,
+    /// Alias saisi dans la ligne d'un câble.
+    AliasEdited(CableId, String),
+    /// Applique l'alias en cours de saisie (`CableRename`).
+    CommitAlias,
     /// Change les canaux d'un câble (`CableSetChannels`).
-    SetChannels(CableId, Channels),
+    SetChannels(CableId, ChannelCount),
     /// Mode clair ou sombre annoncé par le système, au démarrage puis à chaque
     /// changement.
     ThemeSysteme(iced::theme::Mode),
@@ -156,6 +165,7 @@ pub struct App {
     tab: Tab,
     cables: cables::State,
     notice: Option<Notice>,
+    attente: Option<Attente>,
     generation: u32,
     mode: iced::theme::Mode,
 }
@@ -171,6 +181,7 @@ impl App {
             tab: Tab::default(),
             cables: cables::State::default(),
             notice: None,
+            attente: None,
             generation: 0,
             mode: iced::theme::Mode::default(),
         }
@@ -269,15 +280,14 @@ impl App {
                     self.notice = None;
                 }
             }
-            Message::NewCableName(name) => self.cables.new_name = name,
-            Message::NewCableChannels(channels) => self.cables.new_channels = channels,
             Message::AddCable => {
-                let name = self.cables.new_name.trim();
+                // Le câble naît stéréo et sans nom : le démon le nomme, et
+                // l'alias se saisit ensuite dans la ligne.
                 let spec = CableSpec {
-                    name: (!name.is_empty()).then(|| name.to_string()),
-                    channels: self.cables.new_channels.into(),
+                    name: None,
+                    channels: ChannelCount::STEREO,
                 };
-                self.cables.new_name.clear();
+                self.attente = Some(Attente::Creation);
                 self.request(Command::CableAdd { spec });
             }
             Message::AskRemove(id) => {
@@ -287,39 +297,47 @@ impl App {
             Message::CancelDialog => self.cables.close_dialogs(),
             Message::RemoveCable(id) => {
                 self.cables.close_dialogs();
+                self.attente = Some(Attente::Suppression(id));
                 self.request(Command::CableRemove { id });
             }
-            Message::StartRename(id) => {
-                let current = self
-                    .mirror
-                    .cable(id)
-                    .map(|c| c.name.clone())
-                    .unwrap_or_default();
-                self.cables.close_dialogs();
-                self.cables.renaming = Some((id, current));
-            }
-            Message::RenameEdited(value) => {
-                if let Some((_, name)) = &mut self.cables.renaming {
-                    *name = value;
+            Message::AliasEdited(id, value) => {
+                // Passer à une autre ligne valide l'alias en cours plutôt que
+                // de le perdre.
+                if !matches!(&self.cables.renaming, Some((edite, _)) if *edite == id) {
+                    self.commit_alias();
                 }
+                self.cables.renaming = Some((id, value));
             }
-            Message::CommitRename => {
-                if let Some((id, name)) = self.cables.renaming.take() {
-                    let name = name.trim().to_string();
-                    // Un nom vide n'est pas une demande : on referme sans rien
-                    // envoyer.
-                    if !name.is_empty() {
-                        self.request(Command::CableRename { id, name });
-                    }
-                }
+            Message::CommitAlias => self.commit_alias(),
+            Message::SetChannels(id, channels) => {
+                self.request(Command::CableSetChannels { id, channels });
+                // L'avertissement de la maquette : le câble est recréé côté
+                // système, le son se tait un instant.
+                self.poser_notice(Notice::info(i18n::channels_changed(
+                    &id.to_string(),
+                    channels.get(),
+                )));
+                return self.minuteur();
             }
-            Message::SetChannels(id, channels) => self.request(Command::CableSetChannels {
-                id,
-                channels: channels.into(),
-            }),
             Message::ThemeSysteme(mode) => self.mode = mode,
         }
         Task::none()
+    }
+
+    /// Envoie l'alias en cours de saisie, s'il en vaut la peine.
+    ///
+    /// Un alias vide n'est pas une demande, et un alias identique à celui que
+    /// le démon connaît déjà n'a rien à dire : dans les deux cas l'édition se
+    /// referme sans commande.
+    fn commit_alias(&mut self) {
+        let Some((id, name)) = self.cables.renaming.take() else {
+            return;
+        };
+        let name = name.trim().to_string();
+        let inchange = self.mirror.cable(id).is_some_and(|c| c.name == name);
+        if !name.is_empty() && !inchange {
+            self.request(Command::CableRename { id, name });
+        }
     }
 
     /// Pose une notice et ouvre une génération : le minuteur de la notice
@@ -347,16 +365,51 @@ impl App {
                 self.mirror.reset(*snapshot);
                 self.cables.close_dialogs();
                 self.notice = None;
+                self.attente = None;
                 self.connection = Connection::Ready { server };
             }
             ipc::Event::Lost { reason, retry_in } => {
                 self.connection = Connection::Lost { reason, retry_in };
             }
             // L'état ne suit que les notifications : aucun optimisme local.
-            ipc::Event::Notified(notification) => self.mirror.apply(&notification),
+            ipc::Event::Notified(notification) => {
+                // La notice se décide avant la réduction : c'est l'ancien
+                // miroir qui dit si le câble annoncé est nouveau.
+                let notice = self.notice_attendue(&notification);
+                self.mirror.apply(&notification);
+                if let Some(notice) = notice {
+                    self.poser_notice(notice);
+                }
+            }
             // Le message du démon dit déjà quoi faire (ADR-006).
-            ipc::Event::Failed(message) => self.poser_notice(Notice::erreur(message)),
+            ipc::Event::Failed(message) => {
+                // La commande n'a pas abouti : plus rien n'est attendu.
+                self.attente = None;
+                self.poser_notice(Notice::erreur(message));
+            }
         }
+    }
+
+    /// La notice que cette notification mérite, si elle est la réponse à la
+    /// commande attendue.
+    ///
+    /// À appeler **avant** [`Mirror::apply`](crate::model::Mirror::apply) : la
+    /// création se reconnaît à ce que le câble annoncé est inconnu du miroir.
+    fn notice_attendue(&mut self, notification: &Notification) -> Option<Notice> {
+        let Notification::CableChanged { id, info } = notification else {
+            return None;
+        };
+        let texte = match (self.attente?, info) {
+            (Attente::Creation, Some(_)) if self.mirror.cable(*id).is_none() => {
+                i18n::cable_created(&id.to_string())
+            }
+            (Attente::Suppression(cible), None) if cible == *id => {
+                i18n::cable_removed(&id.to_string())
+            }
+            _ => return None,
+        };
+        self.attente = None;
+        Some(Notice::info(texte))
     }
 
     /// Flux d'événements du démon, avec reconnexion automatique.
@@ -386,7 +439,7 @@ impl App {
                     Text::CablesAdd,
                     enabled.then_some(Message::AddCable),
                 )),
-                cables::view(&self.mirror, &self.cables, enabled),
+                cables::view(&self.mirror, &self.cables, enabled, graisse),
             ),
             Tab::Patchbay => (None, shell::a_venir(Text::PatchbaySoon, graisse)),
             Tab::Diagnostic => (None, shell::a_venir(Text::DiagnosticSoon, graisse)),
@@ -509,28 +562,10 @@ mod tests {
         assert!(a.cables().removing.is_none());
     }
 
+    /// Le bouton d'en-tête crée un câble stéréo sans nom : c'est le démon qui
+    /// le nomme, et l'alias se saisit ensuite dans la ligne.
     #[test]
-    fn adding_a_cable_sends_cable_add_and_clears_the_form() {
-        let (mut a, mut rx) = connected();
-        let _ = a.update(Message::NewCableName("  Musique  ".into()));
-        let _ = a.update(Message::NewCableChannels(Channels(4)));
-        let _ = a.update(Message::AddCable);
-        assert_eq!(
-            sent(&mut rx),
-            Command::CableAdd {
-                spec: CableSpec {
-                    name: Some("Musique".into()),
-                    channels: ChannelCount::new(4).unwrap(),
-                }
-            }
-        );
-        assert!(a.cables().new_name.is_empty());
-        // Aucun optimisme local : le miroir attend la notification.
-        assert_eq!(a.mirror().cables.len(), 2);
-    }
-
-    #[test]
-    fn an_unnamed_cable_lets_the_daemon_choose_the_name() {
+    fn adding_a_cable_sends_a_stereo_cable_and_lets_the_daemon_name_it() {
         let (mut a, mut rx) = connected();
         let _ = a.update(Message::AddCable);
         assert_eq!(
@@ -541,6 +576,58 @@ mod tests {
                     channels: ChannelCount::STEREO,
                 }
             }
+        );
+        // Aucun optimisme local : le miroir attend la notification.
+        assert_eq!(a.mirror().cables.len(), 2);
+        assert!(a.notice().is_none(), "rien n'est annoncé avant le démon");
+    }
+
+    /// La notice de création nomme le câble, et ne le nomme qu'une fois le
+    /// démon revenu avec son `CableChanged`.
+    #[test]
+    fn a_created_cable_is_announced_by_its_system_name() {
+        let (mut a, mut rx) = connected();
+        let _ = a.update(Message::AddCable);
+        let _ = sent(&mut rx);
+        let _ = a.update(Message::Ipc(ipc::Event::Notified(Box::new(
+            Notification::CableChanged {
+                id: CableId(3),
+                info: Some(cable(3, "Conduit 3")),
+            },
+        ))));
+        assert_eq!(
+            a.notice().map(|n| n.texte.as_str()),
+            Some("Conduit 3 créé. Il apparaît dans les réglages audio du système.")
+        );
+        assert!(!a.notice().unwrap().erreur);
+        // Un second câble annoncé sans demande ne réannonce rien.
+        let _ = a.update(Message::NoticeExpiree(a.generation));
+        let _ = a.update(Message::Ipc(ipc::Event::Notified(Box::new(
+            Notification::CableChanged {
+                id: CableId(4),
+                info: Some(cable(4, "Conduit 4")),
+            },
+        ))));
+        assert!(a.notice().is_none());
+    }
+
+    /// La notice de suppression attend, elle aussi, la notification.
+    #[test]
+    fn a_removed_cable_is_announced_when_the_daemon_confirms() {
+        let (mut a, mut rx) = connected();
+        let _ = a.update(Message::AskRemove(CableId(2)));
+        let _ = a.update(Message::RemoveCable(CableId(2)));
+        let _ = sent(&mut rx);
+        assert!(a.notice().is_none(), "rien n'est annoncé avant le démon");
+        let _ = a.update(Message::Ipc(ipc::Event::Notified(Box::new(
+            Notification::CableChanged {
+                id: CableId(2),
+                info: None,
+            },
+        ))));
+        assert_eq!(
+            a.notice().map(|n| n.texte.as_str()),
+            Some("Conduit 2 supprimé.")
         );
     }
 
@@ -561,16 +648,18 @@ mod tests {
         assert!(a.cables().removing.is_none());
     }
 
+    /// L'alias s'édite en ligne : la saisie tient dans l'état, la validation
+    /// envoie `CableRename`, un alias vide ou inchangé n'envoie rien.
     #[test]
-    fn renaming_starts_from_the_current_name_and_ignores_an_empty_one() {
+    fn the_alias_is_edited_in_place_and_ignores_an_empty_or_unchanged_one() {
         let (mut a, mut rx) = connected();
-        let _ = a.update(Message::StartRename(CableId(1)));
+        let _ = a.update(Message::AliasEdited(CableId(1), "  Jeu ".into()));
         assert_eq!(
             a.cables().renaming,
-            Some((CableId(1), "Conduit 1".to_string()))
+            Some((CableId(1), "  Jeu ".to_string()))
         );
-        let _ = a.update(Message::RenameEdited("  Jeu ".into()));
-        let _ = a.update(Message::CommitRename);
+        assert!(rx.try_recv().is_err(), "la saisie n'envoie rien");
+        let _ = a.update(Message::CommitAlias);
         assert_eq!(
             sent(&mut rx),
             Command::CableRename {
@@ -580,22 +669,66 @@ mod tests {
         );
         assert!(a.cables().renaming.is_none());
 
-        let _ = a.update(Message::StartRename(CableId(1)));
-        let _ = a.update(Message::RenameEdited("   ".into()));
-        let _ = a.update(Message::CommitRename);
-        assert!(rx.try_recv().is_err(), "un nom vide n'envoie rien");
+        let _ = a.update(Message::AliasEdited(CableId(1), "   ".into()));
+        let _ = a.update(Message::CommitAlias);
+        assert!(rx.try_recv().is_err(), "un alias vide n'envoie rien");
+
+        let _ = a.update(Message::AliasEdited(CableId(1), "Conduit 1".into()));
+        let _ = a.update(Message::CommitAlias);
+        assert!(rx.try_recv().is_err(), "un alias inchangé n'envoie rien");
     }
 
+    /// Commencer à éditer une autre ligne valide l'édition en cours plutôt
+    /// que de la perdre.
     #[test]
-    fn changing_the_channels_sends_cable_set_channels() {
+    fn editing_another_row_commits_the_pending_alias() {
         let (mut a, mut rx) = connected();
-        let _ = a.update(Message::SetChannels(CableId(2), Channels(6)));
+        let _ = a.update(Message::AliasEdited(CableId(1), "Jeu".into()));
+        let _ = a.update(Message::AliasEdited(CableId(2), "Micro".into()));
+        assert_eq!(
+            sent(&mut rx),
+            Command::CableRename {
+                id: CableId(1),
+                name: "Jeu".into(),
+            }
+        );
+        assert_eq!(
+            a.cables().renaming,
+            Some((CableId(2), "Micro".to_string())),
+            "la nouvelle ligne prend la main"
+        );
+    }
+
+    /// Les pas de canaux envoient la valeur visée et annoncent le silence à
+    /// venir ; l'accord suit le nombre.
+    #[test]
+    fn changing_the_channels_sends_cable_set_channels_and_warns() {
+        let (mut a, mut rx) = connected();
+        let _ = a.update(Message::SetChannels(
+            CableId(2),
+            ChannelCount::new(6).unwrap(),
+        ));
         assert_eq!(
             sent(&mut rx),
             Command::CableSetChannels {
                 id: CableId(2),
                 channels: ChannelCount::new(6).unwrap(),
             }
+        );
+        assert_eq!(
+            a.notice().map(|n| n.texte.as_str()),
+            Some("Conduit 2 passe à 6 canaux : réactivation du câble, court silence.")
+        );
+        let _ = a.update(Message::SetChannels(CableId(2), ChannelCount::MONO));
+        let _ = sent(&mut rx);
+        assert_eq!(
+            a.notice().map(|n| n.texte.as_str()),
+            Some("Conduit 2 passe à 1 canal : réactivation du câble, court silence.")
+        );
+        // Aucun optimisme local : le miroir garde les canaux du démon.
+        assert_eq!(
+            a.mirror().cable(CableId(2)).unwrap().channels,
+            ChannelCount::STEREO
         );
     }
 

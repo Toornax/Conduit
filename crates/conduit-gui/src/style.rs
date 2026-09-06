@@ -182,6 +182,50 @@ pub fn onglet(actif: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     }
 }
 
+/// Bouton de pas d'une grandeur — les « − » et « + » des canaux : carré,
+/// sans fond, cerné d'un filet de contour.
+///
+/// Le libellé porte le texte courant et non le texte secondaire : ces boutons
+/// vivent sur une surface posée ([`ligne`]), où le texte secondaire ne passe
+/// que 4,3:1 (voir [`crate::theme::Jetons::texte_2`]). Le survol glisse vers
+/// l'accent lisible du mode, filet compris.
+pub fn bouton_pas(theme: &Theme, status: button::Status) -> button::Style {
+    let j = jetons(theme);
+    let survole = status == button::Status::Hovered;
+    finir(
+        status,
+        button::Style {
+            background: None,
+            text_color: if survole { j.accent_texte } else { j.texte },
+            border: filet_de(if survole { j.accent_texte } else { j.contour }),
+            ..button::Style::default()
+        },
+    )
+}
+
+/// Bouton discret : ni fond, ni filet — la croix de suppression et les
+/// libellés d'appoint d'une ligne.
+///
+/// Même raison que [`bouton_pas`] pour le texte courant plutôt que le texte
+/// secondaire. Le survol glisse vers l'accent lisible du mode : garance en
+/// clair, or en sombre, où la garance ne passe que 2,0:1.
+pub fn bouton_discret(theme: &Theme, status: button::Status) -> button::Style {
+    let j = jetons(theme);
+    finir(
+        status,
+        button::Style {
+            background: None,
+            text_color: if status == button::Status::Hovered {
+                j.accent_texte
+            } else {
+                j.texte
+            },
+            border: Border::default(),
+            ..button::Style::default()
+        },
+    )
+}
+
 // --- Surfaces ---------------------------------------------------------------
 
 /// Fond de la fenêtre.
@@ -229,6 +273,47 @@ pub fn notice_erreur(theme: &Theme) -> container::Style {
     }
 }
 
+/// Ligne d'une liste : la surface posée de [`carte`], **sans filet**.
+///
+/// Une liste de lignes cernées chacune d'un filet ferait une grille de
+/// tableau : les lignes se détachent du fond par leur seule matière.
+pub fn ligne(theme: &Theme) -> container::Style {
+    container::Style {
+        border: Border {
+            radius: rayon(),
+            ..Border::default()
+        },
+        ..carte(theme)
+    }
+}
+
+/// Rayon d'une barre de niveau : la seule exception au rayon commun, une
+/// barre de 4 px de haut ne peut pas porter un rayon de 8.
+pub const RAYON_BARRE: f32 = 2.0;
+
+/// Rail d'une barre de niveau : le fond de la fenêtre creusé dans la ligne.
+pub fn barre_rail(theme: &Theme) -> container::Style {
+    barre(jetons(theme).surface)
+}
+
+/// Remplissage d'une barre de niveau : l'or, qui ne fait ici qu'un aplat.
+pub fn barre_remplie(theme: &Theme) -> container::Style {
+    barre(jetons(theme).or)
+}
+
+/// Un aplat de barre, au [rayon des barres](RAYON_BARRE).
+fn barre(couleur: Color) -> container::Style {
+    container::Style {
+        background: Some(fond(couleur)),
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: Radius::from(RAYON_BARRE),
+        },
+        ..container::Style::default()
+    }
+}
+
 /// Pastille pleine de la couleur donnée : un point, jamais du texte.
 ///
 /// À poser sur un conteneur de taille fixe, par exemple
@@ -243,6 +328,14 @@ pub fn pastille(couleur: Color) -> impl Fn(&Theme) -> container::Style {
         },
         ..container::Style::default()
     }
+}
+
+/// Pastille dont la couleur est choisie parmi les jetons du mode.
+///
+/// Sert aux états qui n'ont pas de matière invariante : l'état inactif d'un
+/// câble, par exemple, prend le texte secondaire du mode.
+pub fn pastille_de(choix: fn(&Jetons) -> Color) -> impl Fn(&Theme) -> container::Style {
+    move |theme| pastille(choix(jetons(theme)))(theme)
 }
 
 // --- Encres -----------------------------------------------------------------
@@ -480,6 +573,14 @@ mod tests {
                 couples.push((quoi, s.text_color, derriere));
             }
         }
+        // Les boutons d'une ligne se lisent sur la surface posée, et non sur
+        // celle de la fenêtre.
+        let boutons_de_ligne: [StyleBouton; 2] = [("pas", bouton_pas), ("discret", bouton_discret)];
+        for (quoi, style) in boutons_de_ligne {
+            for status in ETATS_OPAQUES {
+                couples.push((quoi, style(theme, status).text_color, j.surface_2));
+            }
+        }
         for actif in [false, true] {
             let style = onglet(actif);
             for status in ETATS_OPAQUES {
@@ -494,9 +595,10 @@ mod tests {
         ] {
             couples.push((choix.0, choix.1, j.surface));
         }
-        let conteneurs: [StyleConteneur; 4] = [
+        let conteneurs: [StyleConteneur; 5] = [
             ("surface", surface),
             ("carte", carte),
+            ("ligne", ligne),
             ("notice_info", notice_info),
             ("notice_erreur", notice_erreur),
         ];
@@ -568,6 +670,8 @@ mod tests {
                 for style in [
                     bouton_primaire(&theme, status),
                     bouton_secondaire(&theme, status),
+                    bouton_pas(&theme, status),
+                    bouton_discret(&theme, status),
                     lien(&theme, status),
                 ] {
                     assert_eq!(style.shadow, Shadow::default());
@@ -577,8 +681,19 @@ mod tests {
                     ));
                 }
             }
-            for style in [surface(&theme), carte(&theme), notice_info(&theme)] {
+            for style in [
+                surface(&theme),
+                carte(&theme),
+                ligne(&theme),
+                barre_rail(&theme),
+                barre_remplie(&theme),
+                notice_info(&theme),
+            ] {
                 assert_eq!(style.shadow, Shadow::default());
+                assert!(matches!(
+                    style.background,
+                    None | Some(Background::Color(_))
+                ));
             }
             assert_eq!(menu_deroulant(&theme).shadow, Shadow::default());
             assert_eq!(
@@ -611,12 +726,25 @@ mod tests {
             for status in ETATS_OPAQUES {
                 bordures.push(bouton_primaire(&theme, status).border);
                 bordures.push(bouton_secondaire(&theme, status).border);
+                bordures.push(bouton_pas(&theme, status).border);
             }
             for b in bordures {
                 assert_eq!(b.width, FILET, "filet de {} px", b.width);
             }
-            // Le lien n'a pas de bordure du tout.
-            assert_eq!(lien(&theme, button::Status::Active).border.width, 0.0);
+            // Le lien, le bouton discret, la ligne et les barres n'ont pas de
+            // bordure du tout.
+            for sans in [
+                lien(&theme, button::Status::Active).border,
+                bouton_discret(&theme, button::Status::Active).border,
+                ligne(&theme).border,
+                barre_rail(&theme).border,
+                barre_remplie(&theme).border,
+            ] {
+                assert_eq!(sans.width, 0.0);
+            }
+            // Une barre de 4 px de haut porte le seul rayon dérogatoire.
+            assert_eq!(barre_rail(&theme).border.radius, Radius::from(RAYON_BARRE));
+            assert_eq!(ligne(&theme).border.radius, rayon());
         }
     }
 

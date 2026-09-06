@@ -88,9 +88,16 @@ Base commune : Inter 13 px, capitales espacées de +0,08 em, hauteur minimale
 | primaire | fond encre, texte **or**, filet encre ; survol : texte grège | fond grège, texte encre, filet grège ; survol : texte garance |
 | secondaire | sans fond, texte et filet sépia ; survol : garance | sans fond, texte et filet grège ; survol : **or** |
 | lien | sans fond ni filet ni padding, texte garance souligné ; survol : encre | idem en **or** ; survol : grège |
+| pas (`−` / `+`) | carré de 28, sans fond, filet contour, texte sépia ; survol : garance, filet compris | idem en grège ; survol : **or** |
+| discret | ni fond ni filet, texte sépia ; survol : garance | idem en grège ; survol : **or** |
 
 Le survol du secondaire passe à l'or en mode sombre, et non à la garance :
 la garance ne passe que **2,0:1** sur l'encre. Même raison pour le lien.
+
+Les deux derniers rôles vivent dans une ligne de liste, sur la surface posée :
+ils portent le **texte courant** et non le texte secondaire, qui n'y passe que
+**4,3:1** en mode clair. Le texte secondaire reste au fond de la fenêtre —
+en-têtes de colonnes, pieds, métadonnées de la barre latérale.
 
 `désactivé` = opacité 0,45 ; `pressé` = opacité 0,85, appliquées au texte, au
 filet et au fond.

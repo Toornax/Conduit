@@ -37,13 +37,13 @@ use conduit_gui::{theme, typo};
 /// Taille de la fenêtre dessinée, celle de la maquette.
 const FENETRE: (f32, f32) = (1120.0, 720.0);
 
-/// Un câble de démonstration.
-fn cable(id: u32, nom: &str) -> CableInfo {
+/// Un câble de démonstration : `nom` vide montre l'invite « Sans alias ».
+fn cable(id: u32, nom: &str, canaux: u8, actif: bool) -> CableInfo {
     CableInfo {
         id: CableId(id),
         name: nom.into(),
-        channels: ChannelCount::STEREO,
-        active: true,
+        channels: ChannelCount::new(canaux).expect("canaux hors bornes"),
+        active: actif,
         render: DeviceId::new(format!("null:cable{id}:render")),
         capture: DeviceId::new(format!("null:cable{id}:capture")),
     }
@@ -87,12 +87,22 @@ fn chargement() -> Snapshot {
             noeud(1, "Conduit 2", NodeState::Active),
         ],
         links: vec![],
-        cables: vec![cable(1, "Musique"), cable(2, "Micro traité")],
+        // Représentatif des états qu'une ligne peut prendre : alias donné ou
+        // absent, canaux au-delà de la stéréo, câble inactif.
+        cables: vec![
+            cable(1, "Musique", 2, true),
+            cable(2, "Micro traité", 1, true),
+            cable(3, "", 2, true),
+            cable(4, "Multipiste", 6, false),
+        ],
     }
 }
 
 /// Dessine une vue dans un mode donné et l'écrit dans `target/apercus/`.
-fn rendre(nom: &str, onglet: Tab, theme: &iced::Theme) {
+///
+/// `messages` amène l'application dans l'état à regarder — une confirmation
+/// de suppression ouverte, par exemple.
+fn rendre(nom: &str, onglet: Tab, theme: &iced::Theme, messages: Vec<Message>) {
     let mut app = App::new(PathBuf::from("/tmp/conduitd.sock"));
     let (requester, _commandes) = ipc::Requester::channel(8);
     app.apply_ipc(ipc::Event::Started(requester));
@@ -101,6 +111,9 @@ fn rendre(nom: &str, onglet: Tab, theme: &iced::Theme) {
         snapshot: Box::new(chargement()),
     });
     let _ = app.update(Message::Tab(onglet));
+    for message in messages {
+        let _ = app.update(message);
+    }
 
     let reglages = iced_test::core::Settings {
         fonts: vec![
@@ -132,7 +145,21 @@ fn apercus_des_vues() {
         ("patchbay", Tab::Patchbay),
         ("diagnostic", Tab::Diagnostic),
     ] {
-        rendre(nom, onglet, &theme::clair());
-        rendre(&format!("{nom}-sombre"), onglet, &theme::sombre());
+        rendre(nom, onglet, &theme::clair(), vec![]);
+        rendre(&format!("{nom}-sombre"), onglet, &theme::sombre(), vec![]);
     }
+    // La ligne dont la suppression attend confirmation.
+    let confirmation = || vec![Message::AskRemove(CableId(2))];
+    rendre(
+        "cables-confirmation",
+        Tab::Cables,
+        &theme::clair(),
+        confirmation(),
+    );
+    rendre(
+        "cables-confirmation-sombre",
+        Tab::Cables,
+        &theme::sombre(),
+        confirmation(),
+    );
 }

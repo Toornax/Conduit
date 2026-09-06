@@ -70,18 +70,26 @@ textes! {
     DiagnosticSoon => "tab.diagnostic.soon",
         "La page de diagnostic arrive plus tard : xruns, latence, pilote et export de rapport.";
 
-    CablesTitle => "cables.title", "Câbles virtuels";
     CablesAdd => "cables.add", "Ajouter un câble";
     CablesNone => "cables.none", "Aucun câble pour l'instant";
     CableVisible => "cables.visible.one", "visible par toutes les applications";
     CablesVisible => "cables.visible.many", "visibles par toutes les applications";
     CablesEmpty => "cables.empty",
-        "Aucun câble. Créez-en un ci-dessous : il apparaîtra aussitôt dans les réglages audio du système.";
-    CableName => "cables.name", "Nom du câble";
-    CableNamePlaceholder => "cables.name.placeholder", "Nom du câble (optionnel)";
-    CableActive => "cables.active", "actif";
-    CableInactive => "cables.inactive", "inactif";
-    CableRemoveConfirm => "cables.remove.confirm", "Supprimer ce câble ?";
+        "Aucun câble. « Ajouter un câble » en crée un : il apparaîtra aussitôt dans les réglages audio du système.";
+    ColumnDevice => "cables.column.device", "Périphérique";
+    ColumnAlias => "cables.column.alias", "Alias";
+    ColumnChannels => "cables.column.channels", "Canaux";
+    ColumnLevel => "cables.column.level", "Niveau";
+    ColumnState => "cables.column.state", "État";
+    CableDuplex => "cables.duplex", "Sortie + entrée";
+    CableAlias => "cables.alias.placeholder", "Sans alias";
+    CableAliasNote => "cables.alias.note",
+        "Les alias sont propres à Conduit ; le nom système reste « Conduit N ».";
+    CableLevelInert => "cables.level.inert",
+        "Le démon ne diffuse aucun niveau : les barres restent à zéro tant que les VU-mètres n'existent pas.";
+    CableActive => "cables.active", "Actif";
+    CableInactive => "cables.inactive", "Inactif";
+    CableRemoveConfirm => "cables.remove.confirm", "Supprimer ?";
 
     GraphDriver => "patchbay.driver", "Pilote de graphe";
     Quantum => "patchbay.quantum", "quantum";
@@ -105,10 +113,10 @@ textes! {
     Inconnu => "num.unknown", "—";
     Separateur => "ui.separator", "·";
 
-    Add => "action.add", "Ajouter";
     Remove => "action.remove", "Supprimer";
-    Rename => "action.rename", "Renommer";
-    Validate => "action.validate", "Valider";
+    RemoveIcon => "action.remove.icon", "×";
+    Minus => "action.minus", "−";
+    Plus => "action.plus", "+";
     Cancel => "action.cancel", "Annuler";
     Dismiss => "action.dismiss", "Fermer";
 }
@@ -146,9 +154,45 @@ fn juxtapose(gauche: &str, droite: &str) -> String {
 pub fn cables_subtitle(count: usize) -> String {
     match count {
         0 => t(Text::CablesNone).to_string(),
-        1 => juxtapose("1 câble", t(Text::CableVisible)),
-        n => juxtapose(&format!("{n} câbles"), t(Text::CablesVisible)),
+        1 => juxtapose(&cables_count(1), t(Text::CableVisible)),
+        n => juxtapose(&cables_count(n), t(Text::CablesVisible)),
     }
+}
+
+/// Le compte de câbles, accordé : « Aucun câble », « 1 câble », « 3 câbles ».
+///
+/// Le pied de la vue « Câbles » n'annonce que ce compte ; le sous-titre de
+/// l'en-tête lui ajoute la phrase de visibilité (voir [`cables_subtitle`]).
+pub fn cables_count(count: usize) -> String {
+    match count {
+        0 => "Aucun câble".to_string(),
+        1 => "1 câble".to_string(),
+        n => format!("{n} câbles"),
+    }
+}
+
+/// « Conduit 3 créé. Il apparaît dans les réglages audio du système. »
+///
+/// `cable` est le **nom système** du câble (`CableId`), pas son alias : c'est
+/// sous ce nom que le système d'exploitation le montre.
+pub fn cable_created(cable: &str) -> String {
+    format!("{cable} créé. Il apparaît dans les réglages audio du système.")
+}
+
+/// « Conduit 3 supprimé. »
+pub fn cable_removed(cable: &str) -> String {
+    format!("{cable} supprimé.")
+}
+
+/// « Conduit 3 passe à 4 canaux : réactivation du câble, court silence. »
+///
+/// Changer les canaux recrée le périphérique côté système : l'avertissement
+/// dit le silence qui vient, il ne constate pas un changement déjà fait.
+pub fn channels_changed(cable: &str, channels: u8) -> String {
+    format!(
+        "{cable} passe à {} : réactivation du câble, court silence.",
+        channels_label(channels)
+    )
 }
 
 /// Sous-titre de la vue « Patchbay » : « Pilote de graphe : horloge interne ·
@@ -216,6 +260,34 @@ mod tests {
         assert!(
             !cables_subtitle(3).contains("sur"),
             "aucune limite inventée"
+        );
+    }
+
+    /// Le compte du pied s'accorde, sans la phrase de visibilité.
+    #[test]
+    fn cables_count_agrees_in_number() {
+        assert_eq!(cables_count(0), "Aucun câble");
+        assert_eq!(cables_count(1), "1 câble");
+        assert_eq!(cables_count(12), "12 câbles");
+        assert!(!cables_count(2).contains("visible"));
+    }
+
+    /// Les notices des trois actions nomment le câble par son nom système et
+    /// s'accordent en nombre.
+    #[test]
+    fn les_notices_nomment_le_cable_et_s_accordent() {
+        assert_eq!(
+            cable_created("Conduit 3"),
+            "Conduit 3 créé. Il apparaît dans les réglages audio du système."
+        );
+        assert_eq!(cable_removed("Conduit 2"), "Conduit 2 supprimé.");
+        assert_eq!(
+            channels_changed("Conduit 2", 4),
+            "Conduit 2 passe à 4 canaux : réactivation du câble, court silence."
+        );
+        assert_eq!(
+            channels_changed("Conduit 1", 1),
+            "Conduit 1 passe à 1 canal : réactivation du câble, court silence."
         );
     }
 
