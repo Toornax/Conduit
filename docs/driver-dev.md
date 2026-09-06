@@ -145,6 +145,10 @@ minute environ la première fois ; ensuite le cache Cargo suffit.
 
 ## 3. VM de test
 
+La **séquence complète de validation** des sept tâches du pilote livrées mais jamais
+chargées est dans [vm-bringup.md](vm-bringup.md) : ordre, résultat attendu à chaque
+étape et arbre de diagnostic. Ce chapitre-ci décrit chaque outil isolément.
+
 Jamais de pilote de test sur la machine de développement : un bug = écran bleu, et le
 mode `testsigning` affaiblit la machine. Les scripts du dépôt ne lancent jamais
 `pnputil`, `devgen` ni `bcdedit` **sur l'hôte** : `vm-prepare.ps1` et `vm-cycle.ps1` les

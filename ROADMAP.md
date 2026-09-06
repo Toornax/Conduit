@@ -370,7 +370,10 @@ proposition : trois semaines de travail effectif). Porte de décision en M1a-12.
   *État* : outil et analyse livrés et testés sur signaux synthétiques ; les 10 passes
   réelles attendent le pilote dans la VM.
 - [ ] **M1a-11** `test(driver): 1 h Driver Verifier sans erreur, collecte automatique des dumps`
-- [ ] **M1a-12** `docs: ADR-009 résultat du spike`
+- [ ] **M1a-12** `docs: ADR-014 résultat du spike`
+  Plan de validation et questions de la porte : [vm-bringup.md](docs/vm-bringup.md) §8.
+  (Le numéro ADR-009 annoncé à la rédaction de la feuille de route est pris depuis :
+  la porte de décision devient ADR-014.)
   **Porte de décision.** Succès → poursuite en Rust, M1b. Échec dans le délai → pilote C++
   dérivé de SYSVAD, `portcls-sys` conservé pour le helper si utile, reste de la roadmap inchangé.
 
