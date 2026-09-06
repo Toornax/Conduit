@@ -218,9 +218,12 @@ croissent d'environ 48 000 par seconde, les débordements restent à zéro.
 expliquent la moitié des mesures silencieuses :**
 
 1. **Le volume et la coupure des endpoints.** Un endpoint à zéro ou coupé rend toute
-   la chaîne muette, et ce silence est indiscernable d'un pilote en panne. Le pilote
-   Conduit crée ses endpoints avec une propriété de volume à zéro en registre : c'est
-   *exactement* le piège.
+   la chaîne muette, et ce silence est indiscernable d'un pilote en panne. Le piège est
+   réel mais il ne vient **pas** de nous : le pilote ne pose aucune propriété de volume,
+   ni dans l'INF ni dans ses descripteurs. C'est Windows qui donne à tout endpoint neuf
+   un volume par défaut — **64 %** mesuré le 2026-09-06, soit une amplitude de 0,229 pour
+   0,500 demandée — et qui l'applique par son APO logiciel, faute de nœud de volume dans
+   notre topologie ([driver-design.md](driver-design.md) §5.5, corrigé en M1b-03b).
 
    ```powershell
    conduit-looptest --list --show-volume            # relever, sans rien changer
