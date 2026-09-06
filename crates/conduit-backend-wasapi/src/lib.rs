@@ -12,8 +12,10 @@
 //! - reçoit les rappels du client de notification et en fait des
 //!   [`DeviceEvent`](conduit_backend::DeviceEvent) (`Added`, `Removed`,
 //!   `DefaultChanged`), diffusés aux abonnés de [`Backend::subscribe`] ;
-//! - ouvre les flux ([`Backend::open`]) : crée et initialise les objets WASAPI en
-//!   mode partagé, événementiel, au format demandé ;
+//! - ouvre les flux ([`Backend::open`]) : crée et initialise les objets WASAPI,
+//!   événementiels, au format demandé — en mode **partagé** par défaut, en mode
+//!   **exclusif** si [`WasapiBackend::set_exclusive_policy`] l'a demandé
+//!   ([`ExclusivePolicy`], module `exclusive`) ;
 //! - sert les commandes du [`WasapiBackend`] par `std::sync::mpsc`.
 //!
 //! Les rappels COM arrivent sur un fil que Windows choisit : ils ne font que
@@ -30,9 +32,14 @@
 //! trames du format livré, horodatage `QueryPerformanceCounter` commun à tous les
 //! flux du processus ([`ClockSource`]).
 //!
+//! Le **mode exclusif** (M1b-32, module `exclusive`) est un réglage du backend,
+//! `Never` par défaut : le flux prend alors le périphérique pour lui seul, au
+//! format que le matériel accepte — souvent de l'entier, que le fil du flux
+//! convertit lui-même (module `convert`) puisqu'il n'y a plus d'`AUTOCONVERTPCM`.
+//!
 //! Ce crate ne compile de code que sous Windows ; ailleurs il n'expose rien, pour
-//! que `cargo check --workspace` reste vert sur toutes les cibles. Le mode exclusif
-//! (M1b-32) et le contrôle des câbles (M1b-34) viendront ensuite.
+//! que `cargo check --workspace` reste vert sur toutes les cibles. Le contrôle des
+//! câbles (M1b-34) viendra ensuite.
 //!
 //! ```no_run
 //! # #[cfg(windows)]
@@ -64,7 +71,11 @@ mod clock;
 #[cfg(windows)]
 mod com;
 #[cfg(windows)]
+mod convert;
+#[cfg(windows)]
 mod devices;
+#[cfg(windows)]
+mod exclusive;
 #[cfg(windows)]
 mod mmdevice_thread;
 #[cfg(windows)]
@@ -79,7 +90,11 @@ pub use backend::WasapiBackend;
 #[cfg(windows)]
 pub use clock::{ClockSource, ClockUnits};
 #[cfg(windows)]
+pub use convert::SampleType;
+#[cfg(windows)]
 pub use devices::{cable_id_from_name, PROBED_RATES};
+#[cfg(windows)]
+pub use exclusive::{aligned_period_hns, ExclusivePolicy, ShareMode};
 #[cfg(windows)]
 pub use open::{choose_period, EnginePeriods, InitPath, StreamLatency};
 #[cfg(windows)]

@@ -30,6 +30,7 @@ use windows::Win32::System::Com::{CLSCTX_ALL, STGM_READ};
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 
 use crate::com::{platform_error, CoTaskMem, CoTaskString, PropVariant};
+use crate::convert::SampleType;
 
 /// Fréquences annoncées dans [`DeviceInfo::sample_rates`] pour tout périphérique
 /// dont l'`IAudioClient` s'active : le mode partagé les accepte toutes, par
@@ -57,9 +58,16 @@ const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 /// `WAVE_FORMAT_IEEE_FLOAT` (mmreg.h) : flottants sans `SubFormat`.
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 0x0003;
 
+/// `WAVE_FORMAT_PCM` (mmreg.h) : entiers signés sans `SubFormat`.
+const WAVE_FORMAT_PCM: u16 = 0x0001;
+
 /// `KSDATAFORMAT_SUBTYPE_IEEE_FLOAT` (ksmedia.h) : échantillons flottants.
 const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: GUID =
     GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
+
+/// `KSDATAFORMAT_SUBTYPE_PCM` (ksmedia.h) : échantillons entiers signés — le
+/// sous-format que le matériel accepte le plus souvent en mode exclusif.
+const KSDATAFORMAT_SUBTYPE_PCM: GUID = GUID::from_u128(0x00000001_0000_0010_8000_00aa00389b71);
 
 /// `SPEAKER_FRONT_CENTER` / `SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT` (ksmedia.h).
 const MASK_MONO: u32 = 0x4;
@@ -81,9 +89,17 @@ pub(crate) struct WaveFormat {
     pub(crate) block_align: u16,
     /// `dwChannelMask` si le format est extensible.
     pub(crate) channel_mask: Option<u32>,
+    /// Bits du conteneur d'un échantillon (`wBitsPerSample`).
+    pub(crate) bits: u16,
+    /// Bits significatifs (`wValidBitsPerSample`) ; égal à `bits` hors format
+    /// extensible.
+    pub(crate) valid_bits: u16,
     /// Échantillons `f32` (tag `WAVE_FORMAT_IEEE_FLOAT` ou sous-format IEEE float,
     /// 32 bits) : le format que Conduit consomme tel quel.
     pub(crate) float32: bool,
+    /// Échantillons entiers signés (tag `WAVE_FORMAT_PCM` ou sous-format PCM) : ce
+    /// que le matériel propose le plus souvent en mode exclusif.
+    pub(crate) pcm: bool,
 }
 
 impl WaveFormat {
@@ -94,6 +110,23 @@ impl WaveFormat {
         match self.channel_mask {
             Some(mask) if channels == self.channels => mask,
             _ => default_mask(channels),
+        }
+    }
+
+    /// Type d'échantillon correspondant, si Conduit sait le convertir ; `None`
+    /// pour tout le reste (PCM 8 bits, 20 bits dans 24, float64…).
+    pub(crate) fn sample_type(&self) -> Option<SampleType> {
+        if self.float32 {
+            return Some(SampleType::F32);
+        }
+        if !self.pcm {
+            return None;
+        }
+        match (self.bits, self.valid_bits) {
+            (32, 24) => Some(SampleType::Pcm24In32),
+            (24, 24) => Some(SampleType::Pcm24),
+            (16, 16) => Some(SampleType::Pcm16),
+            _ => None,
         }
     }
 }
@@ -132,47 +165,72 @@ pub(crate) fn wave_format_from_bytes(bytes: &[u8]) -> Option<WaveFormat> {
     }
     let extensible = tag == WAVE_FORMAT_EXTENSIBLE && bytes.len() >= WAVEFORMATEXTENSIBLE_SIZE;
     let channel_mask = extensible.then(|| u32_at(20));
+    // `wValidBitsPerSample` occupe l'union `Samples`, juste après `cbSize`.
+    let valid_bits = if extensible { u16_at(18) } else { bits };
+    let sub_format = extensible.then(|| {
+        let mut data4 = [0u8; 8];
+        data4.copy_from_slice(&bytes[32..40]);
+        GUID {
+            data1: u32_at(24),
+            data2: u16_at(28),
+            data3: u16_at(30),
+            data4,
+        }
+    });
     let float32 = bits == 32
-        && if extensible {
-            let mut data4 = [0u8; 8];
-            data4.copy_from_slice(&bytes[32..40]);
-            GUID {
-                data1: u32_at(24),
-                data2: u16_at(28),
-                data3: u16_at(30),
-                data4,
-            } == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
-        } else {
-            tag == WAVE_FORMAT_IEEE_FLOAT
+        && match sub_format {
+            Some(sub) => sub == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
+            None => tag == WAVE_FORMAT_IEEE_FLOAT,
         };
+    let pcm = match sub_format {
+        Some(sub) => sub == KSDATAFORMAT_SUBTYPE_PCM,
+        None => tag == WAVE_FORMAT_PCM,
+    };
     Some(WaveFormat {
         channels,
         sample_rate,
         block_align,
         channel_mask,
+        bits,
+        valid_bits: if valid_bits == 0 { bits } else { valid_bits },
         float32,
+        pcm,
     })
 }
 
-/// Construit un `WAVEFORMATEXTENSIBLE` float32 entrelacé : le format que Conduit
-/// demande à WASAPI (sondage en M1b-30, flux en mode partagé depuis M1b-31).
-pub(crate) fn float32_format(channels: u16, rate: SampleRate, mask: u32) -> WAVEFORMATEXTENSIBLE {
-    let block_align = channels * 4;
+/// Construit un `WAVEFORMATEXTENSIBLE` entrelacé au type d'échantillon voulu : le
+/// format que Conduit demande à WASAPI (sondage en M1b-30, flux en mode partagé
+/// depuis M1b-31, négociation exclusive depuis M1b-32).
+///
+/// Toujours extensible, même en mono ou stéréo : c'est la forme que le mode
+/// exclusif attend, elle porte `wValidBitsPerSample` (indispensable au PCM 24 dans
+/// un conteneur 32) et le masque de haut-parleurs.
+pub(crate) fn hardware_format(
+    sample: SampleType,
+    channels: u16,
+    rate: SampleRate,
+    mask: u32,
+) -> WAVEFORMATEXTENSIBLE {
+    let block_align = u16::try_from(sample.frame_bytes(usize::from(channels))).unwrap_or(u16::MAX);
     WAVEFORMATEXTENSIBLE {
         Format: WAVEFORMATEX {
             wFormatTag: WAVE_FORMAT_EXTENSIBLE,
             nChannels: channels,
             nSamplesPerSec: rate.hz(),
-            nAvgBytesPerSec: rate.hz() * u32::from(block_align),
+            nAvgBytesPerSec: rate.hz().saturating_mul(u32::from(block_align)),
             nBlockAlign: block_align,
-            wBitsPerSample: 32,
+            wBitsPerSample: sample.bits(),
             cbSize: (WAVEFORMATEXTENSIBLE_SIZE - WAVEFORMATEX_SIZE) as u16,
         },
         Samples: WAVEFORMATEXTENSIBLE_0 {
-            wValidBitsPerSample: 32,
+            wValidBitsPerSample: sample.valid_bits(),
         },
         dwChannelMask: mask,
-        SubFormat: KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
+        SubFormat: if sample.is_pcm() {
+            KSDATAFORMAT_SUBTYPE_PCM
+        } else {
+            KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+        },
     }
 }
 
@@ -505,22 +563,25 @@ pub(crate) fn device_period(client: &IAudioClient) -> Result<DevicePeriod, Backe
 mod tests {
     use super::*;
 
-    /// Image mémoire d'un `WAVEFORMATEXTENSIBLE` float32.
-    fn extensible_bytes(channels: u16, rate: u32, mask: u32) -> Vec<u8> {
-        let format = float32_format(
+    /// Image mémoire d'un `WAVEFORMATEXTENSIBLE`, telle que la publient
+    /// `GetMixFormat`, `PKEY_AudioEngine_DeviceFormat` et `IsFormatSupported`.
+    fn sample_bytes(sample: SampleType, channels: u16, rate: u32, mask: u32) -> Vec<u8> {
+        let format = hardware_format(
+            sample,
             channels,
             SampleRate::new(rate).unwrap_or(SampleRate::HZ_48000),
             mask,
         );
+        let block_align = channels * sample.bytes() as u16;
         let mut bytes = Vec::with_capacity(WAVEFORMATEXTENSIBLE_SIZE);
         bytes.extend_from_slice(&WAVE_FORMAT_EXTENSIBLE.to_le_bytes());
         bytes.extend_from_slice(&channels.to_le_bytes());
         bytes.extend_from_slice(&rate.to_le_bytes());
-        bytes.extend_from_slice(&(rate * u32::from(channels * 4)).to_le_bytes());
-        bytes.extend_from_slice(&(channels * 4).to_le_bytes());
-        bytes.extend_from_slice(&32u16.to_le_bytes());
+        bytes.extend_from_slice(&(rate * u32::from(block_align)).to_le_bytes());
+        bytes.extend_from_slice(&block_align.to_le_bytes());
+        bytes.extend_from_slice(&sample.bits().to_le_bytes());
         bytes.extend_from_slice(&22u16.to_le_bytes());
-        bytes.extend_from_slice(&32u16.to_le_bytes());
+        bytes.extend_from_slice(&sample.valid_bits().to_le_bytes());
         bytes.extend_from_slice(&mask.to_le_bytes());
         let sub = format.SubFormat;
         bytes.extend_from_slice(&sub.data1.to_le_bytes());
@@ -531,9 +592,14 @@ mod tests {
         bytes
     }
 
+    /// Image mémoire d'un `WAVEFORMATEXTENSIBLE` float32 (le cas courant).
+    fn extensible_bytes(channels: u16, rate: u32, mask: u32) -> Vec<u8> {
+        sample_bytes(SampleType::F32, channels, rate, mask)
+    }
+
     #[test]
     fn float32_format_is_consistent() {
-        let format = float32_format(2, SampleRate::HZ_48000, MASK_STEREO);
+        let format = hardware_format(SampleType::F32, 2, SampleRate::HZ_48000, MASK_STEREO);
         let f = format.Format;
         assert_eq!({ f.nChannels }, 2);
         assert_eq!({ f.nSamplesPerSec }, 48_000);
@@ -542,6 +608,7 @@ mod tests {
         assert_eq!({ f.wBitsPerSample }, 32);
         assert_eq!({ f.cbSize }, 22);
         assert_eq!({ format.dwChannelMask }, MASK_STEREO);
+        assert_eq!({ format.SubFormat }, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
         // SAFETY: `Samples` est une union de `u16` : toutes les variantes sont
         // valides pour n'importe quelle valeur.
         assert_eq!(unsafe { format.Samples.wValidBitsPerSample }, 32);
@@ -556,6 +623,65 @@ mod tests {
         let mut bits24 = bytes;
         bits24[14] = 24;
         assert!(!wave_format_from_bytes(&bits24).unwrap().float32);
+    }
+
+    /// M1b-32 : les trois formats entiers proposés au matériel en mode exclusif.
+    #[test]
+    fn pcm_formats_carry_their_container_and_valid_bits() {
+        for (sample, bits, valid, block_align, avg) in [
+            (SampleType::Pcm24In32, 32u16, 24u16, 8u16, 384_000u32),
+            (SampleType::Pcm24, 24, 24, 6, 288_000),
+            (SampleType::Pcm16, 16, 16, 4, 192_000),
+        ] {
+            let format = hardware_format(sample, 2, SampleRate::HZ_48000, MASK_STEREO);
+            let f = format.Format;
+            assert_eq!({ f.wFormatTag }, WAVE_FORMAT_EXTENSIBLE, "{sample}");
+            assert_eq!({ f.nChannels }, 2, "{sample}");
+            assert_eq!({ f.nSamplesPerSec }, 48_000, "{sample}");
+            assert_eq!({ f.wBitsPerSample }, bits, "{sample}");
+            assert_eq!({ f.nBlockAlign }, block_align, "{sample}");
+            assert_eq!({ f.nAvgBytesPerSec }, avg, "{sample}");
+            assert_eq!({ f.cbSize }, 22, "{sample}");
+            assert_eq!({ format.dwChannelMask }, MASK_STEREO, "{sample}");
+            assert_eq!({ format.SubFormat }, KSDATAFORMAT_SUBTYPE_PCM, "{sample}");
+            // SAFETY: `Samples` est une union de `u16` : toutes les variantes sont
+            // valides pour n'importe quelle valeur.
+            let got = unsafe { format.Samples.wValidBitsPerSample };
+            assert_eq!(got, valid, "{sample}");
+            // Sérialisé puis relu, le format se reconnaît lui-même : c'est ainsi
+            // qu'une proposition `S_FALSE` du pilote est traduite.
+            let parsed = wave_format_from_bytes(&sample_bytes(sample, 2, 48_000, MASK_STEREO))
+                .expect("format lisible");
+            assert!(parsed.pcm && !parsed.float32, "{sample}");
+            assert_eq!(parsed.bits, bits, "{sample}");
+            assert_eq!(parsed.valid_bits, valid, "{sample}");
+            assert_eq!(parsed.block_align, block_align, "{sample}");
+            assert_eq!(parsed.sample_type(), Some(sample), "{sample}");
+        }
+        // Un mono 6 canaux : `nBlockAlign` suit le nombre de canaux.
+        let f = hardware_format(SampleType::Pcm24, 6, SampleRate::HZ_96000, 0x3F).Format;
+        assert_eq!({ f.nBlockAlign }, 18);
+        assert_eq!({ f.nAvgBytesPerSec }, 96_000 * 18);
+    }
+
+    /// Les formats que Conduit ne sait pas convertir n'ont pas de type.
+    #[test]
+    fn unknown_sample_layouts_have_no_type() {
+        let float = wave_format_from_bytes(&extensible_bytes(2, 48_000, MASK_STEREO)).unwrap();
+        assert_eq!(float.sample_type(), Some(SampleType::F32));
+        // PCM 20 bits dans un conteneur 24 : reconnu comme PCM, mais pas converti.
+        let mut bytes = sample_bytes(SampleType::Pcm24, 2, 48_000, MASK_STEREO);
+        bytes[18] = 20;
+        let odd = wave_format_from_bytes(&bytes).unwrap();
+        assert!(odd.pcm);
+        assert_eq!(odd.valid_bits, 20);
+        assert_eq!(odd.sample_type(), None);
+        // Ni float ni PCM (sous-format inconnu) : pas de type.
+        let mut bytes = extensible_bytes(2, 48_000, MASK_STEREO);
+        bytes[24] = 9;
+        let alien = wave_format_from_bytes(&bytes).unwrap();
+        assert!(!alien.pcm && !alien.float32);
+        assert_eq!(alien.sample_type(), None);
     }
 
     #[test]
@@ -597,7 +723,10 @@ mod tests {
                 sample_rate: 48_000,
                 block_align: 8,
                 channel_mask: Some(MASK_STEREO),
+                bits: 32,
+                valid_bits: 32,
                 float32: true,
+                pcm: false,
             })
         );
         let bytes = extensible_bytes(6, 96_000, 0x3F);
@@ -608,7 +737,10 @@ mod tests {
                 sample_rate: 96_000,
                 block_align: 24,
                 channel_mask: Some(0x3F),
+                bits: 32,
+                valid_bits: 32,
                 float32: true,
+                pcm: false,
             })
         );
     }
@@ -631,8 +763,16 @@ mod tests {
                 sample_rate: 44_100,
                 block_align: 2,
                 channel_mask: None,
+                bits: 16,
+                valid_bits: 16,
                 float32: false,
+                pcm: true,
             })
+        );
+        // Un `WAVE_FORMAT_PCM` simple se convertit comme du PCM 16 bits.
+        assert_eq!(
+            wave_format_from_bytes(&bytes).and_then(|f| f.sample_type()),
+            Some(SampleType::Pcm16)
         );
         // `WAVE_FORMAT_IEEE_FLOAT` 32 bits sans `SubFormat` est bien du float32.
         let mut float = bytes.clone();

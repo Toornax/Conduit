@@ -1,10 +1,17 @@
-//! Ouverture d'un flux WASAPI en mode partagé : négociation du format et
-//! initialisation de l'`IAudioClient`, sur le fil MMDevice.
+//! Ouverture d'un flux WASAPI : négociation du format et initialisation de
+//! l'`IAudioClient`, sur le fil MMDevice.
 //!
 //! Le format demandé est **honoré** (comme avec PipeWire) : le rappel reçoit
-//! exactement `format.channels` canaux entrelacés `f32` à `format.sample_rate`. Deux
-//! chemins y mènent :
+//! exactement `format.channels` canaux entrelacés `f32` à `format.sample_rate`.
+//! Trois chemins y mènent :
 //!
+//! 0. **Exclusif** — seulement si la politique du backend le demande
+//!    ([`ExclusivePolicy`], module `exclusive`, jamais par défaut) : le flux prend
+//!    le périphérique pour lui seul, au format que le matériel accepte (souvent de
+//!    l'entier : la conversion vers le `f32` du rappel est alors à notre charge,
+//!    module `convert`), avec la période **minimale** du pilote. Un refus retombe
+//!    en partagé ([`ExclusivePolicy::Preferred`]) ou devient une erreur
+//!    ([`ExclusivePolicy::Required`]).
 //! 1. **Basse latence** — le format demandé est le format de mixage du moteur (et
 //!    celui-ci est float32) : `IAudioClient3::InitializeSharedAudioStream` avec la
 //!    plus petite période prise en charge ≥ `block_frames`
@@ -42,10 +49,12 @@ use windows::Win32::Media::Audio::{
 
 use crate::clock::{ClockScale, ClockSource};
 use crate::com::{platform_error, Event};
+use crate::convert::SampleType;
 use crate::devices::{
-    activate_client, describe, device_period, find_active, float32_format, frames_from_period,
+    activate_client, describe, device_period, find_active, frames_from_period, hardware_format,
     mix_format, Defaults, DEFAULT_PERIOD_HNS,
 };
+use crate::exclusive::{required_error, try_exclusive, ExclusivePolicy, ShareMode};
 
 /// Périodes du moteur audio pour un format donné, en trames
 /// (`IAudioClient3::GetSharedModeEnginePeriod`).
@@ -87,15 +96,53 @@ pub enum InitPath {
     },
     /// `IAudioClient::Initialize` avec conversion automatique, période par défaut.
     Converted,
+    /// `IAudioClient::Initialize` en mode **exclusif** (M1b-32) : le périphérique
+    /// n'est plus partagé, la période est la minimale du pilote, et le format
+    /// matériel n'est pas forcément celui du rappel.
+    Exclusive {
+        /// Format d'échantillon que le matériel a accepté. Différent de
+        /// [`SampleType::F32`] = Conduit convertit lui-même dans le fil du flux.
+        sample: SampleType,
+        /// Période obtenue, en unités de 100 ns.
+        period_hns: i64,
+        /// Période obtenue, en trames.
+        period_frames: u32,
+        /// Vrai si `AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED` a imposé une reprise avec
+        /// la taille de tampon que le pilote a lui-même choisie.
+        realigned: bool,
+    },
+}
+
+impl InitPath {
+    /// Mode de partage de ce chemin.
+    pub fn share_mode(self) -> ShareMode {
+        match self {
+            Self::LowLatency { .. } | Self::Converted => ShareMode::Shared,
+            Self::Exclusive { .. } => ShareMode::Exclusive,
+        }
+    }
+
+    /// Format d'échantillon du tampon WASAPI : `f32` sauf en exclusif sur un
+    /// matériel entier.
+    pub fn sample_type(self) -> SampleType {
+        match self {
+            Self::LowLatency { .. } | Self::Converted => SampleType::F32,
+            Self::Exclusive { sample, .. } => sample,
+        }
+    }
 }
 
 /// Latence et tailles d'un flux ouvert (hors trait `DeviceHandle`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamLatency {
-    /// Taille du tampon partagé avec le moteur, en trames (`GetBufferSize`).
+    /// Taille du tampon (partagé avec le moteur, ou celui du pilote en exclusif),
+    /// en trames (`GetBufferSize`).
     pub buffer_frames: usize,
     /// Trames par réveil attendues (`block_frames` effectif).
     pub period_frames: usize,
+    /// Durée d'une période, telle qu'elle découle de `period_frames` à la fréquence
+    /// demandée : la latence « par réveil » du flux, comparable d'un mode à l'autre.
+    pub period: Duration,
     /// Latence du flux rapportée par WASAPI (`GetStreamLatency`), hors tampon.
     /// Certains pilotes rendent 0 en mode partagé (observé sur une sortie HDMI
     /// NVIDIA) : la latence utile se déduit alors de `buffer_frames`.
@@ -123,6 +170,11 @@ pub(crate) struct StreamObjects {
     /// Signalé par le moteur à chaque période (`SetEventHandle`).
     pub(crate) event: Event,
     pub(crate) latency: StreamLatency,
+    /// Format d'échantillon du tampon WASAPI ; hors [`SampleType::F32`], le fil du
+    /// flux convertit lui-même (module `convert`).
+    pub(crate) sample: SampleType,
+    /// Octets d'une trame du tampon WASAPI (`nBlockAlign`).
+    pub(crate) frame_bytes: usize,
     /// Horloge du flux, si le pilote en fournit une.
     pub(crate) clock: Option<AgileReference<IAudioClock>>,
     /// Conversion des positions de `clock` en trames du format livré.
@@ -137,13 +189,20 @@ pub(crate) struct Opened {
     /// Format effectif : fréquence et canaux demandés, `block_frames` obtenu.
     pub(crate) format: StreamFormat,
     pub(crate) objects: StreamObjects,
+    /// Pourquoi le mode exclusif a été refusé, en [`ExclusivePolicy::Preferred`]
+    /// seulement (le flux rendu est alors partagé).
+    pub(crate) exclusive_refusal: Option<String>,
 }
 
-/// Ouvre un flux partagé sur l'endpoint `id`. À appeler depuis le fil MMDevice.
+/// Ouvre un flux sur l'endpoint `id`. À appeler depuis le fil MMDevice.
+///
+/// `policy` décide du mode de partage : partagé par défaut, exclusif tenté ou exigé
+/// selon [`ExclusivePolicy`].
 pub(crate) fn open(
     enumerator: &IMMDeviceEnumerator,
     id: &DeviceId,
     format: StreamFormat,
+    policy: ExclusivePolicy,
 ) -> Result<Opened, BackendError> {
     let device =
         find_active(enumerator, id.as_str())?.ok_or_else(|| BackendError::NotFound(id.clone()))?;
@@ -165,51 +224,35 @@ pub(crate) fn open(
 
     let client = activate_client(&device)?;
     let mix = mix_format(&client)?;
-    let matches_mix = mix.parsed.float32
-        && mix.parsed.channels == channels
-        && mix.parsed.sample_rate == format.sample_rate.hz();
+    let mask = mix.parsed.mask_for(channels);
 
-    let (client, path, block_frames) =
-        match matches_mix.then(|| low_latency(&client, mix.as_ptr(), format.block_frames)) {
-            Some(Ok((period_frames, periods))) => (
-                client,
-                InitPath::LowLatency {
-                    period_frames,
-                    periods,
-                },
-                period_frames as usize,
-            ),
-            // Chemin 1 refusé (ou format différent du mixage) : un client neuf, car un
-            // `IAudioClient` dont l'initialisation a échoué n'est pas réutilisable.
-            _ => {
-                let client = activate_client(&device)?;
-                let period_hns = device_period(&client)
-                    .map(|p| p.default)
-                    .unwrap_or(DEFAULT_PERIOD_HNS);
-                let mask = mix.parsed.mask_for(channels);
-                let wanted = float32_format(channels, format.sample_rate, mask);
-                // SAFETY: `wanted` vit pendant l'appel et commence par un `WAVEFORMATEX` ;
-                // aucun GUID de session (session par défaut du processus).
-                unsafe {
-                    client.Initialize(
-                        AUDCLNT_SHAREMODE_SHARED,
-                        AUDCLNT_STREAMFLAGS_EVENTCALLBACK
-                            | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
-                            | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
-                        0,
-                        0,
-                        core::ptr::addr_of!(wanted).cast::<WAVEFORMATEX>(),
-                        None,
-                    )
-                }
-                .map_err(|e| unsupported_or_platform(id, "IAudioClient::Initialize", &e))?;
-                (
-                    client,
-                    InitPath::Converted,
-                    frames_from_period(period_hns, format.sample_rate),
-                )
-            }
-        };
+    // Chemin 0 : mode exclusif, uniquement si la politique le demande.
+    let exclusive = policy
+        .tries_exclusive()
+        .then(|| try_exclusive(&device, channels, format.sample_rate, mask));
+    let (client, path, block_frames, exclusive_refusal) = match exclusive {
+        Some(Ok(init)) => {
+            let path = InitPath::Exclusive {
+                sample: init.sample,
+                period_hns: init.period_hns,
+                period_frames: init.period_frames,
+                realigned: init.realigned,
+            };
+            (init.client, path, init.period_frames as usize, None)
+        }
+        // `Required` : plutôt une erreur explicite qu'un flux partagé qu'on n'a pas
+        // demandé.
+        Some(Err(reason)) if policy == ExclusivePolicy::Required => {
+            return Err(required_error(id, &reason))
+        }
+        // `Preferred` : repli en partagé, la raison voyage jusqu'à la poignée.
+        Some(Err(reason)) => shared(&device, id, &client, &mix, channels, format, mask)
+            .map(|(client, path, block)| (client, path, block, Some(reason)))?,
+        None => shared(&device, id, &client, &mix, channels, format, mask)
+            .map(|(client, path, block)| (client, path, block, None))?,
+    };
+    let sample = path.sample_type();
+    let frame_bytes = sample.frame_bytes(usize::from(channels));
 
     // SAFETY: client initialisé ; l'événement vit aussi longtemps que le flux
     // (`StreamObjects::event`), plus longtemps que le client.
@@ -243,11 +286,17 @@ pub(crate) fn open(
         channels,
         mix.parsed.sample_rate,
         mix.parsed.block_align,
+        u16::try_from(frame_bytes).unwrap_or(u16::MAX),
     )?;
 
+    let period_frames = block_frames.max(1);
     let latency = StreamLatency {
         buffer_frames: buffer_frames as usize,
-        period_frames: block_frames.max(1),
+        period_frames,
+        period: Duration::from_nanos(
+            (period_frames as u64).saturating_mul(1_000_000_000)
+                / u64::from(format.sample_rate.hz().max(1)),
+        ),
         stream_latency: Duration::from_nanos(u64::try_from(latency_hns.max(0) * 100).unwrap_or(0)),
         path,
         write_ahead_frames: 0,
@@ -264,11 +313,73 @@ pub(crate) fn open(
             service,
             event,
             latency,
+            sample,
+            frame_bytes,
             clock,
             clock_scale,
             clock_source,
         },
+        exclusive_refusal,
     })
+}
+
+/// Chemins partagés 1 (basse latence) et 2 (conversion). Rend le client
+/// **initialisé**, le chemin retenu et `block_frames` effectif.
+///
+/// `probe` est le client déjà activé qui a servi à lire le format de mixage : il
+/// est réutilisé si `InitializeSharedAudioStream` réussit, abandonné sinon (un
+/// `IAudioClient` dont l'initialisation a échoué n'est pas réutilisable).
+fn shared(
+    device: &windows::Win32::Media::Audio::IMMDevice,
+    id: &DeviceId,
+    probe: &IAudioClient,
+    mix: &crate::devices::MixFormat,
+    channels: u16,
+    format: StreamFormat,
+    mask: u32,
+) -> Result<(IAudioClient, InitPath, usize), BackendError> {
+    let matches_mix = mix.parsed.float32
+        && mix.parsed.channels == channels
+        && mix.parsed.sample_rate == format.sample_rate.hz();
+    if matches_mix {
+        if let Ok((period_frames, periods)) = low_latency(probe, mix.as_ptr(), format.block_frames)
+        {
+            return Ok((
+                probe.clone(),
+                InitPath::LowLatency {
+                    period_frames,
+                    periods,
+                },
+                period_frames as usize,
+            ));
+        }
+    }
+    // Chemin 1 refusé (ou format différent du mixage) : un client neuf.
+    let client = activate_client(device)?;
+    let period_hns = device_period(&client)
+        .map(|p| p.default)
+        .unwrap_or(DEFAULT_PERIOD_HNS);
+    let wanted = hardware_format(SampleType::F32, channels, format.sample_rate, mask);
+    // SAFETY: `wanted` vit pendant l'appel et commence par un `WAVEFORMATEX` ;
+    // aucun GUID de session (session par défaut du processus).
+    unsafe {
+        client.Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+                | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+                | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+            0,
+            0,
+            core::ptr::addr_of!(wanted).cast::<WAVEFORMATEX>(),
+            None,
+        )
+    }
+    .map_err(|e| unsupported_or_platform(id, "IAudioClient::Initialize", &e))?;
+    Ok((
+        client,
+        InitPath::Converted,
+        frames_from_period(period_hns, format.sample_rate),
+    ))
 }
 
 /// `IAudioClock` du flux et sa fréquence, classée par rapport au format de mixage
@@ -284,6 +395,7 @@ fn audio_clock(
     channels: u16,
     mix_rate: u32,
     mix_block_align: u16,
+    device_block_align: u16,
 ) -> Result<(Option<AgileReference<IAudioClock>>, ClockScale, ClockSource), BackendError> {
     // SAFETY: client initialisé.
     let clock: Option<IAudioClock> = unsafe { client.GetService() }.ok();
@@ -294,8 +406,14 @@ fn audio_clock(
         .filter(|&f| f > 0);
     match (clock, frequency) {
         (Some(clock), Some(frequency)) => {
-            let (scale, units) =
-                ClockScale::new(frequency, sample_rate, channels, mix_rate, mix_block_align);
+            let (scale, units) = ClockScale::new(
+                frequency,
+                sample_rate,
+                channels,
+                mix_rate,
+                mix_block_align,
+                device_block_align,
+            );
             Ok((
                 Some(agile(&clock, "IAudioClock")?),
                 scale,

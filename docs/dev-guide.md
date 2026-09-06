@@ -155,10 +155,11 @@ défaut = période du moteur (`GetDevicePeriod`) en trames, `is_default` =
 COM alloue est rendu par une garde (`CoTaskString`, `CoTaskMem`, `PropVariant`) ;
 chaque bloc `unsafe` porte son `SAFETY:`.
 
-**Flux.** `open(id, format, rappel)` honore le format demandé : le rappel reçoit
-exactement `format.channels` canaux `f32` entrelacés à `format.sample_rate`. Le fil
-MMDevice (`open`) active l'`IAudioClient` et choisit un chemin : si (fréquence,
-canaux) est le format de mixage et que celui-ci est float32,
+**Flux.** `open(id, format, rappel, politique)` honore le format demandé : le rappel
+reçoit exactement `format.channels` canaux `f32` entrelacés à `format.sample_rate`. Le fil
+MMDevice (`open`) active l'`IAudioClient` et choisit un chemin : si la politique
+demande le mode exclusif et que le matériel l'accorde, voir plus bas ; sinon, si
+(fréquence, canaux) est le format de mixage et que celui-ci est float32,
 `IAudioClient3::InitializeSharedAudioStream` avec la plus petite période prise en
 charge ≥ `block_frames` (`choose_period` : multiple de la fondamentale, bornée à
 `[min, max]` de `GetSharedModeEnginePeriod`) ; sinon `IAudioClient::Initialize`
@@ -166,8 +167,11 @@ en partagé avec `EVENTCALLBACK | AUTOCONVERTPCM | SRC_DEFAULT_QUALITY`, un
 `WAVEFORMATEXTENSIBLE` float32 aux valeurs demandées et la période par défaut
 (`block_frames` effectif = cette période en trames à la fréquence demandée). Un
 refus du premier chemin retombe sur le second avec un client neuf. `format()` rend
-le format effectif ; `WasapiHandle::latency()` (hors trait) expose `GetBufferSize`,
-la période, `GetStreamLatency` (0 chez certains pilotes) et le chemin retenu.
+le format effectif — **toujours** `f32` aux fréquence et canaux demandés, quel que
+soit le mode ; `WasapiHandle::latency()` (hors trait) expose `GetBufferSize`,
+la période (en trames et en durée), `GetStreamLatency` (0 chez certains pilotes en
+partagé) et le chemin retenu ; `share_mode()` et `sample_type()` (hors trait aussi)
+disent le mode obtenu et le format du tampon matériel.
 Les interfaces du crate `windows` ne sont pas `Send` : `IAudioClient` et le
 service de rendu ou de capture voyagent vers le fil du flux en `AgileReference`,
 résolue là-bas (MTA des deux côtés, objets WASAPI libres de fil).
@@ -188,6 +192,73 @@ boucle sans panique : `is_running()` devient faux, `stop()` rend `Disconnected`,
 `Stop` puis `Reset`) : aucun rappel n'est en cours au retour ; `Drop` appelle
 `stop()` puis libère les objets COM sous un appartement MTA temporaire.
 
+**Mode exclusif** (`exclusive` + `convert`, M1b-32). En exclusif, le flux **prend le
+périphérique pour lui seul** : le moteur audio de Windows est court-circuité, plus
+aucune autre application n'y joue. C'est pourquoi c'est un **opt-in par backend**,
+jamais imposé : `WasapiBackend::set_exclusive_policy(ExclusivePolicy)` / `exclusive_policy()`,
+avec `Never` (**défaut**), `Preferred` (tenter, retomber en partagé sinon) et
+`Required` (échouer plutôt que rendre un flux partagé). Le réglage est délibérément
+**hors du trait `Backend`**, qui est portable et ne doit pas gagner une notion
+Windows. Le défaut reste le partagé parce qu'un câble Conduit doit coexister avec le
+reste du système : SPEC §5.6 fait du mode exclusif un bonus de latence, pas la norme.
+Un repli garde sa raison sur la poignée (`WasapiHandle::exclusive_refusal()`) — ce
+crate n'a pas de dépendance de traçage, c'est à l'appelant de la journaliser ; un
+refus en `Required` devient une `BackendError::UnsupportedFormat` qui nomme la cause
+(« un autre programme utilise déjà ce périphérique en mode exclusif », « le mode
+exclusif est désactivé pour ce périphérique : Paramètres > Son > Propriétés > Avancé »,
+« format refusé »), son `HRESULT`, et dit quoi faire.
+
+*Négociation.* Pas d'`AUTOCONVERTPCM` en exclusif : le format passé à `Initialize`
+est celui que le convertisseur reçoit. `exclusive::try_exclusive` propose donc à
+`IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, …)`, aux **fréquence et canaux
+demandés**, un `WAVEFORMATEXTENSIBLE` float32, puis PCM 24 dans un conteneur 32
+(`wBitsPerSample = 32`, `wValidBitsPerSample = 24`), puis PCM 24 compacté, puis
+PCM 16 — le matériel exclusif n'accepte souvent que l'entier. Une proposition du
+pilote (`S_FALSE` + format suggéré ; Microsoft documente `*ppClosestMatch` toujours
+nul en exclusif, on la gère quand même) n'est retenue que si elle garde la fréquence
+et le nombre de canaux : les changer reviendrait à ne pas honorer le format.
+
+*Période et alignement.* `GetDevicePeriod` donne la période **minimale**, passée en
+`hnsBufferDuration` **et** `hnsPeriodicity` (l'événementiel exclusif exige les deux
+égales). Si le pilote répond `AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED` — le rite de passage
+du mode exclusif —, on lit la taille alignée qu'il vient de fixer (`GetBufferSize`),
+on en déduit la période (`aligned_period_hns`, la formule de Microsoft calculée en
+entiers ; une propriété vérifie qu'elle redonne exactement le nombre de trames par
+`frames_from_period`), on **libère et recrée** l'`IAudioClient` — obligatoire, un
+client dont l'initialisation a échoué n'est pas réutilisable — et on réinitialise.
+Une seule reprise, puis abandon. *Aucune des cartes du poste n'a eu besoin de cette
+reprise* : ce chemin n'est couvert que par ses tests unitaires.
+
+*Boucle.* Deux différences dans le fil du flux (`stream`, `Worker::whole_buffer`).
+Un réveil donne accès au **tampon entier** : en exclusif événementiel
+`GetCurrentPadding` rend toujours la taille du tampon (donc « zéro trame libre »,
+ce qui rendrait le flux muet — c'est le piège) et `GetNextPacketSize` ne s'applique
+pas ; on fait donc un `GetBuffer(buffer_frames)` par réveil, et le préremplissage
+initial est le tampon complet. Et la **conversion est à notre charge** : le rappel
+écrit dans le tampon intermédiaire `f32` déjà alloué à l'ouverture, que
+`convert::write_f32` verse dans le tampon WASAPI (`convert::read_f32` en capture).
+Échelle `v × 2^(n−1)`, arrondi au plus proche, écrêtage à `[−2^(n−1), 2^(n−1) − 1]`,
+`NaN` → 0 ; l'aller-retour tient dans un pas de quantification et le retour ne sort
+jamais de `[−1, 1]`. PCM 24 dans 32 : les 24 bits significatifs sont **alignés à
+gauche**, l'octet de poids faible nul. C'est une convention **différente** de celle
+de `conduit_kmd_core::ring` (±32 767) et ce crate n'en dépend pas : `ring::copy_frames`
+est une copie *cyclique* du pilote, limitée à F32/I16 et 8 canaux, sans PCM 24 ; et
+faire dépendre un backend utilisateur de la logique du pilote noyau pour deux
+fonctions scalaires inverserait les couches. Rien n'alloue : `tests/no_alloc.rs`
+couvre le cas exclusif, conversion comprise.
+
+*Ce que le matériel de test accepte.* Les cinq endpoints de rendu du poste
+(2026-09-06, `tests/exclusive.rs`) accordent tous l'exclusif en 48 kHz stéréo, et
+**aucun** n'accepte le float32 : Realtek Digital Output (S/PDIF), G27QC A et E2351
+(HDMI NVIDIA) prennent du **PCM 24 dans un conteneur 32**, l'Audeze Maxwell (USB,
+sorties Chat et Game) du **PCM 24 compacté**. Tous donnent la même géométrie :
+tampon et période de **144 trames (3 ms, 30 000 × 100 ns)** contre **1 056 trames
+(22 ms)** de tampon et 480 trames (10 ms) de période en partagé — soit **3 ms au
+lieu de 22 ms**, sept fois moins, sans réalignement du tampon. `GetStreamLatency`,
+qui rend 0 en partagé sur ces pilotes, rend 3 ms en exclusif. Tout ce matériel est
+**numérique** (S/PDIF, HDMI, USB) : le comportement d'une carte analogique reste à
+vérifier, en particulier le chemin de réalignement et le PCM 16.
+
 **Horloge** (`clock`, M1b-33). À l'ouverture, `IAudioClient::GetService(IAudioClock)`
 et `GetFrequency`. Microsoft ne fixe pas l'unité de cette fréquence, seulement
 qu'elle est celle de la position : `ClockScale::new` la classe (`ClockUnits`) —
@@ -195,9 +266,14 @@ qu'elle est celle de la position : `ClockScale::new` la classe (`ClockUnits`) �
 du mixage → octets/s du mixage (**observé** sur les deux cartes du poste par le
 chemin `IAudioClient3` : 384 000 pour 48 kHz stéréo float32) ; `freq == sample_rate
 × channels × 4` → octets/s du format livré (**observé** par le chemin conversion :
-176 400 en 44,1 kHz mono) ; sinon « autre » — et convertit toujours par le rapport
+176 400 en 44,1 kHz mono) ; `freq == sample_rate × nBlockAlign` du **format
+matériel** → octets/s de celui-ci (cas ajouté en M1b-32 pour un tampon exclusif
+entier ; non rencontré) ; sinon « autre » — et convertit toujours par le rapport
 générique `position × sample_rate / freq` (128 bits), exact dans tous les cas :
-`ClockInfo::position` est en **trames du format livré** au rappel. À chaque rappel,
+`ClockInfo::position` est en **trames du format livré** au rappel. En **mode
+exclusif** les cinq cartes du poste comptent en trames/s (48 000) et non plus en
+octets : sans moteur audio entre le pilote et nous, l'unité change — la conversion
+générique absorbe la différence sans rien changer d'autre. À chaque rappel,
 **avant** de toucher au tampon, `IAudioClock::GetPosition(&pos, &qpc)` :
 `position` = `pos` converti, jamais décroissante ; `timestamp_ns` = `qpc × 100`
 (le compteur de performance en unités de 100 ns : base **QPC commune** à tous les
@@ -233,12 +309,14 @@ test `conduitd_binary_auto_backend_is_wasapi_on_windows` (`crates/conduitd/tests
 lance le binaire et vérifie que le graphe contient chaque endpoint énuméré ; il se
 saute si WASAPI est indisponible ou qu'aucune carte n'est active.
 
-Ce qui manque encore : le mode exclusif (M1b-32), `CableControl` par le helper
-(M1b-34 — d'ici là le démon ignore la section `[[cable]]` avec un avertissement).
+Ce qui manque encore : `CableControl` par le helper (M1b-34 — d'ici là le démon
+ignore la section `[[cable]]` avec un avertissement), et l'exposition du mode
+exclusif dans la configuration du démon (il ouvre tout en partagé pour l'instant).
 Les tests d'intégration (`tests/wasapi.rs`, `tests/stream.rs`, `tests/no_alloc.rs`,
-`tests/two_devices.rs` — 60 s sur deux cartes de rendu, dérive imprimée) tournent
-sur les cartes son de la machine, en silence ; ceux qui demandent un périphérique
-absent se sautent avec un message. À lancer à la main : le critère « casque USB
+`tests/exclusive.rs` — chaque carte de rendu en partagé puis en exclusif, résultat
+imprimé, latences comparées —, `tests/two_devices.rs` — 60 s sur deux cartes de
+rendu, dérive imprimée) tournent sur les cartes son de la machine, en silence ;
+ceux qui demandent un périphérique absent se sautent avec un message. À lancer à la main : le critère « casque USB
 branché → `Added` »
 (`cargo test -p conduit-backend-wasapi --test wasapi -- --ignored --nocapture`), le
 sinus audible

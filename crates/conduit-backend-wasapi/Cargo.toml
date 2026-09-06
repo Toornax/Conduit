@@ -49,6 +49,10 @@ bytemuck = "1"
 # Test d'endurance `two_devices` : le moteur pilote une carte et absorbe la
 # dérive de l'autre par son port asynchrone (critère M1b-33).
 conduit-engine.workspace = true
+# Propriété de l'alignement de période du mode exclusif (M1b-32) : la période
+# rendue par `aligned_period_hns` redonne bien le nombre de trames imposé par le
+# pilote, à toute fréquence acceptée.
+proptest = { workspace = true }
 
 [lints]
 workspace = true

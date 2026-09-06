@@ -9,6 +9,7 @@ use conduit_backend::{
     DeviceInfo, EventReceiver, StreamFormat,
 };
 
+use crate::exclusive::ExclusivePolicy;
 use crate::mmdevice_thread::{Command, Message};
 use crate::stream::WasapiHandle;
 
@@ -28,12 +29,15 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct WasapiBackend {
     sender: mpsc::Sender<Message>,
     thread: Option<JoinHandle<()>>,
+    /// Ce que les prochaines ouvertures font du mode exclusif (M1b-32).
+    policy: ExclusivePolicy,
 }
 
 impl core::fmt::Debug for WasapiBackend {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("WasapiBackend")
             .field("thread_alive", &self.thread.is_some())
+            .field("exclusive_policy", &self.policy)
             .finish()
     }
 }
@@ -59,6 +63,7 @@ impl WasapiBackend {
             Ok(Ok(())) => Ok(Self {
                 sender,
                 thread: Some(thread),
+                policy: ExclusivePolicy::default(),
             }),
             Ok(Err(e)) => {
                 let _ = thread.join();
@@ -76,8 +81,29 @@ impl WasapiBackend {
         }
     }
 
+    /// Ce que les prochaines ouvertures feront du **mode exclusif** WASAPI.
+    ///
+    /// Réglage propre à ce backend, volontairement **hors** du trait
+    /// [`Backend`] : celui-ci est portable (PipeWire, CoreAudio) et ne doit pas
+    /// gagner une notion Windows. Le défaut est [`ExclusivePolicy::Never`] — un
+    /// câble Conduit doit coexister avec les autres applications, et un flux
+    /// exclusif prend le périphérique pour lui seul (SPEC §5.6 : le mode exclusif
+    /// est un bonus de latence, pas la norme). Voir le module `exclusive`.
+    ///
+    /// Le changement ne concerne que les ouvertures suivantes : les flux déjà
+    /// ouverts gardent leur mode.
+    pub fn set_exclusive_policy(&mut self, policy: ExclusivePolicy) {
+        self.policy = policy;
+    }
+
+    /// Politique de mode exclusif en vigueur ([`Self::set_exclusive_policy`]).
+    pub fn exclusive_policy(&self) -> ExclusivePolicy {
+        self.policy
+    }
+
     /// Comme [`Backend::open`], mais rend le type concret : utile pour
-    /// [`WasapiHandle::latency`] et [`WasapiHandle::rt_outcome`], hors trait.
+    /// [`WasapiHandle::latency`], [`WasapiHandle::share_mode`] et
+    /// [`WasapiHandle::rt_outcome`], hors trait.
     pub fn open_handle(
         &mut self,
         id: &DeviceId,
@@ -85,8 +111,14 @@ impl WasapiBackend {
         callback: AudioCallback,
     ) -> Result<WasapiHandle, BackendError> {
         let id = id.clone();
+        let policy = self.policy;
         let opened = self.request(
-            move |reply| Command::Open { id, format, reply },
+            move |reply| Command::Open {
+                id,
+                format,
+                policy,
+                reply,
+            },
             "ouverture",
         )??;
         WasapiHandle::new(opened, callback)
@@ -140,15 +172,18 @@ impl Backend for WasapiBackend {
         .ok()?
     }
 
-    /// Ouvre un flux en mode partagé, événementiel, au format demandé (voir
-    /// `open` et `stream`). La poignée rendue est un [`WasapiHandle`] ; le rappel
-    /// n'est appelé qu'après [`DeviceHandle::start`].
+    /// Ouvre un flux événementiel au format demandé (voir `open` et `stream`), en
+    /// mode partagé sauf si [`Self::set_exclusive_policy`] a demandé l'exclusif.
+    /// La poignée rendue est un [`WasapiHandle`] ; le rappel n'est appelé qu'après
+    /// [`DeviceHandle::start`].
     ///
     /// # Erreurs
     ///
     /// [`BackendError::NotFound`] si l'endpoint n'existe pas ou n'est pas actif,
-    /// [`BackendError::UnsupportedFormat`] pour zéro canal ou un format que le
-    /// moteur refuse malgré la conversion, [`BackendError::Platform`] sinon.
+    /// [`BackendError::UnsupportedFormat`] pour zéro canal, pour un format que le
+    /// moteur refuse malgré la conversion, ou pour un mode exclusif exigé
+    /// ([`ExclusivePolicy::Required`]) mais refusé par le matériel ou déjà pris ;
+    /// [`BackendError::Platform`] sinon.
     fn open(
         &mut self,
         id: &DeviceId,
