@@ -423,9 +423,23 @@ signé par attestation, HLK audio passé, latence conforme à SPEC §5.6, endura
 - [ ] **M1b-03** `feat(driver): état de jack par câble, inactifs masqués`
   `KSPROPERTY_JACK_DESCRIPTION` avec `IsConnected` ; câbles 1 et 2 actifs par défaut.
   *Fait quand* : les réglages Son ne montrent que Conduit 1 et 2 ; les autres apparaissent sous « déconnectés ».
-- [ ] **M1b-04** `feat(driver): IOCTL de configuration (activer, désactiver, canaux)`
-  Interface de périphérique dédiée, ACL administrateur, validation stricte de chaque champ,
-  bascule du jack à chaud.
+- [ ] **M1b-03b** `feat(driver): nœud de volume, pour que le câble soit transparent`
+  Nœud `KSNODETYPE_VOLUME` sur les filtres de topologie, initialisé à 0 dB et piloté par
+  nous. Sans lui, Windows insère son **APO logiciel** et applique au signal le volume par
+  défaut qu'il donne à tout endpoint neuf : mesuré à 64 % le 2026-09-06, soit une amplitude
+  de 0,229 pour 0,500 demandée. Un câble virtuel dont la raison d'être est la transparence
+  bit à bit ne peut pas atténuer ce qu'il transporte
+  ([driver-design.md](docs/driver-design.md) §5.5).
+  *Fait quand* : `conduit-looptest --repeat 10` rend l'amplitude demandée sans avoir à
+  forcer le volume de l'endpoint, et la modifier dans les réglages Son ne change plus rien
+  à ce qui traverse le câble.
+- [ ] **M1b-04** `feat(driver): propriété KS privée de configuration (activer, désactiver, canaux)`
+  Jeu de propriétés KS privé `KSPROPSETID_Conduit` exposé par le filtre de topologie de
+  chaque câble, et non un objet de périphérique de contrôle séparé
+  ([driver-design.md](docs/driver-design.md) §6, décision anticipée) : PortCls fait le
+  routage, l'accès passe par les handles standard, et la validation reste un parseur sur un
+  tampon borné, fuzzable en mode utilisateur (M1b-08). Écriture soumise à
+  `SeSinglePrivilegeCheck(SE_LOAD_DRIVER_PRIVILEGE)`, bascule du jack à chaud.
   *Fait quand* : activation → endpoint visible en < 1 s sans PnP (F-01) ; entrée invalide → `STATUS_INVALID_PARAMETER` sans effet.
 - [ ] **M1b-05** `feat(driver): formats 44,1/48/96 kHz, float32, PCM16 et PCM24`
   *Fait quand* : test de boucle pour chaque format (F-04).
@@ -433,7 +447,7 @@ signé par attestation, HLK audio passé, latence conforme à SPEC §5.6, endura
   *Fait quand* : veille/reprise 50 fois avec flux ouvert, sans erreur ni fuite.
 - [ ] **M1b-07** `feat(driver): comportement à un seul côté ouvert`
   *Fait quand* : capture seule → silence ; rendu seul → pas d'accumulation.
-- [ ] **M1b-08** `test(driver): harnais utilisateur et fuzzing du parseur IOCTL`
+- [ ] **M1b-08** `test(driver): harnais utilisateur et fuzzing du parseur de la propriété KS`
   Le code de validation compile aussi en mode utilisateur pour être fuzzé.
   *Fait quand* : 1 h de fuzzing sans panique.
 - [ ] **M1b-09** `test(driver): 1000 cycles activation/désactivation et 48 h de stress`
@@ -443,7 +457,7 @@ signé par attestation, HLK audio passé, latence conforme à SPEC §5.6, endura
 
 ### M1b.B — Service d'assistance
 
-- [ ] **M1b-20** `feat(helper): service Windows minimal exposant l'IOCTL au démon`
+- [ ] **M1b-20** `feat(helper): service Windows minimal exposant la propriété KS au démon`
   Named pipe à interface fixe (activer, désactiver, canaux, lister), validation, journal.
   *Fait quand* : tests unitaires de validation ; le démon non-admin active un câble via le helper.
 - [ ] **M1b-21** `feat(helper): renommage d'endpoint via le registre`
