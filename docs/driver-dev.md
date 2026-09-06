@@ -211,8 +211,11 @@ Windows 11 l'exige), **Secure Boot désactivé** (sinon `bcdedit /set testsignin
 refusé), points de contrôle automatiques désactivés, interface de services invité
 activée. Le script démarre la VM, ouvre `vmconnect` et affiche la marche à suivre :
 appuyer sur une touche pour démarrer sur l'ISO, installer Windows 11 (Pro), créer un
-**compte local** `test` administrateur sans compte Microsoft (Maj+F10 puis
-`OOBE\BYPASSNRO` si l'installeur l'impose), puis passer à `vm-prepare.ps1`.
+**compte local** `test` administrateur sans compte Microsoft, puis passer à
+`vm-prepare.ps1`. Microsoft a retiré `OOBE\BYPASSNRO` et `ms-cxh:localonly` des images
+récentes : la marche à suivre qui fonctionne encore est détaillée dans
+[vm-bringup.md](vm-bringup.md) §1 (déconnecter la carte réseau, poser la valeur de
+registre `BypassNRO`, redémarrer).
 
 ### 3.2 Préparation : `vm-prepare.ps1`
 

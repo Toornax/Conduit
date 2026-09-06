@@ -41,8 +41,17 @@ de groupe qu'à l'ouverture de session (rouvrir le terminal ne suffit pas). Dét
 
 Génération 2, Secure Boot **désactivé** (sinon `testsigning` est refusé), vTPM activé
 (l'installeur Windows 11 l'exige). Installer Windows 11 Pro avec un compte **local**
-`test` administrateur (`Maj+F10` puis `OOBE\BYPASSNRO` si l'installeur impose un compte
-Microsoft). Puis :
+`test` administrateur. **Microsoft a retiré `OOBE\BYPASSNRO` et `ms-cxh:localonly`** des
+images récentes, 25H2 comprise. Si l'installeur impose un compte Microsoft : déconnecter
+la carte réseau depuis l'hôte, puis dans la VM `Maj+F10` et
+`reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE /v BypassNRO /t REG_DWORD /d 1 /f`
+suivi de `shutdown /r /t 0` ; l'option « Je n'ai pas Internet » réapparaît. Reconnecter la
+carte ensuite, le débogage noyau en dépend.
+
+```powershell
+Get-VMNetworkAdapter -VMName ConduitTest | Disconnect-VMNetworkAdapter   # avant
+Get-VMNetworkAdapter -VMName ConduitTest | Connect-VMNetworkAdapter -SwitchName "Default Switch"
+``` Puis :
 
 ```powershell
 $cred = Get-Credential test
