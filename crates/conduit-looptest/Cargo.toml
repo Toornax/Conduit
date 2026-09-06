@@ -1,0 +1,36 @@
+[package]
+name = "conduit-looptest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Conduit — outil de test de boucle du pilote Windows : sinus → rendu → capture → vérification"
+publish = false
+
+[lib]
+name = "conduit_looptest"
+path = "src/lib.rs"
+
+[[bin]]
+name = "conduit-looptest"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+conduit-backend.workspace = true
+conduit-core.workspace = true
+serde = { workspace = true }
+serde_json = "1"
+
+# Le backend WASAPI n'existe que sous Windows ; ailleurs le binaire se contente
+# d'expliquer qu'il est spécifique à Windows (`cargo check --workspace` reste vert).
+[target.'cfg(windows)'.dependencies]
+conduit-backend-wasapi = { path = "../conduit-backend-wasapi", version = "0.1.0" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true
