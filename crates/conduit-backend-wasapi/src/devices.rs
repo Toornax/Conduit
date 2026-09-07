@@ -19,7 +19,9 @@ use conduit_backend::{BackendError, CableId, DeviceDirection, DeviceId, DeviceIn
 use conduit_core::types::SampleRate;
 use windows::core::HRESULT;
 use windows::core::{Interface, GUID};
-use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+use windows::Win32::Devices::FunctionDiscovery::{
+    PKEY_Device_DeviceDesc, PKEY_Device_FriendlyName,
+};
 use windows::Win32::Foundation::{ERROR_NOT_FOUND, PROPERTYKEY};
 use windows::Win32::Media::Audio::{
     eCapture, eConsole, eRender, EDataFlow, IAudioClient, IMMDevice, IMMDeviceEnumerator,
@@ -246,6 +248,11 @@ pub(crate) fn frames_from_period(period_hns: i64, rate: SampleRate) -> usize {
 /// Reconnaît le nom d'un côté de câble Conduit : exactement `Conduit <n>` avec `n`
 /// décimal sans zéro de tête ni signe (`Conduit 1` → 1 ; `Conduit 01`, `conduit 1`,
 /// `Conduit`, `Conduit 1 (2)` → `None`).
+///
+/// Cette sévérité est voulue : ce parseur reçoit la **description** d'un endpoint
+/// (`PKEY_Device_DeviceDesc`), qui porte le nom d'endpoint seul. Le nom composé que
+/// Windows affiche — « Conduit 1 (Conduit — câbles audio virtuels) » — n'est pas un
+/// identifiant et n'a rien à faire ici : voir [`cable_id_from_endpoint`].
 pub fn cable_id_from_name(name: &str) -> Option<CableId> {
     let digits = name.strip_prefix("Conduit ")?;
     if digits.is_empty()
@@ -255,6 +262,29 @@ pub fn cable_id_from_name(name: &str) -> Option<CableId> {
         return None;
     }
     digits.parse().ok().filter(|n| *n > 0).map(CableId)
+}
+
+/// Identité de câble d'un endpoint, à partir des deux noms que Windows publie
+/// séparément.
+///
+/// Windows **compose** le nom convivial (`PKEY_Device_FriendlyName`) : le nom de
+/// l'endpoint suivi de celui du périphérique qui le porte. Relevé dans la machine
+/// virtuelle sur les deux côtés du câble 1 :
+///
+/// ```text
+/// PKEY_Device_FriendlyName : Conduit 1 (Conduit — câbles audio virtuels)
+/// PKEY_Device_DeviceDesc   : Conduit 1
+/// ```
+///
+/// C'est donc la **description** qui identifie le câble, et le nom composé qui
+/// s'affiche — c'est lui que l'utilisateur reconnaît dans les réglages Son.
+///
+/// Sans description (propriété absente ou illisible), on retombe sur le nom : sur
+/// un endpoint dont Windows ne compose pas le nom, il suffit ; sur un nom composé,
+/// [`cable_id_from_name`] le refuse, ce qui est le bon résultat — mieux vaut « pas
+/// de câble » qu'un câble deviné.
+pub fn cable_id_from_endpoint(description: Option<&str>, name: &str) -> Option<CableId> {
+    cable_id_from_name(description.unwrap_or(name))
 }
 
 /// Identifiants des périphériques par défaut (`eConsole`) au moment de
@@ -408,6 +438,16 @@ fn property(
     Ok(PropVariant::from_owned(value))
 }
 
+/// Lit une propriété **texte** de l'endpoint ; `None` si la lecture échoue, si la
+/// valeur n'est pas une chaîne ou si elle est vide. Une propriété manquante n'est
+/// pas une panne : l'appelant a toujours un repli.
+fn text_property(store: &IPropertyStore, key: &PROPERTYKEY, what: &str) -> Option<String> {
+    property(store, key, what)
+        .ok()?
+        .as_wide_string()
+        .filter(|s| !s.trim().is_empty())
+}
+
 /// Traduit un endpoint actif en [`DeviceInfo`].
 pub(crate) fn describe(
     device: &IMMDevice,
@@ -427,14 +467,18 @@ pub(crate) fn describe(
     // SAFETY: interface valide ; lecture seule du magasin.
     let store = unsafe { device.OpenPropertyStore(STGM_READ) }
         .map_err(|e| platform_error("IMMDevice::OpenPropertyStore", &e))?;
-    let name = property(
+    // Deux noms, deux rôles. Le nom convivial est la composition que Windows
+    // affiche (« Conduit 1 (Conduit — câbles audio virtuels) ») : c'est celui qu'on
+    // publie, celui que l'utilisateur retrouve dans les réglages Son. La
+    // description est le nom d'endpoint seul (« Conduit 1 ») : c'est celle qui
+    // identifie le câble. Voir `cable_id_from_endpoint`.
+    let name = text_property(
         &store,
         &PKEY_Device_FriendlyName,
         "PKEY_Device_FriendlyName",
-    )?
-    .as_wide_string()
-    .filter(|s| !s.trim().is_empty())
+    )
     .unwrap_or_else(|| id.clone());
+    let description = text_property(&store, &PKEY_Device_DeviceDesc, "PKEY_Device_DeviceDesc");
 
     // `IAudioClient` donne le format de mixage et la période. Un échec d'activation
     // n'empêche pas de décrire le périphérique : on retombe sur le format du
@@ -482,7 +526,7 @@ pub(crate) fn describe(
 
     Ok(DeviceInfo {
         is_default: defaults.id_for(direction) == Some(id.as_str()),
-        cable: cable_id_from_name(&name),
+        cable: cable_id_from_endpoint(description.as_deref(), &name),
         id: DeviceId::new(id),
         name,
         direction,
@@ -711,6 +755,45 @@ mod tests {
         assert_eq!(cable_id_from_name("Conduit 0"), None);
         assert_eq!(cable_id_from_name("Conduit 99999999999"), None);
         assert_eq!(cable_id_from_name("Casque USB"), None);
+    }
+
+    /// Le nom composé que Windows affiche n'est **pas** un identifiant de câble.
+    ///
+    /// C'est la mesure faite dans la machine virtuelle : les deux côtés du câble 1
+    /// portent « Conduit 1 (Conduit — câbles audio virtuels) » en
+    /// `PKEY_Device_FriendlyName` et « Conduit 1 » en `PKEY_Device_DeviceDesc`.
+    /// Relâcher `cable_id_from_name` pour accepter la composition reviendrait à
+    /// deviner : « Conduit 1 (2) », que Windows fabrique quand deux périphériques
+    /// portent le même nom, désigne un **autre** endpoint. On corrige la source, pas
+    /// le parseur.
+    #[test]
+    fn le_nom_compose_n_identifie_pas_le_cable() {
+        const COMPOSE: &str = "Conduit 1 (Conduit — câbles audio virtuels)";
+        assert_eq!(cable_id_from_name(COMPOSE), None);
+        // Description absente : le repli sur le nom composé ne devine rien.
+        assert_eq!(cable_id_from_endpoint(None, COMPOSE), None);
+    }
+
+    /// Description et nom composé jouent des rôles différents : l'une identifie le
+    /// câble, l'autre s'affiche.
+    #[test]
+    fn la_description_identifie_le_cable_pas_le_nom_affiche() {
+        const COMPOSE: &str = "Conduit 3 (Conduit — câbles audio virtuels)";
+        assert_eq!(
+            cable_id_from_endpoint(Some("Conduit 3"), COMPOSE),
+            Some(CableId(3))
+        );
+        // Sans description, on retombe sur le nom : suffisant s'il n'est pas composé.
+        assert_eq!(cable_id_from_endpoint(None, "Conduit 3"), Some(CableId(3)));
+        // Une description vide n'arrive pas jusqu'ici (`text_property` la filtre),
+        // mais une description qui n'est pas un câble n'en invente pas un, même si
+        // le nom affiché commence par « Conduit ».
+        assert_eq!(cable_id_from_endpoint(Some("Casque USB"), COMPOSE), None);
+        // Un endpoint qui n'est pas un câble Conduit n'a pas d'identité de câble.
+        assert_eq!(
+            cable_id_from_endpoint(Some("Haut-parleurs"), "Haut-parleurs (Realtek Audio)"),
+            None
+        );
     }
 
     #[test]

@@ -27,7 +27,8 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use conduit_backend::{
-    AudioCallback, Backend, DeviceDirection, DeviceHandle, DeviceInfo, StreamFormat, StreamIo,
+    AudioCallback, Backend, CableId, DeviceDirection, DeviceHandle, DeviceInfo, StreamFormat,
+    StreamIo,
 };
 use conduit_backend_wasapi::{EndpointVolumeControl, WasapiBackend};
 use conduit_core::types::SampleRate;
@@ -36,8 +37,16 @@ use crate::analysis::{self, SineSpec};
 use crate::cli::Args;
 use crate::volume::{Level, Range, RangeState, Reading, State};
 
-/// Préfixe du nom des endpoints du câble Conduit (`devices::cable_id_from_name`).
-const CABLE_PREFIX: &str = "Conduit 1";
+/// Câble retenu quand ni `--render` ni `--capture` ne désigne d'endpoint.
+///
+/// C'est une **identité**, pas un préfixe de nom. « Conduit 1 » est aussi le début
+/// de « Conduit 10 » à « Conduit 16 » : avec seize câbles, une comparaison de
+/// préfixe fait tomber le rendu et la capture sur le premier venu dans l'ordre
+/// d'énumération, donc potentiellement sur deux câbles différents, et la mesure ne
+/// rend que du silence sans que rien ne l'explique. Le champ
+/// [`DeviceInfo::cable`] — que le backend lit dans la description de l'endpoint —
+/// tranche exactement.
+const DEFAULT_CABLE: CableId = CableId(1);
 
 /// Marge de tampon d'enregistrement, en secondes : la capture tourne un peu plus
 /// longtemps que le rendu, et un paquet WASAPI peut déborder la durée demandée.
@@ -135,6 +144,10 @@ impl Session {
                 args.capture.as_deref(),
             )?)
         };
+        // Jouer dans un câble et écouter dans un autre ne rendrait que du silence.
+        if let Some(capture) = &capture {
+            check_same_cable(&render, capture)?;
+        }
         // En écho, le format n'est pas négociable : c'est celui que le moteur
         // mélange vers cet endpoint. Le demander tel quel évite toute conversion
         // sur le chemin qu'on est justement en train de mettre en doute.
@@ -411,16 +424,19 @@ pub fn list(show_volume: bool) -> Result<String, String> {
         .map_err(|e| format!("contrôle du volume indisponible : {e}"))?;
     let mut out = format!("{} endpoint(s) actif(s) :\n", devices.len());
     for device in &devices {
+        // Le marqueur nomme le câble : avec seize câbles, savoir *lequel* est le
+        // seul renseignement utile, et le nom affiché est composé (« Conduit 1
+        // (Conduit — câbles audio virtuels) »), donc illisible à ce jeu-là.
+        let cable = match device.cable {
+            Some(cable) => format!(" ← câble {cable}"),
+            None => String::new(),
+        };
         out.push_str(&format!(
             "  [{}] {}{}{}\n      {} canaux à {} Hz, bloc {} trames\n",
             device.direction,
             device.name,
             if device.is_default { " (défaut)" } else { "" },
-            if device.name.starts_with(CABLE_PREFIX) {
-                " ← câble Conduit"
-            } else {
-                ""
-            },
+            cable,
             device.channels,
             device.sample_rate.hz(),
             device.default_block,
@@ -439,12 +455,12 @@ pub fn list(show_volume: bool) -> Result<String, String> {
         }
         out.push_str(&format!("      id {}\n", device.id));
     }
-    if !devices.iter().any(|d| d.name.starts_with(CABLE_PREFIX)) {
-        out.push_str(&format!(
-            "\nAucun endpoint « {CABLE_PREFIX} … » : le pilote Conduit n'est pas chargé sur cette \
+    if !devices.iter().any(|d| d.cable.is_some()) {
+        out.push_str(
+            "\nAucun endpoint « Conduit N » : le pilote Conduit n'est pas chargé sur cette \
              machine (voir docs/driver-dev.md). Le test de boucle demande alors --render et \
-             --capture explicites.\n"
-        ));
+             --capture explicites.\n",
+        );
     }
     Ok(out)
 }
@@ -574,19 +590,52 @@ pub fn choose(
                     )
                 })
         }
+        // Le câble se reconnaît à son identité, pas à son nom : « Conduit 1 » est
+        // le préfixe de « Conduit 10 »… « Conduit 16 ».
         None => candidates
             .iter()
-            .find(|d| d.name.starts_with(CABLE_PREFIX))
+            .find(|d| d.cable == Some(DEFAULT_CABLE))
             .map(|d| (*d).clone())
             .ok_or_else(|| {
                 format!(
-                    "aucun endpoint de {direction} nommé « {CABLE_PREFIX} … » : le pilote Conduit \
-                     n'est pas chargé (installez-le dans la VM, docs/driver-dev.md). Endpoints de \
-                     {direction} vus : {}. Sinon, désignez des endpoints réels avec --render et \
-                     --capture.",
+                    "aucun endpoint de {direction} n'est le câble « {DEFAULT_CABLE} » : le pilote \
+                     Conduit n'est pas chargé (installez-le dans la VM, docs/driver-dev.md). \
+                     Endpoints de {direction} vus : {}. Sinon, désignez des endpoints réels avec \
+                     --render et --capture.",
                     names()
                 )
             }),
+    }
+}
+
+/// Vérifie que les deux endpoints retenus sont bien les deux côtés du **même**
+/// câble — la question que le diagnostic de l'outil pose déjà quand une mesure ne
+/// rend rien.
+///
+/// Ne refuse que ce qui est réellement incohérent : deux câbles Conduit
+/// **différents**. On jouerait alors dans l'un et écouterait dans l'autre, et le
+/// silence obtenu ressemblerait trait pour trait à un pilote en panne.
+///
+/// **Tout le reste passe, volontairement.** Un endpoint qui n'est pas un câble
+/// Conduit n'a pas de `cable` : c'est le cas normal quand l'utilisateur désigne de
+/// vraies cartes son avec `--render` et `--capture`, et c'est un usage légitime de
+/// l'outil (mesurer une boucle matérielle, ou comparer le câble à un vrai
+/// périphérique). Ne durcissez pas cette règle en exigeant un câble des deux côtés :
+/// elle refuserait des mesures parfaitement valides.
+///
+/// # Erreurs
+///
+/// Message en français nommant les deux endpoints et leurs câbles.
+fn check_same_cable(render: &DeviceInfo, capture: &DeviceInfo) -> Result<(), String> {
+    match (render.cable, capture.cable) {
+        (Some(rendu), Some(capt)) if rendu != capt => Err(format!(
+            "le rendu « {} » est le câble {rendu} et la capture « {} » le câble {capt} : ce ne \
+             sont pas les deux côtés du même câble, la mesure n'entendrait que du silence. \
+             Désignez le même câble des deux côtés avec --render et --capture, ou laissez \
+             l'outil choisir ({DEFAULT_CABLE}).",
+            render.name, capture.name
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -595,6 +644,8 @@ mod tests {
     use super::*;
     use conduit_backend::DeviceId;
 
+    /// Endpoint qui n'est pas un câble Conduit : `cable` vaut `None`, comme le
+    /// backend le rend pour une vraie carte son.
     fn device(name: &str, direction: DeviceDirection) -> DeviceInfo {
         DeviceInfo {
             id: DeviceId::new(format!("{{id-{name}}}")),
@@ -609,29 +660,107 @@ mod tests {
         }
     }
 
+    /// Côté de câble Conduit, tel que le backend le décrit : le nom **composé**
+    /// que Windows affiche, et l'identité lue à part dans la description de
+    /// l'endpoint.
+    fn cable(n: u32, direction: DeviceDirection) -> DeviceInfo {
+        DeviceInfo {
+            cable: Some(CableId(n)),
+            ..device(
+                &format!("Conduit {n} (Conduit — câbles audio virtuels)"),
+                direction,
+            )
+        }
+    }
+
     fn devices() -> Vec<DeviceInfo> {
         vec![
             device(
                 "G27QC A (NVIDIA High Definition Audio)",
                 DeviceDirection::Render,
             ),
-            device("Conduit 1", DeviceDirection::Render),
-            device("Conduit 1", DeviceDirection::Capture),
+            cable(1, DeviceDirection::Render),
+            cable(1, DeviceDirection::Capture),
             device("Microphone (Realtek)", DeviceDirection::Capture),
         ]
+    }
+
+    /// Les seize câbles du pilote. L'ordre d'énumération de WASAPI n'est pas
+    /// garanti — c'est celui de l'installation des périphériques —, alors on prend
+    /// le pire : « Conduit 10 » à « Conduit 16 » avant « Conduit 1 ». Une
+    /// comparaison de préfixe retiendrait « Conduit 10 » ; l'identité de câble non.
+    fn seize_cables() -> Vec<DeviceInfo> {
+        (10..=16)
+            .chain(1..=9)
+            .flat_map(|n| {
+                [
+                    cable(n, DeviceDirection::Render),
+                    cable(n, DeviceDirection::Capture),
+                ]
+            })
+            .collect()
     }
 
     #[test]
     fn cable_choisi_par_defaut() {
         let d = devices();
         assert_eq!(
-            choose(&d, DeviceDirection::Render, None).unwrap().name,
-            "Conduit 1"
+            choose(&d, DeviceDirection::Render, None).unwrap().cable,
+            Some(DEFAULT_CABLE)
         );
         assert_eq!(
-            choose(&d, DeviceDirection::Capture, None).unwrap().name,
-            "Conduit 1"
+            choose(&d, DeviceDirection::Capture, None).unwrap().cable,
+            Some(DEFAULT_CABLE)
         );
+    }
+
+    /// Seize câbles : les deux côtés retenus sont ceux du câble 1, et surtout pas
+    /// ceux de « Conduit 10 », que le préfixe « Conduit 1 » attrapait aussi.
+    #[test]
+    fn seize_cables_le_premier_est_choisi_pas_le_dixieme() {
+        let d = seize_cables();
+        let rendu = choose(&d, DeviceDirection::Render, None).unwrap();
+        let capture = choose(&d, DeviceDirection::Capture, None).unwrap();
+        assert_eq!(rendu.cable, Some(CableId(1)), "{}", rendu.name);
+        assert_eq!(capture.cable, Some(CableId(1)), "{}", capture.name);
+        assert!(rendu.name.starts_with("Conduit 1 ("), "{}", rendu.name);
+        assert!(!rendu.name.starts_with("Conduit 10"), "{}", rendu.name);
+        // Et les deux côtés retenus sont bien ceux du même câble.
+        assert!(check_same_cable(&rendu, &capture).is_ok());
+    }
+
+    /// Deux câbles différents de part et d'autre : refus, et le message nomme les
+    /// deux — c'est le silence qu'on évite d'avoir à expliquer après coup.
+    #[test]
+    fn deux_cables_differents_sont_refuses() {
+        let rendu = cable(1, DeviceDirection::Render);
+        let capture = cable(2, DeviceDirection::Capture);
+        let err = check_same_cable(&rendu, &capture).unwrap_err();
+        assert!(err.contains("Conduit 1"), "{err}");
+        assert!(err.contains("Conduit 2"), "{err}");
+        assert!(err.contains("même câble"), "{err}");
+    }
+
+    /// Deux vraies cartes son désignées à la main : aucun câble, et ce n'est pas
+    /// une erreur. L'outil sert aussi à mesurer une boucle matérielle.
+    #[test]
+    fn endpoints_reels_sans_cable_sont_acceptes() {
+        let rendu = device(
+            "G27QC A (NVIDIA High Definition Audio)",
+            DeviceDirection::Render,
+        );
+        let capture = device("Microphone (Realtek)", DeviceDirection::Capture);
+        assert!(check_same_cable(&rendu, &capture).is_ok());
+        // Un câble d'un côté et une carte réelle de l'autre reste permis : c'est
+        // ainsi qu'on compare le pilote à un vrai périphérique.
+        assert!(check_same_cable(&cable(4, DeviceDirection::Render), &capture).is_ok());
+        assert!(check_same_cable(&rendu, &cable(4, DeviceDirection::Capture)).is_ok());
+        // Le même câble des deux côtés, évidemment.
+        assert!(check_same_cable(
+            &cable(4, DeviceDirection::Render),
+            &cable(4, DeviceDirection::Capture)
+        )
+        .is_ok());
     }
 
     #[test]
@@ -655,8 +784,10 @@ mod tests {
     #[test]
     fn identifiant_exact_prioritaire() {
         let d = devices();
-        let chosen = choose(&d, DeviceDirection::Render, Some("{id-Conduit 1}")).unwrap();
-        assert_eq!(chosen.name, "Conduit 1");
+        let attendu = cable(1, DeviceDirection::Render);
+        let chosen = choose(&d, DeviceDirection::Render, Some(attendu.id.as_str())).unwrap();
+        assert_eq!(chosen.cable, Some(CableId(1)));
+        assert_eq!(chosen.name, attendu.name);
     }
 
     #[test]
