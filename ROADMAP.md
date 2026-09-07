@@ -416,8 +416,23 @@ signé par attestation, HLK audio passé, latence conforme à SPEC §5.6, endura
 
 - [ ] **M1b-01** `feat(driver): paramètres de registre (taille de réserve, canaux) validés au démarrage`
   *Fait quand* : valeurs hors bornes → valeurs par défaut et journal d'événements, jamais d'échec de chargement.
-- [ ] **M1b-02** `feat(driver): réserve de N câbles (N × rendu + N × capture)`
+  *En cours* : `conduit-kmd-core::params` est livré — une fonction **totale** qui écrête vers
+  la borne franchie et rend un compte rendu de ce qu'elle a corrigé, à l'inverse de
+  `format::buffer_bytes` qui refuse (un tampon trop grand est une demande d'application ;
+  un paramètre de registre aberrant est une erreur d'administration, qui ne doit pas
+  empêcher le pilote de charger). Reste le câblage côté pilote : `IoOpenDeviceRegistryKey`
+  + `ZwQueryValueKey` dans `start_device`, les défauts dans `[ConduitCable_HW_AddReg]`, et
+  `IoWriteErrorLogEntry` — car `kmd_log!` est vide en release et ne peut pas tenir le
+  critère du journal.
+- [x] **M1b-02** `feat(driver): réserve de N câbles (N × rendu + N × capture)`
   *Fait quand* : 16 câbles enregistrés, chargement < 2 s.
+  *Mesuré le 2026-09-07*, dans la VM : **16 câbles, 64 sous-périphériques, 32 endpoints**,
+  `CM_PROB_NONE`, démarrage en **0,86 s** — le budget des deux secondes n'est consommé qu'à
+  moitié. L'INF (944 lignes) est engendré depuis les constantes du pilote par
+  `portcls/tests/inf.rs`, dont un test vérifie la fraîcheur du fichier commité.
+  Un plafond oublié a fait échouer le cinquième sous-périphérique avec
+  `STATUS_ALLOTTED_SPACE_EXCEEDED` : `MaxSubdevices`, passé à `PcAddAdapterDevice`, borne
+  `PcRegisterSubdevice` et valait encore la taille d'un seul câble.
 - [ ] **M1b-03** `feat(driver): état de jack par câble, inactifs masqués`
   `KSPROPERTY_JACK_DESCRIPTION` avec `IsConnected` ; câbles 1 et 2 actifs par défaut.
   *Fait quand* : les réglages Son ne montrent que Conduit 1 et 2 ; les autres apparaissent sous « déconnectés ».
