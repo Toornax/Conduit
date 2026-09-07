@@ -31,20 +31,25 @@
 //! messages dans le binaire du pilote. C'est une tâche à part entière, pas un détail de
 //! M1b-01.
 //!
-//! Conséquence, **d'après la documentation citée ci-dessus et non mesurée** (aucune VM
-//! n'a été lancée pour cette tâche) : l'entrée apparaît bien dans le journal *Système*,
-//! datée, avec sa source et son périphérique, mais sa description est le texte de repli
-//! de l'Observateur (« La description de l'ID d'événement … est introuvable »), suivi des
-//! chaînes d'insertion brutes qu'il recopie faute de mieux. C'est donc **la chaîne
+//! Conséquence, **mesurée dans la machine virtuelle le 2026-09-07** : l'entrée apparaît
+//! bien dans le journal *Système*, datée, sous la source `conduit_kmd`, mais son champ
+//! `Message` est **vide** — l'Observateur n'a aucun texte à rendre. C'est donc **la chaîne
 //! d'insertion qui porte l'information**, et elle seule — d'où le soin mis à la rendre
 //! lisible telle quelle, préfixe « Conduit : » compris, plutôt qu'à empiler des
-//! `DumpData` binaires que personne ne décodera. Elle se lit sans ambiguïté par :
+//! `DumpData` binaires que personne ne décodera.
+//!
+//! L'entrée porte **trois** propriétés : `[0]` le nom d'objet du périphérique
+//! (`\Device\…`), `[1]` notre chaîne, `[2]` les octets de `DumpData`. C'est donc l'index
+//! **1** qu'il faut lire, et non le dernier :
 //!
 //! ```text
 //! Get-WinEvent -LogName System -MaxEvents 200 |
 //!   Where-Object ProviderName -eq conduit_kmd |
-//!   Select-Object TimeCreated, Id, @{n='Texte';e={$_.Properties[-1].Value}}
+//!   Select-Object TimeCreated, Id, @{n='Texte';e={$_.Properties[1].Value}}
 //! ```
+//!
+//! Relevé tel quel pendant la campagne :
+//! `Conduit : tampon (ms) (BufferMs) = 999 au-dessus du plafond 500, repli sur 500`.
 //!
 //! # Sévérité
 //!

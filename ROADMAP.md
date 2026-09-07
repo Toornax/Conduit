@@ -414,16 +414,36 @@ signé par attestation, HLK audio passé, latence conforme à SPEC §5.6, endura
 
 ### M1b.A — Pilote
 
-- [ ] **M1b-01** `feat(driver): paramètres de registre (taille de réserve, canaux) validés au démarrage`
+- [x] **M1b-01** `feat(driver): paramètres de registre (taille de réserve, canaux) validés au démarrage`
   *Fait quand* : valeurs hors bornes → valeurs par défaut et journal d'événements, jamais d'échec de chargement.
-  *En cours* : `conduit-kmd-core::params` est livré — une fonction **totale** qui écrête vers
-  la borne franchie et rend un compte rendu de ce qu'elle a corrigé, à l'inverse de
-  `format::buffer_bytes` qui refuse (un tampon trop grand est une demande d'application ;
-  un paramètre de registre aberrant est une erreur d'administration, qui ne doit pas
-  empêcher le pilote de charger). Reste le câblage côté pilote : `IoOpenDeviceRegistryKey`
-  + `ZwQueryValueKey` dans `start_device`, les défauts dans `[ConduitCable_HW_AddReg]`, et
-  `IoWriteErrorLogEntry` — car `kmd_log!` est vide en release et ne peut pas tenir le
-  critère du journal.
+  `conduit-kmd-core::params` est une fonction **totale** : elle écrête vers la borne
+  franchie et rend un compte rendu, à l'inverse de `format::buffer_bytes` qui refuse. Un
+  tampon trop grand est une demande d'application qu'il faut rejeter ; un paramètre de
+  registre aberrant est une erreur d'administration, qu'il ne faut surtout pas transformer
+  en pilote qui ne charge plus.
+  *Mesuré le 2026-09-07*, dans la VM, débogueur série attaché — le pilote **charge dans
+  les huit cas** (statut OK, code problème 0), et ses propres traces disent ce qu'il a
+  décidé :
+
+  | Valeur | Décision | Journal |
+  |---|---|---|
+  | 2 | 2 câbles | (rien : dans les bornes) |
+  | 3 | 3 câbles | (rien) |
+  | 16 (défaut de l'INF) | 16 câbles | (rien) |
+  | 0 | « sous le plancher 1, repli sur 1 » | 1 entrée |
+  | 99 | « au-dessus du plafond 16, repli sur 16 » | 1 entrée |
+  | absente | 16 câbles | 1 entrée |
+  | `"abc"` (`REG_SZ`) | 16 câbles | 1 entrée |
+  | `BufferMs` = 999 | « au-dessus du plafond 500, repli sur 500 » | 1 entrée |
+
+  Le texte de l'Observateur d'événements est **vide** : il faudrait une ressource de
+  messages dans le binaire, que ni l'INF ni `HKR` ne peuvent fournir sans survivre à la
+  désinstallation (F-52). Toute l'information est dans la chaîne d'insertion, propriété
+  **1** sur trois, relevée telle quelle : `Conduit : tampon (ms) (BufferMs) = 999
+  au-dessus du plafond 500, repli sur 500`.
+  Les **canaux** sont lus, validés et journalisés mais pas appliqués : `CHANNELS` est
+  scellée dans les tables KS et dans des assertions à la compilation, et la rendre
+  dynamique serait faire M1b-05 par la bande.
 - [x] **M1b-02** `feat(driver): réserve de N câbles (N × rendu + N × capture)`
   *Fait quand* : 16 câbles enregistrés, chargement < 2 s.
   *Mesuré le 2026-09-07*, dans la VM : **16 câbles, 64 sous-périphériques, 32 endpoints**,
