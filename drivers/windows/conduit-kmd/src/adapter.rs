@@ -133,7 +133,7 @@ unsafe fn install_cable(
     drop(mini);
 
     // 2. TopoRender<n>.
-    let mini = try_new_topology_object(TopoRender { n })
+    let mini = try_new_topology_object(TopoRender { n, cable })
         .ok_or(STATUS_INSUFFICIENT_RESOURCES)
         .or_else(|status| fail("allocation de TopoRender", status))?;
     // SAFETY: idem.
@@ -166,7 +166,7 @@ unsafe fn install_cable(
     }?;
     drop(mini);
 
-    let mini = try_new_topology_object(TopoCapture { n })
+    let mini = try_new_topology_object(TopoCapture { n, cable })
         .ok_or(STATUS_INSUFFICIENT_RESOURCES)
         .or_else(|status| fail("allocation de TopoCapture", status))?;
     // SAFETY: idem.

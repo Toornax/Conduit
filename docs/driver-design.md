@@ -299,8 +299,9 @@ protégé (`IDrmPort`, `PcAddContentHandlers`) et le déclarer serait faux.
 
 ### 4.1 Descripteurs de filtres (M1a-06, minimum accepté par le générateur d'endpoints)
 
-Le spike enregistre le strict nécessaire pour qu'un endpoint rendu et un endpoint capture
-apparaissent ; volume, mute et jack (M1b-03) viendront après. Toutes les tables sont des
+Le spike a d'abord enregistré le strict nécessaire pour qu'un endpoint rendu et un endpoint
+capture apparaissent ; les nœuds de volume et de sourdine sont arrivés en M1b-03b (§5.5),
+le jack viendra en M1b-03. Toutes les tables sont des
 `static` `#[repr(C)]` de `portcls-sys` construites en `const` dans `conduit-kmd::descriptors`.
 
 **Plages de formats** (`KSDATARANGE_AUDIO`, communes aux broches système) : type
@@ -321,17 +322,54 @@ sous-type `KSDATAFORMAT_SUBTYPE_ANALOG`, spécificateur `KSDATAFORMAT_SPECIFIER_
 | `TopoCapture<n>` | 0 | `KSPIN_DATAFLOW_IN` | `KSPIN_COMMUNICATION_NONE` | catégorie `KSNODETYPE_LINE_CONNECTOR` : c'est l'endpoint |
 | | 1 | `KSPIN_DATAFLOW_OUT` | `KSPIN_COMMUNICATION_NONE` | bridge, plage analogique |
 
-Nœuds : aucun en M1a (connexion directe broche 0 → broche 1 via `PCFILTER_NODE` dans
-`PCCONNECTION_DESCRIPTOR`). Connexions physiques après enregistrement des quatre
+Connexions physiques après enregistrement des quatre
 sous-périphériques : `WaveRender<n>` broche 1 → `TopoRender<n>` broche 0 ;
 `TopoCapture<n>` broche 1 → `WaveCapture<n>` broche 0. Chaque broche système déclare
 `KSPIN_DATAFLOW` correct et 1 instance possible (`MaxGlobalInstanceCount = 1`,
 `MaxFilterInstanceCount = 1`) ; broches bridge et endpoint : 0 instance, catégorie
-`KSCATEGORY_AUDIO` pour les bridges (comme SYSVAD). Tables d'automatisation : vides pour
-le spike (`PCAUTOMATION_TABLE` sans propriétés ; PortCls gère `KSPROPSETID_Pin` et
-`KSPROPSETID_Topology`). Catégories du filtre : `CategoryCount = 0`, PortCls fournit les
+`KSCATEGORY_AUDIO` pour les bridges (comme SYSVAD). Catégories du filtre :
+`CategoryCount = 0`, PortCls fournit les
 siennes (`KSCATEGORY_AUDIO`, `RENDER`/`CAPTURE`, `REALTIME` pour WaveRT ; `AUDIO`,
 `TOPOLOGY` pour la topologie) ; l'INF les publie par `AddInterface` (M1a-06).
+
+**Nœuds et connexions internes.** Deux formes de filtre, chacune construite par son
+enveloppe `const` dans `conduit-kmd::descriptors` et vérifiée par ses propres assertions
+`const` :
+
+| Forme | Filtres | Nœuds | Connexions | Table d'automatisation du filtre |
+|---|---|---|---|---|
+| wave | `WaveRender<n>`, `WaveCapture<n>` | aucun (`NodeCount = 0`, `Nodes` **nul**) | 1 : broche 0 → broche 1 via `PCFILTER_NODE` | vide |
+| topologie | `TopoRender<n>`, `TopoCapture<n>` | 2 : index 0 `KSNODETYPE_VOLUME`, index 1 `KSNODETYPE_MUTE` | 3 : broche 0 → volume → sourdine → broche 1 | vide (les propriétés sont sur les **nœuds**) |
+
+Les trois connexions du filtre topologie sont **identiques pour les deux sens**, parce que
+la numérotation des broches y suit déjà le flux des deux côtés (0 = entrée, 1 = sortie),
+alors même que la broche 0 est un bridge côté rendu et un endpoint côté capture :
+`(PCFILTER_NODE, 0) → (volume, KSNODEPIN_STANDARD_IN)`,
+`(volume, KSNODEPIN_STANDARD_OUT) → (sourdine, KSNODEPIN_STANDARD_IN)`,
+`(sourdine, KSNODEPIN_STANDARD_OUT) → (PCFILTER_NODE, 1)`. Attention au piège : les broches
+d'un **nœud** sont numérotées à l'envers de celles d'un filtre — `KSNODEPIN_STANDARD_IN`
+vaut 1 et `KSNODEPIN_STANDARD_OUT` vaut 0 (`ks.h`).
+
+Chaque nœud porte sa propre `PCAUTOMATION_TABLE` d'une seule propriété — le volume
+`KSPROPERTY_AUDIO_VOLUMELEVEL`, la sourdine `KSPROPERTY_AUDIO_MUTE`, toutes deux en
+`GET | SET | BASICSUPPORT` (`portcls::audio`). `PCNODE_DESCRIPTOR::Name` est **nul** : KS
+retombe alors sur `Type` pour le nom affiché, ce qui donne les noms standard et traduits du
+volume et de la sourdine, et n'introduit **aucun contenu par câble**. Le seul contenu
+réellement par câble d'un descripteur reste le GUID `KsPinDescriptor.Name` des broches
+endpoint (§4.2) : nœuds, tables d'automatisation et `PCPROPERTY_ITEM` sont des `static`
+partagées par les seize câbles de M1b-02, le gestionnaire retrouvant le miniport — donc le
+câble — par le `MajorTarget` de la requête. Ce qui se dédouble se dédouble par **sens** et
+non par câble : `volume_item::<V, T>` est monomorphisé sur le type du miniport, et la garde
+de vtable de `portcls::property::handler` compare l'adresse de `T::VTBL`.
+
+Le crate n'étant pas testable par `cargo test` (`wdk-sys` lie le noyau), les assertions
+`const` de `descriptors.rs` sont les seules vérifications disponibles, et deux familles y
+attrapent des pannes **muettes** : le *graphe bien formé* (chaque connexion désigne
+`PCFILTER_NODE` avec un numéro de broche `< PinCount`, ou un index de nœud `< NodeCount`),
+dont l'échec donnerait « aucun endpoint n'apparaît, aucun message d'erreur » ; et la *table
+d'automatisation bien formée* (taille d'élément exacte, compte cohérent avec le tableau
+pointé, `Handler` présent, `Flags` portant au moins un verbe), dont l'échec ferait taire la
+propriété sans rien signaler.
 
 Réalité M1a-09 : les deux broches endpoint (`TopoRender<n>` broche 1, `TopoCapture<n>`
 broche 0) portent en plus un GUID `KsPinDescriptor.Name` — les six autres broches laissent
@@ -647,15 +685,44 @@ applique le gain avant que les trames n'atteignent notre tampon. Un câble Condu
 transporte donc, par défaut, un signal atténué et non l'original.
 
 C'est inacceptable pour un câble virtuel, dont la raison d'être est la transparence bit à
-bit. Deux réponses possibles, à trancher en M1b :
+bit.
 
-1. **exposer un nœud `KSNODETYPE_VOLUME`** sur les filtres de topologie, initialisé à 0 dB
-   et piloté par nous — Windows cesse alors d'insérer son APO ;
-2. **forcer le volume de l'endpoint à 100 %** depuis le démon à la création du câble, ce
-   qui règle le symptôme sans régler la cause (l'utilisateur peut le rebaisser).
+**Décision (M1b-03b) : exposer les nœuds, ne pas appliquer leur valeur.** L'autre réponse
+envisagée — forcer le volume de l'endpoint à 100 % depuis le démon à la création du câble —
+règle le symptôme sans régler la cause (l'utilisateur peut le rebaisser) ; c'est ce que
+fait `conduit-looptest --set-volume` pour rendre la mesure exploitable, pas ce que fait le
+pilote.
 
-La première est la bonne ; la seconde est ce que fait `conduit-looptest --set-volume`
-aujourd'hui pour que la mesure soit exploitable.
+Le mécanisme a **deux moitiés, et en rater une fait échouer la mesure** :
+
+1. **Exposer le nœud.** `TopoRender<n>` et `TopoCapture<n>` déclarent un
+   `KSNODETYPE_VOLUME` et un `KSNODETYPE_MUTE` en série entre leurs deux broches (§4.1).
+   Windows renonce alors à son APO : le gain n'est plus appliqué avant que les trames
+   n'atteignent notre tampon.
+2. **Ne pas appliquer la valeur.** Indispensable, et contre-intuitif. Windows pousse sa
+   valeur par défaut dans notre nœud dès la création de l'endpoint : « initialiser à 0 dB »
+   ne suffit donc pas, la valeur serait écrasée dans la seconde qui suit. C'est en
+   **mémorisant sans appliquer** qu'on obtient 0,500 pour 0,500.
+
+L'état des nœuds vit dans le câble (`cable::NodeState`, un par sens) : un `AtomicI32` par
+canal pour le niveau, un `AtomicU32` pour la sourdine, en `Relaxed` et sans verrou — le
+gestionnaire de propriété tourne à `PASSIVE_LEVEL` sur un fil quelconque, un chargement
+32 bits aligné ne se déchire pas, et il n'y a aucune relation d'ordre à établir avec un
+autre champ. Il est placé là parce que c'est le seul objet que les deux côtés atteignent
+déjà, et que M1b-03 (jack) comme M1b-04 (propriété de configuration) auront besoin du même
+chemin. **Rien ne le lit pour transformer le signal** : `Cable::on_tick` appelle
+`copy_frames`, qui recopie les trames inchangées, octet pour octet.
+
+**Conséquence assumée : le curseur de volume d'un endpoint Conduit est décoratif.** Le
+déplacer change ce que la propriété KS relit, et rien d'autre — le son sort du câble tel
+qu'il y est entré. C'est volontaire, pas un bogue : un câble dont la promesse est la
+transparence bit à bit ne peut pas atténuer ce qu'il transporte. C'est aussi ce que §4
+annonçait déjà par « volume/mute **factices** ».
+
+Vérification attendue en machine : `conduit-looptest --list --show-volume` sur
+« Conduit 1 » doit rendre `−96,0 / 0,0 / 0,5` dB (la plage que `BASICSUPPORT` annonce), et
+les dix passes du test de boucle doivent rendre 0,500 d'amplitude pour 0,500 demandée,
+**sans** `--set-volume`.
 
 ## 6. Surface de contrôle (M1b-04, décision anticipée)
 

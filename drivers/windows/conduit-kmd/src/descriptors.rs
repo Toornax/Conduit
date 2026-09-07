@@ -10,20 +10,49 @@
 //! jamais écrites, ni par le pilote ni par PortCls (les prototypes `PPCFILTER_DESCRIPTOR`
 //! non `const` sont une facilité du header, SYSVAD aussi les déclare `static`).
 //!
-//! Minimum accepté par le générateur d'endpoints (§4.1) : deux broches par filtre, une
-//! connexion directe broche 0 → broche 1 (`PCFILTER_NODE`), aucun nœud, table
-//! d'automatisation vide (PortCls gère `KSPROPSETID_Pin` et `KSPROPSETID_Topology`),
-//! catégories laissées à PortCls (`CategoryCount = 0` : `KSCATEGORY_AUDIO`,
-//! `KSCATEGORY_RENDER`/`CAPTURE`, `KSCATEGORY_REALTIME` pour les ports WaveRT,
-//! `KSCATEGORY_AUDIO`, `KSCATEGORY_TOPOLOGY` pour les ports topologie, comme SYSVAD).
-//! Volume, mute et jack viendront en M1b-03.
+//! Deux broches par filtre et catégories laissées à PortCls (`CategoryCount = 0` :
+//! `KSCATEGORY_AUDIO`, `KSCATEGORY_RENDER`/`CAPTURE`, `KSCATEGORY_REALTIME` pour les ports
+//! WaveRT, `KSCATEGORY_AUDIO`, `KSCATEGORY_TOPOLOGY` pour les ports topologie, comme
+//! SYSVAD). Au-delà, les deux formes de filtre diffèrent :
+//!
+//! - **forme wave** ([`wave_filter`]), pour `WaveRender` et `WaveCapture` : aucun nœud, une
+//!   connexion directe broche 0 → broche 1 (`PCFILTER_NODE`, [`DIRECT_CONNECTION`]), table
+//!   d'automatisation vide (PortCls gère `KSPROPSETID_Pin` et `KSPROPSETID_Topology`) ;
+//! - **forme topologie** ([`topo_filter`]), pour `TopoRender` et `TopoCapture` : deux nœuds
+//!   — index [`NODE_VOLUME`] `KSNODETYPE_VOLUME`, index [`NODE_MUTE`] `KSNODETYPE_MUTE` —
+//!   chacun avec sa table d'automatisation d'une propriété, et trois connexions
+//!   ([`TOPO_CONNECTIONS`]) qui les mettent en série entre les deux broches. La table
+//!   d'automatisation du *filtre*, elle, reste vide : les propriétés sont sur les nœuds.
+//!   Jack : M1b-03.
+//!
+//! # Pourquoi ces nœuds existent (M1b-03b, driver-design.md §5.5)
+//!
+//! Faute de nœud de volume, Windows insère son **APO logiciel** et applique aux trames le
+//! volume par défaut qu'il donne à tout endpoint neuf — mesuré à 64 %, soit une amplitude
+//! de 0,229 pour 0,500 demandée. Le mécanisme qui corrige cela a **deux moitiés** :
+//! *exposer* le nœud, ce que fait ce module, et *ne pas appliquer* la valeur que Windows y
+//! pousse aussitôt, ce que garantit `cable::NodeState`. Le signal traverse `copy_frames`
+//! inchangé, octet pour octet ; le curseur de volume d'un endpoint Conduit est décoratif,
+//! et c'est volontaire.
+//!
+//! # Rien de nouveau n'est *par câble*
+//!
+//! Le seul contenu réellement par câble d'un descripteur est le GUID
+//! `KsPinDescriptor.Name` des broches endpoint ([`PIN_NAME_CABLE_0`]) ; M1b-02 le
+//! générera par numéro. Les nœuds, leurs tables d'automatisation et leurs `PCPROPERTY_ITEM`
+//! sont des `static` **partagées par tous les câbles** : le gestionnaire retrouve le
+//! miniport — donc le câble, donc le `NodeState` — par le `MajorTarget` de la requête. Ce
+//! qui se dédouble ici se dédouble par **sens**, pas par câble : `volume_item::<V, T>` est
+//! monomorphisé sur le type du miniport (`TopoRender` ou `TopoCapture`), et la garde de
+//! vtable de `portcls::property::handler` compare l'adresse de `T::VTBL` — une table
+//! commune aux deux sens rendrait le pilote muet d'un côté.
 //!
 //! | Filtre | Broche | Flux | Communication | Rôle |
 //! |---|---|---|---|---|
 //! | `WaveRender` | [`WAVE_RENDER_PIN_SYSTEM`] = 0 | `IN` | `SINK` | le lecteur écrit ici (plages système) |
 //! | | [`WAVE_RENDER_PIN_BRIDGE`] = 1 | `OUT` | `NONE` | bridge analogique vers `TopoRender` |
 //! | `TopoRender` | [`TOPO_RENDER_PIN_BRIDGE`] = 0 | `IN` | `NONE` | bridge depuis `WaveRender` |
-//! | | [`TOPO_RENDER_PIN_ENDPOINT`] = 1 | `OUT` | `NONE` | `KSNODETYPE_SPEAKER` : l'endpoint |
+//! | | [`TOPO_RENDER_PIN_ENDPOINT`] = 1 | `OUT` | `NONE` | `KSNODETYPE_LINE_CONNECTOR` : l'endpoint (voir [`CATEGORY_LINE_CONNECTOR`]) |
 //! | `WaveCapture` | [`WAVE_CAPTURE_PIN_BRIDGE`] = 0 | `IN` | `NONE` | bridge depuis `TopoCapture` |
 //! | | [`WAVE_CAPTURE_PIN_SYSTEM`] = 1 | `OUT` | `SINK` | l'enregistreur lit ici (plages système) |
 //! | `TopoCapture` | [`TOPO_CAPTURE_PIN_ENDPOINT`] = 0 | `IN` | `NONE` | `KSNODETYPE_LINE_CONNECTOR` : l'endpoint |
@@ -39,23 +68,31 @@
 //! sortie ; c'est pourquoi les constantes sont nommées par filtre et non par rôle.
 //!
 //! Ce crate ne se teste pas en mode utilisateur : les invariants (nombre de broches,
-//! orientation, tailles des structures, cohérence avec `conduit_kmd_core::M1A_FORMATS`)
-//! sont des assertions `const`, vérifiées à la compilation.
+//! orientation, tailles des structures, cohérence avec `conduit_kmd_core::M1A_FORMATS`,
+//! bonne formation du graphe de topologie et des tables d'automatisation) sont des
+//! assertions `const`, vérifiées à la compilation. Ce sont les **seules** vérifications
+//! disponibles ici, et deux d'entre elles attrapent des pannes muettes : une table de
+//! connexions incohérente ne donne « aucun endpoint, aucun message d'erreur », et une
+//! table d'automatisation mal remplie fait taire la propriété sans rien signaler.
 
 use core::fmt;
 use core::mem::size_of;
 use core::ptr;
 
 use conduit_kmd_core::{M1A_FORMATS, SampleFormat};
+use portcls::{mute_item, volume_item};
 use portcls_sys::{
-    GUID, KSCATEGORY_AUDIO, KSDATAFORMAT, KSDATAFORMAT__bindgen_ty_1, KSDATAFORMAT_SPECIFIER_NONE,
-    KSDATAFORMAT_SPECIFIER_WAVEFORMATEX, KSDATAFORMAT_SUBTYPE_ANALOG,
+    GUID, IMiniportTopologyVtbl, KSCATEGORY_AUDIO, KSDATAFORMAT, KSDATAFORMAT__bindgen_ty_1,
+    KSDATAFORMAT_SPECIFIER_NONE, KSDATAFORMAT_SPECIFIER_WAVEFORMATEX, KSDATAFORMAT_SUBTYPE_ANALOG,
     KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, KSDATAFORMAT_SUBTYPE_PCM, KSDATAFORMAT_TYPE_AUDIO,
-    KSDATARANGE, KSDATARANGE_AUDIO, KSNODETYPE_LINE_CONNECTOR, KSNODETYPE_SPEAKER,
+    KSDATARANGE, KSDATARANGE_AUDIO, KSNODEPIN_STANDARD_IN, KSNODEPIN_STANDARD_OUT,
+    KSNODETYPE_LINE_CONNECTOR, KSNODETYPE_MUTE, KSNODETYPE_SPEAKER, KSNODETYPE_VOLUME,
     KSPIN_COMMUNICATION, KSPIN_DATAFLOW, KSPIN_DESCRIPTOR, KSPIN_DESCRIPTOR__bindgen_ty_1,
     PCAUTOMATION_TABLE, PCCONNECTION_DESCRIPTOR, PCEVENT_ITEM, PCFILTER_DESCRIPTOR, PCFILTER_NODE,
     PCMETHOD_ITEM, PCNODE_DESCRIPTOR, PCPIN_DESCRIPTOR, PCPROPERTY_ITEM, PKSDATARANGE, ULONG,
 };
+
+use crate::topo::{TopoCapture, TopoRender};
 
 // ---------------------------------------------------------------------------------
 // Numéros de broche (§4.1), du type que `PcRegisterPhysicalConnection` et les
@@ -82,14 +119,47 @@ pub const TOPO_CAPTURE_PIN_BRIDGE: ULONG = 1;
 /// Nombre de broches de chaque filtre du spike.
 pub const PIN_COUNT: usize = 2;
 
+/// Broche **d'entrée** d'un filtre topologie, quel que soit le sens.
+///
+/// La numérotation des broches suit déjà le flux des deux côtés (0 = entrée, 1 = sortie) :
+/// c'est ce qui permet aux trois connexions de [`TOPO_CONNECTIONS`] d'être **identiques**
+/// pour le rendu et pour la capture, alors que la broche 0 y est un bridge d'un côté et un
+/// endpoint de l'autre. L'assertion `const` ci-dessous relie ces deux constantes aux
+/// quatre numéros nommés par filtre : le jour où l'un d'eux bougerait, la compilation
+/// s'arrête ici plutôt que de laisser une topologie inversée.
+const TOPO_PIN_IN: ULONG = 0;
+/// Broche **de sortie** d'un filtre topologie, quel que soit le sens (voir
+/// [`TOPO_PIN_IN`]).
+const TOPO_PIN_OUT: ULONG = 1;
+
+const _: () = {
+    assert!(TOPO_PIN_IN == TOPO_RENDER_PIN_BRIDGE && TOPO_PIN_IN == TOPO_CAPTURE_PIN_ENDPOINT);
+    assert!(TOPO_PIN_OUT == TOPO_RENDER_PIN_ENDPOINT && TOPO_PIN_OUT == TOPO_CAPTURE_PIN_BRIDGE);
+};
+
+/// Index du nœud `KSNODETYPE_VOLUME` dans les deux filtres topologie.
+pub const NODE_VOLUME: ULONG = 0;
+/// Index du nœud `KSNODETYPE_MUTE` dans les deux filtres topologie.
+pub const NODE_MUTE: ULONG = 1;
+/// Nombre de nœuds d'un filtre topologie.
+pub const NODE_COUNT: usize = 2;
+/// Nombre de connexions d'un filtre topologie : broche 0 → volume → sourdine → broche 1.
+pub const TOPO_CONNECTION_COUNT: usize = 3;
+/// Nombre de connexions d'un filtre WaveRT : la connexion directe broche 0 → broche 1.
+pub const WAVE_CONNECTION_COUNT: usize = 1;
+
+/// Nombre de canaux d'un câble, et donc du nœud de volume (`AudioNodes::channels`).
+///
+/// C'est la valeur unique de M1a, celle des plages de formats ci-dessous ; `topo` vérifie
+/// en `const` qu'elle tient dans `cable::MAX_CHANNELS`.
+pub const CHANNELS: ULONG = 2;
+
 // ---------------------------------------------------------------------------------
 // Formats du spike (§5.4), tirés de `conduit_kmd_core::M1A_FORMATS`.
 // ---------------------------------------------------------------------------------
 
 /// Fréquence d'échantillonnage unique de M1a (Hz).
 const SAMPLE_RATE: ULONG = 48_000;
-/// Nombre de canaux unique de M1a.
-const CHANNELS: ULONG = 2;
 /// Taille du conteneur des échantillons flottants (bits).
 const BITS_F32: ULONG = 32;
 /// Taille du conteneur des échantillons PCM entiers (bits).
@@ -155,6 +225,11 @@ const _: () = {
     assert!(KSDATARANGE_SIZE == 64, "KSDATARANGE fait 64 octets");
     assert!(size_of::<PCPIN_DESCRIPTOR>() == 112);
     assert!(size_of::<PCFILTER_DESCRIPTOR>() == 80);
+    // Au golden depuis M1b-03b (`portcls-sys/tests/layout.golden`) : ces deux tailles sont
+    // annoncées à PortCls dans `NodeSize` et `PropertyItemSize`, qui s'en sert pour
+    // avancer dans les tableaux. Une erreur ici ne se voit pas, elle se lit.
+    assert!(size_of::<PCNODE_DESCRIPTOR>() == 32);
+    assert!(size_of::<PCPROPERTY_ITEM>() == 24);
 };
 
 /// En-tête `KSDATAFORMAT` d'une plage audio : `FormatSize = size`, aucune option, type
@@ -308,12 +383,22 @@ pub const fn connection(
     }
 }
 
-/// Descripteur de filtre : `pins` et `connections` logés dans des `static`, aucun nœud,
-/// table d'automatisation `automation`, catégories laissées à PortCls
+/// Descripteur de filtre, forme générale : `pins`, `nodes` et `connections` logés dans des
+/// `static`, table d'automatisation de filtre `automation`, catégories laissées à PortCls
 /// (`CategoryCount = 0`).
-const fn filter<const P: usize, const C: usize>(
+///
+/// Privé : les filtres du pilote passent par [`wave_filter`] ou [`topo_filter`], qui
+/// nomment les deux formes existantes et sont chacune vérifiée par ses propres assertions
+/// `const`.
+///
+/// Pas d'`Option` pour les nœuds : en contexte `const`, le paramètre générique `N` doit
+/// être fourni de toute façon, et `N == 0` dit déjà « aucun nœud ». C'est alors `Nodes` qui
+/// est mis à **nul** — un tableau vide a une adresse valide, mais PortCls attend le nul
+/// quand `NodeCount` est nul, comme SYSVAD l'écrit.
+const fn filter<const P: usize, const N: usize, const C: usize>(
     automation: &'static Shared<PCAUTOMATION_TABLE>,
     pins: &'static Shared<[PCPIN_DESCRIPTOR; P]>,
+    nodes: &'static Shared<[PCNODE_DESCRIPTOR; N]>,
     connections: &'static Shared<[PCCONNECTION_DESCRIPTOR; C]>,
 ) -> PCFILTER_DESCRIPTOR {
     PCFILTER_DESCRIPTOR {
@@ -325,12 +410,85 @@ const fn filter<const P: usize, const C: usize>(
         PinCount: P as ULONG,
         Pins: ptr::from_ref(pins).cast::<PCPIN_DESCRIPTOR>(),
         NodeSize: size_of::<PCNODE_DESCRIPTOR>() as ULONG,
-        NodeCount: 0,
-        Nodes: ptr::null(),
+        NodeCount: N as ULONG,
+        Nodes: if N == 0 {
+            ptr::null()
+        } else {
+            ptr::from_ref(nodes).cast::<PCNODE_DESCRIPTOR>()
+        },
         ConnectionCount: C as ULONG,
         Connections: ptr::from_ref(connections).cast::<PCCONNECTION_DESCRIPTOR>(),
         CategoryCount: 0,
         Categories: ptr::null(),
+    }
+}
+
+/// **Forme wave** : filtre WaveRT sans nœud, table d'automatisation de filtre vide.
+///
+/// Le signal traverse le filtre WaveRT sans traitement ; les nœuds audio sont sur le filtre
+/// de topologie du même sens ([`topo_filter`]).
+const fn wave_filter<const P: usize, const C: usize>(
+    pins: &'static Shared<[PCPIN_DESCRIPTOR; P]>,
+    connections: &'static Shared<[PCCONNECTION_DESCRIPTOR; C]>,
+) -> PCFILTER_DESCRIPTOR {
+    filter::<P, 0, C>(&EMPTY_AUTOMATION, pins, &NO_NODES, connections)
+}
+
+/// **Forme topologie** : filtre de topologie avec ses nœuds.
+///
+/// La table d'automatisation du filtre reste **vide** : les propriétés sont portées par les
+/// nœuds (`PCNODE_DESCRIPTOR::AutomationTable`), pas par le filtre. PortCls route
+/// `KSPROPERTY_AUDIO_*` vers le nœud désigné par `PCPROPERTY_REQUEST::Node`.
+const fn topo_filter<const P: usize, const N: usize, const C: usize>(
+    pins: &'static Shared<[PCPIN_DESCRIPTOR; P]>,
+    nodes: &'static Shared<[PCNODE_DESCRIPTOR; N]>,
+    connections: &'static Shared<[PCCONNECTION_DESCRIPTOR; C]>,
+) -> PCFILTER_DESCRIPTOR {
+    filter::<P, N, C>(&EMPTY_AUTOMATION, pins, nodes, connections)
+}
+
+/// Table d'automatisation d'un nœud audio : une seule propriété, aucune méthode, aucun
+/// événement.
+///
+/// Les `*ItemSize` sont renseignés même à compte nul, comme dans [`EMPTY_AUTOMATION`] :
+/// PortCls s'en sert pour avancer dans les tableaux, et une taille nulle avec un compte nul
+/// est un piège inutile à laisser.
+const fn one_property_automation(
+    properties: &'static Shared<[PCPROPERTY_ITEM; 1]>,
+) -> PCAUTOMATION_TABLE {
+    PCAUTOMATION_TABLE {
+        PropertyItemSize: size_of::<PCPROPERTY_ITEM>() as ULONG,
+        PropertyCount: 1,
+        Properties: ptr::from_ref(properties).cast::<PCPROPERTY_ITEM>(),
+        MethodItemSize: size_of::<PCMETHOD_ITEM>() as ULONG,
+        MethodCount: 0,
+        Methods: ptr::null(),
+        EventItemSize: size_of::<PCEVENT_ITEM>() as ULONG,
+        EventCount: 0,
+        Events: ptr::null(),
+        Reserved: 0,
+    }
+}
+
+/// Nœud de topologie : type `node_type`, table d'automatisation `automation`, sans nom.
+///
+/// `Name` **nul** : KS retombe alors sur `Type` pour le nom affiché, ce qui donne les noms
+/// standard — et traduits — du volume et de la sourdine. C'est le repli documenté de
+/// `KSPROPERTY_PIN_NAME` (§4.2), appliqué aux nœuds, et c'est exactement ce qu'on veut
+/// ici : un nom de nœud propre au câble n'aurait aucun sens, et introduirait un contenu
+/// par câble dans une `static` qui doit rester partagée par les seize.
+///
+/// `Flags` à 0 : aucun `PCNODE_DESCRIPTOR_FLAG_*` ne s'applique (ils concernent les nœuds
+/// de mixage et de démultiplexage).
+const fn audio_node(
+    node_type: &'static GUID,
+    automation: &'static Shared<PCAUTOMATION_TABLE>,
+) -> PCNODE_DESCRIPTOR {
+    PCNODE_DESCRIPTOR {
+        Flags: 0,
+        AutomationTable: ptr::from_ref(automation).cast::<PCAUTOMATION_TABLE>(),
+        Type: ptr::from_ref(node_type),
+        Name: ptr::null(),
     }
 }
 
@@ -360,6 +518,11 @@ static CATEGORY_LINE_CONNECTOR: GUID = KSNODETYPE_LINE_CONNECTOR;
 /// « Conduit 1 » (`conduit_kmd.inx`, `GUID.PinName.Cable0`).
 static PIN_NAME_CABLE_0: GUID = portcls::PIN_NAME_CABLE_0;
 
+/// `KSNODETYPE_VOLUME`, adressable (`PCNODE_DESCRIPTOR::Type` en prend l'adresse).
+static NODE_TYPE_VOLUME: GUID = KSNODETYPE_VOLUME;
+/// `KSNODETYPE_MUTE`, adressable.
+static NODE_TYPE_MUTE: GUID = KSNODETYPE_MUTE;
+
 /// Plage système flottante 32 bits.
 static RANGE_F32: Shared<KSDATARANGE_AUDIO> =
     Shared(audio_range(KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, BITS_F32));
@@ -376,7 +539,12 @@ static SYSTEM_RANGES: Shared<[PKSDATARANGE; 2]> =
 static BRIDGE_RANGES: Shared<[PKSDATARANGE; 1]> = Shared([range_ptr(&RANGE_ANALOG)]);
 
 /// Table d'automatisation vide : tailles d'élément renseignées, aucun élément.
-static EMPTY_AUTOMATION: Shared<PCAUTOMATION_TABLE> = Shared(PCAUTOMATION_TABLE {
+///
+/// C'est celle des **quatre** filtres : les filtres WaveRT n'ont aucune propriété propre,
+/// et sur les filtres topologie les propriétés sont portées par les nœuds. `const` séparée
+/// de la `static` pour que les assertions ci-dessous puissent la lire (l'évaluation `const`
+/// ne lit pas les `static`).
+const EMPTY_AUTOMATION_TABLE: PCAUTOMATION_TABLE = PCAUTOMATION_TABLE {
     PropertyItemSize: size_of::<PCPROPERTY_ITEM>() as ULONG,
     PropertyCount: 0,
     Properties: ptr::null(),
@@ -387,12 +555,102 @@ static EMPTY_AUTOMATION: Shared<PCAUTOMATION_TABLE> = Shared(PCAUTOMATION_TABLE 
     EventCount: 0,
     Events: ptr::null(),
     Reserved: 0,
-});
+};
+static EMPTY_AUTOMATION: Shared<PCAUTOMATION_TABLE> = Shared(EMPTY_AUTOMATION_TABLE);
 
-/// Connexion directe broche 0 → broche 1, commune aux quatre filtres (l'entrée est
-/// toujours la broche 0, la sortie la broche 1).
-static DIRECT_CONNECTION: Shared<[PCCONNECTION_DESCRIPTOR; 1]> =
-    Shared([connection(PCFILTER_NODE, 0, PCFILTER_NODE, 1)]);
+/// Aucun nœud : le tableau vide que la forme wave passe à [`filter`], qui met alors
+/// `Nodes` à nul. Jamais déréférencé.
+static NO_NODES: Shared<[PCNODE_DESCRIPTOR; 0]> = Shared([]);
+
+// ---------------------------------------------------------------------------------
+// Nœuds audio des filtres topologie (M1b-03b).
+//
+// Ce qui suit se dédouble par **sens**, pas par câble : `volume_item::<V, T>` et
+// `mute_item::<V, T>` sont monomorphisés sur le type du miniport, et la garde de vtable de
+// `portcls::property::handler` compare l'adresse de `T::VTBL`. Les seize câbles de M1b-02
+// partagent ces mêmes `static` ; c'est le `MajorTarget` de la requête qui ramène le
+// gestionnaire au bon miniport, donc au bon `cable::NodeState`.
+// ---------------------------------------------------------------------------------
+
+/// `KSPROPERTY_AUDIO_VOLUMELEVEL` du nœud de volume de `TopoRender`.
+const RENDER_VOLUME_ITEMS: [PCPROPERTY_ITEM; 1] =
+    [volume_item::<IMiniportTopologyVtbl, TopoRender>()];
+/// `KSPROPERTY_AUDIO_MUTE` du nœud de sourdine de `TopoRender`.
+const RENDER_MUTE_ITEMS: [PCPROPERTY_ITEM; 1] = [mute_item::<IMiniportTopologyVtbl, TopoRender>()];
+/// `KSPROPERTY_AUDIO_VOLUMELEVEL` du nœud de volume de `TopoCapture`.
+const CAPTURE_VOLUME_ITEMS: [PCPROPERTY_ITEM; 1] =
+    [volume_item::<IMiniportTopologyVtbl, TopoCapture>()];
+/// `KSPROPERTY_AUDIO_MUTE` du nœud de sourdine de `TopoCapture`.
+const CAPTURE_MUTE_ITEMS: [PCPROPERTY_ITEM; 1] =
+    [mute_item::<IMiniportTopologyVtbl, TopoCapture>()];
+
+static RENDER_VOLUME_PROPERTIES: Shared<[PCPROPERTY_ITEM; 1]> = Shared(RENDER_VOLUME_ITEMS);
+static RENDER_MUTE_PROPERTIES: Shared<[PCPROPERTY_ITEM; 1]> = Shared(RENDER_MUTE_ITEMS);
+static CAPTURE_VOLUME_PROPERTIES: Shared<[PCPROPERTY_ITEM; 1]> = Shared(CAPTURE_VOLUME_ITEMS);
+static CAPTURE_MUTE_PROPERTIES: Shared<[PCPROPERTY_ITEM; 1]> = Shared(CAPTURE_MUTE_ITEMS);
+
+static RENDER_VOLUME_AUTOMATION: Shared<PCAUTOMATION_TABLE> =
+    Shared(one_property_automation(&RENDER_VOLUME_PROPERTIES));
+static RENDER_MUTE_AUTOMATION: Shared<PCAUTOMATION_TABLE> =
+    Shared(one_property_automation(&RENDER_MUTE_PROPERTIES));
+static CAPTURE_VOLUME_AUTOMATION: Shared<PCAUTOMATION_TABLE> =
+    Shared(one_property_automation(&CAPTURE_VOLUME_PROPERTIES));
+static CAPTURE_MUTE_AUTOMATION: Shared<PCAUTOMATION_TABLE> =
+    Shared(one_property_automation(&CAPTURE_MUTE_PROPERTIES));
+
+/// Nœuds de `TopoRender` : volume à l'index [`NODE_VOLUME`], sourdine à [`NODE_MUTE`].
+const TOPO_RENDER_NODES: [PCNODE_DESCRIPTOR; NODE_COUNT] = [
+    audio_node(&NODE_TYPE_VOLUME, &RENDER_VOLUME_AUTOMATION),
+    audio_node(&NODE_TYPE_MUTE, &RENDER_MUTE_AUTOMATION),
+];
+/// Nœuds de `TopoCapture` : mêmes types aux mêmes index, gestionnaires du sens capture.
+const TOPO_CAPTURE_NODES: [PCNODE_DESCRIPTOR; NODE_COUNT] = [
+    audio_node(&NODE_TYPE_VOLUME, &CAPTURE_VOLUME_AUTOMATION),
+    audio_node(&NODE_TYPE_MUTE, &CAPTURE_MUTE_AUTOMATION),
+];
+
+static TOPO_RENDER_NODES_TABLE: Shared<[PCNODE_DESCRIPTOR; NODE_COUNT]> = Shared(TOPO_RENDER_NODES);
+static TOPO_CAPTURE_NODES_TABLE: Shared<[PCNODE_DESCRIPTOR; NODE_COUNT]> =
+    Shared(TOPO_CAPTURE_NODES);
+
+/// Connexion directe broche 0 → broche 1, commune aux **deux filtres WaveRT** (l'entrée est
+/// toujours la broche 0, la sortie la broche 1). Les filtres topologie, eux, font passer le
+/// signal par leurs deux nœuds ([`TOPO_CONNECTIONS`]).
+const DIRECT_CONNECTION: [PCCONNECTION_DESCRIPTOR; WAVE_CONNECTION_COUNT] =
+    [connection(PCFILTER_NODE, 0, PCFILTER_NODE, 1)];
+static DIRECT_CONNECTION_TABLE: Shared<[PCCONNECTION_DESCRIPTOR; WAVE_CONNECTION_COUNT]> =
+    Shared(DIRECT_CONNECTION);
+
+/// Les trois connexions d'un filtre topologie : broche d'entrée → volume → sourdine →
+/// broche de sortie.
+///
+/// **Identiques pour les deux sens**, parce que la numérotation des broches y suit déjà le
+/// flux des deux côtés ([`TOPO_PIN_IN`], [`TOPO_PIN_OUT`]). Les broches des *nœuds*, elles,
+/// sont numérotées à l'envers des broches de filtre : `KSNODEPIN_STANDARD_IN` vaut **1** et
+/// `KSNODEPIN_STANDARD_OUT` vaut **0** (`ks.h`) — d'où les constantes nommées plutôt que
+/// des littéraux, qui se liraient à contresens.
+const TOPO_CONNECTIONS: [PCCONNECTION_DESCRIPTOR; TOPO_CONNECTION_COUNT] = [
+    connection(
+        PCFILTER_NODE,
+        TOPO_PIN_IN,
+        NODE_VOLUME,
+        KSNODEPIN_STANDARD_IN,
+    ),
+    connection(
+        NODE_VOLUME,
+        KSNODEPIN_STANDARD_OUT,
+        NODE_MUTE,
+        KSNODEPIN_STANDARD_IN,
+    ),
+    connection(
+        NODE_MUTE,
+        KSNODEPIN_STANDARD_OUT,
+        PCFILTER_NODE,
+        TOPO_PIN_OUT,
+    ),
+];
+static TOPO_CONNECTIONS_TABLE: Shared<[PCCONNECTION_DESCRIPTOR; TOPO_CONNECTION_COUNT]> =
+    Shared(TOPO_CONNECTIONS);
 
 /// Broches de `WaveRender` : système (entrée) puis bridge (sortie).
 const WAVE_RENDER_PINS: [PCPIN_DESCRIPTOR; PIN_COUNT] = [
@@ -425,28 +683,26 @@ static WAVE_CAPTURE_PINS_TABLE: Shared<[PCPIN_DESCRIPTOR; PIN_COUNT]> = Shared(W
 static TOPO_CAPTURE_PINS_TABLE: Shared<[PCPIN_DESCRIPTOR; PIN_COUNT]> = Shared(TOPO_CAPTURE_PINS);
 
 /// Descripteur du filtre `WaveRender<n>` (rendu par `wave::WaveRender::description`).
-pub static WAVE_RENDER_FILTER: Shared<PCFILTER_DESCRIPTOR> = Shared(filter(
-    &EMPTY_AUTOMATION,
+pub static WAVE_RENDER_FILTER: Shared<PCFILTER_DESCRIPTOR> = Shared(wave_filter(
     &WAVE_RENDER_PINS_TABLE,
-    &DIRECT_CONNECTION,
+    &DIRECT_CONNECTION_TABLE,
 ));
 /// Descripteur du filtre `TopoRender<n>` (rendu par `topo::TopoRender::description`).
-pub static TOPO_RENDER_FILTER: Shared<PCFILTER_DESCRIPTOR> = Shared(filter(
-    &EMPTY_AUTOMATION,
+pub static TOPO_RENDER_FILTER: Shared<PCFILTER_DESCRIPTOR> = Shared(topo_filter(
     &TOPO_RENDER_PINS_TABLE,
-    &DIRECT_CONNECTION,
+    &TOPO_RENDER_NODES_TABLE,
+    &TOPO_CONNECTIONS_TABLE,
 ));
 /// Descripteur du filtre `WaveCapture<n>` (rendu par `wave::WaveCapture::description`).
-pub static WAVE_CAPTURE_FILTER: Shared<PCFILTER_DESCRIPTOR> = Shared(filter(
-    &EMPTY_AUTOMATION,
+pub static WAVE_CAPTURE_FILTER: Shared<PCFILTER_DESCRIPTOR> = Shared(wave_filter(
     &WAVE_CAPTURE_PINS_TABLE,
-    &DIRECT_CONNECTION,
+    &DIRECT_CONNECTION_TABLE,
 ));
 /// Descripteur du filtre `TopoCapture<n>` (rendu par `topo::TopoCapture::description`).
-pub static TOPO_CAPTURE_FILTER: Shared<PCFILTER_DESCRIPTOR> = Shared(filter(
-    &EMPTY_AUTOMATION,
+pub static TOPO_CAPTURE_FILTER: Shared<PCFILTER_DESCRIPTOR> = Shared(topo_filter(
     &TOPO_CAPTURE_PINS_TABLE,
-    &DIRECT_CONNECTION,
+    &TOPO_CAPTURE_NODES_TABLE,
+    &TOPO_CONNECTIONS_TABLE,
 ));
 
 // ---------------------------------------------------------------------------------
@@ -531,40 +787,258 @@ const _: () = {
     assert!(direct.FromNodePin == 0 && direct.ToNodePin == 1);
 };
 
-/// `PinCount == Pins.len()`, `ConnectionCount == 1`, aucun nœud, tailles d'élément
-/// exactes, pour chacun des quatre descripteurs.
-const fn filter_is_well_formed(filter: &PCFILTER_DESCRIPTOR) -> bool {
+/// Le tronc commun aux deux formes : version, tailles d'élément, broches, connexions et
+/// catégories.
+const fn filter_shape_is_common(filter: &PCFILTER_DESCRIPTOR) -> bool {
     filter.Version == 0
         && filter.PinSize as usize == size_of::<PCPIN_DESCRIPTOR>()
         && filter.PinCount as usize == PIN_COUNT
         && !filter.Pins.is_null()
         && filter.NodeSize as usize == size_of::<PCNODE_DESCRIPTOR>()
-        && filter.NodeCount == 0
-        && filter.ConnectionCount == 1
         && !filter.Connections.is_null()
         && !filter.AutomationTable.is_null()
         && filter.CategoryCount == 0
 }
 
+/// **Forme wave** : tronc commun, aucun nœud (`Nodes` nul, pas seulement `NodeCount` nul)
+/// et l'unique connexion directe.
+const fn wave_filter_is_well_formed(filter: &PCFILTER_DESCRIPTOR) -> bool {
+    filter_shape_is_common(filter)
+        && filter.NodeCount == 0
+        && filter.Nodes.is_null()
+        && filter.ConnectionCount as usize == WAVE_CONNECTION_COUNT
+}
+
+/// **Forme topologie** : tronc commun, [`NODE_COUNT`] nœuds réellement pointés et les
+/// [`TOPO_CONNECTION_COUNT`] connexions qui les mettent en série.
+const fn topo_filter_is_well_formed(filter: &PCFILTER_DESCRIPTOR) -> bool {
+    filter_shape_is_common(filter)
+        && filter.NodeCount as usize == NODE_COUNT
+        && !filter.Nodes.is_null()
+        && filter.ConnectionCount as usize == TOPO_CONNECTION_COUNT
+}
+
 const _: () = {
-    assert!(filter_is_well_formed(&filter::<PIN_COUNT, 1>(
-        &EMPTY_AUTOMATION,
+    assert!(wave_filter_is_well_formed(&wave_filter::<
+        PIN_COUNT,
+        WAVE_CONNECTION_COUNT,
+    >(
         &WAVE_RENDER_PINS_TABLE,
-        &DIRECT_CONNECTION,
+        &DIRECT_CONNECTION_TABLE
     )));
-    assert!(filter_is_well_formed(&filter::<PIN_COUNT, 1>(
-        &EMPTY_AUTOMATION,
-        &TOPO_RENDER_PINS_TABLE,
-        &DIRECT_CONNECTION,
-    )));
-    assert!(filter_is_well_formed(&filter::<PIN_COUNT, 1>(
-        &EMPTY_AUTOMATION,
+    assert!(wave_filter_is_well_formed(&wave_filter::<
+        PIN_COUNT,
+        WAVE_CONNECTION_COUNT,
+    >(
         &WAVE_CAPTURE_PINS_TABLE,
-        &DIRECT_CONNECTION,
+        &DIRECT_CONNECTION_TABLE
     )));
-    assert!(filter_is_well_formed(&filter::<PIN_COUNT, 1>(
-        &EMPTY_AUTOMATION,
+    assert!(topo_filter_is_well_formed(&topo_filter::<
+        PIN_COUNT,
+        NODE_COUNT,
+        TOPO_CONNECTION_COUNT,
+    >(
+        &TOPO_RENDER_PINS_TABLE,
+        &TOPO_RENDER_NODES_TABLE,
+        &TOPO_CONNECTIONS_TABLE,
+    )));
+    assert!(topo_filter_is_well_formed(&topo_filter::<
+        PIN_COUNT,
+        NODE_COUNT,
+        TOPO_CONNECTION_COUNT,
+    >(
         &TOPO_CAPTURE_PINS_TABLE,
-        &DIRECT_CONNECTION,
+        &TOPO_CAPTURE_NODES_TABLE,
+        &TOPO_CONNECTIONS_TABLE,
     )));
+};
+
+// ---------------------------------------------------------------------------------
+// Graphe de topologie bien formé.
+//
+// Le pire mode de panne de ce pilote : une table de connexions incohérente donne « aucun
+// endpoint n'apparaît, aucun message d'erreur ». Ni le chargement, ni `StartDevice`, ni
+// `infverif` ne bronchent — un index de nœud d'un de trop, une broche de nœud prise à
+// l'endroit (`KSNODEPIN_STANDARD_IN` vaut 1, pas 0) et la topologie ne se construit
+// simplement pas. Aucune relecture ne voit ça de façon fiable ; ces assertions, si.
+// ---------------------------------------------------------------------------------
+
+/// Une extrémité de connexion : soit une broche du filtre (`PCFILTER_NODE`, et le numéro
+/// doit alors être une broche existante), soit un index de nœud valide.
+const fn endpoint_is_well_formed(
+    node: ULONG,
+    pin: ULONG,
+    node_count: ULONG,
+    pin_count: ULONG,
+) -> bool {
+    if node == PCFILTER_NODE {
+        pin < pin_count
+    } else {
+        // Les broches d'un nœud ne sont pas énumérables depuis le descripteur (elles
+        // dépendent du type de nœud) : seul l'index est vérifiable ici.
+        node < node_count
+    }
+}
+
+/// Les deux extrémités d'une connexion sont bien formées.
+const fn connection_is_well_formed(
+    c: &PCCONNECTION_DESCRIPTOR,
+    node_count: ULONG,
+    pin_count: ULONG,
+) -> bool {
+    endpoint_is_well_formed(c.FromNode, c.FromNodePin, node_count, pin_count)
+        && endpoint_is_well_formed(c.ToNode, c.ToNodePin, node_count, pin_count)
+}
+
+/// Toutes les connexions d'une table, sans indexation ni arithmétique (motif de tranche :
+/// la tête et le reste, jusqu'à épuisement).
+const fn connections_are_well_formed(
+    mut connections: &[PCCONNECTION_DESCRIPTOR],
+    node_count: ULONG,
+    pin_count: ULONG,
+) -> bool {
+    while let [premiere, reste @ ..] = connections {
+        if !connection_is_well_formed(premiere, node_count, pin_count) {
+            return false;
+        }
+        connections = reste;
+    }
+    true
+}
+
+const _: () = {
+    // Filtres WaveRT : aucun nœud, donc toute connexion doit passer par `PCFILTER_NODE`
+    // et ne désigner que des broches existantes.
+    assert!(connections_are_well_formed(
+        &DIRECT_CONNECTION,
+        0,
+        PIN_COUNT as ULONG
+    ));
+    // Filtres topologie : deux nœuds et deux broches.
+    assert!(connections_are_well_formed(
+        &TOPO_CONNECTIONS,
+        NODE_COUNT as ULONG,
+        PIN_COUNT as ULONG
+    ));
+
+    // Et la série est bien celle qu'on croit : broche 0 → volume → sourdine → broche 1.
+    // Sans cela, trois connexions individuellement valides pourraient former un graphe
+    // qui ne relie pas les deux broches.
+    assert!(TOPO_CONNECTIONS[0].FromNode == PCFILTER_NODE);
+    assert!(TOPO_CONNECTIONS[0].FromNodePin == TOPO_PIN_IN);
+    assert!(TOPO_CONNECTIONS[0].ToNode == NODE_VOLUME);
+    assert!(TOPO_CONNECTIONS[0].ToNodePin == KSNODEPIN_STANDARD_IN);
+    assert!(TOPO_CONNECTIONS[1].FromNode == NODE_VOLUME);
+    assert!(TOPO_CONNECTIONS[1].FromNodePin == KSNODEPIN_STANDARD_OUT);
+    assert!(TOPO_CONNECTIONS[1].ToNode == NODE_MUTE);
+    assert!(TOPO_CONNECTIONS[1].ToNodePin == KSNODEPIN_STANDARD_IN);
+    assert!(TOPO_CONNECTIONS[2].FromNode == NODE_MUTE);
+    assert!(TOPO_CONNECTIONS[2].FromNodePin == KSNODEPIN_STANDARD_OUT);
+    assert!(TOPO_CONNECTIONS[2].ToNode == PCFILTER_NODE);
+    assert!(TOPO_CONNECTIONS[2].ToNodePin == TOPO_PIN_OUT);
+
+    // Les broches de nœud sont numérotées à l'envers des broches de filtre : c'est le
+    // genre de constante qu'on recopie de travers une fois pour toutes.
+    assert!(KSNODEPIN_STANDARD_IN == 1 && KSNODEPIN_STANDARD_OUT == 0);
+
+    // Les index de nœud sont ceux que les connexions ci-dessus désignent : les assertions
+    // qui suivent indexent par littéral (`NODE_VOLUME as usize` n'est pas reconnu comme
+    // index constant par `clippy::indexing_slicing`), celle-ci fait le lien.
+    assert!(NODE_VOLUME == 0 && NODE_MUTE == 1);
+    assert!(TOPO_RENDER_NODES.len() == NODE_COUNT && TOPO_CAPTURE_NODES.len() == NODE_COUNT);
+
+    // Les nœuds : type non nul, table d'automatisation présente, nom **nul** — KS retombe
+    // alors sur `Type` pour le nom affiché, ce qui donne les noms standard traduits et
+    // aucun contenu par câble.
+    assert!(!TOPO_RENDER_NODES[0].Type.is_null() && !TOPO_RENDER_NODES[1].Type.is_null());
+    assert!(!TOPO_CAPTURE_NODES[0].Type.is_null() && !TOPO_CAPTURE_NODES[1].Type.is_null());
+    assert!(!TOPO_RENDER_NODES[0].AutomationTable.is_null());
+    assert!(!TOPO_RENDER_NODES[1].AutomationTable.is_null());
+    assert!(!TOPO_CAPTURE_NODES[0].AutomationTable.is_null());
+    assert!(!TOPO_CAPTURE_NODES[1].AutomationTable.is_null());
+    assert!(TOPO_RENDER_NODES[0].Name.is_null() && TOPO_RENDER_NODES[1].Name.is_null());
+    assert!(TOPO_CAPTURE_NODES[0].Name.is_null() && TOPO_CAPTURE_NODES[1].Name.is_null());
+    assert!(TOPO_RENDER_NODES[0].Flags == 0 && TOPO_RENDER_NODES[1].Flags == 0);
+    assert!(TOPO_CAPTURE_NODES[0].Flags == 0 && TOPO_CAPTURE_NODES[1].Flags == 0);
+};
+
+// ---------------------------------------------------------------------------------
+// Tables d'automatisation bien formées.
+//
+// Seconde panne muette : PortCls avance dans le tableau de propriétés par pas de
+// `PropertyItemSize`, et n'appelle que si `Flags` porte le verbe demandé. Une taille
+// erronée, un compte qui ne correspond pas au tableau, un `Handler` absent ou des `Flags`
+// nuls, et la propriété ne répond simplement jamais — sans erreur, sans trace.
+// ---------------------------------------------------------------------------------
+
+/// Une entrée de table : jeu de propriétés désigné, gestionnaire présent, et au moins un
+/// verbe déclaré (`GET`, `SET` ou `BASICSUPPORT`, cf. `portcls::ACCESS_FLAGS`).
+const fn property_item_is_well_formed(item: &PCPROPERTY_ITEM) -> bool {
+    !item.Set.is_null() && item.Handler.is_some() && item.Flags & portcls::ACCESS_FLAGS != 0
+}
+
+/// Toutes les entrées d'un tableau de propriétés (même motif de tranche que
+/// [`connections_are_well_formed`]).
+const fn property_items_are_well_formed(mut items: &[PCPROPERTY_ITEM]) -> bool {
+    while let [premier, reste @ ..] = items {
+        if !property_item_is_well_formed(premier) {
+            return false;
+        }
+        items = reste;
+    }
+    true
+}
+
+/// Une `PCAUTOMATION_TABLE` : tailles d'élément exactes, `PropertyCount` égal à la
+/// longueur du tableau qu'elle pointe, `Properties` nul si et seulement si le compte l'est,
+/// et aucune méthode ni événement (le pilote n'en expose pas).
+const fn automation_is_well_formed(table: &PCAUTOMATION_TABLE, properties: usize) -> bool {
+    table.PropertyItemSize as usize == size_of::<PCPROPERTY_ITEM>()
+        && table.PropertyCount as usize == properties
+        && table.Properties.is_null() == (properties == 0)
+        && table.MethodItemSize as usize == size_of::<PCMETHOD_ITEM>()
+        && table.MethodCount == 0
+        && table.Methods.is_null()
+        && table.EventItemSize as usize == size_of::<PCEVENT_ITEM>()
+        && table.EventCount == 0
+        && table.Events.is_null()
+        && table.Reserved == 0
+}
+
+const _: () = {
+    // La table de filtre, vide : c'est PortCls qui répond à `KSPROPSETID_Pin` et
+    // `KSPROPSETID_Topology`.
+    assert!(automation_is_well_formed(&EMPTY_AUTOMATION_TABLE, 0));
+
+    // Les quatre tables de nœud : une propriété chacune, réellement pointée.
+    assert!(automation_is_well_formed(
+        &one_property_automation(&RENDER_VOLUME_PROPERTIES),
+        1
+    ));
+    assert!(automation_is_well_formed(
+        &one_property_automation(&RENDER_MUTE_PROPERTIES),
+        1
+    ));
+    assert!(automation_is_well_formed(
+        &one_property_automation(&CAPTURE_VOLUME_PROPERTIES),
+        1
+    ));
+    assert!(automation_is_well_formed(
+        &one_property_automation(&CAPTURE_MUTE_PROPERTIES),
+        1
+    ));
+
+    // Et leurs entrées : gestionnaire présent, verbes déclarés.
+    assert!(property_items_are_well_formed(&RENDER_VOLUME_ITEMS));
+    assert!(property_items_are_well_formed(&RENDER_MUTE_ITEMS));
+    assert!(property_items_are_well_formed(&CAPTURE_VOLUME_ITEMS));
+    assert!(property_items_are_well_formed(&CAPTURE_MUTE_ITEMS));
+
+    // `GET | SET | BASICSUPPORT` : le bit `BASICSUPPORT` fait de nous le seul répondant à
+    // ce verbe (PortCls ne le traite plus lui-même) — c'est par lui que la plage du nœud
+    // arrive jusqu'à l'interface utilisateur.
+    assert!(RENDER_VOLUME_ITEMS[0].Flags == portcls::ACCESS_FLAGS);
+    assert!(RENDER_MUTE_ITEMS[0].Flags == portcls::ACCESS_FLAGS);
+    assert!(CAPTURE_VOLUME_ITEMS[0].Flags == portcls::ACCESS_FLAGS);
+    assert!(CAPTURE_MUTE_ITEMS[0].Flags == portcls::ACCESS_FLAGS);
 };

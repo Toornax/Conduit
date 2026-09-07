@@ -40,15 +40,33 @@
 //! Les sections critiques du câble sont courtes (lecture de deux pointeurs, calcul de
 //! position, copie d'une avance de 2 ms) : `GetPosition` d'un flux ne prend que le verrou
 //! du flux, pas celui du câble.
+//!
+//! # Les nœuds KS, et pourquoi ils sont ici
+//!
+//! Le câble porte aussi, par sens, l'état des nœuds de volume et de sourdine de son filtre
+//! de topologie ([`NodeState`], driver-design.md §5.5). C'est le seul objet que les deux
+//! côtés atteignent déjà : les miniports topologie (`topo::TopoRender`,
+//! `topo::TopoCapture`) reçoivent le même `&'static Cable` que les miniports WaveRT, et
+//! M1b-03 (jack) comme M1b-04 (propriété de configuration) auront besoin du même chemin.
+//! Le loger dans le miniport de topologie marcherait aujourd'hui et coûterait un
+//! déménagement demain.
+//!
+//! Ces champs sont des **atomiques, pas des champs sous le verrou du câble** : le
+//! gestionnaire de propriété KS tourne à `PASSIVE_LEVEL` sur un fil quelconque, la lecture
+//! éventuelle viendrait du tick à `DISPATCH_LEVEL`, un chargement 32 bits aligné ne se
+//! déchire pas, et il n'y a aucune relation d'ordre à établir avec un autre champ — d'où
+//! `Relaxed` partout. Prendre le spin lock du câble pour lire quatre octets élèverait
+//! l'IRQL et se sérialiserait avec la boucle locale pour rien.
 
 use core::fmt;
 use core::ptr::{self, NonNull};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use conduit_kmd_core::{
     FrameLayout, Loopback, Notifier, StreamPosition, StreamView, VirtualClock, byte_offset,
     copy_frames, silence,
 };
+use portcls::VOLUME_MAX;
 use portcls::conduit_com::{NtStatus, STATUS_INSUFFICIENT_RESOURCES};
 use portcls_sys::{KSSTATE, PMDL};
 use wdk_sys::ntddk::KeSetEvent;
@@ -219,6 +237,113 @@ impl StreamState {
 /// État verrouillé d'un flux : ce que les emplacements du câble désignent.
 pub type SharedStream = SpinLock<StreamState>;
 
+/// Nombre maximal de canaux d'un nœud de volume : le plafond de M1b-05 (1 à 8 canaux
+/// selon la configuration du câble).
+///
+/// Le tableau est dimensionné une fois pour toutes plutôt qu'au format courant : il coûte
+/// 32 octets par sens dans la section de données, la construction reste `const`, et le
+/// jour où le format d'un câble change, rien à redimensionner.
+pub const MAX_CHANNELS: usize = 8;
+
+/// Niveau par canal et sourdine des nœuds KS d'un sens du câble (driver-design.md §5.5).
+///
+/// # Mémorisé, jamais appliqué — et c'est le mécanisme, pas un raccourci
+///
+/// Le nœud de volume existe pour une raison unique : **faire renoncer Windows à son APO
+/// logiciel**. Sans nœud dans notre topologie, le moteur audio insère le sien et applique
+/// aux trames le volume par défaut qu'il donne à tout endpoint neuf — mesuré à 64 %, soit
+/// une amplitude de 0,229 pour 0,500 demandée. Exposer le nœud suffit à ce que ce gain ne
+/// soit plus appliqué avant que les trames n'atteignent notre tampon.
+///
+/// La seconde moitié est contre-intuitive et tout aussi indispensable : **ne pas appliquer
+/// la valeur**. Windows pousse sa valeur par défaut dans notre nœud dès la création de
+/// l'endpoint ; « initialiser à 0 dB » ne suffirait donc pas, la valeur serait écrasée dans
+/// la seconde qui suit. C'est en mémorisant sans appliquer qu'on obtient 0,500 pour 0,500.
+///
+/// Rien dans le pilote ne lit ces champs pour transformer le signal :
+/// [`Cable::on_tick`] appelle `copy_frames` qui recopie les trames **inchangées, octet pour
+/// octet**. C'est la seule réponse cohérente avec la raison d'être du produit — un câble
+/// dont la promesse est la transparence bit à bit ne peut pas atténuer ce qu'il transporte.
+///
+/// **Conséquence assumée : le curseur de volume d'un endpoint Conduit est décoratif.** Le
+/// déplacer change ce que la propriété KS relit, et rien d'autre. C'est volontaire.
+///
+/// # Synchronisation
+///
+/// Atomiques en `Relaxed`, sans verrou : voir la documentation du module.
+///
+/// # Un état par sens, pas par câble numéroté
+///
+/// Le contenu réellement *par câble* n'est pas ici mais dans le descripteur (le GUID
+/// `KsPinDescriptor.Name`). Les nœuds, leurs tables d'automatisation et leurs gestionnaires
+/// sont des `static` partagées par tous les câbles ; c'est le `MajorTarget` de la requête
+/// qui ramène le gestionnaire au bon miniport, donc au bon `NodeState`.
+#[derive(Debug)]
+pub struct NodeState {
+    /// Niveau de chaque canal, en unités de 1/65536 dB (échelle de `portcls::audio`).
+    levels: [AtomicI32; MAX_CHANNELS],
+    /// Sourdine du nœud, tous canaux confondus : 0 ou 1 (un `AtomicBool` ferait l'affaire,
+    /// mais l'aligné 32 bits se relit sans surprise dans un vidage mémoire).
+    muted: AtomicU32,
+}
+
+impl NodeState {
+    /// Nœuds au repos : tous les canaux à 0 dB, sourdine levée.
+    ///
+    /// Ces valeurs ne survivent pas à la création de l'endpoint — Windows y pousse les
+    /// siennes aussitôt (voir la documentation du type) —, mais elles rendent la première
+    /// lecture cohérente si un client interroge avant lui.
+    pub const fn new() -> Self {
+        Self {
+            // Expression `const` répétée : `[AtomicI32::new(0); N]` exigerait `Copy`.
+            levels: [const { AtomicI32::new(VOLUME_MAX) }; MAX_CHANNELS],
+            muted: AtomicU32::new(0),
+        }
+    }
+
+    /// Niveau du canal `channel`, en unités de 1/65536 dB.
+    ///
+    /// `portcls::audio` a déjà validé `channel` contre le nombre de canaux déclarés ; le
+    /// repli 0 dB au-delà du dernier canal n'est là que pour qu'aucun chemin ne panique.
+    ///
+    /// IRQL : quelconque.
+    pub fn volume(&self, channel: u32) -> i32 {
+        match Self::slot(&self.levels, channel) {
+            Some(level) => level.load(Ordering::Relaxed),
+            None => VOLUME_MAX,
+        }
+    }
+
+    /// Mémorise le niveau du canal `channel` (déjà borné et arrondi par `portcls::audio`).
+    /// **N'applique rien au signal** : voir la documentation du type.
+    ///
+    /// IRQL : quelconque.
+    pub fn set_volume(&self, channel: u32, level: i32) {
+        if let Some(slot) = Self::slot(&self.levels, channel) {
+            slot.store(level, Ordering::Relaxed);
+        }
+    }
+
+    /// État de la sourdine.
+    ///
+    /// IRQL : quelconque.
+    pub fn muted(&self) -> bool {
+        self.muted.load(Ordering::Relaxed) != 0
+    }
+
+    /// Mémorise l'état de la sourdine. **N'applique rien au signal.**
+    ///
+    /// IRQL : quelconque.
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(u32::from(muted), Ordering::Relaxed);
+    }
+
+    /// L'atomique du canal `channel`, ou `None` au-delà du dernier.
+    fn slot(levels: &[AtomicI32; MAX_CHANNELS], channel: u32) -> Option<&AtomicI32> {
+        usize::try_from(channel).ok().and_then(|i| levels.get(i))
+    }
+}
+
 /// Sens d'un flux sur un câble.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -350,16 +475,34 @@ pub struct Cable {
     timer: ExTimer,
     /// Compteurs atomiques de la boucle (hors verrou).
     counters: Counters,
+    /// Nœuds volume et sourdine du filtre `TopoRender<n>` (hors verrou, [`NodeState`]).
+    render_nodes: NodeState,
+    /// Nœuds volume et sourdine du filtre `TopoCapture<n>`.
+    capture_nodes: NodeState,
 }
 
 impl Cable {
-    /// Câble `index`, sans flux ni timer.
+    /// Câble `index`, sans flux ni timer, nœuds au repos.
     pub const fn new(index: u32) -> Self {
         Self {
             index,
             state: SpinLock::new(CableState::new()),
             timer: ExTimer::new(),
             counters: Counters::new(),
+            render_nodes: NodeState::new(),
+            capture_nodes: NodeState::new(),
+        }
+    }
+
+    /// Les nœuds volume et sourdine du sens `direction`.
+    ///
+    /// Hors du spin lock du câble, et volontairement : voir [`NodeState`].
+    ///
+    /// IRQL : quelconque.
+    pub const fn nodes(&self, direction: Direction) -> &NodeState {
+        match direction {
+            Direction::Render => &self.render_nodes,
+            Direction::Capture => &self.capture_nodes,
         }
     }
 
@@ -384,6 +527,10 @@ impl Cable {
     /// boucle à chaque tick et manquerait toutes les notifications d'un tampon de
     /// 10 ms. Un câble qui s'énumère et ne délivre que des trous est plus difficile à
     /// diagnostiquer qu'un `StartDevice` qui échoue proprement (driver-design.md §7).
+    ///
+    /// Les [`NodeState`] ne sont **pas** remis à zéro : Windows repousse sa valeur par
+    /// défaut dans le nœud dès qu'il recrée l'endpoint, et ce que le nœud mémorise
+    /// n'agit de toute façon sur rien.
     ///
     /// IRQL : `PASSIVE_LEVEL`.
     pub fn start(&self) -> Result<(), NtStatus> {
