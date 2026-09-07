@@ -11,13 +11,13 @@
 //!
 //! # Durée de vie et allocation
 //!
-//! Le câble du spike est une **`static`** ([`CABLE_0`]) : sa construction est `const`,
-//! il vit dans la section de données du pilote — non paginée, comme tout le binaire
-//! d'un pilote WDM qui ne marque pas ses sections `PAGE` —, depuis le chargement jusqu'au
-//! déchargement, sans allocation, sans fuite de pool à déclarer à Driver Verifier, sans
-//! `Drop`. Les cycles `StartDevice`/`StopDevice` le réutilisent ([`Cable::start`]) ; seul
-//! son timer est alloué par le noyau, une fois au premier `StartDevice` et supprimé au
-//! déchargement ([`shutdown`]).
+//! Les câbles sont un **tableau `static`** ([`CABLES`], un élément par câble) : leur
+//! construction est `const`, ils vivent dans la section de données du pilote — non
+//! paginée, comme tout le binaire d'un pilote WDM qui ne marque pas ses sections
+//! `PAGE` —, depuis le chargement jusqu'au déchargement, sans allocation, sans fuite de
+//! pool à déclarer à Driver Verifier, sans `Drop`. Les cycles `StartDevice`/`StopDevice`
+//! les réutilisent ([`Cable::start`]) ; seuls leurs timers sont alloués par le noyau, une
+//! fois au premier `StartDevice` et supprimés au déchargement ([`shutdown`]).
 //!
 //! # Synchronisation et contrat des emplacements
 //!
@@ -467,7 +467,8 @@ pub struct SlotOccupied;
 /// Un câble : son numéro, ses deux flux courants, sa boucle locale et son timer.
 #[derive(Debug)]
 pub struct Cable {
-    /// Numéro du câble (0 pour le seul câble de M1a ; « Conduit 1 » pour l'utilisateur).
+    /// Numéro du câble, de 0 à [`CABLE_COUNT`] − 1 (« Conduit *n+1* » pour
+    /// l'utilisateur).
     pub index: u32,
     /// L'état du câble, sous son spin lock.
     state: SpinLock<CableState>,
@@ -552,8 +553,8 @@ impl Cable {
             self.counters.reset();
         }
         let context: PVOID = ptr::from_ref(self).cast_mut().cast();
-        // SAFETY: `self` est le `static` `CABLE_0` : le contexte reste valide jusqu'au
-        // déchargement du pilote, où `shutdown` supprime le timer.
+        // SAFETY: `self` est un élément du `static` `CABLES` : le contexte reste valide
+        // jusqu'au déchargement du pilote, où `shutdown` supprime le timer.
         if unsafe { self.timer.create(cable_tick, context) } {
             return Ok(());
         }
@@ -800,25 +801,66 @@ unsafe extern "C" fn cable_tick(_timer: PEX_TIMER, context: PVOID) {
     cable.on_tick(clock::now());
 }
 
-/// Le câble 0, unique câble de M1a.
-static CABLE_0: Cable = Cable::new(0);
-
-/// Le câble `index`, ou `None` au-delà du dernier câble (M1a : un seul).
-pub fn cable(index: u32) -> Option<&'static Cable> {
-    (index == 0).then_some(&CABLE_0)
+/// Les câbles, construits en `const` : `CABLES[n].index == n`.
+///
+/// `Cable` n'est ni `Copy` ni `Clone` (spin lock, timer, atomiques) et chaque élément
+/// doit connaître son index : d'où la boucle `while`, sans `unsafe` ni `MaybeUninit` —
+/// `Cable::new(0)` est une valeur `const` valide, dont `[const { … }; N]` remplit le
+/// tableau avant que la boucle ne renumérote.
+#[allow(clippy::indexing_slicing)] // évalué à la compilation
+const fn cables() -> [Cable; CABLE_COUNT as usize] {
+    let mut cables = [const { Cable::new(0) }; CABLE_COUNT as usize];
+    let mut i = 1usize;
+    while i < cables.len() {
+        cables[i] = Cable::new(i as u32);
+        i = i.wrapping_add(1);
+    }
+    cables
 }
 
-/// Nombre de câbles servis par ce pilote.
-pub const CABLE_COUNT: u32 = 1;
+const _: () = {
+    // Les index sont ordonnés, 0, 1, … : c'est ce qui autorise `cable(index)` à indexer
+    // directement, et ce qui apparie chaque câble au bon GUID de nom de broche
+    // (`descriptors::PIN_NAMES`) et aux bons noms de sous-périphérique. Motif de tranche
+    // — n'indexe ni ne calcule, donc traverse `indexing_slicing` et
+    // `arithmetic_side_effects` sans aucun `allow`.
+    let cables = cables();
+    let mut reste: &[Cable] = &cables;
+    let mut attendu = 0u32;
+    while let [premier, suite @ ..] = reste {
+        assert!(
+            premier.index == attendu,
+            "les câbles doivent être numérotés dans l'ordre"
+        );
+        reste = suite;
+        attendu = attendu.wrapping_add(1);
+    }
+    assert!(attendu == CABLE_COUNT, "un câble par index");
+};
+
+/// Les câbles servis par ce pilote, dans la section de données du pilote (voir
+/// « Durée de vie et allocation » en tête de module).
+static CABLES: [Cable; CABLE_COUNT as usize] = cables();
+
+/// Le câble `index`, ou `None` au-delà du dernier.
+pub fn cable(index: u32) -> Option<&'static Cable> {
+    usize::try_from(index).ok().and_then(|i| CABLES.get(i))
+}
+
+/// Nombre de câbles servis par ce pilote (`portcls::CABLE_COUNT`, la source unique :
+/// c'est elle qui dimensionne aussi les noms de sous-périphériques, les GUID de noms de
+/// broche et les blocs de l'INF).
+///
+/// M1b-01 la rendra configurable (lecture du registre au démarrage) ; elle reste une
+/// constante pour l'instant.
+pub const CABLE_COUNT: u32 = portcls::CABLE_COUNT as u32;
 
 /// Supprime les timers de tous les câbles : à appeler une fois au déchargement du
 /// pilote, avant de rendre la main à PortCls.
 ///
 /// IRQL : `PASSIVE_LEVEL`, hors de tout spin lock.
 pub fn shutdown() {
-    for index in 0..CABLE_COUNT {
-        if let Some(cable) = cable(index) {
-            cable.shutdown();
-        }
+    for cable in &CABLES {
+        cable.shutdown();
     }
 }

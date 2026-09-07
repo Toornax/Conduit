@@ -10,12 +10,19 @@
   Vérifie aussi que portcls-sys\tests\layout.golden (oracle cl.exe des bindings) est à
   jour : régénération dans un dossier temporaire (regen-layout.ps1) et comparaison.
 
-  Cohérence INF ↔ Rust (M1a-09) : `cargo test -p portcls` lance portcls\tests\inf.rs, qui
-  relit conduit-kmd\conduit_kmd.inx et le compare aux constantes du pilote — noms de
-  sous-périphériques des AddInterface contre WAVE_RENDER_0…, GUID de nom de broche contre
-  pin_name_guid(0), GUID de catégorie contre portcls_sys::KSCATEGORY_*, et encodage
-  UTF-16 LE de la copie de travail. Une divergence y est une panne muette dans la VM
-  (périphérique installé, aucun endpoint, ou endpoint mal nommé) : elle échoue ici.
+  Cohérence INF ↔ Rust (M1a-09, M1b-02) : `cargo test -p portcls` lance
+  portcls\tests\inf.rs, qui relit conduit-kmd\conduit_kmd.inx et le compare aux constantes
+  du pilote — noms de sous-périphériques des AddInterface contre WAVE_RENDER_NAMES[n]…,
+  GUID de nom de broche contre pin_name_guid(n), GUID de catégorie contre
+  portcls_sys::KSCATEGORY_*, et encodage UTF-16 LE de la copie de travail. Une divergence
+  y est une panne muette dans la VM (périphérique installé, aucun endpoint, ou endpoint
+  mal nommé) : elle échoue ici.
+
+  L'INX est ENGENDRÉ (portcls\tests\inf.rs, fonction inf_attendu) : le même `cargo test`
+  vérifie sa FRAÎCHEUR — test inx_est_a_jour — comme ce script vérifie celle de
+  layout.golden. Rien à ajouter ici. Pour le régénérer après un changement de
+  portcls::CABLE_COUNT ou d'une constante :
+    cargo test -p portcls --test inf -- --ignored regenerer_inx
 
   portcls est testé DEUX FOIS, en `dev` puis en `--release`. Ce n'est pas une redondance :
   la garde de vtable de portcls\src\property.rs compare des ADRESSES de vtable, et

@@ -93,8 +93,9 @@ pub use conduit_com;
 pub use portcls_sys;
 
 pub use adapter::{
-    PIN_NAME_CABLE_0, TOPO_CAPTURE_0, TOPO_RENDER_0, WAVE_CAPTURE_0, WAVE_RENDER_0, as_unknown,
-    pin_name_guid, port_init, ref_as_unknown, utf16z,
+    CABLE_COUNT, CAPTURE_NAME_LEN, PIN_NAME_GUIDS, RENDER_NAME_LEN, TOPO_CAPTURE_NAMES,
+    TOPO_RENDER_NAMES, WAVE_CAPTURE_NAMES, WAVE_RENDER_NAMES, as_unknown, pin_name_guid, port_init,
+    ref_as_unknown, subdevice_names, utf16z, utf16z_numbered,
 };
 #[cfg(feature = "kernel")]
 pub use adapter::{new_port, register_physical_connection, register_subdevice};
