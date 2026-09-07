@@ -10,6 +10,7 @@
 //! | `GUID.PinName.Cable<n>` | `pin_name_guid(n)` = `KsPinDescriptor.Name` | l'endpoint s'appelle « Haut-parleurs » / « Ligne » |
 //! | `%KSCATEGORY_*%` | `portcls_sys::KSCATEGORY_*` (en-têtes du WDK) | interface publiée dans la mauvaise classe |
 //! | `HKR,,ReserveSize`… (`.HW`) | `conduit_kmd_core::params` (M1b-01) | le poste est réglé sur une valeur que le pilote ne tient pas pour son défaut |
+//! | `HKR,,ActiveCables` (`.HW`) | `conduit_kmd_core::config` (M1b-04) | une installation neuve et une valeur supprimée donnent deux états de câbles différents |
 //!
 //! Ces pannes ne se voient que dans une VM, et mal. Ce test les transforme en échec de
 //! `cargo test -p portcls`, donc de `tools/check.ps1` et de la CI.
@@ -60,6 +61,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+use conduit_kmd_core::config::{ACTIVE_CABLES_DEFAULT, ACTIVE_CABLES_VALUE_NAME};
 use conduit_kmd_core::params::Param;
 use portcls::{
     CABLE_COUNT, TOPO_CAPTURE_NAMES, TOPO_RENDER_NAMES, WAVE_CAPTURE_NAMES, WAVE_RENDER_NAMES,
@@ -437,6 +439,23 @@ const ENTETE_PARAMETRES: &str = r#"
 ; sont écrites pour que `regedit` montre à l'administrateur ce qu'il peut régler.
 "#;
 
+/// Commentaire du masque des câbles actifs, qui prolonge la même section.
+const ENTETE_MASQUE: &str = r#"
+; État actif des câbles (M1b-04, F-05). Masque de bits : le bit n vaut « câble n+1
+; connecté ». 0x00000003 = « Conduit 1 » et « Conduit 2 » actifs, les quatorze autres
+; rangés sous « Périphériques déconnectés ».
+;
+; À la DIFFÉRENCE des trois valeurs ci-dessus, celle-ci n'est pas un réglage
+; d'administrateur : c'est de l'ÉTAT, que le pilote RÉÉCRIT lui-même à chaque changement
+; demandé par la propriété KS privée KSPROPSETID_Conduit. La modifier à la main marche (le
+; pilote la relit au démarrage suivant) mais elle sera écrasée à la première demande du
+; service d'assistance.
+;
+; Une seule valeur plutôt que seize : une écriture indivisible du point de vue d'un
+; lecteur, et une seule valeur à retirer. En HKR, donc supprimée par PnP avec le
+; périphérique (F-52). Défaut ENGENDRÉ depuis conduit_kmd_core::config.
+"#;
+
 /// Commentaire et en-tête de `[…NT.Interfaces]`.
 const ENTETE_INTERFACES: &str = r#"
 ; Interfaces KS des sous-périphériques, câble par câble. Le deuxième champ est le nom de
@@ -472,6 +491,21 @@ fn parametres_attendus() -> Vec<String> {
             )
         })
         .collect()
+}
+
+/// La ligne `HKR` du masque des câbles actifs (M1b-04), avec son défaut.
+///
+/// Écrite en **hexadécimal** (`0x00000003`) et pas en décimal, contrairement aux trois
+/// paramètres : c'est un masque de bits, et `3` ne dit pas « les câbles 1 et 2 » à qui le
+/// lit dans `regedit`. `0x10001` reste `FLG_ADDREG_TYPE_DWORD` — SetupAPI accepte les deux
+/// notations pour la valeur.
+///
+/// Source unique : `conduit_kmd_core::config::ACTIVE_CABLES_DEFAULT`, le repli sur lequel
+/// `conduit_kmd::registry::read_active_cables` se rabat quand la valeur manque. Les deux
+/// doivent coïncider, faute de quoi une installation neuve et une valeur supprimée
+/// donneraient deux états différents.
+fn masque_attendu() -> String {
+    format!("HKR,,{ACTIVE_CABLES_VALUE_NAME},0x10001,{ACTIVE_CABLES_DEFAULT:#010x}")
 }
 
 /// Les lignes d'un bloc littéral, sans le saut de ligne de mise en page initial.
@@ -533,6 +567,9 @@ fn inf_attendu() -> String {
     ajouter(&mut std::iter::once(String::new()));
     ajouter(&mut bloc(ENTETE_PARAMETRES).map(str::to_owned));
     ajouter(&mut parametres_attendus().into_iter());
+    ajouter(&mut std::iter::once(String::new()));
+    ajouter(&mut bloc(ENTETE_MASQUE).map(str::to_owned));
+    ajouter(&mut std::iter::once(masque_attendu()));
     ajouter(&mut std::iter::once(String::new()));
 
     // Dix `AddInterface` par câble, groupés par câble.
@@ -765,10 +802,24 @@ fn defauts_de_parametres_identiques_au_pilote() {
         );
     }
 
+    // Le masque des câbles actifs (M1b-04, F-05) : le pilote se replie exactement sur
+    // cette valeur quand `ActiveCables` manque. Une divergence donnerait deux états
+    // différents selon qu'on vient d'installer ou qu'on a supprimé la valeur — un écart
+    // que seul un utilisateur perplexe finirait par signaler.
+    let attendue = masque_attendu();
+    assert!(
+        section.contains(&attendue.as_str()),
+        "[ConduitCable_HW_AddReg] : « {attendue} » manquante. Le pilote lit \
+         « {ACTIVE_CABLES_VALUE_NAME} » dans la clé matérielle et retient \
+         {ACTIVE_CABLES_DEFAULT:#010x} à défaut : l'INF doit écrire exactement cette \
+         valeur.\nSection commitée : {section:#?}"
+    );
+
     // F-52 (désinstallation propre) : PnP retire les `HKR` de la clé matérielle avec le
     // périphérique. Une écriture `HKLM` survivrait à la désinstallation et laisserait le
     // registre sale — et `infverif /w` la refuserait si elle visait une clé hors du
-    // périphérique.
+    // périphérique. C'est ce qui rend le masque de M1b-04 désinstallable proprement, lui
+    // que le pilote réécrit tout au long de la vie du périphérique.
     for ligne in &section {
         assert!(
             ligne.starts_with("HKR,"),

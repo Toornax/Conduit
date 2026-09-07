@@ -16,6 +16,9 @@
 //! - les bornes des paramètres de registre ([`params`]) : réserve de câbles, canaux et
 //!   durée de tampon, écrêtés vers leur borne avec un rapport de ce qui a été corrigé,
 //!   pour qu'un registre aberrant ne fasse jamais échouer le chargement (M1b-01) ;
+//! - le contrat du jeu de propriétés KS privé de configuration ([`config`]) : le GUID du
+//!   jeu, la structure d'échange et **tout** son parseur, plus le masque de bits qui
+//!   persiste l'état actif des câbles (M1b-04, M1b-08) ;
 //! - le plan de copie de la boucle locale ([`loopback`]) : à chaque tick du timer du
 //!   câble, quelles trames de rendu écrire à quelles trames de capture, quand écrire
 //!   du silence, et quand le tick est trop en retard pour rattraper.
@@ -64,6 +67,7 @@
 #[cfg(any(test, feature = "std"))]
 extern crate std;
 
+pub mod config;
 pub mod format;
 pub mod loopback;
 pub mod notify;
@@ -71,6 +75,12 @@ pub mod params;
 pub mod position;
 pub mod ring;
 
+pub use config::{
+    cable_bit, is_active, sanitize_mask, with_active, CableState, ConfigError, ConfigGuid, MaskFix,
+    ACTIVE_CABLES_DEFAULT, ACTIVE_CABLES_LABEL, ACTIVE_CABLES_MASK, ACTIVE_CABLES_VALUE_NAME,
+    CABLE_MAX, CABLE_STATE_BYTES, CONFIG_VERSION, KSPROPERTY_CONDUIT_CABLE_STATE,
+    KSPROPERTY_CONDUIT_VERSION, KSPROPSETID_CONDUIT,
+};
 pub use format::{
     buffer_bytes, buffer_bytes_for_notifications, validate, FormatError, RequestedFormat,
     SampleKind, SupportedFormat, M1A_FORMATS,

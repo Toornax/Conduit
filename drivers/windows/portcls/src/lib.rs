@@ -21,6 +21,7 @@
 //! | [`property`] | trait [`PropertyHandler`] ↔ `PCPROPERTY_ITEM`/`PCPROPERTY_REQUEST` : les propriétés KS d'un miniport |
 //! | [`audio`] | sémantique des nœuds volume/sourdine au-dessus de [`property`] : trait [`AudioNodes`], gestionnaires [`Volume`] et [`Mute`], échelle en 1/65536 dB |
 //! | [`jack`] | `KSPROPERTY_JACK_DESCRIPTION` au-dessus de [`property`] : trait [`JackInfo`], gestionnaire [`JackDescription`] — une propriété du **filtre** qui décrit une **broche** |
+//! | [`config`] | jeu de propriétés **privé** `KSPROPSETID_Conduit` au-dessus de [`property`] : trait [`CableConfig`], gestionnaires [`ConduitCableState`] et [`ConduitVersion`] — la surface de contrôle du démon (M1b-04) ; toute la validation vit dans `conduit_kmd_core::config`, pour être fuzzable |
 //! | [`adapter`] | côté adaptateur : `PcNewPort`, `IPort::Init`, `PcRegisterSubdevice`, `PcRegisterPhysicalConnection` (feature `kernel`), noms des sous-périphériques et GUID de nom de broche partagés avec l'INF |
 //! | [`status`] | les codes `NTSTATUS` du contrat PortCls absents de `conduit-com` |
 //!
@@ -80,6 +81,7 @@ extern crate std;
 
 pub mod adapter;
 pub mod audio;
+pub mod config;
 pub mod jack;
 pub mod miniport;
 pub mod power;
@@ -104,6 +106,11 @@ pub use adapter::{new_port, register_physical_connection, register_subdevice};
 pub use audio::{
     ACCESS_FLAGS, AudioNodes, Channel, Mute, Trace, VOLUME_DELTA, VOLUME_MAX, VOLUME_MIN, Volume,
     mute_item, volume_item,
+};
+pub use conduit_kmd_core;
+pub use config::{
+    CABLE_STATE_ACCESS_FLAGS, CableConfig, ConduitCableState, ConduitVersion, ConfigTrace,
+    VERSION_ACCESS_FLAGS, cable_state_item, version_item,
 };
 pub use jack::{
     JACK_ACCESS_FLAGS, JACK_COLOR, JACK_CONNECTION_TYPE, JACK_GEN_LOCATION, JACK_GEO_LOCATION,

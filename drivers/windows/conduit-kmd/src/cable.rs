@@ -58,6 +58,21 @@
 //! débranché l'est de ses deux bouts, et les deux filtres de topologie lisent le même
 //! atomique.
 //!
+//! # L'état actif est persisté (M1b-04)
+//!
+//! Depuis M1b-04, cet état est **modifiable** par le jeu de propriétés privé
+//! `KSPROPSETID_Conduit` ([`Cable::set_connected`]) et **survit au redémarrage** sans le
+//! démon (F-05) : une unique valeur `REG_DWORD` `ActiveCables` dans la clé matérielle du
+//! périphérique porte le masque de bits des seize câbles (voir
+//! `conduit_kmd_core::config::ACTIVE_CABLES_VALUE_NAME` pour le pourquoi d'un masque plutôt
+//! que de seize valeurs). `StartDevice` la lit et l'applique par [`apply_active_mask`] ;
+//! chaque écriture réussie de la propriété la réécrit entière depuis [`active_mask`].
+//!
+//! La constante `CONNECTED_BY_DEFAULT` de M1b-03 a disparu : l'état de départ ne se déduit
+//! plus du numéro de câble, il vient du registre. Ce qu'il en reste est le **défaut du
+//! masque**, `conduit_kmd_core::config::ACTIVE_CABLES_DEFAULT` (0x3, « Conduit 1 » et
+//! « Conduit 2 »), sur lequel la lecture se replie et que l'INF écrit à l'installation.
+//!
 //! Ces champs sont des **atomiques, pas des champs sous le verrou du câble** : le
 //! gestionnaire de propriété KS tourne à `PASSIVE_LEVEL` sur un fil quelconque, la lecture
 //! éventuelle viendrait du tick à `DISPATCH_LEVEL`, un chargement 32 bits aligné ne se
@@ -65,23 +80,33 @@
 //! `Relaxed` partout. Prendre le spin lock du câble pour lire quatre octets élèverait
 //! l'IRQL et se sérialiserait avec la boucle locale pour rien.
 
+use core::ffi::c_void;
 use core::fmt;
 use core::ptr::{self, NonNull};
-use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
+use conduit_kmd_core::config::{self, ACTIVE_CABLES_DEFAULT};
 use conduit_kmd_core::{
     FrameLayout, Loopback, Notifier, StreamPosition, StreamView, VirtualClock, byte_offset,
     copy_frames, silence,
 };
 use portcls::VOLUME_MAX;
 use portcls::conduit_com::{NtStatus, STATUS_INSUFFICIENT_RESOURCES};
-use portcls_sys::{KSSTATE, PMDL};
+use portcls_sys::{KSSTATE, PDEVICE_OBJECT, PMDL};
 use wdk_sys::ntddk::KeSetEvent;
 use wdk_sys::{KEVENT, PEX_TIMER, PVOID};
 
 use crate::clock;
+use crate::eventlog::EventLog;
+use crate::registry;
 use crate::sync::{SpinLock, SpinLockGuard};
 use crate::timer::ExTimer;
+
+/// `STATUS_DEVICE_NOT_READY` (`0xC00000A3`) : le câble n'a pas encore vu de `StartDevice`,
+/// donc il n'a pas d'objet de périphérique et rien à persister. Ne devrait pas se produire
+/// (une propriété KS suppose un sous-périphérique enregistré), mais un statut nommé vaut
+/// mieux qu'un pointeur nul déréférencé.
+const STATUS_DEVICE_NOT_READY: NtStatus = 0xC000_00A3_u32 as NtStatus;
 
 /// Nombre maximal d'événements de notification par flux
 /// (`RegisterNotificationEvent`) : PortCls n'en enregistre qu'un par client, deux
@@ -491,11 +516,42 @@ pub struct Cable {
     /// 1 (hors verrou, comme [`NodeState`] ; un `AtomicU32` plutôt qu'un `AtomicBool` pour
     /// que l'aligné 32 bits se relise sans surprise dans un vidage mémoire).
     connected: AtomicU32,
+    /// L'objet de périphérique de l'adaptateur qui a démarré ce câble, nul avant le
+    /// premier [`Cable::start`] : c'est par lui que [`Cable::set_connected`] atteint le
+    /// registre et le journal d'événements.
+    ///
+    /// # Pourquoi le câble le porte
+    ///
+    /// La persistance de M1b-04 se déclenche depuis un **gestionnaire de propriété KS**,
+    /// qui ne reçoit ni objet de périphérique ni IRP de PnP : il n'a que le `MajorTarget`
+    /// de sa requête, donc le miniport, donc ce câble. Il fallait bien que l'objet de
+    /// périphérique soit joignable depuis ici. Le loger dans le câble plutôt que dans une
+    /// `static` de module n'ajoute aucune hypothèse : il est réécrit à chaque
+    /// `StartDevice`, comme le timer et les compteurs, et suit donc le cycle de vie qui
+    /// existe déjà. (Une seconde instance d'adaptateur partagerait de toute façon le
+    /// tableau `static` [`CABLES`] tout entier — c'est une limite du pilote, pas de ce
+    /// champ.)
+    ///
+    /// # Validité
+    ///
+    /// PortCls détient une référence sur l'objet de périphérique tant que l'adaptateur
+    /// vit, et il ne route une propriété vers un de nos miniports que pendant cette
+    /// période : entre le `StartDevice` qui pose ce pointeur et le retrait du
+    /// périphérique, il désigne un objet vivant. [`shutdown`] le remet à nul au
+    /// déchargement.
+    device: AtomicPtr<c_void>,
 }
 
 impl Cable {
-    /// Câble `index`, sans flux ni timer, nœuds au repos, connecté si son index est
-    /// inférieur à [`CONNECTED_BY_DEFAULT`].
+    /// Câble `index`, sans flux ni timer, nœuds au repos, état actif au **défaut du
+    /// masque**.
+    ///
+    /// L'état de départ n'est plus une propriété du numéro de câble : il vient du registre
+    /// (`ActiveCables`), que `StartDevice` lit et applique par [`apply_active_mask`] avant
+    /// d'enregistrer le moindre sous-périphérique. La valeur posée ici est donc le repli
+    /// [`ACTIVE_CABLES_DEFAULT`], celui-là même sur lequel la lecture se rabat, et elle
+    /// n'est observable que si l'on interrogeait un câble avant tout `StartDevice` — ce
+    /// qu'aucun chemin ne fait, faute d'endpoint.
     pub const fn new(index: u32) -> Self {
         Self {
             index,
@@ -504,11 +560,17 @@ impl Cable {
             counters: Counters::new(),
             render_nodes: NodeState::new(),
             capture_nodes: NodeState::new(),
-            connected: AtomicU32::new(if connected_by_default(index) { 1 } else { 0 }),
+            connected: AtomicU32::new(if config::is_active(ACTIVE_CABLES_DEFAULT, index) {
+                1
+            } else {
+                0
+            }),
+            device: AtomicPtr::new(ptr::null_mut()),
         }
     }
 
-    /// L'état de connexion du câble, celui que `KSJACK_DESCRIPTION::IsConnected` porte.
+    /// L'état de connexion du câble, celui que `KSJACK_DESCRIPTION::IsConnected` porte et
+    /// que `KSPROPERTY_CONDUIT_CABLE_STATE` rend.
     ///
     /// `false` range l'endpoint sous « Périphériques déconnectés » dans les réglages Son,
     /// des deux côtés du câble à la fois.
@@ -518,19 +580,64 @@ impl Cable {
         self.connected.load(Ordering::Relaxed) != 0
     }
 
-    /// Fixe l'état de connexion du câble.
+    /// Fixe l'état de connexion du câble **et le persiste** (M1b-04).
     ///
-    /// **Personne ne l'appelle encore** : M1b-03 se contente d'exposer l'état de départ,
-    /// M1b-04 branchera dessus une propriété KS privée. Ce jour-là, il faudra **aussi**
-    /// émettre `KSEVENT_PINCAPS_JACKINFOCHANGE` sur les deux filtres de topologie du
-    /// câble — Windows n'interroge pas le jack en boucle, et sans cet événement
-    /// l'interface restera figée sur l'état du démarrage (voir `portcls::jack`).
+    /// L'état en mémoire est appliqué d'abord et **toujours** ; le `Err` rendu ne décrit
+    /// que l'échec de l'écriture au registre, que l'appelant ne doit pas propager à sa
+    /// propriété (un disque plein ne doit pas empêcher d'activer un câble). L'échec est
+    /// déjà journalisé par [`crate::registry::write_active_cables`].
     ///
-    /// IRQL : quelconque.
-    #[allow(dead_code)] // point d'accroche de M1b-04, documenté ci-dessus
-    pub fn set_connected(&self, connected: bool) {
+    /// La persistance écrit le masque **entier**, recalculé depuis l'état vivant des seize
+    /// câbles : c'est ce qui fait de l'écriture une seule valeur indivisible du point de
+    /// vue d'un lecteur (voir `conduit_kmd_core::config::ACTIVE_CABLES_VALUE_NAME`). Deux
+    /// `SET` concurrents sur deux câbles différents peuvent donc se recouvrir — le dernier
+    /// écrit gagne, et il écrit un masque cohérent avec l'état en mémoire au moment où il
+    /// l'a lu. Sérialiser coûterait un verrou à `PASSIVE_LEVEL` pour une course qui,
+    /// au pire, rejoue une écriture de registre au démarrage suivant.
+    ///
+    /// # Le point d'insertion de `KSEVENT_PINCAPS_JACKINFOCHANGE`
+    ///
+    /// **C'est ici**, juste après le `store` ci-dessous et avant la persistance : les deux
+    /// filtres de topologie du câble (`TopoRender<n>` et `TopoCapture<n>`) doivent recevoir
+    /// l'événement, faute de quoi Windows n'ira jamais relire
+    /// `KSPROPERTY_JACK_DESCRIPTION` et l'interface restera figée sur l'état du démarrage
+    /// (voir `portcls::jack`). Le symptôme serait « la propriété KS rend la bonne valeur
+    /// mais le panneau de son ne bouge pas ». La brique d'événements
+    /// (`PCEVENT_ITEM` dans la table d'automatisation du filtre, `PcGenerateEventList`) est
+    /// construite à part et sera raccordée ici.
+    ///
+    /// IRQL : `PASSIVE_LEVEL` (l'écriture au registre l'exige).
+    pub fn set_connected(&self, connected: bool) -> Result<(), NtStatus> {
         self.connected
             .store(u32::from(connected), Ordering::Relaxed);
+        // ICI : émettre KSEVENT_PINCAPS_JACKINFOCHANGE sur TopoRender<index> et
+        // TopoCapture<index> (M1b-04, brique d'événements). Voir la documentation
+        // ci-dessus.
+        self.persist_active_mask()
+    }
+
+    /// Écrit le masque des câbles actifs dans la clé matérielle du périphérique.
+    ///
+    /// `Err(STATUS_DEVICE_NOT_READY)` si le câble n'a pas encore vu de `StartDevice` : il
+    /// n'y a alors aucun objet de périphérique, donc aucune clé à ouvrir. Ce cas ne devrait
+    /// pas se produire — une propriété KS suppose un sous-périphérique enregistré — mais il
+    /// vaut mieux un statut nommé qu'un déréférencement de pointeur nul.
+    fn persist_active_mask(&self) -> Result<(), NtStatus> {
+        let device = self.device.load(Ordering::Relaxed);
+        if device.is_null() {
+            kmd_log!(
+                "câble {} : pas d'objet de périphérique, masque non persisté",
+                self.index
+            );
+            return Err(STATUS_DEVICE_NOT_READY);
+        }
+        // SAFETY: `device` est l'objet de périphérique posé par `start` et vivant tant que
+        // l'adaptateur l'est (voir la documentation du champ `device`) ; l'`EventLog` ne
+        // sert que dans cet appel.
+        let log = unsafe { EventLog::new(device.cast()) };
+        // SAFETY: idem ; la propriété est traitée à `PASSIVE_LEVEL`, ce qu'exigent
+        // `IoOpenDeviceRegistryKey` et `ZwSetValueKey`.
+        unsafe { registry::write_active_cables(device.cast(), active_mask(), log) }
     }
 
     /// Les nœuds volume et sourdine du sens `direction`.
@@ -571,10 +678,21 @@ impl Cable {
     /// défaut dans le nœud dès qu'il recrée l'endpoint, et ce que le nœud mémorise
     /// n'agit de toute façon sur rien. L'état de connexion non plus : c'est un réglage de
     /// l'utilisateur, pas un état de session, et il doit survivre à un cycle
-    /// `StopDevice`/`StartDevice` (une mise en veille, par exemple).
+    /// `StopDevice`/`StartDevice` (une mise en veille, par exemple). `start_device` l'a de
+    /// toute façon déjà relu du registre par [`apply_active_mask`], **avant** cet appel.
+    ///
+    /// `device` est mémorisé : c'est par lui que [`Cable::set_connected`] atteindra ensuite
+    /// le registre et le journal d'événements (voir le champ `device`).
     ///
     /// IRQL : `PASSIVE_LEVEL`.
-    pub fn start(&self) -> Result<(), NtStatus> {
+    ///
+    /// # Safety
+    ///
+    /// `device` est l'objet de périphérique remis à `StartDevice`, vivant au moins jusqu'au
+    /// retrait du périphérique — donc au-delà de toute propriété KS routée vers un miniport
+    /// de ce câble.
+    pub unsafe fn start(&self, device: PDEVICE_OBJECT) -> Result<(), NtStatus> {
+        self.device.store(device.cast(), Ordering::Relaxed);
         {
             let mut state = self.state();
             if !state.render.is_null() || !state.capture.is_null() {
@@ -810,6 +928,10 @@ impl Cable {
     /// IRQL : `PASSIVE_LEVEL`, hors de tout spin lock.
     fn shutdown(&self) {
         self.timer.delete();
+        // L'objet de périphérique ne survit pas au déchargement : le pointeur repart à nul
+        // pour qu'aucun chemin résiduel ne s'en serve. `persist_active_mask` traite ce cas
+        // par un statut nommé, jamais par un déréférencement.
+        self.device.store(ptr::null_mut(), Ordering::Relaxed);
         kmd_log!(
             "câble {} : timer supprimé après {} ticks depuis le dernier StartDevice ({} trames copiées, {} silences, {} débordements)",
             self.index,
@@ -895,39 +1017,61 @@ pub fn cable(index: u32) -> Option<&'static Cable> {
 /// constante pour l'instant.
 pub const CABLE_COUNT: u32 = portcls::CABLE_COUNT as u32;
 
-/// Nombre de câbles **connectés au démarrage** : les deux premiers, « Conduit 1 » et
-/// « Conduit 2 ».
-///
-/// Les seize câbles s'énumèrent toujours tous — un endpoint apparaît pour chacun d'eux —
-/// mais quatorze se présentent à Windows comme des prises vides et se rangent sous
-/// « Périphériques déconnectés », hors de la liste des périphériques utilisables. C'est ce
-/// qui rend un pilote à seize câbles supportable dans le panneau de son sans rien changer
-/// à l'énumération PnP.
-///
-/// M1b-04 le rendra modifiable câble par câble ([`Cable::set_connected`]) ; cette
-/// constante ne restera alors que l'**état de départ**.
-pub const CONNECTED_BY_DEFAULT: u32 = 2;
+// Le masque du contrat portable adresse exactement les câbles de ce pilote. Une
+// divergence perdrait silencieusement l'état des câbles au-delà du plus petit des deux :
+// leur bit ne serait jamais écrit (masque trop court) ou jamais relu (tableau trop court).
+const _: () = assert!(
+    config::CABLE_MAX == CABLE_COUNT,
+    "le masque ActiveCables et le tableau des câbles doivent couvrir les mêmes câbles"
+);
+// Le défaut n'allume que des câbles qui existent : « Conduit 1 » et « Conduit 2 ».
+const _: () = {
+    assert!(config::is_active(ACTIVE_CABLES_DEFAULT, 0));
+    assert!(config::is_active(ACTIVE_CABLES_DEFAULT, 1));
+    assert!(!config::is_active(ACTIVE_CABLES_DEFAULT, 2));
+    assert!(!config::is_active(
+        ACTIVE_CABLES_DEFAULT,
+        CABLE_COUNT.wrapping_sub(1)
+    ));
+};
 
-/// Le câble `index` est-il connecté au démarrage ?
+/// L'état actif des seize câbles, en masque de bits : le bit *n* vaut « câble *n*
+/// connecté ».
 ///
-/// Une fonction plutôt qu'un `if` en ligne dans [`Cable::new`] : l'état de départ n'est
-/// pas relisible depuis un contexte `const` (il vit dans un atomique), c'est donc ce
-/// prédicat que les assertions ci-dessous vérifient. Une inversion de comparaison
-/// donnerait quatorze câbles connectés et deux masqués — visible seulement en machine,
-/// sinon.
-pub const fn connected_by_default(index: u32) -> bool {
-    index < CONNECTED_BY_DEFAULT
+/// C'est exactement ce que [`crate::registry::write_active_cables`] persiste, et ce que
+/// [`apply_active_mask`] a posé au démarrage. Reconstruit à la demande depuis les atomiques
+/// plutôt que tenu à jour en double : un second exemplaire du même état est un second
+/// exemplaire à garder cohérent.
+///
+/// IRQL : quelconque.
+pub fn active_mask() -> u32 {
+    let mut masque = 0;
+    for cable in &CABLES {
+        masque = config::with_active(masque, cable.index, cable.is_connected());
+    }
+    masque
 }
 
-const _: () = {
-    assert!(
-        CONNECTED_BY_DEFAULT <= CABLE_COUNT,
-        "on ne peut pas connecter plus de câbles qu'il n'en existe"
-    );
-    assert!(CONNECTED_BY_DEFAULT == 2, "« Conduit 1 » et « Conduit 2 »");
-    assert!(connected_by_default(0) && connected_by_default(1));
-    assert!(!connected_by_default(2) && !connected_by_default(CABLE_COUNT.wrapping_sub(1)));
-};
+/// Applique un masque lu au registre à l'état de tous les câbles.
+///
+/// Appelé une fois par `StartDevice`, **avant** l'enregistrement du moindre
+/// sous-périphérique : c'est ce qui fait qu'un endpoint apparaît d'emblée dans le bon état
+/// plutôt que de basculer sous les yeux de l'utilisateur. Les câbles au-delà de la réserve
+/// sont réglés eux aussi — ils ne produisent aucun endpoint, mais garder leur bit cohérent
+/// évite qu'une réduction puis une remise à seize de `ReserveSize` ne perde leur état.
+///
+/// Ne persiste rien : le masque **vient** du registre.
+///
+/// IRQL : `PASSIVE_LEVEL`.
+pub fn apply_active_mask(masque: u32) {
+    for cable in &CABLES {
+        cable.connected.store(
+            u32::from(config::is_active(masque, cable.index)),
+            Ordering::Relaxed,
+        );
+    }
+    kmd_log!("câbles : masque actif {masque:#06x} appliqué");
+}
 
 /// Supprime les timers de tous les câbles : à appeler une fois au déchargement du
 /// pilote, avant de rendre la main à PortCls.

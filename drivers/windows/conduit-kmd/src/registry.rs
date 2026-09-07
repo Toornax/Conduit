@@ -1,8 +1,29 @@
-//! Lecture des paramètres de registre au démarrage (M1b-01, driver-design.md §2.1).
+//! Lecture des paramètres de registre au démarrage (M1b-01, driver-design.md §2.1) et
+//! persistance de l'état actif des câbles (M1b-04, §6).
 //!
 //! `StartDevice` lit trois `REG_DWORD` dans la **clé matérielle** du périphérique —
 //! `ReserveSize`, `Channels`, `BufferMs` — les confronte à leurs bornes par
-//! [`conduit_kmd_core::params::sanitize`], et journalise ce qu'il a corrigé.
+//! [`conduit_kmd_core::params::sanitize`], et journalise ce qu'il a corrigé. Il y lit
+//! aussi le masque `ActiveCables` ([`read_active_cables`]), que le gestionnaire de
+//! propriété privée réécrit ensuite à chaque changement ([`write_active_cables`]).
+//!
+//! # Deux natures, deux chemins
+//!
+//! Les trois paramètres et le masque partagent la même clé et les mêmes primitives, mais
+//! **pas la même nature**, et c'est pourquoi ils ne passent pas par la même fonction :
+//!
+//! | | `ReserveSize`, `Channels`, `BufferMs` | `ActiveCables` |
+//! |---|---|---|
+//! | Qui écrit | l'administrateur (et l'INF, une fois) | le **pilote**, à chaque `SET` |
+//! | Quand c'est lu | `StartDevice` | `StartDevice` |
+//! | Ce que c'est | de la configuration | de l'**état** |
+//!
+//! Les fondre dans [`read_params`] aurait demandé un quatrième `Param` dans le crate
+//! portable, donc un quatrième défaut, un quatrième rang de code d'événement et une
+//! quatrième correction — pour une valeur que l'administrateur n'est pas censé régler à la
+//! main et que le pilote écrase à la première demande de l'utilisateur. Le prix de la
+//! séparation est **une ouverture de clé de plus** au démarrage, négligeable devant les
+//! seize câbles à enregistrer.
 //!
 //! # La règle qui gouverne tout ce module : **on charge quand même**
 //!
@@ -49,20 +70,34 @@
 //! nulle part, ne survit pas au retour, et aucun code utilisateur ne s'exécute entre les
 //! deux.
 //!
-//! IRQL : `PASSIVE_LEVEL` (contexte de `IRP_MN_START_DEVICE`), exigé par
-//! `IoOpenDeviceRegistryKey` comme par `ZwQueryValueKey`.
+//! # L'écriture, et pourquoi elle ne peut pas faire échouer une propriété
+//!
+//! [`write_active_cables`] rouvre la clé en `KEY_WRITE` et pose la valeur par
+//! `ZwSetValueKey`. Elle peut échouer — registre saturé, ruche en lecture seule, clé
+//! retirée sous nos pieds pendant un retrait de périphérique — et **ce n'est pas une raison
+//! de refuser la demande de l'utilisateur** : l'état en mémoire est déjà appliqué quand
+//! elle est appelée, l'échec part au journal d'événements, et le seul effet est que le
+//! prochain démarrage repartira sur la valeur persistée précédemment. Un disque plein ne
+//! doit pas empêcher d'activer un câble.
+//!
+//! IRQL : `PASSIVE_LEVEL` (contexte de `IRP_MN_START_DEVICE` pour la lecture, contexte du
+//! gestionnaire de propriété pour l'écriture), exigé par `IoOpenDeviceRegistryKey` comme
+//! par `ZwQueryValueKey` et `ZwSetValueKey`.
 
+use conduit_kmd_core::config::{
+    ACTIVE_CABLES_DEFAULT, ACTIVE_CABLES_LABEL, ACTIVE_CABLES_VALUE_NAME, sanitize_mask,
+};
 use conduit_kmd_core::params::{self, Param, Params, RawParams};
 use portcls::conduit_com::{NtStatus, nt_success};
 use portcls_sys::PDEVICE_OBJECT;
 use wdk_sys::_KEY_VALUE_INFORMATION_CLASS::KeyValuePartialInformation;
 use wdk_sys::ntddk::{
     IoGetDeviceAttachmentBaseRef, IoOpenDeviceRegistryKey, ObfDereferenceObject, ZwClose,
-    ZwQueryValueKey,
+    ZwQueryValueKey, ZwSetValueKey,
 };
 use wdk_sys::{
-    HANDLE, KEY_READ, KEY_VALUE_PARTIAL_INFORMATION, PLUGPLAY_REGKEY_DEVICE, STATUS_SUCCESS, ULONG,
-    UNICODE_STRING, USHORT, WCHAR,
+    HANDLE, KEY_READ, KEY_VALUE_PARTIAL_INFORMATION, KEY_WRITE, PLUGPLAY_REGKEY_DEVICE,
+    STATUS_SUCCESS, ULONG, UNICODE_STRING, USHORT, WCHAR,
 };
 
 use crate::eventlog::{EventLog, kmd_event};
@@ -99,10 +134,11 @@ const PARTIAL_INFO_BYTES: usize = DATA_OFFSET.saturating_add(80);
 /// Unités UTF-16 réservées à un nom de valeur.
 const NAME_UNITS: usize = 32;
 
-// Les trois noms tiennent dans le tampon (noms ASCII : un octet par unité UTF-16).
+// Les quatre noms tiennent dans le tampon (noms ASCII : un octet par unité UTF-16).
 const _: () = assert!(Param::Reserve.value_name().len() < NAME_UNITS);
 const _: () = assert!(Param::Channels.value_name().len() < NAME_UNITS);
 const _: () = assert!(Param::BufferMs.value_name().len() < NAME_UNITS);
+const _: () = assert!(ACTIVE_CABLES_VALUE_NAME.len() < NAME_UNITS);
 
 /// Codes portés par `UniqueErrorValue` : la seule information qui survivrait si le texte
 /// de l'entrée n'arrivait pas jusqu'à l'Observateur (voir [`crate::eventlog`]).
@@ -120,9 +156,16 @@ mod code {
     pub(super) const INEXPLOITABLE: u32 = 0x0004_0000;
     /// Valeur lue, mais hors de ses bornes : écrêtée.
     pub(super) const HORS_BORNES: u32 = 0x0005_0000;
+    /// La clé matérielle n'a pas pu être ouverte **en écriture** (M1b-04).
+    pub(super) const CLE_ECRITURE: u32 = 0x0006_0000;
+    /// `ZwSetValueKey` a échoué : l'état actif ne survivra pas au redémarrage.
+    pub(super) const ECRITURE: u32 = 0x0007_0000;
 }
 
 /// Rang du paramètre dans [`Param::ALL`], pour composer un `UniqueErrorValue`.
+///
+/// [`RANG_MASQUE`] prolonge cette numérotation pour `ActiveCables`, qui n'est pas un
+/// `Param` mais partage les codes de lecture.
 const fn rang(param: Param) -> u32 {
     match param {
         Param::Reserve => 0,
@@ -130,6 +173,9 @@ const fn rang(param: Param) -> u32 {
         Param::BufferMs => 2,
     }
 }
+
+/// Rang de `ActiveCables` dans les codes d'événement, à la suite des trois paramètres.
+const RANG_MASQUE: u32 = 3;
 
 /// Nom de valeur encodé en UTF-16 sur la pile, avec l'`UNICODE_STRING` qui le décrit.
 ///
@@ -189,14 +235,20 @@ enum Lecture {
     TropGrande(ULONG),
 }
 
-/// Ouvre la clé matérielle du périphérique en lecture. Voir la note sur le PDO et celle
-/// sur `OBJ_KERNEL_HANDLE` en tête de module.
+/// Ouvre la clé matérielle du périphérique avec l'accès `access` (`KEY_READ` ou
+/// `KEY_WRITE`). Voir la note sur le PDO et celle sur `OBJ_KERNEL_HANDLE` en tête de
+/// module.
+///
+/// L'accès est un paramètre plutôt qu'un `KEY_READ` en dur : demander `KEY_WRITE` pour une
+/// simple lecture ferait échouer l'ouverture sur une ruche en lecture seule, et demander
+/// `KEY_READ` pour une écriture la ferait échouer dans `ZwSetValueKey`, plus loin et moins
+/// clairement.
 ///
 /// # Safety
 ///
-/// `device` est l'objet de périphérique remis à `StartDevice`, valide le temps de
-/// l'appel, et l'appelant est à `PASSIVE_LEVEL`.
-unsafe fn open_device_key(device: PDEVICE_OBJECT) -> Result<HANDLE, NtStatus> {
+/// `device` est un objet de périphérique vivant de ce pilote, valide le temps de l'appel,
+/// et l'appelant est à `PASSIVE_LEVEL`.
+unsafe fn open_device_key(device: PDEVICE_OBJECT, access: ULONG) -> Result<HANDLE, NtStatus> {
     // SAFETY: `device` est valide (contrat) ; la routine rend une référence sur l'objet
     // du bas de la pile, ou sur `device` lui-même s'il n'est attaché à rien.
     let pdo = unsafe { IoGetDeviceAttachmentBaseRef(device.cast()) };
@@ -204,8 +256,7 @@ unsafe fn open_device_key(device: PDEVICE_OBJECT) -> Result<HANDLE, NtStatus> {
     // SAFETY: `pdo` est référencé et vivant jusqu'au déréférencement ci-dessous ; `key`
     // est une variable locale inscriptible. Un `pdo` nul serait refusé par
     // `IoOpenDeviceRegistryKey` avec `STATUS_INVALID_PARAMETER`, jamais déréférencé.
-    let status =
-        unsafe { IoOpenDeviceRegistryKey(pdo, PLUGPLAY_REGKEY_DEVICE, KEY_READ, &mut key) };
+    let status = unsafe { IoOpenDeviceRegistryKey(pdo, PLUGPLAY_REGKEY_DEVICE, access, &mut key) };
     if !pdo.is_null() {
         // SAFETY: rend la référence prise par `IoGetDeviceAttachmentBaseRef`, comme sa
         // documentation l'exige (« must be matched by a subsequent call to
@@ -303,7 +354,7 @@ unsafe fn read_dword(key: HANDLE, nom: &str) -> Lecture {
 /// l'appel.
 pub(crate) unsafe fn read_params(device: PDEVICE_OBJECT, log: EventLog) -> Params {
     // SAFETY: contrat de la fonction relayé.
-    let raw = match unsafe { open_device_key(device) } {
+    let raw = match unsafe { open_device_key(device, KEY_READ) } {
         Ok(key) => {
             // SAFETY: `key` vient d'être ouvert en `KEY_READ` et n'est fermé qu'après.
             let raw = unsafe { read_all(key, log) };
@@ -405,4 +456,182 @@ unsafe fn read_all(key: HANDLE, log: EventLog) -> RawParams {
         }
     }
     raw
+}
+
+// ---------------------------------------------------------------------------------
+// `ActiveCables` : l'état actif des câbles, persisté par le pilote (M1b-04).
+// ---------------------------------------------------------------------------------
+
+/// Lit le masque `ActiveCables` dans la clé matérielle du périphérique.
+///
+/// **Ne peut pas échouer** : rend toujours un masque utilisable, comme [`read_params`] rend
+/// toujours des [`Params`]. Clé inaccessible, valeur absente, d'un autre type, illisible :
+/// chacun se journalise et se replie sur [`ACTIVE_CABLES_DEFAULT`] (les câbles 1 et 2). Les
+/// bits au-delà du dernier câble sont ignorés et signalés
+/// ([`conduit_kmd_core::config::sanitize_mask`]).
+///
+/// Une valeur **absente** est consignée pour la même raison que les trois paramètres :
+/// l'INF l'écrit (`[ConduitCable_HW_AddReg]`), donc sur un poste installé proprement son
+/// absence signifie que quelqu'un ou quelque chose l'a supprimée. Sur un poste mis à jour
+/// depuis une version antérieure à M1b-04, en revanche, elle est normale — d'où un message
+/// qui nomme les deux cas plutôt qu'un seul.
+///
+/// IRQL : `PASSIVE_LEVEL`.
+///
+/// # Safety
+///
+/// `device` est l'objet de périphérique remis à `StartDevice`, valide le temps de l'appel.
+pub(crate) unsafe fn read_active_cables(device: PDEVICE_OBJECT, log: EventLog) -> u32 {
+    // SAFETY: contrat de la fonction relayé.
+    let brut = match unsafe { open_device_key(device, KEY_READ) } {
+        Ok(key) => {
+            // SAFETY: `key` vient d'être ouvert en `KEY_READ` et n'est fermé qu'après.
+            let lue = unsafe { read_dword(key, ACTIVE_CABLES_VALUE_NAME) };
+            // SAFETY: `key` est le descripteur rendu par `IoOpenDeviceRegistryKey`, que sa
+            // documentation demande de fermer par `ZwClose` ; il n'est plus utilisé.
+            let status = unsafe { ZwClose(key) };
+            if status != STATUS_SUCCESS {
+                kmd_log!("registre : ZwClose a échoué : {status:#010x}");
+            }
+            lue
+        }
+        Err(status) => {
+            kmd_event!(
+                log,
+                code::CLE.saturating_add(RANG_MASQUE),
+                "clé matérielle illisible ({status:#010x}), {ACTIVE_CABLES_LABEL} \
+                 ({ACTIVE_CABLES_VALUE_NAME}) par défaut ({ACTIVE_CABLES_DEFAULT:#06x})"
+            );
+            Lecture::Illisible(status)
+        }
+    };
+
+    let valeur = match brut {
+        Lecture::Valeur(valeur) => valeur,
+        Lecture::Absente => {
+            kmd_event!(
+                log,
+                code::ABSENTE.saturating_add(RANG_MASQUE),
+                "{ACTIVE_CABLES_LABEL} ({ACTIVE_CABLES_VALUE_NAME}) absente de la clé du \
+                 périphérique (mise à jour depuis une version antérieure, ou valeur \
+                 supprimée), repli sur {ACTIVE_CABLES_DEFAULT:#06x}"
+            );
+            return ACTIVE_CABLES_DEFAULT;
+        }
+        Lecture::Illisible(status) => {
+            kmd_event!(
+                log,
+                code::ILLISIBLE.saturating_add(RANG_MASQUE),
+                "{ACTIVE_CABLES_LABEL} ({ACTIVE_CABLES_VALUE_NAME}) illisible \
+                 ({status:#010x}), repli sur {ACTIVE_CABLES_DEFAULT:#06x}"
+            );
+            return ACTIVE_CABLES_DEFAULT;
+        }
+        Lecture::Inexploitable { kind, len } => {
+            kmd_event!(
+                log,
+                code::INEXPLOITABLE.saturating_add(RANG_MASQUE),
+                "{ACTIVE_CABLES_LABEL} ({ACTIVE_CABLES_VALUE_NAME}) : type {kind}, {len} \
+                 octets (REG_DWORD attendu), repli sur {ACTIVE_CABLES_DEFAULT:#06x}"
+            );
+            return ACTIVE_CABLES_DEFAULT;
+        }
+        Lecture::TropGrande(taille) => {
+            kmd_event!(
+                log,
+                code::INEXPLOITABLE.saturating_add(RANG_MASQUE),
+                "{ACTIVE_CABLES_LABEL} ({ACTIVE_CABLES_VALUE_NAME}) : {taille} octets, \
+                 trop grande pour un REG_DWORD, repli sur {ACTIVE_CABLES_DEFAULT:#06x}"
+            );
+            return ACTIVE_CABLES_DEFAULT;
+        }
+    };
+
+    let (masque, correction) = sanitize_mask(valeur);
+    if let Some(correction) = correction {
+        kmd_log!("registre : {correction}");
+        kmd_event!(
+            log,
+            code::HORS_BORNES.saturating_add(RANG_MASQUE),
+            "{correction}"
+        );
+    }
+    kmd_log!("registre : {ACTIVE_CABLES_LABEL} = {masque:#06x}");
+    masque
+}
+
+/// Écrit le masque `ActiveCables` dans la clé matérielle du périphérique.
+///
+/// Rend le `NTSTATUS` de l'échec, **que l'appelant ne doit pas propager à sa propriété** :
+/// l'état en mémoire est déjà appliqué quand cette fonction est appelée, et un registre
+/// saturé ne doit pas empêcher d'activer un câble (voir la note d'écriture en tête de
+/// module). L'échec part aussi au journal d'événements ici même, pour que l'administrateur
+/// le retrouve sans débogueur — c'est le seul symptôme d'un réglage qui ne survivra pas au
+/// redémarrage.
+///
+/// IRQL : `PASSIVE_LEVEL` (contexte du gestionnaire de propriété).
+///
+/// # Safety
+///
+/// `device` est un objet de périphérique vivant de ce pilote, valide le temps de l'appel.
+pub(crate) unsafe fn write_active_cables(
+    device: PDEVICE_OBJECT,
+    masque: u32,
+    log: EventLog,
+) -> Result<(), NtStatus> {
+    // SAFETY: contrat de la fonction relayé.
+    let key = match unsafe { open_device_key(device, KEY_WRITE) } {
+        Ok(key) => key,
+        Err(status) => {
+            kmd_event!(
+                log,
+                code::CLE_ECRITURE.saturating_add(RANG_MASQUE),
+                "clé matérielle inaccessible en écriture ({status:#010x}) : \
+                 {ACTIVE_CABLES_LABEL} = {masque:#06x} ne survivra pas au redémarrage"
+            );
+            return Err(status);
+        }
+    };
+
+    // `tampon` doit vivre aussi longtemps que l'`UNICODE_STRING` qui le pointe.
+    let mut tampon = ValueName::new(ACTIVE_CABLES_VALUE_NAME);
+    let mut nom = tampon.as_unicode_string();
+    // `REG_DWORD` est petit-boutiste par définition de `winnt.h`, comme le décodage de
+    // `params::decode_dword` le suppose en lecture : les deux sens doivent employer la même
+    // convention, sinon un masque relu vaudrait son propre miroir.
+    let mut octets = masque.to_le_bytes();
+    // `REG_DWORD_BYTES` est une constante de 4 : la conversion ne peut pas échouer.
+    let taille = ULONG::try_from(params::REG_DWORD_BYTES).unwrap_or(0);
+
+    // SAFETY: `key` est ouvert en `KEY_WRITE` ; `nom` et `octets` sont des variables
+    // locales vivantes le temps de l'appel, et `taille` est bien la taille de `octets`.
+    // `TitleIndex` est ignoré et doit valoir 0.
+    let status = unsafe {
+        ZwSetValueKey(
+            key,
+            &mut nom,
+            0,
+            params::REG_DWORD,
+            octets.as_mut_ptr().cast(),
+            taille,
+        )
+    };
+    // SAFETY: `key` est le descripteur rendu par `IoOpenDeviceRegistryKey`, fermé une seule
+    // fois et plus utilisé ensuite — succès comme échec de l'écriture.
+    let fermeture = unsafe { ZwClose(key) };
+    if fermeture != STATUS_SUCCESS {
+        kmd_log!("registre : ZwClose a échoué : {fermeture:#010x}");
+    }
+
+    if nt_success(status) {
+        kmd_log!("registre : {ACTIVE_CABLES_LABEL} = {masque:#06x} persisté");
+        return Ok(());
+    }
+    kmd_event!(
+        log,
+        code::ECRITURE.saturating_add(RANG_MASQUE),
+        "{ACTIVE_CABLES_LABEL} ({ACTIVE_CABLES_VALUE_NAME}) = {masque:#06x} non écrite \
+         ({status:#010x}) : le réglage est actif mais ne survivra pas au redémarrage"
+    );
+    Err(status)
 }
