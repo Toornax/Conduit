@@ -1,11 +1,19 @@
 ;
 ; conduit_kmd.inx : source de l'INF du pilote Conduit (câbles audio virtuels).
 ;
+; ENGENDRÉ par `portcls/tests/inf.rs` (fonction `inf_attendu`) : n'éditez pas ce fichier
+; à la main. Les blocs par câble — AddInterface, sections d'interface, HKR\MediaCategories
+; et jetons [Strings] — sont dérivés de `portcls::CABLE_COUNT` et des constantes du
+; pilote. Pour le régénérer :
+;   cargo test -p portcls --test inf -- --ignored regenerer_inx
+; puis commitez. `cargo test -p portcls` (donc tools\check.ps1 et la CI) échoue tant que
+; le fichier commité diffère du texte engendré.
+;
 ; ENCODAGE : UTF-16 LE avec BOM dans la copie de travail. Un INF qui contient des
 ; caractères non ASCII doit être en UTF-16 LE (« General Guidelines for INF Files » :
 ; « if your INF contains non-ASCII characters, you must save the file as a Unicode
 ; (UTF-16 LE) file ») ; en UTF-8 sans BOM, SetupAPI le relit dans la page de codes ANSI
-; et « câbles » deviendrait « câbles » dans le gestionnaire de périphériques.
+; et « câbles » deviendrait « cÃ¢bles » dans le gestionnaire de périphériques.
 ; `.gitattributes` garde le fichier en UTF-8 dans le dépôt (diffs lisibles) et le
 ; restitue en UTF-16 LE : `*.inx text working-tree-encoding=UTF-16LE-BOM eol=crlf`.
 ; Le test `portcls/tests/inf.rs` échoue si le BOM manque dans la copie de travail
@@ -22,17 +30,20 @@
 ; classe MEDIA. Include/Needs de ks.inf et wdmaudio.inf enregistrent Kernel Streaming et
 ; PortCls ; AssociatedFilters et Driver sont les valeurs que wdmaud attend d'un adaptateur
 ; audio.
-; M1a-06 : interfaces KS des quatre sous-périphériques que StartDevice enregistre
-; (docs/driver-design.md §4.1) : WaveRender0 (KSCATEGORY_AUDIO, RENDER, REALTIME),
-; WaveCapture0 (AUDIO, CAPTURE, REALTIME), TopoRender0 et TopoCapture0 (AUDIO, TOPOLOGY).
+; M1a-06 : interfaces KS des sous-périphériques que StartDevice enregistre
+; (docs/driver-design.md §4.1), quatre par câble : WaveRender<n> (KSCATEGORY_AUDIO,
+; RENDER, REALTIME), WaveCapture<n> (AUDIO, CAPTURE, REALTIME), TopoRender<n> et
+; TopoCapture<n> (AUDIO, TOPOLOGY).
 ; Le nom de référence de chaque AddInterface est le nom passé à PcRegisterSubdevice ;
 ; CLSID est le proxy KS (ksproxy).
 ; M1a-09 : nom des endpoints (docs/driver-design.md §4.2). Le nom affiché par Windows
 ; est composé du **nom de la broche bridge** et du nom de l'adaptateur ; la broche se
-; nomme par son GUID `KsPinDescriptor.Name`, que ce fichier associe à « Conduit 1 » dans
-; `HKR\MediaCategories`. Le GUID est celui de `portcls::adapter::pin_name_guid(0)` et
+; nomme par son GUID `KsPinDescriptor.Name`, que ce fichier associe à « Conduit <n+1> »
+; dans `HKR\MediaCategories`. Le GUID est celui de `portcls::adapter::pin_name_guid(n)` et
 ; `portcls/tests/inf.rs` vérifie l'égalité. Sécurité de l'objet de périphérique et
 ; DeviceType dans .NT.HW.
+; M1b-02 : un câble devient seize. Rien de nouveau n'est déclaré ici : les mêmes blocs,
+; répétés par numéro de câble.
 ; Structure de référence : SYSVAD SimpleAudioSample, jamais copié.
 ;
 ; Désinstallation (F-52) : aucune section DelReg ni DelFiles n'est nécessaire. Toutes
@@ -87,9 +98,24 @@ HKR,,Driver,,conduit_kmd.sys
 ; le seul levier documenté pour nommer un endpoint sans toucher à l'espace de noms global
 ; (HKLM\SYSTEM\CurrentControlSet\Control\MediaCategories, réservé et interdit par
 ; infverif /w). Sans elle, la catégorie KSNODETYPE_SPEAKER donnerait « Haut-parleurs » et
-; KSNODETYPE_LINE_CONNECTOR « Ligne ».
+; KSNODETYPE_LINE_CONNECTOR « Ligne ». Une ligne par câble.
 [ConduitCable_PinNames_AddReg]
 HKR,%MediaCategories%\%GUID.PinName.Cable0%,Name,,%PinName.Cable0%
+HKR,%MediaCategories%\%GUID.PinName.Cable1%,Name,,%PinName.Cable1%
+HKR,%MediaCategories%\%GUID.PinName.Cable2%,Name,,%PinName.Cable2%
+HKR,%MediaCategories%\%GUID.PinName.Cable3%,Name,,%PinName.Cable3%
+HKR,%MediaCategories%\%GUID.PinName.Cable4%,Name,,%PinName.Cable4%
+HKR,%MediaCategories%\%GUID.PinName.Cable5%,Name,,%PinName.Cable5%
+HKR,%MediaCategories%\%GUID.PinName.Cable6%,Name,,%PinName.Cable6%
+HKR,%MediaCategories%\%GUID.PinName.Cable7%,Name,,%PinName.Cable7%
+HKR,%MediaCategories%\%GUID.PinName.Cable8%,Name,,%PinName.Cable8%
+HKR,%MediaCategories%\%GUID.PinName.Cable9%,Name,,%PinName.Cable9%
+HKR,%MediaCategories%\%GUID.PinName.Cable10%,Name,,%PinName.Cable10%
+HKR,%MediaCategories%\%GUID.PinName.Cable11%,Name,,%PinName.Cable11%
+HKR,%MediaCategories%\%GUID.PinName.Cable12%,Name,,%PinName.Cable12%
+HKR,%MediaCategories%\%GUID.PinName.Cable13%,Name,,%PinName.Cable13%
+HKR,%MediaCategories%\%GUID.PinName.Cable14%,Name,,%PinName.Cable14%
+HKR,%MediaCategories%\%GUID.PinName.Cable15%,Name,,%PinName.Cable15%
 
 [ConduitCable_Install.NT.Services]
 AddService = conduit_kmd, 0x00000002, ConduitCable_Service
@@ -113,23 +139,173 @@ AddReg = ConduitCable_HW_AddReg
 HKR,,DeviceType,0x10001,0x0000001D
 HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GRGWGX;;;BA)(A;;GRGWGX;;;WD)(A;;GRGWGX;;;RC)"
 
-; Interfaces KS des sous-périphériques (câble 0). Le deuxième champ est le nom de
+; Interfaces KS des sous-périphériques, câble par câble. Le deuxième champ est le nom de
 ; référence du sous-périphérique, tel que PcRegisterSubdevice le reçoit : il doit
 ; correspondre exactement aux constantes de `portcls::adapter`
-; (WAVE_RENDER_0, TOPO_RENDER_0, WAVE_CAPTURE_0, TOPO_CAPTURE_0). Une divergence donne un
-; périphérique qui s'installe sans publier aucun endpoint ; `portcls/tests/inf.rs` la
-; détecte.
+; (WAVE_RENDER_NAMES[n], TOPO_RENDER_NAMES[n], WAVE_CAPTURE_NAMES[n],
+; TOPO_CAPTURE_NAMES[n]). Une divergence donne un périphérique qui s'installe sans publier
+; aucun endpoint ; `portcls/tests/inf.rs` la détecte.
 [ConduitCable_Install.NT.Interfaces]
-AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveRender0%,  WaveRender0.Interface
-AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_WaveRender0%,  WaveRender0.Interface
-AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveRender0%,  WaveRender0.Interface
-AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoRender0%,  TopoRender0.Interface
-AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoRender0%,  TopoRender0.Interface
-AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveCapture0%, WaveCapture0.Interface
-AddInterface = %KSCATEGORY_CAPTURE%,  %KSNAME_WaveCapture0%, WaveCapture0.Interface
-AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveCapture0%, WaveCapture0.Interface
-AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoCapture0%, TopoCapture0.Interface
-AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoCapture0%, TopoCapture0.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveRender0%,   WaveRender0.Interface
+AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_WaveRender0%,   WaveRender0.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveRender0%,   WaveRender0.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoRender0%,   TopoRender0.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoRender0%,   TopoRender0.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveCapture0%,  WaveCapture0.Interface
+AddInterface = %KSCATEGORY_CAPTURE%,  %KSNAME_WaveCapture0%,  WaveCapture0.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveCapture0%,  WaveCapture0.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoCapture0%,  TopoCapture0.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoCapture0%,  TopoCapture0.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveRender1%,   WaveRender1.Interface
+AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_WaveRender1%,   WaveRender1.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveRender1%,   WaveRender1.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoRender1%,   TopoRender1.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoRender1%,   TopoRender1.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveCapture1%,  WaveCapture1.Interface
+AddInterface = %KSCATEGORY_CAPTURE%,  %KSNAME_WaveCapture1%,  WaveCapture1.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveCapture1%,  WaveCapture1.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoCapture1%,  TopoCapture1.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoCapture1%,  TopoCapture1.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveRender2%,   WaveRender2.Interface
+AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_WaveRender2%,   WaveRender2.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveRender2%,   WaveRender2.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoRender2%,   TopoRender2.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoRender2%,   TopoRender2.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveCapture2%,  WaveCapture2.Interface
+AddInterface = %KSCATEGORY_CAPTURE%,  %KSNAME_WaveCapture2%,  WaveCapture2.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveCapture2%,  WaveCapture2.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoCapture2%,  TopoCapture2.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoCapture2%,  TopoCapture2.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveRender3%,   WaveRender3.Interface
+AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_WaveRender3%,   WaveRender3.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveRender3%,   WaveRender3.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoRender3%,   TopoRender3.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoRender3%,   TopoRender3.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveCapture3%,  WaveCapture3.Interface
+AddInterface = %KSCATEGORY_CAPTURE%,  %KSNAME_WaveCapture3%,  WaveCapture3.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveCapture3%,  WaveCapture3.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoCapture3%,  TopoCapture3.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoCapture3%,  TopoCapture3.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveRender4%,   WaveRender4.Interface
+AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_WaveRender4%,   WaveRender4.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveRender4%,   WaveRender4.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoRender4%,   TopoRender4.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoRender4%,   TopoRender4.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveCapture4%,  WaveCapture4.Interface
+AddInterface = %KSCATEGORY_CAPTURE%,  %KSNAME_WaveCapture4%,  WaveCapture4.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveCapture4%,  WaveCapture4.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoCapture4%,  TopoCapture4.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoCapture4%,  TopoCapture4.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveRender5%,   WaveRender5.Interface
+AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_WaveRender5%,   WaveRender5.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveRender5%,   WaveRender5.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoRender5%,   TopoRender5.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoRender5%,   TopoRender5.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveCapture5%,  WaveCapture5.Interface
+AddInterface = %KSCATEGORY_CAPTURE%,  %KSNAME_WaveCapture5%,  WaveCapture5.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveCapture5%,  WaveCapture5.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoCapture5%,  TopoCapture5.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoCapture5%,  TopoCapture5.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveRender6%,   WaveRender6.Interface
+AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_WaveRender6%,   WaveRender6.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveRender6%,   WaveRender6.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoRender6%,   TopoRender6.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoRender6%,   TopoRender6.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveCapture6%,  WaveCapture6.Interface
+AddInterface = %KSCATEGORY_CAPTURE%,  %KSNAME_WaveCapture6%,  WaveCapture6.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveCapture6%,  WaveCapture6.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoCapture6%,  TopoCapture6.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoCapture6%,  TopoCapture6.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveRender7%,   WaveRender7.Interface
+AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_WaveRender7%,   WaveRender7.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveRender7%,   WaveRender7.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoRender7%,   TopoRender7.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoRender7%,   TopoRender7.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveCapture7%,  WaveCapture7.Interface
+AddInterface = %KSCATEGORY_CAPTURE%,  %KSNAME_WaveCapture7%,  WaveCapture7.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveCapture7%,  WaveCapture7.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoCapture7%,  TopoCapture7.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoCapture7%,  TopoCapture7.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveRender8%,   WaveRender8.Interface
+AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_WaveRender8%,   WaveRender8.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveRender8%,   WaveRender8.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoRender8%,   TopoRender8.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoRender8%,   TopoRender8.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveCapture8%,  WaveCapture8.Interface
+AddInterface = %KSCATEGORY_CAPTURE%,  %KSNAME_WaveCapture8%,  WaveCapture8.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveCapture8%,  WaveCapture8.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoCapture8%,  TopoCapture8.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoCapture8%,  TopoCapture8.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveRender9%,   WaveRender9.Interface
+AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_WaveRender9%,   WaveRender9.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveRender9%,   WaveRender9.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoRender9%,   TopoRender9.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoRender9%,   TopoRender9.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveCapture9%,  WaveCapture9.Interface
+AddInterface = %KSCATEGORY_CAPTURE%,  %KSNAME_WaveCapture9%,  WaveCapture9.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveCapture9%,  WaveCapture9.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoCapture9%,  TopoCapture9.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoCapture9%,  TopoCapture9.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveRender10%,  WaveRender10.Interface
+AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_WaveRender10%,  WaveRender10.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveRender10%,  WaveRender10.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoRender10%,  TopoRender10.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoRender10%,  TopoRender10.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveCapture10%, WaveCapture10.Interface
+AddInterface = %KSCATEGORY_CAPTURE%,  %KSNAME_WaveCapture10%, WaveCapture10.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveCapture10%, WaveCapture10.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoCapture10%, TopoCapture10.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoCapture10%, TopoCapture10.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveRender11%,  WaveRender11.Interface
+AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_WaveRender11%,  WaveRender11.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveRender11%,  WaveRender11.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoRender11%,  TopoRender11.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoRender11%,  TopoRender11.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveCapture11%, WaveCapture11.Interface
+AddInterface = %KSCATEGORY_CAPTURE%,  %KSNAME_WaveCapture11%, WaveCapture11.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveCapture11%, WaveCapture11.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoCapture11%, TopoCapture11.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoCapture11%, TopoCapture11.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveRender12%,  WaveRender12.Interface
+AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_WaveRender12%,  WaveRender12.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveRender12%,  WaveRender12.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoRender12%,  TopoRender12.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoRender12%,  TopoRender12.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveCapture12%, WaveCapture12.Interface
+AddInterface = %KSCATEGORY_CAPTURE%,  %KSNAME_WaveCapture12%, WaveCapture12.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveCapture12%, WaveCapture12.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoCapture12%, TopoCapture12.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoCapture12%, TopoCapture12.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveRender13%,  WaveRender13.Interface
+AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_WaveRender13%,  WaveRender13.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveRender13%,  WaveRender13.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoRender13%,  TopoRender13.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoRender13%,  TopoRender13.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveCapture13%, WaveCapture13.Interface
+AddInterface = %KSCATEGORY_CAPTURE%,  %KSNAME_WaveCapture13%, WaveCapture13.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveCapture13%, WaveCapture13.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoCapture13%, TopoCapture13.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoCapture13%, TopoCapture13.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveRender14%,  WaveRender14.Interface
+AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_WaveRender14%,  WaveRender14.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveRender14%,  WaveRender14.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoRender14%,  TopoRender14.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoRender14%,  TopoRender14.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveCapture14%, WaveCapture14.Interface
+AddInterface = %KSCATEGORY_CAPTURE%,  %KSNAME_WaveCapture14%, WaveCapture14.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveCapture14%, WaveCapture14.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoCapture14%, TopoCapture14.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoCapture14%, TopoCapture14.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveRender15%,  WaveRender15.Interface
+AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_WaveRender15%,  WaveRender15.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveRender15%,  WaveRender15.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoRender15%,  TopoRender15.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoRender15%,  TopoRender15.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_WaveCapture15%, WaveCapture15.Interface
+AddInterface = %KSCATEGORY_CAPTURE%,  %KSNAME_WaveCapture15%, WaveCapture15.Interface
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_WaveCapture15%, WaveCapture15.Interface
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_TopoCapture15%, TopoCapture15.Interface
+AddInterface = %KSCATEGORY_TOPOLOGY%, %KSNAME_TopoCapture15%, TopoCapture15.Interface
 
 ; FriendlyName par interface : nom du **filtre** dans le registre des interfaces de
 ; périphérique, pas celui de l'endpoint (§4.2). Il sert au diagnostic (Get-PnpDevice
@@ -162,31 +338,602 @@ AddReg = TopoCapture0.Interface.AddReg
 HKR,,CLSID,,%Proxy.CLSID%
 HKR,,FriendlyName,,%Conduit.TopoCapture0.FriendlyName%
 
+[WaveRender1.Interface]
+AddReg = WaveRender1.Interface.AddReg
+
+[WaveRender1.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveRender1.FriendlyName%
+
+[TopoRender1.Interface]
+AddReg = TopoRender1.Interface.AddReg
+
+[TopoRender1.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoRender1.FriendlyName%
+
+[WaveCapture1.Interface]
+AddReg = WaveCapture1.Interface.AddReg
+
+[WaveCapture1.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveCapture1.FriendlyName%
+
+[TopoCapture1.Interface]
+AddReg = TopoCapture1.Interface.AddReg
+
+[TopoCapture1.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoCapture1.FriendlyName%
+
+[WaveRender2.Interface]
+AddReg = WaveRender2.Interface.AddReg
+
+[WaveRender2.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveRender2.FriendlyName%
+
+[TopoRender2.Interface]
+AddReg = TopoRender2.Interface.AddReg
+
+[TopoRender2.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoRender2.FriendlyName%
+
+[WaveCapture2.Interface]
+AddReg = WaveCapture2.Interface.AddReg
+
+[WaveCapture2.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveCapture2.FriendlyName%
+
+[TopoCapture2.Interface]
+AddReg = TopoCapture2.Interface.AddReg
+
+[TopoCapture2.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoCapture2.FriendlyName%
+
+[WaveRender3.Interface]
+AddReg = WaveRender3.Interface.AddReg
+
+[WaveRender3.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveRender3.FriendlyName%
+
+[TopoRender3.Interface]
+AddReg = TopoRender3.Interface.AddReg
+
+[TopoRender3.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoRender3.FriendlyName%
+
+[WaveCapture3.Interface]
+AddReg = WaveCapture3.Interface.AddReg
+
+[WaveCapture3.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveCapture3.FriendlyName%
+
+[TopoCapture3.Interface]
+AddReg = TopoCapture3.Interface.AddReg
+
+[TopoCapture3.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoCapture3.FriendlyName%
+
+[WaveRender4.Interface]
+AddReg = WaveRender4.Interface.AddReg
+
+[WaveRender4.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveRender4.FriendlyName%
+
+[TopoRender4.Interface]
+AddReg = TopoRender4.Interface.AddReg
+
+[TopoRender4.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoRender4.FriendlyName%
+
+[WaveCapture4.Interface]
+AddReg = WaveCapture4.Interface.AddReg
+
+[WaveCapture4.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveCapture4.FriendlyName%
+
+[TopoCapture4.Interface]
+AddReg = TopoCapture4.Interface.AddReg
+
+[TopoCapture4.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoCapture4.FriendlyName%
+
+[WaveRender5.Interface]
+AddReg = WaveRender5.Interface.AddReg
+
+[WaveRender5.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveRender5.FriendlyName%
+
+[TopoRender5.Interface]
+AddReg = TopoRender5.Interface.AddReg
+
+[TopoRender5.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoRender5.FriendlyName%
+
+[WaveCapture5.Interface]
+AddReg = WaveCapture5.Interface.AddReg
+
+[WaveCapture5.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveCapture5.FriendlyName%
+
+[TopoCapture5.Interface]
+AddReg = TopoCapture5.Interface.AddReg
+
+[TopoCapture5.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoCapture5.FriendlyName%
+
+[WaveRender6.Interface]
+AddReg = WaveRender6.Interface.AddReg
+
+[WaveRender6.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveRender6.FriendlyName%
+
+[TopoRender6.Interface]
+AddReg = TopoRender6.Interface.AddReg
+
+[TopoRender6.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoRender6.FriendlyName%
+
+[WaveCapture6.Interface]
+AddReg = WaveCapture6.Interface.AddReg
+
+[WaveCapture6.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveCapture6.FriendlyName%
+
+[TopoCapture6.Interface]
+AddReg = TopoCapture6.Interface.AddReg
+
+[TopoCapture6.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoCapture6.FriendlyName%
+
+[WaveRender7.Interface]
+AddReg = WaveRender7.Interface.AddReg
+
+[WaveRender7.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveRender7.FriendlyName%
+
+[TopoRender7.Interface]
+AddReg = TopoRender7.Interface.AddReg
+
+[TopoRender7.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoRender7.FriendlyName%
+
+[WaveCapture7.Interface]
+AddReg = WaveCapture7.Interface.AddReg
+
+[WaveCapture7.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveCapture7.FriendlyName%
+
+[TopoCapture7.Interface]
+AddReg = TopoCapture7.Interface.AddReg
+
+[TopoCapture7.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoCapture7.FriendlyName%
+
+[WaveRender8.Interface]
+AddReg = WaveRender8.Interface.AddReg
+
+[WaveRender8.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveRender8.FriendlyName%
+
+[TopoRender8.Interface]
+AddReg = TopoRender8.Interface.AddReg
+
+[TopoRender8.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoRender8.FriendlyName%
+
+[WaveCapture8.Interface]
+AddReg = WaveCapture8.Interface.AddReg
+
+[WaveCapture8.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveCapture8.FriendlyName%
+
+[TopoCapture8.Interface]
+AddReg = TopoCapture8.Interface.AddReg
+
+[TopoCapture8.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoCapture8.FriendlyName%
+
+[WaveRender9.Interface]
+AddReg = WaveRender9.Interface.AddReg
+
+[WaveRender9.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveRender9.FriendlyName%
+
+[TopoRender9.Interface]
+AddReg = TopoRender9.Interface.AddReg
+
+[TopoRender9.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoRender9.FriendlyName%
+
+[WaveCapture9.Interface]
+AddReg = WaveCapture9.Interface.AddReg
+
+[WaveCapture9.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveCapture9.FriendlyName%
+
+[TopoCapture9.Interface]
+AddReg = TopoCapture9.Interface.AddReg
+
+[TopoCapture9.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoCapture9.FriendlyName%
+
+[WaveRender10.Interface]
+AddReg = WaveRender10.Interface.AddReg
+
+[WaveRender10.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveRender10.FriendlyName%
+
+[TopoRender10.Interface]
+AddReg = TopoRender10.Interface.AddReg
+
+[TopoRender10.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoRender10.FriendlyName%
+
+[WaveCapture10.Interface]
+AddReg = WaveCapture10.Interface.AddReg
+
+[WaveCapture10.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveCapture10.FriendlyName%
+
+[TopoCapture10.Interface]
+AddReg = TopoCapture10.Interface.AddReg
+
+[TopoCapture10.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoCapture10.FriendlyName%
+
+[WaveRender11.Interface]
+AddReg = WaveRender11.Interface.AddReg
+
+[WaveRender11.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveRender11.FriendlyName%
+
+[TopoRender11.Interface]
+AddReg = TopoRender11.Interface.AddReg
+
+[TopoRender11.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoRender11.FriendlyName%
+
+[WaveCapture11.Interface]
+AddReg = WaveCapture11.Interface.AddReg
+
+[WaveCapture11.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveCapture11.FriendlyName%
+
+[TopoCapture11.Interface]
+AddReg = TopoCapture11.Interface.AddReg
+
+[TopoCapture11.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoCapture11.FriendlyName%
+
+[WaveRender12.Interface]
+AddReg = WaveRender12.Interface.AddReg
+
+[WaveRender12.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveRender12.FriendlyName%
+
+[TopoRender12.Interface]
+AddReg = TopoRender12.Interface.AddReg
+
+[TopoRender12.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoRender12.FriendlyName%
+
+[WaveCapture12.Interface]
+AddReg = WaveCapture12.Interface.AddReg
+
+[WaveCapture12.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveCapture12.FriendlyName%
+
+[TopoCapture12.Interface]
+AddReg = TopoCapture12.Interface.AddReg
+
+[TopoCapture12.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoCapture12.FriendlyName%
+
+[WaveRender13.Interface]
+AddReg = WaveRender13.Interface.AddReg
+
+[WaveRender13.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveRender13.FriendlyName%
+
+[TopoRender13.Interface]
+AddReg = TopoRender13.Interface.AddReg
+
+[TopoRender13.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoRender13.FriendlyName%
+
+[WaveCapture13.Interface]
+AddReg = WaveCapture13.Interface.AddReg
+
+[WaveCapture13.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveCapture13.FriendlyName%
+
+[TopoCapture13.Interface]
+AddReg = TopoCapture13.Interface.AddReg
+
+[TopoCapture13.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoCapture13.FriendlyName%
+
+[WaveRender14.Interface]
+AddReg = WaveRender14.Interface.AddReg
+
+[WaveRender14.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveRender14.FriendlyName%
+
+[TopoRender14.Interface]
+AddReg = TopoRender14.Interface.AddReg
+
+[TopoRender14.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoRender14.FriendlyName%
+
+[WaveCapture14.Interface]
+AddReg = WaveCapture14.Interface.AddReg
+
+[WaveCapture14.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveCapture14.FriendlyName%
+
+[TopoCapture14.Interface]
+AddReg = TopoCapture14.Interface.AddReg
+
+[TopoCapture14.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoCapture14.FriendlyName%
+
+[WaveRender15.Interface]
+AddReg = WaveRender15.Interface.AddReg
+
+[WaveRender15.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveRender15.FriendlyName%
+
+[TopoRender15.Interface]
+AddReg = TopoRender15.Interface.AddReg
+
+[TopoRender15.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoRender15.FriendlyName%
+
+[WaveCapture15.Interface]
+AddReg = WaveCapture15.Interface.AddReg
+
+[WaveCapture15.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.WaveCapture15.FriendlyName%
+
+[TopoCapture15.Interface]
+AddReg = TopoCapture15.Interface.AddReg
+
+[TopoCapture15.Interface.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Conduit.TopoCapture15.FriendlyName%
+
 [Strings]
 Conduit                  = "Conduit"
 DiskName                 = "Disque d'installation Conduit"
 ConduitCable.DeviceDesc  = "Conduit — câbles audio virtuels"
 ConduitCable.ServiceDesc = "Conduit — pilote de câbles audio virtuels"
 
-; Noms de sous-périphérique : identiques aux constantes de `portcls::adapter`.
-KSNAME_WaveRender0  = "WaveRender0"
-KSNAME_TopoRender0  = "TopoRender0"
-KSNAME_WaveCapture0 = "WaveCapture0"
-KSNAME_TopoCapture0 = "TopoCapture0"
+; Noms de sous-périphérique : identiques aux constantes de `portcls::adapter`,
+; quatre par câble.
+KSNAME_WaveRender0   = "WaveRender0"
+KSNAME_TopoRender0   = "TopoRender0"
+KSNAME_WaveCapture0  = "WaveCapture0"
+KSNAME_TopoCapture0  = "TopoCapture0"
+KSNAME_WaveRender1   = "WaveRender1"
+KSNAME_TopoRender1   = "TopoRender1"
+KSNAME_WaveCapture1  = "WaveCapture1"
+KSNAME_TopoCapture1  = "TopoCapture1"
+KSNAME_WaveRender2   = "WaveRender2"
+KSNAME_TopoRender2   = "TopoRender2"
+KSNAME_WaveCapture2  = "WaveCapture2"
+KSNAME_TopoCapture2  = "TopoCapture2"
+KSNAME_WaveRender3   = "WaveRender3"
+KSNAME_TopoRender3   = "TopoRender3"
+KSNAME_WaveCapture3  = "WaveCapture3"
+KSNAME_TopoCapture3  = "TopoCapture3"
+KSNAME_WaveRender4   = "WaveRender4"
+KSNAME_TopoRender4   = "TopoRender4"
+KSNAME_WaveCapture4  = "WaveCapture4"
+KSNAME_TopoCapture4  = "TopoCapture4"
+KSNAME_WaveRender5   = "WaveRender5"
+KSNAME_TopoRender5   = "TopoRender5"
+KSNAME_WaveCapture5  = "WaveCapture5"
+KSNAME_TopoCapture5  = "TopoCapture5"
+KSNAME_WaveRender6   = "WaveRender6"
+KSNAME_TopoRender6   = "TopoRender6"
+KSNAME_WaveCapture6  = "WaveCapture6"
+KSNAME_TopoCapture6  = "TopoCapture6"
+KSNAME_WaveRender7   = "WaveRender7"
+KSNAME_TopoRender7   = "TopoRender7"
+KSNAME_WaveCapture7  = "WaveCapture7"
+KSNAME_TopoCapture7  = "TopoCapture7"
+KSNAME_WaveRender8   = "WaveRender8"
+KSNAME_TopoRender8   = "TopoRender8"
+KSNAME_WaveCapture8  = "WaveCapture8"
+KSNAME_TopoCapture8  = "TopoCapture8"
+KSNAME_WaveRender9   = "WaveRender9"
+KSNAME_TopoRender9   = "TopoRender9"
+KSNAME_WaveCapture9  = "WaveCapture9"
+KSNAME_TopoCapture9  = "TopoCapture9"
+KSNAME_WaveRender10  = "WaveRender10"
+KSNAME_TopoRender10  = "TopoRender10"
+KSNAME_WaveCapture10 = "WaveCapture10"
+KSNAME_TopoCapture10 = "TopoCapture10"
+KSNAME_WaveRender11  = "WaveRender11"
+KSNAME_TopoRender11  = "TopoRender11"
+KSNAME_WaveCapture11 = "WaveCapture11"
+KSNAME_TopoCapture11 = "TopoCapture11"
+KSNAME_WaveRender12  = "WaveRender12"
+KSNAME_TopoRender12  = "TopoRender12"
+KSNAME_WaveCapture12 = "WaveCapture12"
+KSNAME_TopoCapture12 = "TopoCapture12"
+KSNAME_WaveRender13  = "WaveRender13"
+KSNAME_TopoRender13  = "TopoRender13"
+KSNAME_WaveCapture13 = "WaveCapture13"
+KSNAME_TopoCapture13 = "TopoCapture13"
+KSNAME_WaveRender14  = "WaveRender14"
+KSNAME_TopoRender14  = "TopoRender14"
+KSNAME_WaveCapture14 = "WaveCapture14"
+KSNAME_TopoCapture14 = "TopoCapture14"
+KSNAME_WaveRender15  = "WaveRender15"
+KSNAME_TopoRender15  = "TopoRender15"
+KSNAME_WaveCapture15 = "WaveCapture15"
+KSNAME_TopoCapture15 = "TopoCapture15"
 
 ; Noms des filtres dans le registre des interfaces (diagnostic).
-Conduit.WaveRender0.FriendlyName  = "Conduit 1 (rendu, WaveRT)"
-Conduit.TopoRender0.FriendlyName  = "Conduit 1 (rendu, topologie)"
-Conduit.WaveCapture0.FriendlyName = "Conduit 1 (capture, WaveRT)"
-Conduit.TopoCapture0.FriendlyName = "Conduit 1 (capture, topologie)"
+Conduit.WaveRender0.FriendlyName   = "Conduit 1 (rendu, WaveRT)"
+Conduit.TopoRender0.FriendlyName   = "Conduit 1 (rendu, topologie)"
+Conduit.WaveCapture0.FriendlyName  = "Conduit 1 (capture, WaveRT)"
+Conduit.TopoCapture0.FriendlyName  = "Conduit 1 (capture, topologie)"
+Conduit.WaveRender1.FriendlyName   = "Conduit 2 (rendu, WaveRT)"
+Conduit.TopoRender1.FriendlyName   = "Conduit 2 (rendu, topologie)"
+Conduit.WaveCapture1.FriendlyName  = "Conduit 2 (capture, WaveRT)"
+Conduit.TopoCapture1.FriendlyName  = "Conduit 2 (capture, topologie)"
+Conduit.WaveRender2.FriendlyName   = "Conduit 3 (rendu, WaveRT)"
+Conduit.TopoRender2.FriendlyName   = "Conduit 3 (rendu, topologie)"
+Conduit.WaveCapture2.FriendlyName  = "Conduit 3 (capture, WaveRT)"
+Conduit.TopoCapture2.FriendlyName  = "Conduit 3 (capture, topologie)"
+Conduit.WaveRender3.FriendlyName   = "Conduit 4 (rendu, WaveRT)"
+Conduit.TopoRender3.FriendlyName   = "Conduit 4 (rendu, topologie)"
+Conduit.WaveCapture3.FriendlyName  = "Conduit 4 (capture, WaveRT)"
+Conduit.TopoCapture3.FriendlyName  = "Conduit 4 (capture, topologie)"
+Conduit.WaveRender4.FriendlyName   = "Conduit 5 (rendu, WaveRT)"
+Conduit.TopoRender4.FriendlyName   = "Conduit 5 (rendu, topologie)"
+Conduit.WaveCapture4.FriendlyName  = "Conduit 5 (capture, WaveRT)"
+Conduit.TopoCapture4.FriendlyName  = "Conduit 5 (capture, topologie)"
+Conduit.WaveRender5.FriendlyName   = "Conduit 6 (rendu, WaveRT)"
+Conduit.TopoRender5.FriendlyName   = "Conduit 6 (rendu, topologie)"
+Conduit.WaveCapture5.FriendlyName  = "Conduit 6 (capture, WaveRT)"
+Conduit.TopoCapture5.FriendlyName  = "Conduit 6 (capture, topologie)"
+Conduit.WaveRender6.FriendlyName   = "Conduit 7 (rendu, WaveRT)"
+Conduit.TopoRender6.FriendlyName   = "Conduit 7 (rendu, topologie)"
+Conduit.WaveCapture6.FriendlyName  = "Conduit 7 (capture, WaveRT)"
+Conduit.TopoCapture6.FriendlyName  = "Conduit 7 (capture, topologie)"
+Conduit.WaveRender7.FriendlyName   = "Conduit 8 (rendu, WaveRT)"
+Conduit.TopoRender7.FriendlyName   = "Conduit 8 (rendu, topologie)"
+Conduit.WaveCapture7.FriendlyName  = "Conduit 8 (capture, WaveRT)"
+Conduit.TopoCapture7.FriendlyName  = "Conduit 8 (capture, topologie)"
+Conduit.WaveRender8.FriendlyName   = "Conduit 9 (rendu, WaveRT)"
+Conduit.TopoRender8.FriendlyName   = "Conduit 9 (rendu, topologie)"
+Conduit.WaveCapture8.FriendlyName  = "Conduit 9 (capture, WaveRT)"
+Conduit.TopoCapture8.FriendlyName  = "Conduit 9 (capture, topologie)"
+Conduit.WaveRender9.FriendlyName   = "Conduit 10 (rendu, WaveRT)"
+Conduit.TopoRender9.FriendlyName   = "Conduit 10 (rendu, topologie)"
+Conduit.WaveCapture9.FriendlyName  = "Conduit 10 (capture, WaveRT)"
+Conduit.TopoCapture9.FriendlyName  = "Conduit 10 (capture, topologie)"
+Conduit.WaveRender10.FriendlyName  = "Conduit 11 (rendu, WaveRT)"
+Conduit.TopoRender10.FriendlyName  = "Conduit 11 (rendu, topologie)"
+Conduit.WaveCapture10.FriendlyName = "Conduit 11 (capture, WaveRT)"
+Conduit.TopoCapture10.FriendlyName = "Conduit 11 (capture, topologie)"
+Conduit.WaveRender11.FriendlyName  = "Conduit 12 (rendu, WaveRT)"
+Conduit.TopoRender11.FriendlyName  = "Conduit 12 (rendu, topologie)"
+Conduit.WaveCapture11.FriendlyName = "Conduit 12 (capture, WaveRT)"
+Conduit.TopoCapture11.FriendlyName = "Conduit 12 (capture, topologie)"
+Conduit.WaveRender12.FriendlyName  = "Conduit 13 (rendu, WaveRT)"
+Conduit.TopoRender12.FriendlyName  = "Conduit 13 (rendu, topologie)"
+Conduit.WaveCapture12.FriendlyName = "Conduit 13 (capture, WaveRT)"
+Conduit.TopoCapture12.FriendlyName = "Conduit 13 (capture, topologie)"
+Conduit.WaveRender13.FriendlyName  = "Conduit 14 (rendu, WaveRT)"
+Conduit.TopoRender13.FriendlyName  = "Conduit 14 (rendu, topologie)"
+Conduit.WaveCapture13.FriendlyName = "Conduit 14 (capture, WaveRT)"
+Conduit.TopoCapture13.FriendlyName = "Conduit 14 (capture, topologie)"
+Conduit.WaveRender14.FriendlyName  = "Conduit 15 (rendu, WaveRT)"
+Conduit.TopoRender14.FriendlyName  = "Conduit 15 (rendu, topologie)"
+Conduit.WaveCapture14.FriendlyName = "Conduit 15 (capture, WaveRT)"
+Conduit.TopoCapture14.FriendlyName = "Conduit 15 (capture, topologie)"
+Conduit.WaveRender15.FriendlyName  = "Conduit 16 (rendu, WaveRT)"
+Conduit.TopoRender15.FriendlyName  = "Conduit 16 (rendu, topologie)"
+Conduit.WaveCapture15.FriendlyName = "Conduit 16 (capture, WaveRT)"
+Conduit.TopoCapture15.FriendlyName = "Conduit 16 (capture, topologie)"
 
-; Nom de broche du câble 0 : c'est lui que l'utilisateur voit (§4.2). Le GUID est
-; `portcls::adapter::pin_name_guid(0)` ; le dernier octet porte le numéro de câble, ce qui
-; donnera les seize GUID de M1b-02. Sous-clé « MediaCategories » de la clé logicielle du
+; Noms de broche : c'est eux que l'utilisateur voit (§4.2). Le GUID est celui de
+; `portcls::adapter::pin_name_guid(n)` ; seul son dernier octet porte le numéro du
+; câble, ce qui donne les seize. Sous-clé « MediaCategories » de la clé logicielle du
 ; périphérique (HKR), pas l'espace global HKLM.
 MediaCategories        = "MediaCategories"
 GUID.PinName.Cable0    = "{CAA74E3D-9BD5-4F78-8EAC-26A5A1AE0F00}"
 PinName.Cable0         = "Conduit 1"
+GUID.PinName.Cable1    = "{CAA74E3D-9BD5-4F78-8EAC-26A5A1AE0F01}"
+PinName.Cable1         = "Conduit 2"
+GUID.PinName.Cable2    = "{CAA74E3D-9BD5-4F78-8EAC-26A5A1AE0F02}"
+PinName.Cable2         = "Conduit 3"
+GUID.PinName.Cable3    = "{CAA74E3D-9BD5-4F78-8EAC-26A5A1AE0F03}"
+PinName.Cable3         = "Conduit 4"
+GUID.PinName.Cable4    = "{CAA74E3D-9BD5-4F78-8EAC-26A5A1AE0F04}"
+PinName.Cable4         = "Conduit 5"
+GUID.PinName.Cable5    = "{CAA74E3D-9BD5-4F78-8EAC-26A5A1AE0F05}"
+PinName.Cable5         = "Conduit 6"
+GUID.PinName.Cable6    = "{CAA74E3D-9BD5-4F78-8EAC-26A5A1AE0F06}"
+PinName.Cable6         = "Conduit 7"
+GUID.PinName.Cable7    = "{CAA74E3D-9BD5-4F78-8EAC-26A5A1AE0F07}"
+PinName.Cable7         = "Conduit 8"
+GUID.PinName.Cable8    = "{CAA74E3D-9BD5-4F78-8EAC-26A5A1AE0F08}"
+PinName.Cable8         = "Conduit 9"
+GUID.PinName.Cable9    = "{CAA74E3D-9BD5-4F78-8EAC-26A5A1AE0F09}"
+PinName.Cable9         = "Conduit 10"
+GUID.PinName.Cable10   = "{CAA74E3D-9BD5-4F78-8EAC-26A5A1AE0F0A}"
+PinName.Cable10        = "Conduit 11"
+GUID.PinName.Cable11   = "{CAA74E3D-9BD5-4F78-8EAC-26A5A1AE0F0B}"
+PinName.Cable11        = "Conduit 12"
+GUID.PinName.Cable12   = "{CAA74E3D-9BD5-4F78-8EAC-26A5A1AE0F0C}"
+PinName.Cable12        = "Conduit 13"
+GUID.PinName.Cable13   = "{CAA74E3D-9BD5-4F78-8EAC-26A5A1AE0F0D}"
+PinName.Cable13        = "Conduit 14"
+GUID.PinName.Cable14   = "{CAA74E3D-9BD5-4F78-8EAC-26A5A1AE0F0E}"
+PinName.Cable14        = "Conduit 15"
+GUID.PinName.Cable15   = "{CAA74E3D-9BD5-4F78-8EAC-26A5A1AE0F0F}"
+PinName.Cable15        = "Conduit 16"
 
 ; Catégories KS (ksmedia.h) et proxy KS (ksproxy.ax, %SystemRoot%\INF\ks.inf).
 KSCATEGORY_AUDIO    = "{6994AD04-93EF-11D0-A3CC-00A0C9223196}"

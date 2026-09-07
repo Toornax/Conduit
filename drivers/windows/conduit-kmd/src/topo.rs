@@ -2,8 +2,9 @@
 //! [`TopoCapture`], un par sens, implémentent `portcls::MiniportTopology` et
 //! `portcls::AudioNodes`.
 //!
-//! Ils exposent leur descripteur de filtre (`descriptors::TOPO_RENDER_FILTER`,
-//! `TOPO_CAPTURE_FILTER` : broche bridge, broche endpoint, nœud de volume, nœud de
+//! Ils exposent le descripteur de filtre **de leur câble**
+//! (`descriptors::topo_render_filter(n)`, `topo_capture_filter(n)` : broche bridge,
+//! broche endpoint nommée par le GUID du câble, nœud de volume, nœud de
 //! sourdine) et servent les propriétés de ces nœuds en déléguant au [`NodeState`] du bon
 //! sens dans le câble. `Init` ne conserve rien : le port topologie et la liste de
 //! ressources reçus sont relâchés en sortie (`Drop` des enveloppes). Jack : M1b-03 ;
@@ -39,7 +40,9 @@ use portcls::{AudioNodes, MiniportTopology, PortTopology, ResourceList, Trace};
 use portcls_sys::{IUnknown, PCFILTER_DESCRIPTOR};
 
 use crate::cable::{Cable, Direction, MAX_CHANNELS, NodeState};
-use crate::descriptors::{CHANNELS, TOPO_CAPTURE_FILTER, TOPO_RENDER_FILTER};
+use crate::descriptors::{
+    CHANNELS, topo_capture_filter, topo_capture_filter_0, topo_render_filter, topo_render_filter_0,
+};
 
 const _: () = assert!(
     CHANNELS as usize <= MAX_CHANNELS,
@@ -76,7 +79,13 @@ impl MiniportTopology for TopoRender {
 
     // IRQL: PASSIVE_LEVEL
     fn description(&self) -> &'static PCFILTER_DESCRIPTOR {
-        TOPO_RENDER_FILTER.get()
+        // Les seize filtres ne diffèrent que par le GUID de nom de leur broche endpoint,
+        // d'où l'indexation par `self.n`. Le trait rend une **référence**, pas une
+        // `Option` : le repli sur le câble 0 n'est là que pour qu'aucun chemin ne panique
+        // (même idiome que `cable::NodeState::volume`). `n < CABLE_COUNT` est garanti par
+        // l'appelant : `adapter::install_cable` ne construit ce miniport que pour un
+        // câble dont `cable::cable(n)` et `portcls::subdevice_names(n)` ont répondu.
+        topo_render_filter(self.n).unwrap_or_else(topo_render_filter_0)
     }
 }
 
@@ -142,7 +151,8 @@ impl MiniportTopology for TopoCapture {
 
     // IRQL: PASSIVE_LEVEL
     fn description(&self) -> &'static PCFILTER_DESCRIPTOR {
-        TOPO_CAPTURE_FILTER.get()
+        // Repli documenté sur le câble 0 : voir `TopoRender::description`.
+        topo_capture_filter(self.n).unwrap_or_else(topo_capture_filter_0)
     }
 }
 

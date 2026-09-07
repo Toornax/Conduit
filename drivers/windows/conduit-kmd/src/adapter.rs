@@ -28,9 +28,8 @@ use portcls::conduit_com::{
     nt_success,
 };
 use portcls::{
-    ResourceList, TOPO_CAPTURE_0, TOPO_RENDER_0, WAVE_CAPTURE_0, WAVE_RENDER_0, as_unknown,
-    new_port, port_init, ref_as_unknown, register_physical_connection, register_subdevice,
-    try_new_topology_object, try_new_wavert_object,
+    ResourceList, as_unknown, new_port, port_init, ref_as_unknown, register_physical_connection,
+    register_subdevice, subdevice_names, try_new_topology_object, try_new_wavert_object,
 };
 use portcls_sys::{
     CLSID_PortTopology, CLSID_PortWaveRT, GUID, IUnknown, NTSTATUS, PDEVICE_OBJECT, PIRP,
@@ -104,15 +103,23 @@ unsafe fn install_cable(
     let Some(cable) = cable::cable(n) else {
         return fail("câble inconnu", STATUS_INVALID_PARAMETER);
     };
+    // Les quatre noms de référence du câble (`WaveRender<n>`…), tels que l'INF les publie
+    // dans ses `AddInterface` : leur absence est le seul garde-fou de numéro à passer.
+    let Some(
+        [
+            wave_render_name,
+            topo_render_name,
+            wave_capture_name,
+            topo_capture_name,
+        ],
+    ) = subdevice_names(n)
+    else {
+        return fail("nom de sous-périphérique", STATUS_INVALID_PARAMETER);
+    };
     // Oublie les flux d'un éventuel cycle précédent et crée le timer haute résolution de
     // la boucle locale (§5.3) : sans lui, le câble ne transporterait rien.
     if let Err(status) = cable.start() {
         return fail("démarrage du câble (timer haute résolution)", status);
-    }
-    // M1a : seuls les noms du câble 0 existent (`portcls::adapter`) ; M1b-02 les
-    // générera par numéro.
-    if n != 0 {
-        return fail("nom de sous-périphérique", STATUS_INVALID_PARAMETER);
     }
 
     // 1. WaveRender<n>.
@@ -126,7 +133,7 @@ unsafe fn install_cable(
             irp,
             resources,
             &CLSID_PortWaveRT,
-            &WAVE_RENDER_0,
+            wave_render_name,
             &as_unknown(&mini),
         )
     }?;
@@ -143,7 +150,7 @@ unsafe fn install_cable(
             irp,
             resources,
             &CLSID_PortTopology,
-            &TOPO_RENDER_0,
+            topo_render_name,
             &as_unknown(&mini),
         )
     }?;
@@ -160,7 +167,7 @@ unsafe fn install_cable(
             irp,
             resources,
             &CLSID_PortWaveRT,
-            &WAVE_CAPTURE_0,
+            wave_capture_name,
             &as_unknown(&mini),
         )
     }?;
@@ -176,7 +183,7 @@ unsafe fn install_cable(
             irp,
             resources,
             &CLSID_PortTopology,
-            &TOPO_CAPTURE_0,
+            topo_capture_name,
             &as_unknown(&mini),
         )
     }?;

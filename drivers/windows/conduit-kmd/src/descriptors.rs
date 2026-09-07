@@ -35,12 +35,17 @@
 //! inchangé, octet pour octet ; le curseur de volume d'un endpoint Conduit est décoratif,
 //! et c'est volontaire.
 //!
-//! # Rien de nouveau n'est *par câble*
+//! # Ce qui est *par câble*, et ce qui ne l'est pas
 //!
 //! Le seul contenu réellement par câble d'un descripteur est le GUID
-//! `KsPinDescriptor.Name` des broches endpoint ([`PIN_NAME_CABLE_0`]) ; M1b-02 le
-//! générera par numéro. Les nœuds, leurs tables d'automatisation et leurs `PCPROPERTY_ITEM`
-//! sont des `static` **partagées par tous les câbles** : le gestionnaire retrouve le
+//! `KsPinDescriptor.Name` des broches endpoint ([`PIN_NAMES`], un par câble depuis
+//! M1b-02) : les seize filtres de topologie d'un même sens ne diffèrent que par lui, d'où
+//! les tables [`TOPO_RENDER_PINS`] et [`TOPO_CAPTURE_PINS`], une rangée par câble, et les
+//! deux tableaux de [`PCFILTER_DESCRIPTOR`] qui les pointent. Les **filtres wave**, eux,
+//! restent uniques : rien n'y est par câble.
+//!
+//! Les nœuds, leurs tables d'automatisation et leurs `PCPROPERTY_ITEM` sont des `static`
+//! **partagées par tous les câbles** : le gestionnaire retrouve le
 //! miniport — donc le câble, donc le `NodeState` — par le `MajorTarget` de la requête. Ce
 //! qui se dédouble ici se dédouble par **sens**, pas par câble : `volume_item::<V, T>` est
 //! monomorphisé sur le type du miniport (`TopoRender` ou `TopoCapture`), et la garde de
@@ -59,9 +64,10 @@
 //! | | [`TOPO_CAPTURE_PIN_BRIDGE`] = 1 | `OUT` | `NONE` | bridge vers `WaveCapture` |
 //!
 //! Les deux broches endpoint sont les seules à porter un `KsPinDescriptor.Name`
-//! (`portcls::pin_name_guid(0)`, M1a-09) : c'est ce GUID que KS résout en « Conduit 1 »
-//! par la clé `HKR\MediaCategories` que l'INF écrit, et donc le nom que l'utilisateur
-//! voit (driver-design.md §4.2). Toutes les autres broches laissent `Name` nul.
+//! (`portcls::pin_name_guid(n)`, M1a-09) : c'est ce GUID que KS résout en
+//! « Conduit *n+1* » par la clé `HKR\MediaCategories` que l'INF écrit, et donc le nom que
+//! l'utilisateur voit (driver-design.md §4.2). Toutes les autres broches laissent `Name`
+//! nul.
 //!
 //! Les numéros de broche suivent la direction des données, comme dans §4.1 et dans
 //! SYSVAD : la broche 0 est toujours l'entrée (`KSPIN_DATAFLOW_IN`), la broche 1 la
@@ -80,7 +86,7 @@ use core::mem::size_of;
 use core::ptr;
 
 use conduit_kmd_core::{M1A_FORMATS, SampleFormat};
-use portcls::{mute_item, volume_item};
+use portcls::{CABLE_COUNT, PIN_NAME_GUIDS, mute_item, volume_item};
 use portcls_sys::{
     GUID, IMiniportTopologyVtbl, KSCATEGORY_AUDIO, KSDATAFORMAT, KSDATAFORMAT__bindgen_ty_1,
     KSDATAFORMAT_SPECIFIER_NONE, KSDATAFORMAT_SPECIFIER_WAVEFORMATEX, KSDATAFORMAT_SUBTYPE_ANALOG,
@@ -353,15 +359,20 @@ const fn system_pin(flow: KSPIN_DATAFLOW::Type) -> PCPIN_DESCRIPTOR {
 /// `KSNODETYPE_SPEAKER` ou `KSNODETYPE_LINE_CONNECTOR` (c'est elle que le générateur
 /// d'endpoints expose), plage analogique, aucune instance.
 ///
-/// C'est **la seule broche nommée** : son GUID `Name` ([`PIN_NAME_CABLE_0`]) est ce que
-/// KS résout en « Conduit 1 » (§4.2). Sans lui, KS retomberait sur la catégorie et
-/// l'endpoint s'appellerait « Haut-parleurs » ou « Ligne ».
-const fn endpoint_pin(flow: KSPIN_DATAFLOW::Type, category: &'static GUID) -> PCPIN_DESCRIPTOR {
+/// C'est **la seule broche nommée** : son GUID `Name` ([`PIN_NAMES`], celui du câble) est
+/// ce que KS résout en « Conduit *n+1* » (§4.2). Sans lui, KS retomberait sur la
+/// catégorie et l'endpoint s'appellerait « Haut-parleurs » ou « Ligne ». C'est aussi le
+/// **seul** contenu qui distingue les seize filtres de topologie d'un même sens.
+const fn endpoint_pin(
+    flow: KSPIN_DATAFLOW::Type,
+    category: &'static GUID,
+    name: &'static GUID,
+) -> PCPIN_DESCRIPTOR {
     pin(
         flow,
         KSPIN_COMMUNICATION::KSPIN_COMMUNICATION_NONE,
         category,
-        Some(&PIN_NAME_CABLE_0),
+        Some(name),
         &BRIDGE_RANGES,
         0,
     )
@@ -395,9 +406,13 @@ pub const fn connection(
 /// être fourni de toute façon, et `N == 0` dit déjà « aucun nœud ». C'est alors `Nodes` qui
 /// est mis à **nul** — un tableau vide a une adresse valide, mais PortCls attend le nul
 /// quand `NodeCount` est nul, comme SYSVAD l'écrit.
+///
+/// `pins` est une **rangée** d'une table logée dans une `static` : les filtres topologie
+/// en ont une par câble ([`pins_row`]), les filtres wave une seule
+/// (`Shared::get`). Les autres tables restent enveloppées, elles ne se dédoublent pas.
 const fn filter<const P: usize, const N: usize, const C: usize>(
     automation: &'static Shared<PCAUTOMATION_TABLE>,
-    pins: &'static Shared<[PCPIN_DESCRIPTOR; P]>,
+    pins: &'static [PCPIN_DESCRIPTOR; P],
     nodes: &'static Shared<[PCNODE_DESCRIPTOR; N]>,
     connections: &'static Shared<[PCCONNECTION_DESCRIPTOR; C]>,
 ) -> PCFILTER_DESCRIPTOR {
@@ -428,7 +443,7 @@ const fn filter<const P: usize, const N: usize, const C: usize>(
 /// Le signal traverse le filtre WaveRT sans traitement ; les nœuds audio sont sur le filtre
 /// de topologie du même sens ([`topo_filter`]).
 const fn wave_filter<const P: usize, const C: usize>(
-    pins: &'static Shared<[PCPIN_DESCRIPTOR; P]>,
+    pins: &'static [PCPIN_DESCRIPTOR; P],
     connections: &'static Shared<[PCCONNECTION_DESCRIPTOR; C]>,
 ) -> PCFILTER_DESCRIPTOR {
     filter::<P, 0, C>(&EMPTY_AUTOMATION, pins, &NO_NODES, connections)
@@ -440,7 +455,7 @@ const fn wave_filter<const P: usize, const C: usize>(
 /// nœuds (`PCNODE_DESCRIPTOR::AutomationTable`), pas par le filtre. PortCls route
 /// `KSPROPERTY_AUDIO_*` vers le nœud désigné par `PCPROPERTY_REQUEST::Node`.
 const fn topo_filter<const P: usize, const N: usize, const C: usize>(
-    pins: &'static Shared<[PCPIN_DESCRIPTOR; P]>,
+    pins: &'static [PCPIN_DESCRIPTOR; P],
     nodes: &'static Shared<[PCNODE_DESCRIPTOR; N]>,
     connections: &'static Shared<[PCCONNECTION_DESCRIPTOR; C]>,
 ) -> PCFILTER_DESCRIPTOR {
@@ -513,10 +528,19 @@ static CATEGORY_SPEAKER: GUID = KSNODETYPE_SPEAKER;
 /// passe lui aussi en connecteur de ligne, au prix de l'icône et du rang de sélection par
 /// défaut. C'est le repli prévu par driver-design.md §4.2.
 static CATEGORY_LINE_CONNECTOR: GUID = KSNODETYPE_LINE_CONNECTOR;
-/// GUID de nom des broches endpoint du câble 0, adressable : `KsPinDescriptor.Name` en
-/// prend l'adresse et PortCls la conserve (§4.2). L'INF associe ce même GUID à
-/// « Conduit 1 » (`conduit_kmd.inx`, `GUID.PinName.Cable0`).
-static PIN_NAME_CABLE_0: GUID = portcls::PIN_NAME_CABLE_0;
+/// GUID de nom des broches endpoint, **un par câble** et adressables :
+/// `KsPinDescriptor.Name` en prend l'adresse et PortCls la conserve (§4.2). L'INF associe
+/// ces mêmes GUID à « Conduit *n+1* » (`conduit_kmd.inx`, `GUID.PinName.Cable<n>`).
+///
+/// Doublet `const` puis `static` : les assertions ci-dessous lisent
+/// [`portcls::PIN_NAME_GUIDS`], l'évaluation `const` ne lisant pas les `static`.
+static PIN_NAMES: [GUID; CABLE_COUNT] = portcls::PIN_NAME_GUIDS;
+
+/// Le GUID de nom de broche du câble `cable`, adressable.
+#[allow(clippy::indexing_slicing)] // évalué à la compilation, `cable < CABLE_COUNT`
+const fn pin_name(cable: usize) -> &'static GUID {
+    &PIN_NAMES[cable]
+}
 
 /// `KSNODETYPE_VOLUME`, adressable (`PCNODE_DESCRIPTOR::Type` en prend l'adresse).
 static NODE_TYPE_VOLUME: GUID = KSNODETYPE_VOLUME;
@@ -657,53 +681,179 @@ const WAVE_RENDER_PINS: [PCPIN_DESCRIPTOR; PIN_COUNT] = [
     system_pin(KSPIN_DATAFLOW::KSPIN_DATAFLOW_IN),
     bridge_pin(KSPIN_DATAFLOW::KSPIN_DATAFLOW_OUT),
 ];
-/// Broches de `TopoRender` : bridge (entrée) puis endpoint (sortie).
-///
-/// L'endpoint est un **connecteur de ligne** et non un haut-parleur : voir
-/// [`CATEGORY_LINE_CONNECTOR`], c'est la seule catégorie qui laisse le pilote nommer son
-/// endpoint.
-const TOPO_RENDER_PINS: [PCPIN_DESCRIPTOR; PIN_COUNT] = [
-    bridge_pin(KSPIN_DATAFLOW::KSPIN_DATAFLOW_IN),
-    endpoint_pin(KSPIN_DATAFLOW::KSPIN_DATAFLOW_OUT, &CATEGORY_LINE_CONNECTOR),
-];
 /// Broches de `WaveCapture` : bridge (entrée) puis système (sortie).
 const WAVE_CAPTURE_PINS: [PCPIN_DESCRIPTOR; PIN_COUNT] = [
     bridge_pin(KSPIN_DATAFLOW::KSPIN_DATAFLOW_IN),
     system_pin(KSPIN_DATAFLOW::KSPIN_DATAFLOW_OUT),
 ];
-/// Broches de `TopoCapture` : endpoint connecteur de ligne (entrée) puis bridge (sortie).
-const TOPO_CAPTURE_PINS: [PCPIN_DESCRIPTOR; PIN_COUNT] = [
-    endpoint_pin(KSPIN_DATAFLOW::KSPIN_DATAFLOW_IN, &CATEGORY_LINE_CONNECTOR),
-    bridge_pin(KSPIN_DATAFLOW::KSPIN_DATAFLOW_OUT),
-];
 
 static WAVE_RENDER_PINS_TABLE: Shared<[PCPIN_DESCRIPTOR; PIN_COUNT]> = Shared(WAVE_RENDER_PINS);
-static TOPO_RENDER_PINS_TABLE: Shared<[PCPIN_DESCRIPTOR; PIN_COUNT]> = Shared(TOPO_RENDER_PINS);
 static WAVE_CAPTURE_PINS_TABLE: Shared<[PCPIN_DESCRIPTOR; PIN_COUNT]> = Shared(WAVE_CAPTURE_PINS);
-static TOPO_CAPTURE_PINS_TABLE: Shared<[PCPIN_DESCRIPTOR; PIN_COUNT]> = Shared(TOPO_CAPTURE_PINS);
+
+/// Broches de `TopoRender<n>` : bridge (entrée) puis endpoint (sortie), nommé par le GUID
+/// du câble `cable`.
+///
+/// L'endpoint est un **connecteur de ligne** et non un haut-parleur : voir
+/// [`CATEGORY_LINE_CONNECTOR`], c'est la seule catégorie qui laisse le pilote nommer son
+/// endpoint.
+const fn topo_render_pins(cable: usize) -> [PCPIN_DESCRIPTOR; PIN_COUNT] {
+    [
+        bridge_pin(KSPIN_DATAFLOW::KSPIN_DATAFLOW_IN),
+        endpoint_pin(
+            KSPIN_DATAFLOW::KSPIN_DATAFLOW_OUT,
+            &CATEGORY_LINE_CONNECTOR,
+            pin_name(cable),
+        ),
+    ]
+}
+
+/// Broches de `TopoCapture<n>` : endpoint connecteur de ligne (entrée) puis bridge
+/// (sortie).
+const fn topo_capture_pins(cable: usize) -> [PCPIN_DESCRIPTOR; PIN_COUNT] {
+    [
+        endpoint_pin(
+            KSPIN_DATAFLOW::KSPIN_DATAFLOW_IN,
+            &CATEGORY_LINE_CONNECTOR,
+            pin_name(cable),
+        ),
+        bridge_pin(KSPIN_DATAFLOW::KSPIN_DATAFLOW_OUT),
+    ]
+}
+
+/// Les [`CABLE_COUNT`] jeux de broches d'un sens de topologie, dans l'ordre des câbles.
+///
+/// `rendu` : vrai pour `TopoRender`, faux pour `TopoCapture` — un `bool` plutôt qu'un
+/// pointeur de fonction, que l'évaluation `const` n'appelle pas.
+#[allow(clippy::indexing_slicing)] // évalué à la compilation
+const fn topo_pins_table(rendu: bool) -> [[PCPIN_DESCRIPTOR; PIN_COUNT]; CABLE_COUNT] {
+    let mut out = [const { topo_render_pins(0) }; CABLE_COUNT];
+    let mut i = 0;
+    while i < CABLE_COUNT {
+        out[i] = if rendu {
+            topo_render_pins(i)
+        } else {
+            topo_capture_pins(i)
+        };
+        i = i.wrapping_add(1);
+    }
+    out
+}
+
+/// Broches des seize filtres `TopoRender<n>`.
+const TOPO_RENDER_PINS: [[PCPIN_DESCRIPTOR; PIN_COUNT]; CABLE_COUNT] = topo_pins_table(true);
+/// Broches des seize filtres `TopoCapture<n>`.
+const TOPO_CAPTURE_PINS: [[PCPIN_DESCRIPTOR; PIN_COUNT]; CABLE_COUNT] = topo_pins_table(false);
+
+static TOPO_RENDER_PINS_TABLE: Shared<[[PCPIN_DESCRIPTOR; PIN_COUNT]; CABLE_COUNT]> =
+    Shared(TOPO_RENDER_PINS);
+static TOPO_CAPTURE_PINS_TABLE: Shared<[[PCPIN_DESCRIPTOR; PIN_COUNT]; CABLE_COUNT]> =
+    Shared(TOPO_CAPTURE_PINS);
+
+/// La rangée du câble `cable` dans une table de broches logée dans une `static` : c'est
+/// son adresse que `PCFILTER_DESCRIPTOR::Pins` conserve.
+#[allow(clippy::indexing_slicing)] // évalué à la compilation, `cable < CABLE_COUNT`
+const fn pins_row(
+    table: &'static Shared<[[PCPIN_DESCRIPTOR; PIN_COUNT]; CABLE_COUNT]>,
+    cable: usize,
+) -> &'static [PCPIN_DESCRIPTOR; PIN_COUNT] {
+    &table.get()[cable]
+}
+
+/// Descripteur du filtre `TopoRender<n>` du câble `cable`.
+const fn topo_render_filter_of(cable: usize) -> PCFILTER_DESCRIPTOR {
+    topo_filter(
+        pins_row(&TOPO_RENDER_PINS_TABLE, cable),
+        &TOPO_RENDER_NODES_TABLE,
+        &TOPO_CONNECTIONS_TABLE,
+    )
+}
+
+/// Descripteur du filtre `TopoCapture<n>` du câble `cable`.
+const fn topo_capture_filter_of(cable: usize) -> PCFILTER_DESCRIPTOR {
+    topo_filter(
+        pins_row(&TOPO_CAPTURE_PINS_TABLE, cable),
+        &TOPO_CAPTURE_NODES_TABLE,
+        &TOPO_CONNECTIONS_TABLE,
+    )
+}
+
+/// Les [`CABLE_COUNT`] descripteurs de filtre topologie d'un sens (voir
+/// [`topo_pins_table`] pour `rendu`).
+#[allow(clippy::indexing_slicing)] // évalué à la compilation
+const fn topo_filters(rendu: bool) -> [PCFILTER_DESCRIPTOR; CABLE_COUNT] {
+    let mut out = [const { topo_render_filter_of(0) }; CABLE_COUNT];
+    let mut i = 0;
+    while i < CABLE_COUNT {
+        out[i] = if rendu {
+            topo_render_filter_of(i)
+        } else {
+            topo_capture_filter_of(i)
+        };
+        i = i.wrapping_add(1);
+    }
+    out
+}
 
 /// Descripteur du filtre `WaveRender<n>` (rendu par `wave::WaveRender::description`).
+///
+/// **Un seul pour les seize câbles** : rien n'y est par câble (le nom de broche est sur
+/// les filtres de topologie).
 pub static WAVE_RENDER_FILTER: Shared<PCFILTER_DESCRIPTOR> = Shared(wave_filter(
-    &WAVE_RENDER_PINS_TABLE,
+    WAVE_RENDER_PINS_TABLE.get(),
     &DIRECT_CONNECTION_TABLE,
 ));
-/// Descripteur du filtre `TopoRender<n>` (rendu par `topo::TopoRender::description`).
-pub static TOPO_RENDER_FILTER: Shared<PCFILTER_DESCRIPTOR> = Shared(topo_filter(
-    &TOPO_RENDER_PINS_TABLE,
-    &TOPO_RENDER_NODES_TABLE,
-    &TOPO_CONNECTIONS_TABLE,
-));
-/// Descripteur du filtre `WaveCapture<n>` (rendu par `wave::WaveCapture::description`).
+/// Descripteur du filtre `WaveCapture<n>` (rendu par `wave::WaveCapture::description`),
+/// unique lui aussi.
 pub static WAVE_CAPTURE_FILTER: Shared<PCFILTER_DESCRIPTOR> = Shared(wave_filter(
-    &WAVE_CAPTURE_PINS_TABLE,
+    WAVE_CAPTURE_PINS_TABLE.get(),
     &DIRECT_CONNECTION_TABLE,
 ));
-/// Descripteur du filtre `TopoCapture<n>` (rendu par `topo::TopoCapture::description`).
-pub static TOPO_CAPTURE_FILTER: Shared<PCFILTER_DESCRIPTOR> = Shared(topo_filter(
-    &TOPO_CAPTURE_PINS_TABLE,
-    &TOPO_CAPTURE_NODES_TABLE,
-    &TOPO_CONNECTIONS_TABLE,
-));
+
+/// Descripteurs des seize filtres `TopoRender<n>` (const : lu par les assertions).
+const TOPO_RENDER_FILTERS: [PCFILTER_DESCRIPTOR; CABLE_COUNT] = topo_filters(true);
+/// Descripteurs des seize filtres `TopoCapture<n>`.
+const TOPO_CAPTURE_FILTERS: [PCFILTER_DESCRIPTOR; CABLE_COUNT] = topo_filters(false);
+
+static TOPO_RENDER_FILTER_TABLE: Shared<[PCFILTER_DESCRIPTOR; CABLE_COUNT]> =
+    Shared(TOPO_RENDER_FILTERS);
+static TOPO_CAPTURE_FILTER_TABLE: Shared<[PCFILTER_DESCRIPTOR; CABLE_COUNT]> =
+    Shared(TOPO_CAPTURE_FILTERS);
+
+/// Descripteur du filtre `TopoRender<n>` du câble `cable`, `None` au-delà du dernier.
+///
+/// L'appelant (`topo::TopoRender::description`) a un `n < CABLE_COUNT` garanti mais doit
+/// rendre une référence : c'est à lui de dire ce qu'il fait du `None`, comme
+/// `cable::NodeState::volume` avec son canal.
+#[must_use]
+pub fn topo_render_filter(cable: u32) -> Option<&'static PCFILTER_DESCRIPTOR> {
+    usize::try_from(cable)
+        .ok()
+        .and_then(|index| TOPO_RENDER_FILTER_TABLE.get().get(index))
+}
+
+/// Descripteur du filtre `TopoCapture<n>` du câble `cable`, `None` au-delà du dernier.
+#[must_use]
+pub fn topo_capture_filter(cable: u32) -> Option<&'static PCFILTER_DESCRIPTOR> {
+    usize::try_from(cable)
+        .ok()
+        .and_then(|index| TOPO_CAPTURE_FILTER_TABLE.get().get(index))
+}
+
+/// Le filtre `TopoRender0`, repli de [`topo_render_filter`] : le câble 0 existe toujours
+/// ([`CABLE_COUNT`] ≥ 1, assertion `const` de `portcls::adapter`). Motif de tranche — ni
+/// indexation ni arithmétique.
+#[must_use]
+pub fn topo_render_filter_0() -> &'static PCFILTER_DESCRIPTOR {
+    let [premier, ..] = TOPO_RENDER_FILTER_TABLE.get();
+    premier
+}
+
+/// Le filtre `TopoCapture0`, repli de [`topo_capture_filter`].
+#[must_use]
+pub fn topo_capture_filter_0() -> &'static PCFILTER_DESCRIPTOR {
+    let [premier, ..] = TOPO_CAPTURE_FILTER_TABLE.get();
+    premier
+}
 
 // ---------------------------------------------------------------------------------
 // Invariants (§4.1), vérifiés à la compilation.
@@ -722,13 +872,76 @@ const fn pin_is(
         && pin.MaxFilterInstanceCount == instances
 }
 
+/// Les deux broches d'un filtre topologie, pour **toutes** les rangées d'une table (une
+/// par câble) : orientation et communication, et la broche endpoint — la sortie au rendu,
+/// l'entrée à la capture — est la seule nommée, avec sa plage analogique unique.
+///
+/// Motif de tranche : ni indexation ni arithmétique.
+const fn topo_pins_are_well_formed(
+    mut rangees: &[[PCPIN_DESCRIPTOR; PIN_COUNT]],
+    endpoint_en_sortie: bool,
+) -> bool {
+    while let [rangee, reste @ ..] = rangees {
+        let [entree, sortie] = rangee;
+        if !pin_is(
+            entree,
+            KSPIN_DATAFLOW::KSPIN_DATAFLOW_IN,
+            KSPIN_COMMUNICATION::KSPIN_COMMUNICATION_NONE,
+            0,
+        ) || !pin_is(
+            sortie,
+            KSPIN_DATAFLOW::KSPIN_DATAFLOW_OUT,
+            KSPIN_COMMUNICATION::KSPIN_COMMUNICATION_NONE,
+            0,
+        ) {
+            return false;
+        }
+        let (endpoint, bridge) = if endpoint_en_sortie {
+            (sortie, entree)
+        } else {
+            (entree, sortie)
+        };
+        if endpoint.KsPinDescriptor.Name.is_null() || !bridge.KsPinDescriptor.Name.is_null() {
+            return false;
+        }
+        if endpoint.KsPinDescriptor.DataRangesCount != 1
+            || bridge.KsPinDescriptor.DataRangesCount != 1
+        {
+            return false;
+        }
+        rangees = reste;
+    }
+    true
+}
+
+/// Les GUID de nom de broche portent le numéro du câble, dans l'ordre : `names[i]` a
+/// `Data4[7] == depart + i`.
+///
+/// C'est l'assertion qui distingue seize câbles d'un seul. Les autres ne vérifient que la
+/// **présence** d'un nom ; avec seize endpoints, les pannes à attraper sont « deux câbles
+/// portent le même nom » (endpoints indistinguables dans le panneau de son) et « le
+/// câble 5 porte le GUID du 6 » (endpoints permutés). `portcls::pin_name_guid` ne faisant
+/// varier que ce dernier octet, celle-ci les couvre toutes les deux.
+#[allow(clippy::indexing_slicing)] // index constant dans un tableau de 8 octets
+const fn pin_names_are_numbered(mut names: &[GUID], mut attendu: u8) -> bool {
+    while let [premier, reste @ ..] = names {
+        if premier.Data4[7] != attendu {
+            return false;
+        }
+        names = reste;
+        attendu = attendu.wrapping_add(1);
+    }
+    true
+}
+
 const _: () = {
     use KSPIN_COMMUNICATION::{KSPIN_COMMUNICATION_NONE as NONE, KSPIN_COMMUNICATION_SINK as SINK};
     use KSPIN_DATAFLOW::{KSPIN_DATAFLOW_IN as IN, KSPIN_DATAFLOW_OUT as OUT};
 
-    // Deux broches par filtre, numérotées par la direction des données.
-    assert!(WAVE_RENDER_PINS.len() == PIN_COUNT && TOPO_RENDER_PINS.len() == PIN_COUNT);
-    assert!(WAVE_CAPTURE_PINS.len() == PIN_COUNT && TOPO_CAPTURE_PINS.len() == PIN_COUNT);
+    // Deux broches par filtre, numérotées par la direction des données ; un jeu de
+    // broches de topologie par câble.
+    assert!(WAVE_RENDER_PINS.len() == PIN_COUNT && WAVE_CAPTURE_PINS.len() == PIN_COUNT);
+    assert!(TOPO_RENDER_PINS.len() == CABLE_COUNT && TOPO_CAPTURE_PINS.len() == CABLE_COUNT);
     assert!(WAVE_RENDER_PIN_SYSTEM == 0 && WAVE_RENDER_PIN_BRIDGE == 1);
     assert!(TOPO_RENDER_PIN_BRIDGE == 0 && TOPO_RENDER_PIN_ENDPOINT == 1);
     assert!(WAVE_CAPTURE_PIN_BRIDGE == 0 && WAVE_CAPTURE_PIN_SYSTEM == 1);
@@ -737,18 +950,16 @@ const _: () = {
     // Orientation : broches système `SINK` à 1 instance, bridges et endpoints `NONE` à 0.
     assert!(pin_is(&WAVE_RENDER_PINS[0], IN, SINK, 1));
     assert!(pin_is(&WAVE_RENDER_PINS[1], OUT, NONE, 0));
-    assert!(pin_is(&TOPO_RENDER_PINS[0], IN, NONE, 0));
-    assert!(pin_is(&TOPO_RENDER_PINS[1], OUT, NONE, 0));
     assert!(pin_is(&WAVE_CAPTURE_PINS[0], IN, NONE, 0));
     assert!(pin_is(&WAVE_CAPTURE_PINS[1], OUT, SINK, 1));
-    assert!(pin_is(&TOPO_CAPTURE_PINS[0], IN, NONE, 0));
-    assert!(pin_is(&TOPO_CAPTURE_PINS[1], OUT, NONE, 0));
+    // Les seize jeux de broches de topologie, orientation et nommage compris.
+    assert!(topo_pins_are_well_formed(&TOPO_RENDER_PINS, true));
+    assert!(topo_pins_are_well_formed(&TOPO_CAPTURE_PINS, false));
 
     // Plages : deux plages système, une plage analogique.
     assert!(WAVE_RENDER_PINS[0].KsPinDescriptor.DataRangesCount == 2);
     assert!(WAVE_RENDER_PINS[1].KsPinDescriptor.DataRangesCount == 1);
     assert!(WAVE_CAPTURE_PINS[1].KsPinDescriptor.DataRangesCount == 2);
-    assert!(TOPO_RENDER_PINS[1].KsPinDescriptor.DataRangesCount == 1);
 
     // Plages système : 2 canaux, 48 kHz, 32 bits flottants et 16 bits PCM, `FormatSize`
     // exact.
@@ -769,13 +980,11 @@ const _: () = {
     assert!(analog.FormatSize == 64);
 
     // Nom de broche (§4.2) : seules les deux broches endpoint des filtres topologie en
-    // portent un (`endpoint_pin` n'a qu'un GUID à donner, celui du câble 0) ; comparer
-    // les adresses ici est hors de portée de l'évaluation `const`, l'absence ou la
-    // présence suffit.
-    assert!(!TOPO_RENDER_PINS[1].KsPinDescriptor.Name.is_null());
-    assert!(!TOPO_CAPTURE_PINS[0].KsPinDescriptor.Name.is_null());
-    assert!(TOPO_RENDER_PINS[0].KsPinDescriptor.Name.is_null());
-    assert!(TOPO_CAPTURE_PINS[1].KsPinDescriptor.Name.is_null());
+    // portent un (vérifié rangée par rangée ci-dessus) ; comparer les adresses ici est
+    // hors de portée de l'évaluation `const`, mais le **numéro** porté par chaque GUID
+    // l'est, et c'est lui qui distingue les seize câbles.
+    assert!(PIN_NAME_GUIDS.len() == CABLE_COUNT);
+    assert!(pin_names_are_numbered(&PIN_NAME_GUIDS, 0));
     assert!(WAVE_RENDER_PINS[0].KsPinDescriptor.Name.is_null());
     assert!(WAVE_RENDER_PINS[1].KsPinDescriptor.Name.is_null());
     assert!(WAVE_CAPTURE_PINS[0].KsPinDescriptor.Name.is_null());
@@ -818,39 +1027,38 @@ const fn topo_filter_is_well_formed(filter: &PCFILTER_DESCRIPTOR) -> bool {
         && filter.ConnectionCount as usize == TOPO_CONNECTION_COUNT
 }
 
+/// Tous les filtres d'une table de topologie (même motif de tranche que
+/// [`connections_are_well_formed`]).
+const fn topo_filters_are_well_formed(mut filters: &[PCFILTER_DESCRIPTOR]) -> bool {
+    while let [premier, reste @ ..] = filters {
+        if !topo_filter_is_well_formed(premier) {
+            return false;
+        }
+        filters = reste;
+    }
+    true
+}
+
 const _: () = {
     assert!(wave_filter_is_well_formed(&wave_filter::<
         PIN_COUNT,
         WAVE_CONNECTION_COUNT,
     >(
-        &WAVE_RENDER_PINS_TABLE,
+        WAVE_RENDER_PINS_TABLE.get(),
         &DIRECT_CONNECTION_TABLE
     )));
     assert!(wave_filter_is_well_formed(&wave_filter::<
         PIN_COUNT,
         WAVE_CONNECTION_COUNT,
     >(
-        &WAVE_CAPTURE_PINS_TABLE,
+        WAVE_CAPTURE_PINS_TABLE.get(),
         &DIRECT_CONNECTION_TABLE
     )));
-    assert!(topo_filter_is_well_formed(&topo_filter::<
-        PIN_COUNT,
-        NODE_COUNT,
-        TOPO_CONNECTION_COUNT,
-    >(
-        &TOPO_RENDER_PINS_TABLE,
-        &TOPO_RENDER_NODES_TABLE,
-        &TOPO_CONNECTIONS_TABLE,
-    )));
-    assert!(topo_filter_is_well_formed(&topo_filter::<
-        PIN_COUNT,
-        NODE_COUNT,
-        TOPO_CONNECTION_COUNT,
-    >(
-        &TOPO_CAPTURE_PINS_TABLE,
-        &TOPO_CAPTURE_NODES_TABLE,
-        &TOPO_CONNECTIONS_TABLE,
-    )));
+    // Les seize filtres de chaque sens, et pas seulement le premier.
+    assert!(TOPO_RENDER_FILTERS.len() == CABLE_COUNT);
+    assert!(TOPO_CAPTURE_FILTERS.len() == CABLE_COUNT);
+    assert!(topo_filters_are_well_formed(&TOPO_RENDER_FILTERS));
+    assert!(topo_filters_are_well_formed(&TOPO_CAPTURE_FILTERS));
 };
 
 // ---------------------------------------------------------------------------------
