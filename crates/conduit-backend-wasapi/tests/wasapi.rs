@@ -67,9 +67,19 @@ fn backend_starts_and_enumerates_plausible_devices() {
             (1..=38_400).contains(&device.default_block),
             "bloc invraisemblable : {device:?}"
         );
+        // L'identité du câble vient de la **description** de l'endpoint
+        // (`PKEY_Device_DeviceDesc`, « Conduit 1 ») ; le nom publié est la
+        // composition que Windows affiche (« Conduit 1 (Conduit — câbles audio
+        // virtuels) »). Les deux doivent parler du même câble : sur du matériel
+        // réel, c'est la seule vérification qui les confronte.
         assert!(
-            device.cable.is_none() || device.name.starts_with("Conduit "),
-            "câble reconnu sur un nom qui n'en est pas un : {device:?}"
+            device.cable.is_none_or(|cable| {
+                // Pas un `starts_with` du seul nom de câble : « Conduit 1 » est le
+                // préfixe de « Conduit 16 ».
+                let nom = cable.to_string();
+                device.name == nom || device.name.starts_with(&format!("{nom} ("))
+            }),
+            "câble reconnu sur un endpoint dont le nom affiché dit autre chose : {device:?}"
         );
     }
     // Les identifiants d'endpoint sont uniques.
