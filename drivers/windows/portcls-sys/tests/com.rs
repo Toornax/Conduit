@@ -76,6 +76,7 @@ contrats_com! {
     IPortTopology / IPortTopologyVtbl : IID_IPortTopology [IID_IPort],
     IPortWaveRT / IPortWaveRTVtbl : IID_IPortWaveRT [IID_IPort],
     IPortWaveRTStream / IPortWaveRTStreamVtbl : IID_IPortWaveRTStream [],
+    IPortEvents / IPortEventsVtbl : IID_IPortEvents [],
     IResourceList / IResourceListVtbl : IID_IResourceList [],
     IRegistryKey / IRegistryKeyVtbl : IID_IRegistryKey [],
 }

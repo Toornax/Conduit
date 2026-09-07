@@ -25,13 +25,14 @@ use conduit_com::{ComInterface, ComVtable, Guid, IID_IUNKNOWN};
 use crate::{
     GUID, IAdapterPowerManagement, IAdapterPowerManagementVtbl, IID_IAdapterPowerManagement,
     IID_IMiniport, IID_IMiniportTopology, IID_IMiniportWaveRT, IID_IMiniportWaveRTStream,
-    IID_IMiniportWaveRTStreamNotification, IID_IPort, IID_IPortTopology, IID_IPortWaveRT,
-    IID_IPortWaveRTStream, IID_IRegistryKey, IID_IResourceList, IMiniport, IMiniportTopology,
-    IMiniportTopologyVtbl, IMiniportVtbl, IMiniportWaveRT, IMiniportWaveRTStream,
-    IMiniportWaveRTStreamNotification, IMiniportWaveRTStreamNotificationVtbl,
-    IMiniportWaveRTStreamVtbl, IMiniportWaveRTVtbl, IPort, IPortTopology, IPortTopologyVtbl,
-    IPortVtbl, IPortWaveRT, IPortWaveRTStream, IPortWaveRTStreamVtbl, IPortWaveRTVtbl,
-    IRegistryKey, IRegistryKeyVtbl, IResourceList, IResourceListVtbl, IUnknown, IUnknownVtbl,
+    IID_IMiniportWaveRTStreamNotification, IID_IPort, IID_IPortEvents, IID_IPortTopology,
+    IID_IPortWaveRT, IID_IPortWaveRTStream, IID_IRegistryKey, IID_IResourceList, IMiniport,
+    IMiniportTopology, IMiniportTopologyVtbl, IMiniportVtbl, IMiniportWaveRT,
+    IMiniportWaveRTStream, IMiniportWaveRTStreamNotification,
+    IMiniportWaveRTStreamNotificationVtbl, IMiniportWaveRTStreamVtbl, IMiniportWaveRTVtbl, IPort,
+    IPortEvents, IPortEventsVtbl, IPortTopology, IPortTopologyVtbl, IPortVtbl, IPortWaveRT,
+    IPortWaveRTStream, IPortWaveRTStreamVtbl, IPortWaveRTVtbl, IRegistryKey, IRegistryKeyVtbl,
+    IResourceList, IResourceListVtbl, IUnknown, IUnknownVtbl,
 };
 
 /// `GUID` généré → `conduit_com::Guid`, champ par champ (`const`, pour les tables `IIDS`).
@@ -99,5 +100,10 @@ interface_com!(IPort / IPortVtbl : IID_IPort []);
 interface_com!(IPortTopology / IPortTopologyVtbl : IID_IPortTopology [IID_IPort]);
 interface_com!(IPortWaveRT / IPortWaveRTVtbl : IID_IPortWaveRT [IID_IPort]);
 interface_com!(IPortWaveRTStream / IPortWaveRTStreamVtbl : IID_IPortWaveRTStream []);
+// `IPortEvents` dérive directement de `IUnknown` (`DECLARE_INTERFACE_(IPortEvents,IUnknown)`,
+// portcls.h) : aucune interface de base intermédiaire, d'où la liste vide. Elle n'est pas
+// remise au miniport dans `Init` — elle s'obtient par `QueryInterface` sur le port avec
+// `IID_IPortEvents` (voir `portcls::event`).
+interface_com!(IPortEvents / IPortEventsVtbl : IID_IPortEvents []);
 interface_com!(IResourceList / IResourceListVtbl : IID_IResourceList []);
 interface_com!(IRegistryKey / IRegistryKeyVtbl : IID_IRegistryKey []);

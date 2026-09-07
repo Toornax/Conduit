@@ -89,6 +89,7 @@ tailles! {
     PCPROPERTY_ITEM => PCPROPERTY_ITEM,
     PCPROPERTY_REQUEST => PCPROPERTY_REQUEST,
     PCEVENT_ITEM => PCEVENT_ITEM,
+    PCEVENT_REQUEST => PCEVENT_REQUEST,
     PCAUTOMATION_TABLE => PCAUTOMATION_TABLE,
     KSJACK_DESCRIPTION => KSJACK_DESCRIPTION,
     KSRTAUDIO_BUFFER => KSRTAUDIO_BUFFER,
@@ -107,6 +108,8 @@ tailles! {
     KSNODEPROPERTY_AUDIO_CHANNEL => KSNODEPROPERTY_AUDIO_CHANNEL,
     KSMULTIPLE_ITEM => KSMULTIPLE_ITEM,
     KSP_PIN => KSP_PIN,
+    KSEVENTDATA => KSEVENTDATA,
+    KSEVENT_ENTRY => KSEVENT_ENTRY,
     IUnknownVtbl => IUnknownVtbl,
     IMiniportVtbl => IMiniportVtbl,
     IMiniportWaveRTVtbl => IMiniportWaveRTVtbl,
@@ -120,6 +123,7 @@ tailles! {
     IPortWaveRTStreamVtbl => IPortWaveRTStreamVtbl,
     IResourceListVtbl => IResourceListVtbl,
     IRegistryKeyVtbl => IRegistryKeyVtbl,
+    IPortEventsVtbl => IPortEventsVtbl,
     IPortClsVersionVtbl => IPortClsVersionVtbl,
 }
 
@@ -181,6 +185,36 @@ decalages! {
         Flags,
         Handler,
     },
+    PCEVENT_ITEM {
+        Set,
+        Id,
+        Flags,
+        Handler,
+    },
+    PCEVENT_REQUEST {
+        MajorTarget,
+        MinorTarget,
+        Node,
+        EventItem,
+        EventEntry,
+        Verb,
+        Irp,
+    },
+    PCAUTOMATION_TABLE {
+        PropertyItemSize,
+        PropertyCount,
+        Properties,
+        MethodItemSize,
+        MethodCount,
+        Methods,
+        EventItemSize,
+        EventCount,
+        Events,
+        Reserved,
+    },
+    KSEVENTDATA {
+        NotificationType,
+    },
 }
 
 guids! {
@@ -190,6 +224,7 @@ guids! {
     IID_IAdapterPowerManagement,
     IID_IPortWaveRT,
     IID_IPortTopology,
+    IID_IPortEvents,
     KSCATEGORY_AUDIO,
     KSDATAFORMAT_SUBTYPE_PCM,
     KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
@@ -197,6 +232,7 @@ guids! {
     KSNODETYPE_VOLUME,
     KSNODETYPE_MUTE,
     KSPROPSETID_Jack,
+    KSEVENTSETID_PinCapsChange,
     KSPROPSETID_Audio,
     KSPROPTYPESETID_General,
 }

@@ -56,6 +56,8 @@ macro_rules! interfaces_com {
                 ("IPortWaveRTStreamVtbl", 10),
                 ("IResourceListVtbl", 11),
                 ("IRegistryKeyVtbl", 11),
+                // `IPortEvents` : IUnknown, puis AddEventToEventList et GenerateEventList.
+                ("IPortEventsVtbl", 5),
                 ("IPortClsVersionVtbl", 4),
             ];
             let obtenus: &[(&str, usize)] = &[
@@ -80,7 +82,64 @@ interfaces_com! {
     IPortWaveRTStream / IPortWaveRTStreamVtbl,
     IResourceList / IResourceListVtbl,
     IRegistryKey / IRegistryKeyVtbl,
+    IPortEvents / IPortEventsVtbl,
     IPortClsVersion / IPortClsVersionVtbl,
+}
+
+/// Ordre des slots de `IPortEvents` (`portcls.h` 26100) : `IUnknown`, puis
+/// `AddEventToEventList`, puis `GenerateEventList`.
+///
+/// Les deux méthodes rendent `void` : **aucun moyen de savoir si le port a fait quelque
+/// chose**. C'est ce qui rend l'événement de changement de prise indétectable en test
+/// unitaire (voir `portcls::event`), et c'est pourquoi l'ordre des slots est figé ici :
+/// une inversion enverrait l'entrée d'événement dans `GenerateEventList` sans le moindre
+/// diagnostic.
+#[test]
+fn ordre_des_slots_iportevents() {
+    let offsets = [
+        (
+            "QueryInterface",
+            offset_of!(IPortEventsVtbl, QueryInterface),
+        ),
+        ("AddRef", offset_of!(IPortEventsVtbl, AddRef)),
+        ("Release", offset_of!(IPortEventsVtbl, Release)),
+        (
+            "AddEventToEventList",
+            offset_of!(IPortEventsVtbl, AddEventToEventList),
+        ),
+        (
+            "GenerateEventList",
+            offset_of!(IPortEventsVtbl, GenerateEventList),
+        ),
+    ];
+    for (i, (nom, offset)) in offsets.iter().enumerate() {
+        assert_eq!(*offset, i * SLOT, "slot {i} = {nom}");
+    }
+    assert_eq!(size_of::<IPortEventsVtbl>(), offsets.len() * SLOT);
+}
+
+/// Les verbes d'événement de PortCls sont des **bits**, pas un énuméré dense :
+/// `SUPPORT` vaut 4, pas 3. Un `match` exhaustif sur 0..=3 les manquerait.
+#[test]
+fn verbes_d_evenement() {
+    assert_eq!(PCEVENT_VERB_NONE, 0);
+    assert_eq!(PCEVENT_VERB_ADD, 1);
+    assert_eq!(PCEVENT_VERB_REMOVE, 2);
+    assert_eq!(PCEVENT_VERB_SUPPORT, 4);
+    // Les flags de `PCEVENT_ITEM` sont les `KSEVENT_TYPE_*` homonymes.
+    assert_eq!(PCEVENT_ITEM_FLAG_ENABLE, KSEVENT_TYPE_ENABLE);
+    assert_eq!(PCEVENT_ITEM_FLAG_ONESHOT, KSEVENT_TYPE_ONESHOT);
+    assert_eq!(PCEVENT_ITEM_FLAG_BASICSUPPORT, KSEVENT_TYPE_BASICSUPPORT);
+    // `KSEVENT_PINCAPS_JACKINFOCHANGE` est la **deuxième** valeur de l'énumération
+    // `KSEVENT_PINCAPS_CHANGENOTIFICATIONS` : 1, pas 0 (0 est FORMATCHANGE).
+    assert_eq!(
+        KSEVENT_PINCAPS_CHANGENOTIFICATIONS::KSEVENT_PINCAPS_FORMATCHANGE,
+        0
+    );
+    assert_eq!(
+        KSEVENT_PINCAPS_CHANGENOTIFICATIONS::KSEVENT_PINCAPS_JACKINFOCHANGE,
+        1
+    );
 }
 
 /// Ordre des slots de `IMiniportWaveRT` dans `portcls.h` 26100 : `IUnknown`, puis

@@ -88,22 +88,34 @@
 //! miniport fournit ([`JackInfo::channel_mapping`]) : la documentation le veut non nul
 //! **pour les seules broches de rendu analogique**, et nul pour les broches de capture.
 //!
-//! # La dette que M1b-04 devra payer : `KSEVENT_PINCAPS_JACKINFOCHANGE`
+//! # La contrepartie obligatoire : `KSEVENT_PINCAPS_JACKINFOCHANGE`
 //!
 //! Windows **n'interroge pas le jack en boucle**. Il lit `KSPROPERTY_JACK_DESCRIPTION` à
 //! la construction de l'endpoint, puis n'y revient que si le pilote le lui signale par
-//! l'événement `KSEVENT_PINCAPS_JACKINFOCHANGE` (jeu
-//! `KSEVENTSETID_PinCapsChange`, `PCEVENT_ITEM` dans la table d'automatisation du filtre,
-//! `PcGenerateEventList` pour l'émettre).
+//! l'événement `KSEVENT_PINCAPS_JACKINFOCHANGE` (jeu `KSEVENTSETID_PinCapsChange`,
+//! `PCEVENT_ITEM` dans la table d'automatisation du **filtre**,
+//! `IPortEvents::GenerateEventList` pour l'émettre).
 //!
-//! M1b-03 ne l'implémente pas, et **c'est cohérent** : rien ne change encore l'état de
-//! connexion, un événement qui ne se produit jamais n'a pas de lecteur. Mais dès que
-//! M1b-04 rendra l'état modifiable, **cet événement devient obligatoire** : sans lui,
-//! l'interface utilisateur restera figée sur l'état du démarrage, une déconnexion demandée
-//! par l'utilisateur n'aura aucun effet visible, et le symptôme sera « la propriété KS
-//! rend la bonne valeur mais le panneau de son ne bouge pas » — un faux mystère qui coûte
-//! une demi-journée. La table d'automatisation du filtre a déjà `EventCount = 0` et
-//! `EventItemSize` renseigné ; il n'y a qu'à la remplir.
+//! M1b-03 ne l'implémentait pas, et **c'était cohérent** : rien ne changeait encore l'état
+//! de connexion, un événement qui ne se produit jamais n'a pas de lecteur. Dès que l'état
+//! devient modifiable, **cet événement devient obligatoire** : sans lui, l'interface
+//! utilisateur reste figée sur l'état du démarrage, une déconnexion demandée par
+//! l'utilisateur n'a aucun effet visible, et le symptôme est « la propriété KS rend la
+//! bonne valeur mais le panneau de son ne bouge pas » — un faux mystère qui coûte une
+//! demi-journée.
+//!
+//! La brique existe désormais : [`crate::event`] — [`jack_info_change_item`] pour l'entrée
+//! de table, [`with_events`] pour la poser à côté de [`jack_description_item`] dans la même
+//! `PCAUTOMATION_TABLE` de filtre, et [`PortEvents::jack_info_change`] pour émettre. Il
+//! reste à câbler côté `conduit-kmd` : garder l'`IPortEvents` du port dans le miniport
+//! topologie ([`EventSource`]), et appeler la notification depuis `Cable::set_connected`,
+//! une fois par filtre de topologie du câble avec le numéro de sa broche endpoint — celle
+//! que [`JackInfo::jack_pin`] désigne.
+//!
+//! [`jack_info_change_item`]: crate::event::jack_info_change_item
+//! [`with_events`]: crate::event::with_events
+//! [`PortEvents::jack_info_change`]: crate::event::PortEvents::jack_info_change
+//! [`EventSource`]: crate::event::EventSource
 
 use conduit_com::{NtStatus, STATUS_INVALID_PARAMETER};
 use portcls_sys::{

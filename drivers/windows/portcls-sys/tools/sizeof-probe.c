@@ -71,6 +71,7 @@ int main(void)
     TAILLE(PCPROPERTY_ITEM);
     TAILLE(PCPROPERTY_REQUEST);
     TAILLE(PCEVENT_ITEM);
+    TAILLE(PCEVENT_REQUEST);
     TAILLE(PCAUTOMATION_TABLE);
     TAILLE(KSJACK_DESCRIPTION);
     TAILLE(KSRTAUDIO_BUFFER);
@@ -95,6 +96,18 @@ int main(void)
     TAILLE(KSMULTIPLE_ITEM);
     TAILLE(KSP_PIN);
 
+    /* M1b-04, événements KS. Le miniport ne construit AUCUNE de ces trois structures :
+     * PortCls lui passe une PCEVENT_REQUEST qui porte l'entrée d'événement, et le
+     * miniport se contente de la rendre à IPortEvents::AddEventToEventList. Les mesurer
+     * sert donc à autre chose que de la sérialisation : à prouver que les bindings
+     * décrivent les MÊMES structures que le WDK, là où une divergence de disposition
+     * ferait lire le Verb ou le MajorTarget au mauvais décalage — c'est-à-dire un
+     * déréférencement d'un champ pour un autre, au noyau. KSEVENTDATA est la structure
+     * que le client remplit et que KS place derrière KSEVENT_ENTRY::EventData ; on ne
+     * l'écrit pas non plus, on la mesure pour la même raison. */
+    TAILLE(KSEVENTDATA);
+    TAILLE(KSEVENT_ENTRY);
+
     /* Vtables COM plates : slots × 8. */
     TAILLE(IUnknownVtbl);
     TAILLE(IMiniportVtbl);
@@ -109,6 +122,10 @@ int main(void)
     TAILLE(IPortWaveRTStreamVtbl);
     TAILLE(IResourceListVtbl);
     TAILLE(IRegistryKeyVtbl);
+    /* M1b-04 : IPortEvents, obtenue par QueryInterface sur le port. Cinq slots
+     * (IUnknown, AddEventToEventList, GenerateEventList) : c'est par cette vtable que
+     * l'événement de changement de prise part. */
+    TAILLE(IPortEventsVtbl);
     /* Piège du WDK 26100 : IPortClsVersion ne recopie pas DEFINE_ABSTRACT_UNKNOWN(), sa
      * vtable C n'a qu'un slot (GetVersion) alors que l'objet COM réel en a quatre
      * (IUnknown puis GetVersion). portcls-sys la corrige à la main (src/fixups.rs) ; la
@@ -162,6 +179,39 @@ int main(void)
     DECALAGE(PCPROPERTY_ITEM, Id);
     DECALAGE(PCPROPERTY_ITEM, Flags);
     DECALAGE(PCPROPERTY_ITEM, Handler);
+    /* M1b-04. PCEVENT_ITEM a la MÊME forme que PCPROPERTY_ITEM (Set, Id, Flags,
+     * Handler aux mêmes décalages) : c'est ce que ces quatre lignes établissent, et
+     * c'est ce qui rend le constructeur d'entrée d'événement le jumeau de celui de
+     * propriété. PCEVENT_REQUEST, elle, DIFFÈRE de PCPROPERTY_REQUEST : le Verb y est
+     * au décalage 40, pas 32, parce qu'un champ EventEntry s'intercale — se tromper
+     * là lirait le pointeur d'entrée d'événement en guise de verbe. */
+    DECALAGE(PCEVENT_ITEM, Set);
+    DECALAGE(PCEVENT_ITEM, Id);
+    DECALAGE(PCEVENT_ITEM, Flags);
+    DECALAGE(PCEVENT_ITEM, Handler);
+    DECALAGE(PCEVENT_REQUEST, MajorTarget);
+    DECALAGE(PCEVENT_REQUEST, MinorTarget);
+    DECALAGE(PCEVENT_REQUEST, Node);
+    DECALAGE(PCEVENT_REQUEST, EventItem);
+    DECALAGE(PCEVENT_REQUEST, EventEntry);
+    DECALAGE(PCEVENT_REQUEST, Verb);
+    DECALAGE(PCEVENT_REQUEST, Irp);
+    /* La table d'automatisation porte propriétés, méthodes ET événements ; ses trois
+     * triplets (ItemSize, Count, pointeur) se suivent. Les décalages du dernier
+     * triplet sont ce que M1b-04 remplit. */
+    DECALAGE(PCAUTOMATION_TABLE, PropertyItemSize);
+    DECALAGE(PCAUTOMATION_TABLE, PropertyCount);
+    DECALAGE(PCAUTOMATION_TABLE, Properties);
+    DECALAGE(PCAUTOMATION_TABLE, MethodItemSize);
+    DECALAGE(PCAUTOMATION_TABLE, MethodCount);
+    DECALAGE(PCAUTOMATION_TABLE, Methods);
+    DECALAGE(PCAUTOMATION_TABLE, EventItemSize);
+    DECALAGE(PCAUTOMATION_TABLE, EventCount);
+    DECALAGE(PCAUTOMATION_TABLE, Events);
+    DECALAGE(PCAUTOMATION_TABLE, Reserved);
+    /* KSEVENTDATA : seul NotificationType est nommable des deux côtés (le reste est une
+     * union anonyme, que offset_of! ne sait pas désigner en Rust). */
+    DECALAGE(KSEVENTDATA, NotificationType);
 
     /* GUID. */
     GUID_PC(IID_IUnknown);
@@ -170,6 +220,9 @@ int main(void)
     GUID_PC(IID_IAdapterPowerManagement);
     GUID_PC(IID_IPortWaveRT);
     GUID_PC(IID_IPortTopology);
+    /* M1b-04 : l'IID que QueryInterface sur le port doit recevoir pour rendre
+     * l'interface par laquelle l'événement part. */
+    GUID_PC(IID_IPortEvents);
     GUID_KS(KSCATEGORY_AUDIO);
     GUID_KS(KSDATAFORMAT_SUBTYPE_PCM);
     GUID_KS(KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
@@ -177,6 +230,8 @@ int main(void)
     GUID_KS(KSNODETYPE_VOLUME);
     GUID_KS(KSNODETYPE_MUTE);
     GUID_KS(KSPROPSETID_Jack);
+    /* M1b-04 : le jeu d'événement de KSEVENT_PINCAPS_JACKINFOCHANGE. */
+    GUID_KS(KSEVENTSETID_PinCapsChange);
     GUID_KS(KSPROPSETID_Audio);
     GUID_KS(KSPROPTYPESETID_General);
     return 0;
