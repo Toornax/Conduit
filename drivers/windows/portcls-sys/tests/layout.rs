@@ -3,9 +3,14 @@
 //!
 //! Deux compilateurs sur les mêmes en-têtes du WDK : clang (bindgen, `build.rs`) et
 //! cl.exe (le probe). Chaque ligne du golden donne une assertion nommée : `sizeof` d'une
-//! structure ou d'une vtable (nombre de slots × 8), ou valeur d'un GUID. Le test échoue
-//! aussi si le golden et les tables ci-dessous ne couvrent pas exactement les mêmes noms,
-//! pour qu'un ajout d'un côté ne soit pas oublié de l'autre.
+//! structure ou d'une vtable (nombre de slots × 8), `offset` d'un champ, ou valeur d'un
+//! GUID. Le test échoue aussi si le golden et les tables ci-dessous ne couvrent pas
+//! exactement les mêmes noms, pour qu'un ajout d'un côté ne soit pas oublié de l'autre.
+//!
+//! Les décalages comptent autant que les tailles pour les structures de propriétés KS :
+//! M1b les sérialise à la main, champ par champ, dans les tampons venus du mode
+//! utilisateur (écrire à travers un pointeur de structure potentiellement désaligné
+//! serait un comportement indéfini en Rust), donc chaque décalage y devient du code.
 
 // Tests en mode utilisateur : une panique est un échec de test, pas un écran bleu.
 #![allow(
@@ -16,7 +21,10 @@
     clippy::arithmetic_side_effects
 )]
 
-use std::{collections::BTreeSet, mem::size_of};
+use std::{
+    collections::BTreeSet,
+    mem::{offset_of, size_of},
+};
 
 use portcls_sys::*;
 
@@ -29,6 +37,22 @@ macro_rules! tailles {
         fn taille(nom: &str) -> Option<usize> {
             match nom {
                 $(stringify!($nom) => Some(size_of::<$type>()),)*
+                _ => None,
+            }
+        }
+    };
+}
+
+/// Table `« Type.Champ » → offset_of!(Type, Champ)`, dans l'ordre du probe.
+macro_rules! decalages {
+    ($($type:ident { $($champ:ident),* $(,)? }),* $(,)?) => {
+        const NOMS_DECALAGES: &[&str] = &[
+            $($(concat!(stringify!($type), ".", stringify!($champ))),*),*
+        ];
+        fn decalage(nom: &str) -> Option<usize> {
+            match nom {
+                $($(concat!(stringify!($type), ".", stringify!($champ))
+                    => Some(offset_of!($type, $champ)),)*)*
                 _ => None,
             }
         }
@@ -76,6 +100,11 @@ tailles! {
     DEVICE_OBJECT => DEVICE_OBJECT,
     IRP => IRP,
     UNICODE_STRING => UNICODE_STRING,
+    KSPROPERTY_DESCRIPTION => KSPROPERTY_DESCRIPTION,
+    KSPROPERTY_MEMBERSHEADER => KSPROPERTY_MEMBERSHEADER,
+    KSPROPERTY_STEPPING_LONG => KSPROPERTY_STEPPING_LONG,
+    KSNODEPROPERTY => KSNODEPROPERTY,
+    KSNODEPROPERTY_AUDIO_CHANNEL => KSNODEPROPERTY_AUDIO_CHANNEL,
     IUnknownVtbl => IUnknownVtbl,
     IMiniportVtbl => IMiniportVtbl,
     IMiniportWaveRTVtbl => IMiniportWaveRTVtbl,
@@ -92,6 +121,49 @@ tailles! {
     IPortClsVersionVtbl => IPortClsVersionVtbl,
 }
 
+decalages! {
+    KSPROPERTY_DESCRIPTION {
+        AccessFlags,
+        DescriptionSize,
+        PropTypeSet,
+        MembersListCount,
+        Reserved,
+    },
+    KSPROPERTY_MEMBERSHEADER {
+        MembersFlags,
+        MembersSize,
+        MembersCount,
+        Flags,
+    },
+    KSPROPERTY_STEPPING_LONG {
+        SteppingDelta,
+        Reserved,
+        Bounds,
+    },
+    KSNODEPROPERTY {
+        Property,
+        NodeId,
+        Reserved,
+    },
+    KSNODEPROPERTY_AUDIO_CHANNEL {
+        NodeProperty,
+        Channel,
+        Reserved,
+    },
+    PCNODE_DESCRIPTOR {
+        Flags,
+        AutomationTable,
+        Type,
+        Name,
+    },
+    PCPROPERTY_ITEM {
+        Set,
+        Id,
+        Flags,
+        Handler,
+    },
+}
+
 guids! {
     IID_IUnknown,
     IID_IMiniportWaveRT,
@@ -103,7 +175,11 @@ guids! {
     KSDATAFORMAT_SUBTYPE_PCM,
     KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
     KSNODETYPE_SPEAKER,
+    KSNODETYPE_VOLUME,
+    KSNODETYPE_MUTE,
     KSPROPSETID_Jack,
+    KSPROPSETID_Audio,
+    KSPROPTYPESETID_General,
 }
 
 /// Même format que le probe : `XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX` en majuscules.
@@ -142,6 +218,15 @@ fn tailles_et_guids_conformes_au_golden() {
                     "size_of::<{nom}>() : Rust {obtenu}, cl.exe {attendu}"
                 );
             }
+            "offset" => {
+                let attendu: usize = attendu.parse().expect("décalage entier dans le golden");
+                let obtenu = decalage(nom)
+                    .unwrap_or_else(|| panic!("{nom} absent de la table `decalages!`"));
+                assert_eq!(
+                    obtenu, attendu,
+                    "offset_of!({nom}) : Rust {obtenu}, cl.exe {attendu}"
+                );
+            }
             "guid" => {
                 let obtenu =
                     guid(nom).unwrap_or_else(|| panic!("{nom} absent de la table `guids!`"));
@@ -163,15 +248,24 @@ fn golden_et_tables_couvrent_les_memes_noms() {
         .filter(|(g, _, _)| *g == "sizeof")
         .map(|(_, n, _)| n)
         .collect();
+    let golden_decalages: BTreeSet<&str> = lignes_golden()
+        .filter(|(g, _, _)| *g == "offset")
+        .map(|(_, n, _)| n)
+        .collect();
     let golden_guids: BTreeSet<&str> = lignes_golden()
         .filter(|(g, _, _)| *g == "guid")
         .map(|(_, n, _)| n)
         .collect();
     let tables_tailles: BTreeSet<&str> = NOMS_TAILLES.iter().copied().collect();
+    let tables_decalages: BTreeSet<&str> = NOMS_DECALAGES.iter().copied().collect();
     let tables_guids: BTreeSet<&str> = NOMS_GUIDS.iter().copied().collect();
     assert_eq!(
         golden_tailles, tables_tailles,
         "sizeof : golden ≠ table `tailles!`"
+    );
+    assert_eq!(
+        golden_decalages, tables_decalages,
+        "offset : golden ≠ table `decalages!`"
     );
     assert_eq!(golden_guids, tables_guids, "guid : golden ≠ table `guids!`");
 }

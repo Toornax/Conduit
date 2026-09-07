@@ -9,6 +9,7 @@
  *
  * Sortie (tests/layout.golden), une ligne par mesure, champs séparés par une tabulation :
  *   sizeof<TAB>Nom<TAB>octets
+ *   offset<TAB>Nom.Champ<TAB>octets
  *   guid<TAB>Nom<TAB>XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
  * Les sizeof des vtables (`IXxxVtbl`) valent nombre de slots × 8.
  */
@@ -31,6 +32,11 @@
 int __cdecl printf(const char *format, ...);
 
 #define TAILLE(type) printf("sizeof\t%s\t%u\n", #type, (unsigned)sizeof(type))
+/* Décalage d'un champ : ce que M1b doit connaître pour sérialiser à la main, octet par
+ * octet, dans un tampon du mode utilisateur (écrire à travers un pointeur de structure
+ * potentiellement désaligné serait un comportement indéfini côté Rust). */
+#define DECALAGE(type, champ) \
+    printf("offset\t%s.%s\t%u\n", #type, #champ, (unsigned)FIELD_OFFSET(type, champ))
 
 static void guid(const char *nom, const GUID *g)
 {
@@ -77,6 +83,14 @@ int main(void)
     TAILLE(IRP);
     TAILLE(UNICODE_STRING);
 
+    /* Structures de propriétés KS que M1b sérialise à la main (BasicSupport et
+     * propriétés de nœud : volume, mute). */
+    TAILLE(KSPROPERTY_DESCRIPTION);
+    TAILLE(KSPROPERTY_MEMBERSHEADER);
+    TAILLE(KSPROPERTY_STEPPING_LONG);
+    TAILLE(KSNODEPROPERTY);
+    TAILLE(KSNODEPROPERTY_AUDIO_CHANNEL);
+
     /* Vtables COM plates : slots × 8. */
     TAILLE(IUnknownVtbl);
     TAILLE(IMiniportVtbl);
@@ -99,6 +113,36 @@ int main(void)
     printf("sizeof\t%s\t%u\n", "IPortClsVersionVtbl",
            (unsigned)(sizeof(IUnknownVtbl) + sizeof(IPortClsVersionVtbl)));
 
+    /* Décalages des champs des structures que M1b écrit champ par champ, plus ceux des
+     * descripteurs qui portent les nœuds et les propriétés de la topologie. Une taille
+     * juste ne suffit pas : c'est le décalage qui rend la sérialisation manuelle sûre. */
+    DECALAGE(KSPROPERTY_DESCRIPTION, AccessFlags);
+    DECALAGE(KSPROPERTY_DESCRIPTION, DescriptionSize);
+    DECALAGE(KSPROPERTY_DESCRIPTION, PropTypeSet);
+    DECALAGE(KSPROPERTY_DESCRIPTION, MembersListCount);
+    DECALAGE(KSPROPERTY_DESCRIPTION, Reserved);
+    DECALAGE(KSPROPERTY_MEMBERSHEADER, MembersFlags);
+    DECALAGE(KSPROPERTY_MEMBERSHEADER, MembersSize);
+    DECALAGE(KSPROPERTY_MEMBERSHEADER, MembersCount);
+    DECALAGE(KSPROPERTY_MEMBERSHEADER, Flags);
+    DECALAGE(KSPROPERTY_STEPPING_LONG, SteppingDelta);
+    DECALAGE(KSPROPERTY_STEPPING_LONG, Reserved);
+    DECALAGE(KSPROPERTY_STEPPING_LONG, Bounds);
+    DECALAGE(KSNODEPROPERTY, Property);
+    DECALAGE(KSNODEPROPERTY, NodeId);
+    DECALAGE(KSNODEPROPERTY, Reserved);
+    DECALAGE(KSNODEPROPERTY_AUDIO_CHANNEL, NodeProperty);
+    DECALAGE(KSNODEPROPERTY_AUDIO_CHANNEL, Channel);
+    DECALAGE(KSNODEPROPERTY_AUDIO_CHANNEL, Reserved);
+    DECALAGE(PCNODE_DESCRIPTOR, Flags);
+    DECALAGE(PCNODE_DESCRIPTOR, AutomationTable);
+    DECALAGE(PCNODE_DESCRIPTOR, Type);
+    DECALAGE(PCNODE_DESCRIPTOR, Name);
+    DECALAGE(PCPROPERTY_ITEM, Set);
+    DECALAGE(PCPROPERTY_ITEM, Id);
+    DECALAGE(PCPROPERTY_ITEM, Flags);
+    DECALAGE(PCPROPERTY_ITEM, Handler);
+
     /* GUID. */
     GUID_PC(IID_IUnknown);
     GUID_PC(IID_IMiniportWaveRT);
@@ -110,6 +154,10 @@ int main(void)
     GUID_KS(KSDATAFORMAT_SUBTYPE_PCM);
     GUID_KS(KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
     GUID_KS(KSNODETYPE_SPEAKER);
+    GUID_KS(KSNODETYPE_VOLUME);
+    GUID_KS(KSNODETYPE_MUTE);
     GUID_KS(KSPROPSETID_Jack);
+    GUID_KS(KSPROPSETID_Audio);
+    GUID_KS(KSPROPTYPESETID_General);
     return 0;
 }

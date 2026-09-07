@@ -1,6 +1,7 @@
 ﻿<#
 .SYNOPSIS
-  Régénère portcls-sys\tests\layout.golden : sizeof et GUID de référence calculés par cl.exe.
+  Régénère portcls-sys\tests\layout.golden : sizeof, décalages de champs et GUID de
+  référence calculés par cl.exe.
 .DESCRIPTION
   Compile portcls-sys\tools\sizeof-probe.c avec cl.exe (Build Tools, trouvés par vswhere)
   sur les en-têtes km et shared du WDK (version de packaging\windows\versions.json), avec
@@ -77,7 +78,7 @@ try {
 
   $header = @(
     "# Généré par drivers/windows/tools/regen-layout.ps1 (cl.exe, WDK $wdkVersion, x64) : ne pas éditer.",
-    "# sizeof<TAB>Nom<TAB>octets | guid<TAB>Nom<TAB>XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
+    "# sizeof<TAB>Nom<TAB>octets | offset<TAB>Nom.Champ<TAB>octets | guid<TAB>Nom<TAB>XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
   )
   $text = (($header + @($lines)) -join "`n") + "`n"
   $outDir = Split-Path -Parent $OutFile
