@@ -91,6 +91,13 @@
 //! endroit où regarder, et poser une seconde table sur la broche endpoint est l'expérience
 //! à tenter — les tests unitaires de ce module ne peuvent rien en dire.
 //!
+//! # Deux endpoints par câble
+//!
+//! Un câble a **deux** filtres de topologie, donc deux ports, donc deux abonnements à
+//! réveiller pour un même changement d'état de connexion. [`JackTargets`] tient les deux
+//! (chacun avec **sa** broche endpoint, qui diffère par sens) et porte le comptage de
+//! références qui rend le signalement insensible au démontage d'un miniport.
+//!
 //! # Frontière de confiance
 //!
 //! Plus étroite que celle de [`crate::property`], et pour une bonne raison : une
@@ -423,14 +430,17 @@ where
 /// méthodes, événements — indépendants les uns des autres ; c'est exactement ce que fait la
 /// macro `DEFINE_PCAUTOMATION_TABLE_PROP_EVENT` de `portcls.h`. Cette fonction remplit le
 /// **troisième** sans toucher aux deux autres, pour que les tables existantes du pilote
-/// (`one_property_automation` de `conduit-kmd`, qui fige `EventCount = 0`) gagnent leurs
-/// événements par une seule ligne de plus :
+/// (`property_automation` de `conduit-kmd`, qui fige `EventCount = 0`) gagnent leurs
+/// événements par une seule ligne de plus — ce que `conduit-kmd` écrit désormais pour ses
+/// deux filtres de topologie :
 ///
 /// ```ignore
-/// static TOPO_RENDER_AUTOMATION: Shared<PCAUTOMATION_TABLE> = Shared(with_events(
-///     one_property_automation(&RENDER_JACK_PROPERTIES),
-///     RENDER_JACK_EVENTS.get(),
-/// ));
+/// const fn topo_render_automation() -> PCAUTOMATION_TABLE {
+///     with_events(
+///         property_automation(&RENDER_FILTER_PROPERTIES),
+///         RENDER_FILTER_EVENTS.get(),
+///     )
+/// }
 /// ```
 ///
 /// `EventItemSize` vaut `sizeof(PCEVENT_ITEM)` : la documentation permet une taille
@@ -624,6 +634,174 @@ impl PortEvents {
 const KS_TRUE: BOOL = 1;
 /// `BOOL` de Windows : `FALSE`.
 const KS_FALSE: BOOL = 0;
+
+// ---------------------------------------------------------------------------------
+// Les destinataires d'un câble : un filtre de topologie par sens.
+// ---------------------------------------------------------------------------------
+
+/// Un filtre de topologie à réveiller : l'`IPortEvents` de **son** port et le numéro de
+/// **sa** broche endpoint.
+///
+/// Les deux vont ensemble et c'est tout l'intérêt du type : l'enveloppe s'obtient par
+/// `QueryInterface` sur l'objet port, que seul le miniport de topologie voit, et la broche
+/// diffère par sens (1 au rendu, 0 à la capture, voir `conduit_kmd::descriptors`). Les
+/// séparer, c'est prendre le risque de signaler la broche d'un sens sur le port de
+/// l'autre — panne parfaitement silencieuse : l'événement part, aucun abonné ne le
+/// reconnaît, l'interface reste figée.
+///
+/// # La référence COM
+///
+/// Un `JackTarget` **possède** une référence sur le port (celle que `QueryInterface` a
+/// rendue, ou une de plus pour chaque [`Clone`]). Elle est rendue au `Drop`. C'est ce
+/// comptage, et lui seul, qui rend le signalement insensible à la destruction du miniport :
+/// voir [`JackTargets`].
+#[derive(Debug, Clone)]
+pub struct JackTarget {
+    /// L'`IPortEvents` du port de ce filtre.
+    events: PortEvents,
+    /// La broche endpoint de ce filtre, celle que le signalement désigne.
+    pin: u32,
+}
+
+impl JackTarget {
+    /// Le port `events` et sa broche endpoint `pin`.
+    ///
+    /// `pin` est la broche **endpoint**, la même que
+    /// [`JackInfo::jack_pin`](crate::jack::JackInfo::jack_pin) — jamais la broche bridge.
+    pub fn new(events: PortEvents, pin: u32) -> Self {
+        Self { events, pin }
+    }
+
+    /// La broche endpoint visée par [`notify`](Self::notify).
+    pub fn pin(&self) -> u32 {
+        self.pin
+    }
+
+    /// L'enveloppe du port, pour la rendre à un gestionnaire d'événement
+    /// ([`EventSource::port_events`]).
+    pub fn port_events(&self) -> &PortEvents {
+        &self.events
+    }
+
+    /// `KSEVENT_PINCAPS_JACKINFOCHANGE` sur ce filtre, pour sa broche endpoint.
+    ///
+    /// IRQL : voir [`PortEvents::generate`].
+    pub fn notify(&self) -> Result<(), NtStatus> {
+        self.events.jack_info_change(self.pin)
+    }
+}
+
+/// Les deux destinataires d'un câble — le filtre de topologie du rendu et celui de la
+/// capture — et le signalement des deux.
+///
+/// # Pourquoi les deux, et pourquoi ici
+///
+/// L'état de connexion d'un câble est **par câble**, pas par sens : le changer doit faire
+/// relire `KSPROPERTY_JACK_DESCRIPTION` aux deux endpoints. Or l'enveloppe s'obtient sur
+/// l'objet **port**, que seul un miniport de topologie voit, et il y en a **deux par
+/// câble** : c'est donc le câble qui porte les deux, chacune posée par le miniport
+/// correspondant quand il reçoit son port dans `Init`.
+///
+/// # La course entre le signalement et le démontage
+///
+/// `set_connected` peut être appelé pendant qu'un miniport se démonte. Lire un pointeur de
+/// port puis l'utiliser après sa libération est un écran bleu ; deux propriétés de ce type
+/// l'interdisent, et elles ne suffisent qu'ensemble :
+///
+/// 1. **le comptage de références** : [`Clone`] prend une référence de plus sur chacun des
+///    deux ports (`AddRef`), et le `Drop` la rend. Une copie prise avant le démontage
+///    maintient donc le port vivant jusqu'à ce que le signalement soit fini, même si le
+///    miniport disparaît entre-temps ;
+/// 2. **le verrou du propriétaire** : ce type n'en a pas — il est fait pour vivre dans le
+///    verrou de son propriétaire (`conduit_kmd::cable::Cable`), et le retrait
+///    ([`take_render`](Self::take_render), [`take_capture`](Self::take_capture)) comme la
+///    copie doivent le traverser. Un signaleur voit donc soit la cible **avant** le retrait,
+///    et il en tient alors une copie comptée, soit `None` après : jamais un pointeur
+///    libéré.
+///
+/// La copie doit être prise **sous** le verrou et le signalement fait **dehors** :
+/// `GenerateEventList` appelle PortCls, et le `Drop` de la copie peut relâcher la dernière
+/// référence sur le port, ce qui n'a rien à faire dans une section critique.
+#[derive(Debug, Clone, Default)]
+pub struct JackTargets {
+    /// Le filtre `TopoRender` du câble, s'il a fait son `Init`.
+    render: Option<JackTarget>,
+    /// Le filtre `TopoCapture` du câble.
+    capture: Option<JackTarget>,
+}
+
+impl JackTargets {
+    /// Aucun destinataire : l'état d'un câble avant tout `Init`.
+    ///
+    /// `const` : le tableau des câbles est une `static` construite à la compilation.
+    pub const fn new() -> Self {
+        Self {
+            render: None,
+            capture: None,
+        }
+    }
+
+    /// Pose le destinataire du sens **rendu** et rend celui qu'il remplace, s'il y en
+    /// avait un.
+    ///
+    /// L'ancien est **rendu** plutôt que détruit ici : son `Drop` relâche une référence
+    /// COM, ce que l'appelant doit pouvoir faire hors de son verrou.
+    pub fn set_render(&mut self, target: JackTarget) -> Option<JackTarget> {
+        self.render.replace(target)
+    }
+
+    /// Pose le destinataire du sens **capture** (voir [`set_render`](Self::set_render)).
+    pub fn set_capture(&mut self, target: JackTarget) -> Option<JackTarget> {
+        self.capture.replace(target)
+    }
+
+    /// Retire le destinataire du sens rendu et le rend (voir
+    /// [`set_render`](Self::set_render) pour le « rend » plutôt que « détruit »).
+    pub fn take_render(&mut self) -> Option<JackTarget> {
+        self.render.take()
+    }
+
+    /// Retire le destinataire du sens capture.
+    pub fn take_capture(&mut self) -> Option<JackTarget> {
+        self.capture.take()
+    }
+
+    /// Retire les deux d'un coup (déchargement du pilote).
+    pub fn take_all(&mut self) -> Self {
+        core::mem::take(self)
+    }
+
+    /// Le destinataire du sens rendu.
+    pub fn render(&self) -> Option<&JackTarget> {
+        self.render.as_ref()
+    }
+
+    /// Le destinataire du sens capture.
+    pub fn capture(&self) -> Option<&JackTarget> {
+        self.capture.as_ref()
+    }
+
+    /// Aucun des deux sens n'a de destinataire.
+    pub fn is_empty(&self) -> bool {
+        self.render.is_none() && self.capture.is_none()
+    }
+
+    /// `KSEVENT_PINCAPS_JACKINFOCHANGE` aux **deux** sens, rendu puis capture, chacun sur
+    /// **sa** broche endpoint.
+    ///
+    /// Un sens sans destinataire est sauté sans bruit : c'est l'état normal d'un câble dont
+    /// le périphérique n'a pas démarré, et il n'y a rien à signaler à personne. Les erreurs
+    /// sont ignorées : `GenerateEventList` rend `void`, la seule qui puisse remonter est un
+    /// slot vide, qu'aucun objet COM réel ne présente.
+    ///
+    /// À appeler **hors** du verrou qui protège ce type, à `<= DISPATCH_LEVEL` (voir
+    /// [`PortEvents::generate`]) ; en pratique à `PASSIVE_LEVEL`.
+    pub fn notify_jack_change(&self) {
+        for target in [self.render(), self.capture()].into_iter().flatten() {
+            let _ = target.notify();
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------------
 // Le gestionnaire de `KSEVENT_PINCAPS_JACKINFOCHANGE`.

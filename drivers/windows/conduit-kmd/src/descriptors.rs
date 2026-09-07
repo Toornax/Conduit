@@ -24,7 +24,9 @@
 //!   ([`TOPO_CONNECTIONS`]) qui les mettent en série entre les deux broches. La table
 //!   d'automatisation du *filtre* porte, depuis M1b-03, les propriétés qui ne sont ni de
 //!   nœud ni de broche : `KSPROPERTY_JACK_DESCRIPTION`, puis les deux propriétés du jeu
-//!   privé `KSPROPSETID_Conduit` de M1b-04 (état du câble, version du contrat).
+//!   privé `KSPROPSETID_Conduit` de M1b-04 (état du câble, version du contrat) — et,
+//!   depuis M1b-04 également, l'**événement** `KSEVENT_PINCAPS_JACKINFOCHANGE`, sans lequel
+//!   Windows ne relirait jamais le jack après un changement d'état.
 //!
 //! # Le jack est une propriété du **filtre** (M1b-03)
 //!
@@ -106,8 +108,10 @@ use core::ptr;
 
 use conduit_kmd_core::{M1A_FORMATS, SampleFormat};
 use portcls::{
-    CABLE_COUNT, CABLE_STATE_ACCESS_FLAGS, JACK_ACCESS_FLAGS, PIN_NAME_GUIDS, VERSION_ACCESS_FLAGS,
-    cable_state_item, jack_description_item, mute_item, version_item, volume_item,
+    CABLE_COUNT, CABLE_STATE_ACCESS_FLAGS, JACK_ACCESS_FLAGS, JACK_EVENT_FLAGS,
+    JACK_INFO_CHANGE_ID, PIN_NAME_GUIDS, VERSION_ACCESS_FLAGS, cable_state_item,
+    jack_description_item, jack_info_change_item, mute_item, version_item, volume_item,
+    with_events,
 };
 use portcls_sys::{
     GUID, IMiniportTopologyVtbl, KSCATEGORY_AUDIO, KSDATAFORMAT, KSDATAFORMAT__bindgen_ty_1,
@@ -473,9 +477,10 @@ const fn wave_filter<const P: usize, const C: usize>(
 
 /// **Forme topologie** : filtre de topologie avec ses nœuds.
 ///
-/// `automation` est la table du **filtre** : elle ne porte que
-/// `KSPROPERTY_JACK_DESCRIPTION` (voir l'en-tête de module), et se dédouble par sens
-/// comme celles des nœuds. Les propriétés audio, elles, restent sur les nœuds
+/// `automation` est la table du **filtre** : elle porte les propriétés qui ne sont ni de
+/// nœud ni de broche et l'événement `JACKINFOCHANGE` (voir l'en-tête de module), et se
+/// dédouble par sens comme celles des nœuds. Les propriétés audio, elles, restent sur les
+/// nœuds
 /// (`PCNODE_DESCRIPTOR::AutomationTable`) : PortCls route `KSPROPERTY_AUDIO_*` vers le nœud
 /// désigné par `PCPROPERTY_REQUEST::Node`, et les propriétés de filtre vers cette table-ci.
 const fn topo_filter<const P: usize, const N: usize, const C: usize>(
@@ -499,12 +504,12 @@ const fn topo_filter<const P: usize, const N: usize, const C: usize>(
 /// PortCls s'en sert pour avancer dans les tableaux, et une taille nulle avec un compte nul
 /// est un piège inutile à laisser.
 ///
-/// `EventCount = 0` reste la **dette de M1b-04** : maintenant que l'état de connexion est
-/// modifiable, il faut y déclarer un `PCEVENT_ITEM` `KSEVENT_PINCAPS_JACKINFOCHANGE` sur
-/// les filtres de topologie, faute de quoi Windows n'ira jamais relire le jack et
-/// l'interface restera figée sur l'état du démarrage (voir `portcls::jack`). La brique
-/// d'événements est construite à part ; le point d'émission est marqué dans
-/// `cable::Cable::set_connected`.
+/// `EventCount = 0` : cette fonction ne bâtit que le triplet des propriétés. Les deux
+/// tables de **filtre** de topologie y ajoutent leur `PCEVENT_ITEM`
+/// `KSEVENT_PINCAPS_JACKINFOCHANGE` en enveloppant le résultat dans `portcls::with_events`
+/// ([`TOPO_RENDER_AUTOMATION`], [`TOPO_CAPTURE_AUTOMATION`]) ; les quatre tables de nœud,
+/// elles, n'ont pas d'événement et gardent le triplet nul. C'est exactement ce que fait la
+/// macro `DEFINE_PCAUTOMATION_TABLE_PROP_EVENT` de `portcls.h`, en deux temps.
 const fn property_automation<const P: usize>(
     properties: &'static Shared<[PCPROPERTY_ITEM; P]>,
 ) -> PCAUTOMATION_TABLE {
@@ -678,12 +683,63 @@ static RENDER_FILTER_PROPERTIES: Shared<[PCPROPERTY_ITEM; FILTER_PROPERTY_COUNT]
 static CAPTURE_FILTER_PROPERTIES: Shared<[PCPROPERTY_ITEM; FILTER_PROPERTY_COUNT]> =
     Shared(CAPTURE_FILTER_ITEMS);
 
-/// Table d'automatisation du filtre `TopoRender<n>` : le jack et le jeu privé.
-static TOPO_RENDER_AUTOMATION: Shared<PCAUTOMATION_TABLE> =
-    Shared(property_automation(&RENDER_FILTER_PROPERTIES));
-/// Table d'automatisation du filtre `TopoCapture<n>`.
-static TOPO_CAPTURE_AUTOMATION: Shared<PCAUTOMATION_TABLE> =
-    Shared(property_automation(&CAPTURE_FILTER_PROPERTIES));
+/// Nombre d'événements portés par un filtre de topologie : `JACKINFOCHANGE`, et lui seul.
+const FILTER_EVENT_COUNT: usize = 1;
+
+/// `KSEVENT_PINCAPS_JACKINFOCHANGE` du **filtre** `TopoRender<n>` (M1b-04).
+///
+/// Sur le **filtre**, pas sur la broche endpoint : l'item est déclaré au niveau filtre et
+/// c'est le *signalement* qui désigne la broche (`GenerateEventList(…, PinEvent = TRUE,
+/// PinId = …)`). Cette géométrie est celle de SYSVAD, **attestée et non spécifiée** — voir
+/// l'en-tête de `portcls::event`, qui dit aussi quelle expérience tenter si l'événement ne
+/// partait pas en machine.
+///
+/// Monomorphisé sur `TopoRender` comme les propriétés, et pour la même raison : la garde de
+/// vtable du thunk compare l'adresse de `T::VTBL`.
+const RENDER_FILTER_EVENT_ITEMS: [PCEVENT_ITEM; FILTER_EVENT_COUNT] =
+    [jack_info_change_item::<IMiniportTopologyVtbl, TopoRender>()];
+/// Le même événement sur le filtre `TopoCapture<n>`, monomorphisé sur son type.
+const CAPTURE_FILTER_EVENT_ITEMS: [PCEVENT_ITEM; FILTER_EVENT_COUNT] =
+    [jack_info_change_item::<IMiniportTopologyVtbl, TopoCapture>()];
+
+static RENDER_FILTER_EVENTS: Shared<[PCEVENT_ITEM; FILTER_EVENT_COUNT]> =
+    Shared(RENDER_FILTER_EVENT_ITEMS);
+static CAPTURE_FILTER_EVENTS: Shared<[PCEVENT_ITEM; FILTER_EVENT_COUNT]> =
+    Shared(CAPTURE_FILTER_EVENT_ITEMS);
+
+/// Table d'automatisation du filtre `TopoRender<n>` : les trois propriétés, **plus**
+/// l'événement qui fait relire le jack.
+///
+/// `property_automation` bâtit les deux premiers triplets, `with_events` le troisième :
+/// c'est ce que fait la macro `DEFINE_PCAUTOMATION_TABLE_PROP_EVENT` de `portcls.h`.
+const fn topo_render_automation() -> PCAUTOMATION_TABLE {
+    with_events(
+        property_automation(&RENDER_FILTER_PROPERTIES),
+        RENDER_FILTER_EVENTS.get(),
+    )
+}
+
+/// Table d'automatisation du filtre `TopoCapture<n>`, même forme, l'autre sens.
+const fn topo_capture_automation() -> PCAUTOMATION_TABLE {
+    with_events(
+        property_automation(&CAPTURE_FILTER_PROPERTIES),
+        CAPTURE_FILTER_EVENTS.get(),
+    )
+}
+
+/// Doublet `const` puis `static`, comme [`EMPTY_AUTOMATION_TABLE`] : c'est **cette**
+/// valeur que les assertions de fin de fichier lisent, et c'est elle que la `static`
+/// enveloppe. Sans le doublet, les assertions devraient reconstruire une table de leur
+/// côté et ne diraient plus rien de celle que le pilote livre — une table de filtre qui
+/// perdrait son `with_events` passerait alors la compilation **sans un mot**, et le seul
+/// symptôme serait un endpoint figé sur son état de démarrage. C'est le pire mode de panne
+/// de ce module (voir l'en-tête), et le doublet est ce qui l'empêche.
+const TOPO_RENDER_AUTOMATION_TABLE: PCAUTOMATION_TABLE = topo_render_automation();
+/// Le même doublet pour le sens capture.
+const TOPO_CAPTURE_AUTOMATION_TABLE: PCAUTOMATION_TABLE = topo_capture_automation();
+
+static TOPO_RENDER_AUTOMATION: Shared<PCAUTOMATION_TABLE> = Shared(TOPO_RENDER_AUTOMATION_TABLE);
+static TOPO_CAPTURE_AUTOMATION: Shared<PCAUTOMATION_TABLE> = Shared(TOPO_CAPTURE_AUTOMATION_TABLE);
 
 static RENDER_VOLUME_AUTOMATION: Shared<PCAUTOMATION_TABLE> =
     Shared(property_automation(&RENDER_VOLUME_PROPERTIES));
@@ -1271,10 +1327,42 @@ const fn property_items_are_well_formed(mut items: &[PCPROPERTY_ITEM]) -> bool {
     true
 }
 
-/// Une `PCAUTOMATION_TABLE` : tailles d'élément exactes, `PropertyCount` égal à la
-/// longueur du tableau qu'elle pointe, `Properties` nul si et seulement si le compte l'est,
-/// et aucune méthode ni événement (le pilote n'en expose pas).
-const fn automation_is_well_formed(table: &PCAUTOMATION_TABLE, properties: usize) -> bool {
+/// Une entrée d'événement : jeu désigné, gestionnaire présent, et les flags de SYSVAD —
+/// `ENABLE` (sans quoi PortCls refuserait les verbes `ADD`/`REMOVE`, donc tout abonnement)
+/// et **pas** `ONESHOT` (l'abonnement doit survivre à la première notification).
+const fn event_item_is_well_formed(item: &PCEVENT_ITEM) -> bool {
+    !item.Set.is_null()
+        && item.Handler.is_some()
+        && item.Id == JACK_INFO_CHANGE_ID
+        && item.Flags == JACK_EVENT_FLAGS
+}
+
+/// Toutes les entrées d'un tableau d'événements (même motif de tranche que
+/// [`connections_are_well_formed`]).
+const fn event_items_are_well_formed(mut items: &[PCEVENT_ITEM]) -> bool {
+    while let [premier, reste @ ..] = items {
+        if !event_item_is_well_formed(premier) {
+            return false;
+        }
+        items = reste;
+    }
+    true
+}
+
+/// Une `PCAUTOMATION_TABLE` : tailles d'élément exactes, `PropertyCount` et `EventCount`
+/// égaux à la longueur des tableaux qu'ils pointent, pointeurs nuls si et seulement si les
+/// comptes le sont, et aucune méthode (le pilote n'en expose pas).
+///
+/// `events` **n'est pas toujours nul** depuis M1b-04 : les deux tables de filtre de
+/// topologie en déclarent un, les quatre tables de nœud aucun. C'est ce paramètre qui
+/// attrape une table de filtre qui aurait perdu son `with_events` — cas parfaitement muet
+/// autrement : la propriété continuerait de répondre, Windows ne s'abonnerait jamais, et
+/// l'interface resterait figée.
+const fn automation_is_well_formed(
+    table: &PCAUTOMATION_TABLE,
+    properties: usize,
+    events: usize,
+) -> bool {
     table.PropertyItemSize as usize == size_of::<PCPROPERTY_ITEM>()
         && table.PropertyCount as usize == properties
         && table.Properties.is_null() == (properties == 0)
@@ -1282,27 +1370,40 @@ const fn automation_is_well_formed(table: &PCAUTOMATION_TABLE, properties: usize
         && table.MethodCount == 0
         && table.Methods.is_null()
         && table.EventItemSize as usize == size_of::<PCEVENT_ITEM>()
-        && table.EventCount == 0
-        && table.Events.is_null()
+        && table.EventCount as usize == events
+        && table.Events.is_null() == (events == 0)
         && table.Reserved == 0
 }
 
 const _: () = {
     // La table des filtres **wave**, vide : c'est PortCls qui répond à `KSPROPSETID_Pin` et
     // `KSPROPSETID_Topology`.
-    assert!(automation_is_well_formed(&EMPTY_AUTOMATION_TABLE, 0));
+    assert!(automation_is_well_formed(&EMPTY_AUTOMATION_TABLE, 0, 0));
 
-    // Les deux tables de filtre **topologie** : le jack, l'état et la version.
+    // Les deux tables de filtre **topologie**, celles-là mêmes que les `static` livrent
+    // (doublet `const` puis `static`) : le jack, l'état et la version, **plus**
+    // l'événement `JACKINFOCHANGE`. C'est ce dernier triplet qui sépare un endpoint qui
+    // suit l'état du câble d'un endpoint figé au démarrage.
     assert!(automation_is_well_formed(
-        &property_automation(&RENDER_FILTER_PROPERTIES),
-        FILTER_PROPERTY_COUNT
+        &TOPO_RENDER_AUTOMATION_TABLE,
+        FILTER_PROPERTY_COUNT,
+        FILTER_EVENT_COUNT
     ));
     assert!(automation_is_well_formed(
-        &property_automation(&CAPTURE_FILTER_PROPERTIES),
-        FILTER_PROPERTY_COUNT
+        &TOPO_CAPTURE_AUTOMATION_TABLE,
+        FILTER_PROPERTY_COUNT,
+        FILTER_EVENT_COUNT
     ));
     assert!(property_items_are_well_formed(&RENDER_FILTER_ITEMS));
     assert!(property_items_are_well_formed(&CAPTURE_FILTER_ITEMS));
+
+    // Les deux entrées d'événement : le bon jeu, le bon identifiant, les flags de SYSVAD.
+    // `JACKINFOCHANGE` (1) et `FORMATCHANGE` (0) ne diffèrent que par l'identifiant, et
+    // signaler le second à la place du premier serait indétectable.
+    assert!(event_items_are_well_formed(&RENDER_FILTER_EVENT_ITEMS));
+    assert!(event_items_are_well_formed(&CAPTURE_FILTER_EVENT_ITEMS));
+    assert!(JACK_INFO_CHANGE_ID == 1);
+    assert!(JACK_EVENT_FLAGS & portcls_sys::KSEVENT_TYPE_ONESHOT == 0);
 
     // `GET | BASICSUPPORT`, et surtout **pas** `SET` : `KSPROPERTY_JACK_DESCRIPTION` est en
     // lecture seule (« Get: Yes, Set: No »). C'est le jeu privé de M1b-04, deux entrées
@@ -1326,22 +1427,27 @@ const _: () = {
     assert!(RENDER_FILTER_ITEMS[1].Id != RENDER_FILTER_ITEMS[2].Id);
     assert!(CAPTURE_FILTER_ITEMS[1].Id != CAPTURE_FILTER_ITEMS[2].Id);
 
-    // Les quatre tables de nœud : une propriété chacune, réellement pointée.
+    // Les quatre tables de nœud : une propriété chacune, réellement pointée, et **aucun**
+    // événement — les nœuds de volume et de sourdine n'en déclarent pas.
     assert!(automation_is_well_formed(
         &property_automation(&RENDER_VOLUME_PROPERTIES),
-        1
+        1,
+        0
     ));
     assert!(automation_is_well_formed(
         &property_automation(&RENDER_MUTE_PROPERTIES),
-        1
+        1,
+        0
     ));
     assert!(automation_is_well_formed(
         &property_automation(&CAPTURE_VOLUME_PROPERTIES),
-        1
+        1,
+        0
     ));
     assert!(automation_is_well_formed(
         &property_automation(&CAPTURE_MUTE_PROPERTIES),
-        1
+        1,
+        0
     ));
 
     // Et leurs entrées : gestionnaire présent, verbes déclarés.

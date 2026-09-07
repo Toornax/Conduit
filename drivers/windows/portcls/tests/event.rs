@@ -45,9 +45,9 @@ use portcls::portcls_sys::{
 };
 use portcls::{
     EventEntry, EventHandler, EventRequest, EventSource, EventTrace, JACK_EVENT_FLAGS,
-    JACK_INFO_CHANGE_ID, JackInfoChange, MiniportTopology, PortEvents, PortTopology, ResourceList,
-    STATUS_INVALID_DEVICE_REQUEST, STATUS_NOT_SUPPORTED, event, jack_info_change_item,
-    new_topology_object, unknown, with_events,
+    JACK_INFO_CHANGE_ID, JackInfoChange, JackTarget, JackTargets, MiniportTopology, PortEvents,
+    PortTopology, ResourceList, STATUS_INVALID_DEVICE_REQUEST, STATUS_NOT_SUPPORTED, event,
+    jack_info_change_item, new_topology_object, unknown, with_events,
 };
 
 // ---------------------------------------------------------------------------------
@@ -444,7 +444,7 @@ fn with_events_remplit_le_triplet_evenement_et_laisse_le_reste() {
 }
 
 /// La table complète bâtie en `static`, **exactement** comme `conduit-kmd` la bâtira :
-/// `one_property_automation(&…)` enveloppé dans `with_events(…, ÉVÉNEMENTS.get())`.
+/// `property_automation(&…)` enveloppé dans `with_events(…, ÉVÉNEMENTS.get())`.
 ///
 /// Ce test existe pour une raison précise : il vérifie que `with_events` est appelable dans
 /// un initialiseur de `static`, à travers l'enveloppe `Sync` du pilote (`Shared`, ici
@@ -472,7 +472,7 @@ fn la_table_complete_se_batit_en_static() {
     static EVENEMENTS: Enveloppe<[PCEVENT_ITEM; 1]> =
         Enveloppe([jack_info_change_item::<IMiniportTopologyVtbl, Cible>()]);
 
-    /// L'équivalent de `one_property_automation` de `conduit-kmd`.
+    /// L'équivalent de `property_automation` de `conduit-kmd`.
     const fn une_propriete(p: &'static Enveloppe<[PCPROPERTY_ITEM; 1]>) -> PCAUTOMATION_TABLE {
         PCAUTOMATION_TABLE {
             PropertyItemSize: size_of::<PCPROPERTY_ITEM>() as ULONG,
@@ -909,5 +909,292 @@ fn le_guid_passe_au_port_n_est_pas_la_static() {
     assert_ne!(
         vue, statique,
         "le port reçoit une copie sur la pile, pas la constante du crate"
+    );
+}
+
+// ---------------------------------------------------------------------------------
+// 7. `JackTargets` : les deux filtres de topologie d'un câble.
+//
+// C'est le mécanisme que `conduit_kmd::cable::Cable` porte sous son spin lock et que
+// `set_connected` déclenche. Le verrou n'est pas ici (le noyau n'existe pas en mode
+// utilisateur) ; tout le reste l'est, y compris la propriété qui rend la course avec le
+// démontage impossible — le comptage de références.
+// ---------------------------------------------------------------------------------
+
+/// Broche endpoint du filtre `TopoRender<n>` (`conduit_kmd::descriptors`).
+const BROCHE_ENDPOINT_RENDU: ULONG = 1;
+/// Broche endpoint du filtre `TopoCapture<n>` : **l'autre**, et c'est tout l'enjeu.
+const BROCHE_ENDPOINT_CAPTURE: ULONG = 0;
+
+/// L'`IPortEvents` d'un faux port, obtenue comme `Init` le fait : par `QueryInterface`.
+fn events_par_query_interface(port: &ComPtr<IPortEventsVtbl, FauxPortEvents>) -> PortEvents {
+    // SAFETY: `port` est vivant et détenu par l'appelant.
+    let r = unsafe { ComRef::<IPortEvents>::from_raw_add_ref(port.as_raw().cast()) };
+    PortEvents::from_port(&r).expect("le faux port répond à IID_IPortEvents")
+}
+
+/// Les signalements reçus par un faux port.
+fn generations(port: &ComPtr<IPortEventsVtbl, FauxPortEvents>) -> Vec<Generation> {
+    port.object().get().generations.lock().unwrap().clone()
+}
+
+/// Un câble dont les deux miniports ont fait leur `Init` : deux ports distincts, deux
+/// broches distinctes.
+fn cable_complet(
+    rendu: &ComPtr<IPortEventsVtbl, FauxPortEvents>,
+    capture: &ComPtr<IPortEventsVtbl, FauxPortEvents>,
+) -> JackTargets {
+    let mut cibles = JackTargets::new();
+    cibles.set_render(JackTarget::new(
+        events_par_query_interface(rendu),
+        BROCHE_ENDPOINT_RENDU,
+    ));
+    cibles.set_capture(JackTarget::new(
+        events_par_query_interface(capture),
+        BROCHE_ENDPOINT_CAPTURE,
+    ));
+    cibles
+}
+
+/// Ce que `TopoRender::init` et `TopoCapture::init` font : obtenir l'enveloppe par
+/// `QueryInterface` et la déposer dans le câble **avec la broche de leur sens**.
+///
+/// Un câble neuf n'a aucun destinataire — c'est son état avant tout `StartDevice`.
+#[test]
+fn init_depose_l_enveloppe_et_la_broche_de_son_sens() {
+    let vide = JackTargets::new();
+    assert!(vide.is_empty(), "un câble neuf n'a aucun destinataire");
+    assert!(vide.render().is_none() && vide.capture().is_none());
+
+    let rendu = faux_port_events();
+    let capture = faux_port_events();
+    let cibles = cable_complet(&rendu, &capture);
+
+    assert!(!cibles.is_empty());
+    assert_eq!(
+        cibles.render().expect("le sens rendu est posé").pin(),
+        BROCHE_ENDPOINT_RENDU
+    );
+    assert_eq!(
+        cibles.capture().expect("le sens capture est posé").pin(),
+        BROCHE_ENDPOINT_CAPTURE
+    );
+    // Chaque cible tient une référence sur **son** port (celle du `QueryInterface`).
+    assert_eq!(rendu.refcount(), 2);
+    assert_eq!(capture.refcount(), 2);
+}
+
+/// Ce que `Cable::set_connected` déclenche : les **deux** sens sont réveillés, chacun sur
+/// **sa** broche endpoint, sur **son** port.
+///
+/// C'est le test qui vaut la tâche entière : signaler la broche d'un sens sur le port de
+/// l'autre part quand même, ne réveille personne, et ne se voit nulle part ailleurs.
+#[test]
+fn les_deux_sens_sont_notifies_chacun_sur_sa_broche() {
+    let rendu = faux_port_events();
+    let capture = faux_port_events();
+    let cibles = cable_complet(&rendu, &capture);
+
+    cibles.notify_jack_change();
+
+    for (port, broche, sens) in [
+        (&rendu, BROCHE_ENDPOINT_RENDU, "rendu"),
+        (&capture, BROCHE_ENDPOINT_CAPTURE, "capture"),
+    ] {
+        let vues = generations(port);
+        assert_eq!(vues.len(), 1, "un seul signalement au sens {sens}");
+        let g = vues[0];
+        assert_eq!(
+            g.set,
+            Some(GUID2::de(&KSEVENTSETID_PinCapsChange)),
+            "sens {sens} : le jeu est passé, pas NULL"
+        );
+        assert_eq!(g.id, JACK_INFO_CHANGE_ID, "sens {sens}");
+        assert_eq!(g.pin_event, 1, "sens {sens} : PinEvent = TRUE");
+        assert_eq!(g.pin_id, broche, "sens {sens} : la broche de CE filtre");
+        assert_eq!(g.node_event, 0, "sens {sens} : NodeEvent = FALSE");
+    }
+}
+
+/// Un câble dont aucun miniport ne s'est fait connaître : rien ne part, et rien ne
+/// panique. C'est l'état de tout câble avant `StartDevice`, et `set_connected` peut y être
+/// atteint (le service d'assistance n'attend pas que l'endpoint existe).
+#[test]
+fn un_cable_sans_miniport_ne_notifie_rien() {
+    JackTargets::new().notify_jack_change();
+
+    // Et à moitié posé : seul le sens posé est réveillé.
+    let rendu = faux_port_events();
+    let jamais_pose = faux_port_events();
+    let mut cibles = JackTargets::new();
+    cibles.set_render(JackTarget::new(
+        events_par_query_interface(&rendu),
+        BROCHE_ENDPOINT_RENDU,
+    ));
+    cibles.notify_jack_change();
+
+    assert_eq!(generations(&rendu).len(), 1);
+    assert!(
+        generations(&jamais_pose).is_empty(),
+        "un port qui n'a jamais été posé ne reçoit rien"
+    );
+}
+
+/// Le démontage rend la référence COM, et pas avant : la pose la prend, le retrait rend la
+/// cible, et c'est sa **destruction** — hors du verrou, côté câble — qui relâche.
+#[test]
+fn le_retrait_rend_la_reference_com() {
+    let port = faux_port_events();
+    let seul = port.refcount();
+    assert_eq!(seul, 1, "seul le test détient le faux port");
+
+    let mut cibles = JackTargets::new();
+    cibles.set_render(JackTarget::new(
+        events_par_query_interface(&port),
+        BROCHE_ENDPOINT_RENDU,
+    ));
+    assert_eq!(port.refcount(), 2, "la pose a pris une référence");
+
+    // `Drop` du miniport : le câble retire la cible et la rend à son appelant.
+    let retiree = cibles.take_render();
+    assert!(retiree.is_some(), "le retrait rend la cible");
+    assert!(cibles.is_empty(), "le sens est libre");
+    assert_eq!(
+        port.refcount(),
+        2,
+        "retirer ne relâche pas : c'est la destruction de la cible qui relâche"
+    );
+
+    drop(retiree);
+    assert_eq!(port.refcount(), seul, "la référence est rendue");
+
+    // Le câble ne notifie plus ce sens : la cible n'y est plus.
+    cibles.notify_jack_change();
+    assert!(generations(&port).is_empty());
+}
+
+/// **La course**. Un signalement qui a pris sa copie sous le verrou survit au démontage du
+/// miniport : la copie tient une référence de plus, le port ne peut donc pas être détruit
+/// pendant qu'on le signale.
+///
+/// C'est la propriété sur laquelle repose `conduit_kmd::cable::Cable::notify_jack_change`,
+/// et la seule qu'un test puisse montrer : un pointeur libéré puis signalé serait un écran
+/// bleu, pas un test rouge.
+#[test]
+fn la_copie_survit_au_demontage_du_miniport() {
+    let rendu = faux_port_events();
+    let capture = faux_port_events();
+    let mut cibles = cable_complet(&rendu, &capture);
+
+    // Sous le verrou : la copie que `set_connected` emporte.
+    let copie = cibles.clone();
+    assert_eq!(rendu.refcount(), 3, "la copie a pris une référence de plus");
+    assert_eq!(capture.refcount(), 3);
+
+    // Verrou relâché, et les deux miniports se démontent au même instant : le câble n'a
+    // plus rien, et les deux cibles d'origine sont détruites.
+    drop(cibles.take_render());
+    drop(cibles.take_capture());
+    assert!(cibles.is_empty());
+    assert_eq!(
+        rendu.refcount(),
+        2,
+        "le port est encore vivant : la copie le tient"
+    );
+    assert_eq!(capture.refcount(), 2);
+
+    // Le signalement part quand même, et sur les bonnes broches.
+    copie.notify_jack_change();
+    assert_eq!(generations(&rendu)[0].pin_id, BROCHE_ENDPOINT_RENDU);
+    assert_eq!(generations(&capture)[0].pin_id, BROCHE_ENDPOINT_CAPTURE);
+
+    // Et la copie rend ses deux références en mourant.
+    drop(copie);
+    assert_eq!(rendu.refcount(), 1);
+    assert_eq!(capture.refcount(), 1);
+}
+
+/// Une seconde pose sur le même sens rend la première **au lieu de la détruire** : c'est ce
+/// qui permet au câble de relâcher la référence hors de son verrou.
+#[test]
+fn une_seconde_pose_rend_la_premiere() {
+    let premier = faux_port_events();
+    let second = faux_port_events();
+
+    let mut cibles = JackTargets::new();
+    assert!(
+        cibles
+            .set_capture(JackTarget::new(
+                events_par_query_interface(&premier),
+                BROCHE_ENDPOINT_CAPTURE
+            ))
+            .is_none(),
+        "rien à remplacer la première fois"
+    );
+    let ancienne = cibles.set_capture(JackTarget::new(
+        events_par_query_interface(&second),
+        BROCHE_ENDPOINT_CAPTURE,
+    ));
+    assert!(ancienne.is_some(), "la précédente est rendue, pas détruite");
+    assert_eq!(premier.refcount(), 2, "elle tient encore sa référence");
+    drop(ancienne);
+    assert_eq!(premier.refcount(), 1);
+
+    // Et c'est bien le second port qui est notifié désormais.
+    cibles.notify_jack_change();
+    assert!(generations(&premier).is_empty());
+    assert_eq!(generations(&second).len(), 1);
+}
+
+/// `take_all` (déchargement du pilote) vide les deux sens d'un coup et rend les deux
+/// références.
+#[test]
+fn take_all_vide_les_deux_sens() {
+    let rendu = faux_port_events();
+    let capture = faux_port_events();
+    let mut cibles = cable_complet(&rendu, &capture);
+
+    let restantes = cibles.take_all();
+    assert!(cibles.is_empty(), "le câble n'a plus de destinataire");
+    assert!(restantes.render().is_some() && restantes.capture().is_some());
+    assert_eq!(rendu.refcount(), 2);
+
+    drop(restantes);
+    assert_eq!(rendu.refcount(), 1);
+    assert_eq!(capture.refcount(), 1);
+}
+
+/// L'enveloppe rendue au verbe `ADD` (`EventSource::port_events`) est bien celle du port de
+/// ce sens : c'est par elle que l'abonnement entre dans la liste du **bon** port.
+#[test]
+fn l_enveloppe_du_sens_est_celle_de_son_port() {
+    let rendu = faux_port_events();
+    let capture = faux_port_events();
+    let cibles = cable_complet(&rendu, &capture);
+
+    // Ce que `Cable::jack_port_events` rend au miniport du sens rendu, et ce que le verbe
+    // `ADD` en fait : l'abonnement entre dans la liste de ce port-là.
+    let enveloppe = cibles
+        .render()
+        .expect("sens rendu posé")
+        .port_events()
+        .clone();
+    let this = new_topology_object(Cible {
+        port: Some(enveloppe),
+        traces: Mutex::new(Vec::new()),
+    })
+    .into_raw();
+    let mut req = requete(&ITEM_JACK, this, PCEVENT_VERB_ADD);
+    assert_eq!(appeler(&ITEM_JACK, &mut req), STATUS_SUCCESS);
+    assert_eq!(common::release(this), 0);
+
+    assert_eq!(
+        *rendu.object().get().ajouts.lock().unwrap(),
+        vec![FAUSSE_ENTREE],
+        "l'abonnement entre dans la liste du port du rendu"
+    );
+    assert!(
+        capture.object().get().ajouts.lock().unwrap().is_empty(),
+        "et surtout pas dans celle de l'autre sens"
     );
 }

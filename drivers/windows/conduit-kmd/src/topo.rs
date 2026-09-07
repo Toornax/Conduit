@@ -8,9 +8,33 @@
 //! sourdine) et servent les propriétés de ces nœuds en déléguant au [`NodeState`] du bon
 //! sens dans le câble. Ils implémentent aussi `portcls::JackInfo`, la propriété de
 //! **filtre** `KSPROPERTY_JACK_DESCRIPTION` (M1b-03), et `portcls::CableConfig`, le jeu de
-//! propriétés **privé** `KSPROPSETID_Conduit` (M1b-04). `Init` ne conserve rien : le port
-//! topologie et la liste de ressources reçus sont relâchés en sortie (`Drop` des
-//! enveloppes). `DataRangeIntersection` reste au défaut (PortCls intersecte lui-même).
+//! propriétés **privé** `KSPROPSETID_Conduit` (M1b-04), et `portcls::EventSource`, par
+//! lequel part `KSEVENT_PINCAPS_JACKINFOCHANGE`. `DataRangeIntersection` reste au défaut
+//! (PortCls intersecte lui-même).
+//!
+//! # Ce qu'`Init` retient du port, et jusqu'à quand
+//!
+//! `Init` ne retient du port qu'**une** chose : son `IPortEvents`, obtenu par
+//! `QueryInterface` (`portcls::PortEvents::from_port`). L'enveloppe `IPortTopology` et la
+//! liste de ressources sont relâchées en sortie comme avant (`Drop` des enveloppes).
+//!
+//! C'est le seul chemin par lequel cette interface est atteignable : elle s'obtient sur
+//! l'objet **port**, que seul un miniport de topologie voit, et il y a **deux ports par
+//! câble**. Le miniport la dépose donc, avec le numéro de **sa** broche endpoint, dans le
+//! câble ([`Cable::attach_jack_events`]), qui porte les deux et les signale tous les deux
+//! quand son état de connexion change (`portcls::JackTargets`).
+//!
+//! La référence COM ainsi prise est rendue par le **`Drop` du miniport**
+//! ([`Cable::detach_jack_events`]) : c'est l'instant où PortCls a fini d'appeler cet objet
+//! — le `Drop` suit son `Release` final — donc le premier où plus personne ne peut avoir
+//! besoin du port par notre intermédiaire. La rendre plus tôt exposerait un signalement
+//! concurrent à un port détruit ; plus tard, il n'y a pas de plus tard.
+//!
+//! Un `QueryInterface(IID_IPortEvents)` qui échoue fait **échouer `Init`**, comme la
+//! topologie de SYSVAD. Le port de PortCls implémente toujours cette interface : un refus
+//! voudrait dire que ce n'est pas le port qu'on croit, et continuer produirait un endpoint
+//! dont l'état ne pourrait plus jamais changer sans que rien ne le dise. Un `StartDevice`
+//! qui échoue proprement se diagnostique ; une interface figée, non (driver-design.md §7).
 //!
 //! # Les deux sens implémentent le **même** état de configuration
 //!
@@ -69,8 +93,8 @@
 
 use portcls::conduit_com::{ComRef, NtStatus, STATUS_SUCCESS};
 use portcls::{
-    AudioNodes, CableConfig, ConfigTrace, JackInfo, JackTrace, MiniportTopology, PortTopology,
-    ResourceList, Trace,
+    AudioNodes, CableConfig, ConfigTrace, EventSource, EventTrace, JackInfo, JackTarget, JackTrace,
+    MiniportTopology, PortEvents, PortTopology, ResourceList, Trace,
 };
 use portcls_sys::{IUnknown, KSAUDIO_SPEAKER_STEREO, PCFILTER_DESCRIPTOR, ULONG};
 
@@ -110,6 +134,12 @@ const _: () = {
     // broche bridge vers le filtre WaveRT (voir l'en-tête de module).
     assert!(TOPO_RENDER_PIN_ENDPOINT == 1 && TOPO_CAPTURE_PIN_ENDPOINT == 0);
     assert!(TOPO_RENDER_PIN_ENDPOINT < BROCHES && TOPO_CAPTURE_PIN_ENDPOINT < BROCHES);
+    // Les deux sens ne visent pas la même broche, et c'est ce qui rend le signalement de
+    // `KSEVENT_PINCAPS_JACKINFOCHANGE` faux ou juste : une `JackTarget` construite avec la
+    // broche de l'autre sens partirait quand même, sans réveiller personne (voir
+    // `portcls::event`). Si un jour les deux valaient le même numéro, la confusion
+    // deviendrait invisible — d'où cette assertion, qui n'a l'air de rien.
+    assert!(TOPO_RENDER_PIN_ENDPOINT != TOPO_CAPTURE_PIN_ENDPOINT);
     // Autant de bits à 1 dans la cartographie que de canaux déclarés.
     assert!(MAPPING_RENDU.count_ones() == CHANNELS);
     assert!(MAPPING_CAPTURE == 0);
@@ -132,15 +162,31 @@ impl TopoRender {
 }
 
 impl MiniportTopology for TopoRender {
-    // IRQL: PASSIVE_LEVEL
+    // IRQL: PASSIVE_LEVEL — le seul endroit d'où l'`IPortEvents` du port est atteignable
+    // (voir l'en-tête de module).
     fn init(
         &self,
         _adapter: Option<ComRef<IUnknown>>,
         _resources: ResourceList,
-        _port: PortTopology,
+        port: PortTopology,
     ) -> NtStatus {
         kmd_log!("TopoRender{}::Init", self.n);
-        STATUS_SUCCESS
+        match PortEvents::from_port(port.com_ref()) {
+            Ok(events) => {
+                self.cable.attach_jack_events(
+                    Direction::Render,
+                    JackTarget::new(events, TOPO_RENDER_PIN_ENDPOINT),
+                );
+                STATUS_SUCCESS
+            }
+            Err(status) => {
+                kmd_log!(
+                    "TopoRender{} : QueryInterface(IID_IPortEvents) a échoué ({status:#010x}), Init échoue",
+                    self.n
+                );
+                status
+            }
+        }
     }
 
     // IRQL: PASSIVE_LEVEL
@@ -247,6 +293,35 @@ impl CableConfig for TopoRender {
     }
 }
 
+impl EventSource for TopoRender {
+    // IRQL: PASSIVE_LEVEL (verbe `ADD`) — la copie prend une référence de plus, sous le
+    // verrou des destinataires : elle reste utilisable même si ce miniport se démonte.
+    fn port_events(&self) -> Option<PortEvents> {
+        self.cable.jack_port_events(Direction::Render)
+    }
+
+    // IRQL: PASSIVE_LEVEL
+    fn trace(&self, trace: &EventTrace) {
+        kmd_log!("TopoRender{} : {trace:?}", self.n);
+    }
+}
+
+impl Drop for TopoRender {
+    /// Retire le destinataire d'événement du câble et **relâche la référence COM** prise
+    /// dans `Init`.
+    ///
+    /// C'est le bon endroit et il n'y en a pas d'autre : ce `Drop` suit le `Release` final
+    /// que PortCls fait sur ce miniport, donc tout appel entrant est déjà terminé, et il
+    /// précède la disparition de l'objet, donc le câble ne gardera pas de cible morte. Un
+    /// signalement concurrent est indifférent à ce retrait : il passe par le même verrou et
+    /// tient déjà une copie comptée s'il a vu la cible (voir `portcls::JackTargets`).
+    ///
+    /// IRQL : `PASSIVE_LEVEL`.
+    fn drop(&mut self) {
+        self.cable.detach_jack_events(Direction::Render);
+    }
+}
+
 /// Miniport topologie du filtre `TopoCapture<n>`.
 #[derive(Debug)]
 pub struct TopoCapture {
@@ -264,15 +339,31 @@ impl TopoCapture {
 }
 
 impl MiniportTopology for TopoCapture {
-    // IRQL: PASSIVE_LEVEL
+    // IRQL: PASSIVE_LEVEL — voir `TopoRender::init` : même geste, l'autre sens, et **sa**
+    // broche endpoint.
     fn init(
         &self,
         _adapter: Option<ComRef<IUnknown>>,
         _resources: ResourceList,
-        _port: PortTopology,
+        port: PortTopology,
     ) -> NtStatus {
         kmd_log!("TopoCapture{}::Init", self.n);
-        STATUS_SUCCESS
+        match PortEvents::from_port(port.com_ref()) {
+            Ok(events) => {
+                self.cable.attach_jack_events(
+                    Direction::Capture,
+                    JackTarget::new(events, TOPO_CAPTURE_PIN_ENDPOINT),
+                );
+                STATUS_SUCCESS
+            }
+            Err(status) => {
+                kmd_log!(
+                    "TopoCapture{} : QueryInterface(IID_IPortEvents) a échoué ({status:#010x}), Init échoue",
+                    self.n
+                );
+                status
+            }
+        }
     }
 
     // IRQL: PASSIVE_LEVEL
@@ -371,5 +462,27 @@ impl CableConfig for TopoCapture {
     // IRQL: PASSIVE_LEVEL
     fn trace(&self, trace: &ConfigTrace<'_>) {
         kmd_log!("TopoCapture{} : {trace:?}", self.n);
+    }
+}
+
+impl EventSource for TopoCapture {
+    // IRQL: PASSIVE_LEVEL — voir `TopoRender`, l'autre sens du même câble.
+    fn port_events(&self) -> Option<PortEvents> {
+        self.cable.jack_port_events(Direction::Capture)
+    }
+
+    // IRQL: PASSIVE_LEVEL
+    fn trace(&self, trace: &EventTrace) {
+        kmd_log!("TopoCapture{} : {trace:?}", self.n);
+    }
+}
+
+impl Drop for TopoCapture {
+    /// Retire le destinataire d'événement du câble et relâche la référence COM prise dans
+    /// `Init` : voir `TopoRender`, même raisonnement, l'autre sens.
+    ///
+    /// IRQL : `PASSIVE_LEVEL`.
+    fn drop(&mut self) {
+        self.cable.detach_jack_events(Direction::Capture);
     }
 }

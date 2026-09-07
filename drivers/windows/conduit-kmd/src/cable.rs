@@ -41,6 +41,11 @@
 //! position, copie d'une avance de 2 ms) : `GetPosition` d'un flux ne prend que le verrou
 //! du flux, pas celui du câble.
 //!
+//! Le câble porte un **second** spin lock, celui des destinataires d'événement
+//! ([`Cable::attach_jack_events`]) : il n'entre dans aucun ordre de verrouillage, parce
+//! qu'il n'est jamais tenu en même temps qu'un autre — ni dans un sens ni dans l'autre.
+//! Voir la documentation du champ `jack_events`.
+//!
 //! # Les nœuds KS, et pourquoi ils sont ici
 //!
 //! Le câble porte aussi, par sens, l'état des nœuds de volume et de sourdine de son filtre
@@ -68,6 +73,12 @@
 //! que de seize valeurs). `StartDevice` la lit et l'applique par [`apply_active_mask`] ;
 //! chaque écriture réussie de la propriété la réécrit entière depuis [`active_mask`].
 //!
+//! Un changement d'état **se signale** : [`Cable::set_connected`] émet
+//! `KSEVENT_PINCAPS_JACKINFOCHANGE` sur les deux filtres de topologie du câble
+//! ([`Cable::notify_jack_change`]) avant de persister. Sans cet événement, Windows ne
+//! relit jamais `KSPROPERTY_JACK_DESCRIPTION` : la propriété rendrait la bonne valeur et
+//! le panneau de son ne bougerait pas (voir `portcls::event`).
+//!
 //! La constante `CONNECTED_BY_DEFAULT` de M1b-03 a disparu : l'état de départ ne se déduit
 //! plus du numéro de câble, il vient du registre. Ce qu'il en reste est le **défaut du
 //! masque**, `conduit_kmd_core::config::ACTIVE_CABLES_DEFAULT` (0x3, « Conduit 1 » et
@@ -82,6 +93,7 @@
 
 use core::ffi::c_void;
 use core::fmt;
+use core::mem::ManuallyDrop;
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
@@ -90,8 +102,8 @@ use conduit_kmd_core::{
     FrameLayout, Loopback, Notifier, StreamPosition, StreamView, VirtualClock, byte_offset,
     copy_frames, silence,
 };
-use portcls::VOLUME_MAX;
 use portcls::conduit_com::{NtStatus, STATUS_INSUFFICIENT_RESOURCES};
+use portcls::{JackTarget, JackTargets, PortEvents, VOLUME_MAX};
 use portcls_sys::{KSSTATE, PDEVICE_OBJECT, PMDL};
 use wdk_sys::ntddk::KeSetEvent;
 use wdk_sys::{KEVENT, PEX_TIMER, PVOID};
@@ -393,6 +405,16 @@ impl Direction {
             Self::Capture => "CaptureStream",
         }
     }
+
+    /// Nom du sens pour la journalisation (« rendu », « capture »), quand ce n'est pas
+    /// d'un flux qu'on parle mais du sens lui-même — les filtres de topologie, par
+    /// exemple, n'ont pas de flux.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Render => "rendu",
+            Self::Capture => "capture",
+        }
+    }
 }
 
 /// L'état du câble sous son spin lock : les deux emplacements, le plan de la boucle
@@ -512,6 +534,39 @@ pub struct Cable {
     render_nodes: NodeState,
     /// Nœuds volume et sourdine du filtre `TopoCapture<n>`.
     capture_nodes: NodeState,
+    /// Les **deux** filtres de topologie du câble, tels qu'ils se sont fait connaître dans
+    /// leur `Init` : c'est par eux que [`Cable::set_connected`] fait relire la prise à
+    /// Windows (`portcls::JackTargets`).
+    ///
+    /// # Un verrou à part, et lequel
+    ///
+    /// Ni atomique (une `PortEvents` est une référence comptée, pas un mot) ni sous le
+    /// verrou du câble : un **spin lock dédié**, jamais pris en même temps qu'un autre —
+    /// ni le verrou du câble, ni celui d'un flux ne sont pris pendant qu'on le tient, et
+    /// réciproquement. Il n'entre donc dans aucun ordre de verrouillage, ce qui est la
+    /// façon la plus simple de ne pas se tromper d'ordre. Il ne protège que deux `Option`,
+    /// et la section critique la plus longue est une copie qui prend deux références COM.
+    ///
+    /// C'est ce verrou qui rend impossible la course entre le signalement et le démontage
+    /// d'un miniport : voir `portcls::JackTargets` et [`Cable::notify_jack_change`].
+    ///
+    /// # Pourquoi `ManuallyDrop`
+    ///
+    /// Une `JackTarget` possède une référence COM, donc une glu de destruction — et un
+    /// [`Cable`] n'a pas le droit d'en avoir une. Les câbles sont un tableau `static`
+    /// construit **à la compilation** ([`cables`]), par un `const fn` qui **affecte** chaque
+    /// élément : une affectation détruit la valeur remplacée, et l'évaluation `const`
+    /// refuse toute destruction (`E0493`). La même règle interdirait les assertions qui
+    /// vérifient la numérotation des câbles. Le choix est donc entre « pas de glu » et
+    /// « pas de vérification à la compilation », et ce module a déjà tranché ailleurs.
+    ///
+    /// Ce n'est pas une fuite : un [`Cable`] **n'est jamais détruit** — il vit dans la
+    /// section de données du pilote, du chargement au déchargement (voir l'en-tête de
+    /// module) —, si bien que la glu ne s'exécuterait de toute façon jamais. Les références
+    /// COM, elles, sont rendues explicitement : par [`Cable::detach_jack_events`] au `Drop`
+    /// de chaque miniport, et par [`shutdown`] au déchargement, pour ce qui aurait
+    /// survécu. `ManuallyDrop` ne fait qu'écrire ce qui était déjà vrai.
+    jack_events: SpinLock<ManuallyDrop<JackTargets>>,
     /// `KSJACK_DESCRIPTION::IsConnected` des **deux** filtres de topologie du câble : 0 ou
     /// 1 (hors verrou, comme [`NodeState`] ; un `AtomicU32` plutôt qu'un `AtomicBool` pour
     /// que l'aligné 32 bits se relise sans surprise dans un vidage mémoire).
@@ -560,6 +615,7 @@ impl Cable {
             counters: Counters::new(),
             render_nodes: NodeState::new(),
             capture_nodes: NodeState::new(),
+            jack_events: SpinLock::new(ManuallyDrop::new(JackTargets::new())),
             connected: AtomicU32::new(if config::is_active(ACTIVE_CABLES_DEFAULT, index) {
                 1
             } else {
@@ -595,25 +651,128 @@ impl Cable {
     /// l'a lu. Sérialiser coûterait un verrou à `PASSIVE_LEVEL` pour une course qui,
     /// au pire, rejoue une écriture de registre au démarrage suivant.
     ///
-    /// # Le point d'insertion de `KSEVENT_PINCAPS_JACKINFOCHANGE`
+    /// # `KSEVENT_PINCAPS_JACKINFOCHANGE`, entre l'état et la persistance
     ///
-    /// **C'est ici**, juste après le `store` ci-dessous et avant la persistance : les deux
-    /// filtres de topologie du câble (`TopoRender<n>` et `TopoCapture<n>`) doivent recevoir
-    /// l'événement, faute de quoi Windows n'ira jamais relire
-    /// `KSPROPERTY_JACK_DESCRIPTION` et l'interface restera figée sur l'état du démarrage
-    /// (voir `portcls::jack`). Le symptôme serait « la propriété KS rend la bonne valeur
-    /// mais le panneau de son ne bouge pas ». La brique d'événements
-    /// (`PCEVENT_ITEM` dans la table d'automatisation du filtre, `PcGenerateEventList`) est
-    /// construite à part et sera raccordée ici.
+    /// Les deux filtres de topologie du câble (`TopoRender<n>` et `TopoCapture<n>`)
+    /// reçoivent l'événement **après** le `store` et **avant** la persistance
+    /// ([`Cable::notify_jack_change`]) : sans lui, Windows n'irait jamais relire
+    /// `KSPROPERTY_JACK_DESCRIPTION` et l'interface resterait figée sur l'état du démarrage
+    /// (voir `portcls::jack`) — « la propriété KS rend la bonne valeur mais le panneau de
+    /// son ne bouge pas ».
     ///
-    /// IRQL : `PASSIVE_LEVEL` (l'écriture au registre l'exige).
+    /// L'ordre compte dans un seul sens : le signalement doit suivre le `store`, puisque
+    /// c'est la valeur enregistrée que Windows relira. Le placer avant la persistance,
+    /// plutôt qu'après, fait que l'interface bouge même si l'écriture au registre échoue —
+    /// l'état en mémoire, lui, a bien changé.
+    ///
+    /// # IRQL
+    ///
+    /// **`PASSIVE_LEVEL`**, et pour deux raisons indépendantes : l'écriture au registre
+    /// l'exige (`IoOpenDeviceRegistryKey`, `ZwSetValueKey`), et le `Drop` de la copie des
+    /// destinataires peut relâcher la dernière référence sur un objet port, ce qui ne se
+    /// fait pas à IRQL élevé. Le signalement lui-même n'est pas le facteur limitant :
+    /// `GenerateEventList` tolère `<= DISPATCH_LEVEL` sans réserve (voir
+    /// `portcls::event`). Le spin lock des destinataires, lui, n'est tenu que le temps
+    /// d'une copie, à `DISPATCH_LEVEL`.
     pub fn set_connected(&self, connected: bool) -> Result<(), NtStatus> {
         self.connected
             .store(u32::from(connected), Ordering::Relaxed);
-        // ICI : émettre KSEVENT_PINCAPS_JACKINFOCHANGE sur TopoRender<index> et
-        // TopoCapture<index> (M1b-04, brique d'événements). Voir la documentation
-        // ci-dessus.
+        self.notify_jack_change();
         self.persist_active_mask()
+    }
+
+    /// Inscrit le filtre de topologie du sens `direction` comme destinataire de
+    /// `KSEVENT_PINCAPS_JACKINFOCHANGE`, avec la broche endpoint de **ce** filtre.
+    ///
+    /// Appelé par `topo::TopoRender::init` / `topo::TopoCapture::init`, seuls endroits où
+    /// l'objet port est visible. La `JackTarget` porte la référence COM obtenue par
+    /// `QueryInterface` ; c'est le câble qui la possède désormais, et
+    /// [`detach_jack_events`](Self::detach_jack_events) qui la rendra.
+    ///
+    /// IRQL : `PASSIVE_LEVEL` (`Init`).
+    pub fn attach_jack_events(&self, direction: Direction, target: JackTarget) {
+        let ancienne = {
+            let mut cibles = self.jack_events.lock();
+            match direction {
+                Direction::Render => cibles.set_render(target),
+                Direction::Capture => cibles.set_capture(target),
+            }
+        };
+        // Hors du verrou : le `Drop` d'une cible relâche une référence COM, et la dernière
+        // détruirait l'objet port — jamais à `DISPATCH_LEVEL`.
+        if ancienne.is_some() {
+            kmd_log!(
+                "câble {} : une cible d'événement {} était déjà inscrite (remplacée)",
+                self.index,
+                direction.name()
+            );
+        }
+        drop(ancienne);
+    }
+
+    /// Retire le destinataire du sens `direction` et **relâche sa référence COM**.
+    ///
+    /// Appelé par le `Drop` du miniport de topologie : c'est le dernier instant où la
+    /// cible est encore joignable, et le premier où la relâcher est sûr. Après le retour,
+    /// un signalement concurrent ne peut plus trouver ce sens (il l'a vu avant, et il en
+    /// tient alors une copie comptée : voir `portcls::JackTargets`).
+    ///
+    /// IRQL : `PASSIVE_LEVEL` (`Release` final du miniport, depuis PortCls).
+    pub fn detach_jack_events(&self, direction: Direction) {
+        let cible = {
+            let mut cibles = self.jack_events.lock();
+            match direction {
+                Direction::Render => cibles.take_render(),
+                Direction::Capture => cibles.take_capture(),
+            }
+        };
+        // Verrou relâché : voir `attach_jack_events`.
+        drop(cible);
+    }
+
+    /// L'`IPortEvents` du filtre de topologie du sens `direction`, s'il s'est fait
+    /// connaître : ce que `portcls::EventSource::port_events` rend au verbe `ADD`.
+    ///
+    /// La copie prend une référence de plus, sous le verrou : l'appelant peut la garder
+    /// aussi longtemps qu'il veut sans risquer que le miniport la démonte sous lui.
+    ///
+    /// IRQL : `PASSIVE_LEVEL` (verbe `ADD` d'un événement KS).
+    pub fn jack_port_events(&self, direction: Direction) -> Option<PortEvents> {
+        let cibles = self.jack_events.lock();
+        match direction {
+            Direction::Render => cibles.render(),
+            Direction::Capture => cibles.capture(),
+        }
+        .map(|cible| cible.port_events().clone())
+    }
+
+    /// Signale `KSEVENT_PINCAPS_JACKINFOCHANGE` aux **deux** filtres de topologie du
+    /// câble, chacun sur sa broche endpoint.
+    ///
+    /// Un câble dont aucun miniport ne s'est fait connaître ne notifie rien et ne
+    /// s'en plaint pas : c'est l'état normal avant `StartDevice`.
+    ///
+    /// # Pourquoi la copie
+    ///
+    /// La copie est prise **sous** le verrou et le signalement fait **dehors**. Sous le
+    /// verrou, chaque copie prend une référence COM de plus : le port ne peut donc pas
+    /// être détruit pendant qu'on le signale, même si le miniport se démonte au même
+    /// instant — il devra passer par ce même verrou pour retirer sa cible, et il ne
+    /// trouvera plus qu'un compteur qui ne tombe pas à zéro. Dehors, parce que
+    /// `GenerateEventList` appelle PortCls et que le `Drop` de la copie peut détruire un
+    /// objet port : ni l'un ni l'autre n'a sa place dans une section critique à
+    /// `DISPATCH_LEVEL`.
+    ///
+    /// IRQL : `PASSIVE_LEVEL` (voir [`set_connected`](Self::set_connected)).
+    fn notify_jack_change(&self) {
+        // `JackTargets::clone` et non `garde.clone()` : la garde donne un
+        // `ManuallyDrop<JackTargets>`, dont le `Clone` rendrait une copie **sans** glu de
+        // destruction — deux références COM prises et jamais rendues.
+        let cibles = {
+            let garde = self.jack_events.lock();
+            JackTargets::clone(&garde)
+        };
+        cibles.notify_jack_change();
     }
 
     /// Écrit le masque des câbles actifs dans la clé matérielle du périphérique.
@@ -709,6 +868,21 @@ impl Cable {
             // trace qui cumulerait les ticks des cycles précédents ferait croire à une
             // image obsolète du pilote.
             self.counters.reset();
+        }
+        // Les cibles d'événement ne sont **pas** effacées : elles sont posées par les
+        // `Init` des miniports de topologie, qui suivent ce `start`, et retirées par leur
+        // `Drop`, qui précède le `StopDevice` suivant. En trouver une ici signalerait un
+        // miniport survivant à son cycle — jamais vu, mais silencieux si on n'y regarde
+        // pas.
+        let cible_restante = {
+            let cibles = self.jack_events.lock();
+            !cibles.is_empty()
+        };
+        if cible_restante {
+            kmd_log!(
+                "câble {} : une cible d'événement était encore inscrite au démarrage",
+                self.index
+            );
         }
         let context: PVOID = ptr::from_ref(self).cast_mut().cast();
         // SAFETY: `self` est un élément du `static` `CABLES` : le contexte reste valide
@@ -928,6 +1102,15 @@ impl Cable {
     /// IRQL : `PASSIVE_LEVEL`, hors de tout spin lock.
     fn shutdown(&self) {
         self.timer.delete();
+        // Les cibles d'événement devraient déjà avoir été retirées par le `Drop` de leur
+        // miniport ; les relâcher ici garantit qu'aucune référence sur un objet port ne
+        // survit au déchargement. Hors du verrou, comme partout ailleurs : le `Drop` d'une
+        // cible peut détruire l'objet port.
+        let restantes = {
+            let mut cibles = self.jack_events.lock();
+            cibles.take_all()
+        };
+        drop(restantes);
         // L'objet de périphérique ne survit pas au déchargement : le pointeur repart à nul
         // pour qu'aucun chemin résiduel ne s'en serve. `persist_active_mask` traite ce cas
         // par un statut nommé, jamais par un déréférencement.
