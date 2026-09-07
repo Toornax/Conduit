@@ -433,9 +433,25 @@ signé par attestation, HLK audio passé, latence conforme à SPEC §5.6, endura
   Un plafond oublié a fait échouer le cinquième sous-périphérique avec
   `STATUS_ALLOTTED_SPACE_EXCEEDED` : `MaxSubdevices`, passé à `PcAddAdapterDevice`, borne
   `PcRegisterSubdevice` et valait encore la taille d'un seul câble.
-- [ ] **M1b-03** `feat(driver): état de jack par câble, inactifs masqués`
+- [x] **M1b-03** `feat(driver): état de jack par câble, inactifs masqués`
   `KSPROPERTY_JACK_DESCRIPTION` avec `IsConnected` ; câbles 1 et 2 actifs par défaut.
   *Fait quand* : les réglages Son ne montrent que Conduit 1 et 2 ; les autres apparaissent sous « déconnectés ».
+  *Mesuré le 2026-09-07*, dans la VM — et **mesuré plutôt que constaté à l'œil** : ce que
+  les réglages Son affichent est l'état MMDevice, qui se lit. Les seize câbles publient
+  bien leurs trente-deux endpoints ; **seuls Conduit 1 et 2 sont à l'état 1 (actif)**, les
+  quatorze autres à l'état **8 (débranché)**, et seuls les quatre endpoints des deux
+  premiers câbles ont un devnode présent.
+  Trois affirmations de la conception étaient fausses et ont été corrigées avant d'écrire
+  le code : la description de prise est une propriété du **filtre**, pas de la broche (une
+  broche bridge à `MaxInstanceCount = 0` ne s'instancie jamais, une table posée là ne
+  serait jamais atteinte) ; `N` compte les **prises**, pas les canaux, donc un câble en
+  déclare **une** à deux canaux ; et la broche décrite est celle qui porte la catégorie
+  d'endpoint, pas celle que notre code appelle `bridge_pin` — collision de vocabulaire avec
+  la documentation. Cette dernière erreur ne casse rien de visible : la propriété répond,
+  toujours vide. Des assertions `const` la verrouillent désormais.
+  *Dette assumée* : `KSEVENT_PINCAPS_JACKINFOCHANGE` n'est pas implémenté. Rien ne change
+  encore l'état, mais sans lui M1b-04 donnerait « la propriété rend la bonne valeur et le
+  panneau de son ne bouge pas ». Noté à trois endroits du code.
 - [x] **M1b-03b** `feat(driver): nœud de volume, pour que le câble soit transparent`
   Nœuds `KSNODETYPE_VOLUME` et `KSNODETYPE_MUTE` sur les filtres de topologie. Sans eux,
   Windows insère son **APO logiciel** et applique au signal le volume par défaut qu'il
