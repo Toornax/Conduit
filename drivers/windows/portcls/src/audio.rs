@@ -8,23 +8,29 @@
 //! `conduit-kmd`, dans des atomiques ; c'est lui qui implémentera [`AudioNodes`] pour
 //! `TopoRender` et `TopoCapture`.
 //!
-//! # L'échelle de volume : 1/65536 dB, mesurée et non devinée
+//! # L'échelle de volume : 1/65536 dB, documentée et pas encore mesurée
 //!
 //! `KSPROPERTY_AUDIO_VOLUMELEVEL` transporte un `LONG` en unités de **1/65536 dB**
 //! (virgule fixe 16.16), **et non en centièmes de décibel** — c'est l'erreur classique,
 //! et elle est silencieuse : l'endpoint fonctionne, mais le curseur de Windows parcourt
 //! une plage absurde. D'où [`VOLUME_MIN`], [`VOLUME_MAX`] et [`VOLUME_DELTA`], appuyés
-//! sur trois sources concordantes :
+//! sur **deux sources concordantes**, et une **vérification qui reste à faire** :
 //!
 //! - la documentation Microsoft de `KSPROPERTY_AUDIO_VOLUMELEVEL` (« *in units of
 //!   1/65536 decibel* ») ;
 //! - les constantes de SYSVAD (`VOLUME_STEPPING_DELTA`, `VOLUME_SIGNED_MAXIMUM`,
 //!   `VOLUME_SIGNED_MINIMUM` dans son `minwavert.h`), qui décrivent la même plage ;
-//! - un **relevé en machine virtuelle** : `IAudioEndpointVolume::GetVolumeRange` sur
-//!   l'endpoint Conduit doit rendre exactement `−96,0 / 0,0 / 0,5` dB. C'est le contrôle
-//!   à refaire si l'échelle change un jour, et c'est le test de `BASICSUPPORT` complet
-//!   (palier 72) qui le rappellera : la plage annoncée là est *littéralement* ce que le
-//!   moteur audio affiche.
+//! - **à faire, une fois le nœud câblé** : `conduit-looptest --list --show-volume` sur
+//!   l'endpoint « Conduit 1 » doit rendre `−96,0 / 0,0 / 0,5` dB. Tant que ce relevé
+//!   n'existe pas, l'échelle est une lecture de documentation et rien de plus.
+//!
+//! Le relevé du 2026-09-07 sur les cartes de la machine hôte donne bien `−96,0 / 0,0`
+//! comme bornes, mais un pas de **1,5 dB** — et les trois cartes, matériels sans rapport,
+//! annoncent une plage rigoureusement identique. C'est donc le volume **logiciel** de
+//! Windows qui répond, faute de nœud dans leur topologie : la mesure conforte les bornes
+//! et ne dit rien du pas d'un vrai nœud. C'est le test de `BASICSUPPORT` complet
+//! (palier 72) qui fige ce que nous annonçons, et la plage qu'il décrit est
+//! *littéralement* ce que le moteur audio affichera.
 //!
 //! # `KSPROPERTY_TYPE_BASICSUPPORT` n'est pas optionnel
 //!
