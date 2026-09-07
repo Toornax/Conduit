@@ -421,16 +421,20 @@ signé par attestation, HLK audio passé, latence conforme à SPEC §5.6, endura
 - [ ] **M1b-03** `feat(driver): état de jack par câble, inactifs masqués`
   `KSPROPERTY_JACK_DESCRIPTION` avec `IsConnected` ; câbles 1 et 2 actifs par défaut.
   *Fait quand* : les réglages Son ne montrent que Conduit 1 et 2 ; les autres apparaissent sous « déconnectés ».
-- [ ] **M1b-03b** `feat(driver): nœud de volume, pour que le câble soit transparent`
-  Nœud `KSNODETYPE_VOLUME` sur les filtres de topologie, initialisé à 0 dB et piloté par
-  nous. Sans lui, Windows insère son **APO logiciel** et applique au signal le volume par
-  défaut qu'il donne à tout endpoint neuf : mesuré à 64 % le 2026-09-06, soit une amplitude
-  de 0,229 pour 0,500 demandée. Un câble virtuel dont la raison d'être est la transparence
-  bit à bit ne peut pas atténuer ce qu'il transporte
-  ([driver-design.md](docs/driver-design.md) §5.5).
+- [x] **M1b-03b** `feat(driver): nœud de volume, pour que le câble soit transparent`
+  Nœuds `KSNODETYPE_VOLUME` et `KSNODETYPE_MUTE` sur les filtres de topologie. Sans eux,
+  Windows insère son **APO logiciel** et applique au signal le volume par défaut qu'il
+  donne à tout endpoint neuf : mesuré à 64 % le 2026-09-06, soit une amplitude de 0,229
+  pour 0,500 demandée ([driver-design.md](docs/driver-design.md) §5.5).
   *Fait quand* : `conduit-looptest --repeat 10` rend l'amplitude demandée sans avoir à
   forcer le volume de l'endpoint, et la modifier dans les réglages Son ne change plus rien
   à ce qui traverse le câble.
+  *Mesuré le 2026-09-07*, en session console : un endpoint neuf rend **100 %** au lieu de
+  64 %, dix passes sur dix à **amplitude 0,500**, et le volume forcé à **30 % laisse
+  l'amplitude à 0,500** — le curseur est décoratif, le câble est transparent. Au passage,
+  deux hypothèses de conception vérifiées : l'échelle est bien 1/65536 dB (plage annoncée
+  −96,0 / 0,0 dB au pas de 0,5), et le canal est bien le premier `LONG` de l'instance
+  (Windows interroge canal 0 puis canal 1).
 - [ ] **M1b-04** `feat(driver): propriété KS privée de configuration (activer, désactiver, canaux)`
   Jeu de propriétés KS privé `KSPROPSETID_Conduit` exposé par le filtre de topologie de
   chaque câble, et non un objet de périphérique de contrôle séparé
