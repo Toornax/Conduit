@@ -19,6 +19,7 @@
 //! | [`stream`] | traits [`MiniportWaveRTStream`] / [`MiniportWaveRTStreamNotification`] ↔ leurs vtables, [`AudioBuffer`] |
 //! | [`received`] | enveloppes des interfaces reçues : [`ResourceList`], [`PortTopology`], [`PortWaveRT`], [`PortWaveRTStream`], [`RegistryKey`] |
 //! | [`property`] | trait [`PropertyHandler`] ↔ `PCPROPERTY_ITEM`/`PCPROPERTY_REQUEST` : les propriétés KS d'un miniport |
+//! | [`audio`] | sémantique des nœuds volume/sourdine au-dessus de [`property`] : trait [`AudioNodes`], gestionnaires [`Volume`] et [`Mute`], échelle en 1/65536 dB |
 //! | [`adapter`] | côté adaptateur : `PcNewPort`, `IPort::Init`, `PcRegisterSubdevice`, `PcRegisterPhysicalConnection` (feature `kernel`), noms des sous-périphériques et GUID de nom de broche partagés avec l'INF |
 //! | [`status`] | les codes `NTSTATUS` du contrat PortCls absents de `conduit-com` |
 //!
@@ -77,6 +78,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod adapter;
+pub mod audio;
 pub mod miniport;
 pub mod power;
 pub mod property;
@@ -96,6 +98,10 @@ pub use adapter::{
 };
 #[cfg(feature = "kernel")]
 pub use adapter::{new_port, register_physical_connection, register_subdevice};
+pub use audio::{
+    ACCESS_FLAGS, AudioNodes, Channel, Mute, Trace, VOLUME_DELTA, VOLUME_MAX, VOLUME_MIN, Volume,
+    mute_item, volume_item,
+};
 pub use power::{
     AdapterPowerManagement, PowerObject, PowerVtbl, new_power_object, try_new_power_object,
 };
