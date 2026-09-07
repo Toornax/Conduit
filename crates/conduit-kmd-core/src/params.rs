@@ -154,6 +154,54 @@ const _: () = assert!(MAX_CHANNELS == FrameLayout::MAX_CHANNELS as u32);
 const _: () = assert!(MAX_RESERVE <= u8::MAX as u32);
 const _: () = assert!(MAX_CHANNELS <= u8::MAX as u32);
 
+/// Type `REG_DWORD` de `winnt.h` : entier de 32 bits, stocké dans le boutisme de la
+/// machine (`REG_DWORD` et `REG_DWORD_LITTLE_ENDIAN` sont la même valeur, 4).
+///
+/// La constante est **recopiée** plutôt qu'importée de `wdk-sys` : ce crate est
+/// portable, sans dépendance, et se teste depuis Linux et macOS. Une divergence entre
+/// les deux serait silencieuse et coûteuse — toutes les valeurs seraient rejetées et le
+/// pilote prendrait ses défauts sans qu'aucun test ne bronche — d'où l'assertion à la
+/// compilation `conduit_kmd::registry::_REG_DWORD_IDENTIQUE_AU_WDK`, qui les compare
+/// côté pilote.
+pub const REG_DWORD: u32 = 4;
+
+/// Taille, en octets, de la charge utile d'un `REG_DWORD`.
+pub const REG_DWORD_BYTES: usize = 4;
+
+/// Décode la charge utile d'une valeur de registre en `u32`, ou rend `None`.
+///
+/// `kind` est le champ `Type` de `KEY_VALUE_PARTIAL_INFORMATION`, `data` sa charge utile
+/// tronquée à `DataLength` octets. Rend `None` — c'est-à-dire « le registre ne fournit
+/// rien d'exploitable, prends la valeur par défaut » — dans les trois cas que
+/// l'administrateur peut provoquer :
+///
+/// - **mauvais type** : un `REG_SZ` (« 16 ») là où un `REG_DWORD` est attendu, la faute
+///   la plus courante dans `regedit` ; `REG_DWORD_BIG_ENDIAN` est refusé de la même
+///   façon, c'est un autre type ;
+/// - **taille incohérente** : un `REG_DWORD` dont `DataLength` ne vaut pas exactement
+///   quatre octets, qu'il soit tronqué (valeur écrite à la main dans une ruche, lecture
+///   coupée par un tampon trop court) ou trop long ;
+/// - **données vides** : `DataLength` nul, ce que produit une valeur créée sans contenu.
+///
+/// # Pourquoi cette fonction vit ici et pas dans le pilote
+///
+/// C'est la partie la plus facile à casser du chemin de lecture — un décalage d'octet,
+/// un boutisme, une taille acceptée trop généreusement — et la seule qui ne demande
+/// aucun appel noyau. Isolée ici, elle est couverte par `cargo test -p
+/// conduit-kmd-core` ; laissée dans `conduit-kmd`, elle ne serait testable qu'en machine
+/// virtuelle, car `wdk-sys` lie les bibliothèques noyau jusque sous `cargo test`.
+pub const fn decode_dword(kind: u32, data: &[u8]) -> Option<u32> {
+    if kind != REG_DWORD || data.len() != REG_DWORD_BYTES {
+        return None;
+    }
+    match data.first_chunk::<REG_DWORD_BYTES>() {
+        // Boutisme de la machine : `REG_DWORD` == `REG_DWORD_LITTLE_ENDIAN`, et Windows
+        // ne tourne que sur des architectures petit-boutistes (x64, ARM64).
+        Some(octets) => Some(u32::from_le_bytes(*octets)),
+        None => None,
+    }
+}
+
 /// Un des trois paramètres de registre.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Param {
@@ -603,6 +651,65 @@ mod tests {
         assert!(report.get(Param::Channels).is_none());
     }
 
+    /// Autres types de `winnt.h` cités dans les cas de test.
+    const REG_SZ: u32 = 1;
+    const REG_BINARY: u32 = 3;
+    const REG_DWORD_BIG_ENDIAN: u32 = 5;
+    const REG_QWORD: u32 = 11;
+
+    #[test]
+    fn decodage_du_registre() {
+        // Bon type, bonne taille : la valeur, en petit-boutiste.
+        assert_eq!(decode_dword(REG_DWORD, &[16, 0, 0, 0]), Some(16));
+        assert_eq!(decode_dword(REG_DWORD, &[0, 0, 0, 0]), Some(0));
+        assert_eq!(
+            decode_dword(REG_DWORD, &[0xFF, 0xFF, 0xFF, 0xFF]),
+            Some(u32::MAX)
+        );
+        // Le boutisme n'est pas une supposition : 0x0000_0010, pas 0x1000_0000.
+        assert_eq!(decode_dword(REG_DWORD, &[0x10, 0, 0, 0]), Some(0x10));
+
+        // Bon type, taille tronquée ou trop longue : rien d'exploitable. Accepter trois
+        // octets en complétant de zéros rendrait 16 pour un `10 00 00` amputé, une
+        // valeur plausible et fausse.
+        assert_eq!(decode_dword(REG_DWORD, &[16, 0, 0]), None);
+        assert_eq!(decode_dword(REG_DWORD, &[16]), None);
+        assert_eq!(decode_dword(REG_DWORD, &[16, 0, 0, 0, 0]), None);
+
+        // Données vides : valeur créée sans contenu.
+        assert_eq!(decode_dword(REG_DWORD, &[]), None);
+
+        // Mauvais type, même quand les octets auraient un sens. `REG_SZ` est la faute
+        // courante de `regedit` (« Valeur chaîne » au lieu de « Valeur DWORD »).
+        for kind in [REG_SZ, REG_BINARY, REG_DWORD_BIG_ENDIAN, REG_QWORD, 0] {
+            assert_eq!(decode_dword(kind, &[16, 0, 0, 0]), None, "type {kind}");
+            assert_eq!(decode_dword(kind, &[]), None, "type {kind}");
+        }
+        // « 16 » en `REG_SZ` : six octets d'UTF-16 terminés par NUL, refusés.
+        assert_eq!(decode_dword(REG_SZ, &[0x31, 0, 0x36, 0, 0, 0]), None);
+
+        // Utilisable dans un contexte constant, comme le reste du module.
+        const LUE: Option<u32> = decode_dword(REG_DWORD, &[2, 0, 0, 0]);
+        assert_eq!(LUE, Some(2));
+    }
+
+    #[test]
+    fn le_decodage_alimente_la_validation() {
+        // Le chemin complet tel que le pilote l'enchaîne : octets du registre →
+        // `decode_dword` → `sanitize`. Une valeur d'un type inattendu ne se distingue
+        // plus d'une valeur absente, et donne le défaut sans correction signalée.
+        let raw = RawParams {
+            reserve: decode_dword(REG_DWORD, &[2, 0, 0, 0]),
+            channels: decode_dword(REG_SZ, &[0x32, 0, 0, 0]),
+            buffer_ms: decode_dword(REG_DWORD, &[0xF4, 0x01, 0, 0]),
+        };
+        let (params, report) = sanitize(raw);
+        assert_eq!(params.reserve, 2);
+        assert_eq!(params.channels, DEFAULT_CHANNELS as u8);
+        assert_eq!(params.buffer_ms, 500);
+        assert!(report.is_empty());
+    }
+
     #[test]
     fn bornes_coherentes_avec_le_voisin() {
         // Les bornes du tampon sont celles de `format`, pas une deuxième opinion.
@@ -621,6 +728,22 @@ mod tests {
     }
 
     proptest! {
+        /// Le décodage rend exactement ce que le registre contenait, et rien d'autre :
+        /// aller-retour sur tout le domaine, et refus de toute charge utile qui n'est
+        /// pas un `REG_DWORD` de quatre octets — quelle que soit sa longueur, sans
+        /// panique ni indexation hors bornes.
+        #[test]
+        fn decodage_aller_retour(
+            valeur in any::<u32>(),
+            kind in any::<u32>(),
+            octets in proptest::collection::vec(any::<u8>(), 0..24),
+        ) {
+            prop_assert_eq!(decode_dword(REG_DWORD, &valeur.to_le_bytes()), Some(valeur));
+
+            let attendu = kind == REG_DWORD && octets.len() == REG_DWORD_BYTES;
+            prop_assert_eq!(decode_dword(kind, &octets).is_some(), attendu);
+        }
+
         /// Critère de M1b-01 : quelle que soit la clé `Parameters` — n'importe quelle
         /// valeur sur tout le domaine de chaque champ, présente ou absente — la sortie
         /// est dans les bornes et rien ne panique.

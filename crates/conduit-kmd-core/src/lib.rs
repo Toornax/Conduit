@@ -77,6 +77,9 @@ pub use format::{
 };
 pub use loopback::{CopyOp, Loopback, Plan, SilenceOp, StreamView, LEAD_MS};
 pub use notify::{align_frames, boundaries_crossed, Notifier};
-pub use params::{sanitize, Correction, Fix, Param, Params, RawParams, Report};
+pub use params::{
+    decode_dword, sanitize, Correction, Fix, Param, Params, RawParams, Report, REG_DWORD,
+    REG_DWORD_BYTES,
+};
 pub use position::{byte_offset, StreamPosition, VirtualClock};
 pub use ring::{copy_frames, silence, FrameLayout, RingError, SampleFormat};

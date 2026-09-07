@@ -139,6 +139,21 @@ AddReg = ConduitCable_HW_AddReg
 HKR,,DeviceType,0x10001,0x0000001D
 HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GRGWGX;;;BA)(A;;GRGWGX;;;WD)(A;;GRGWGX;;;RC)"
 
+; Paramètres du pilote (M1b-01). `conduit_kmd::registry` les lit au démarrage par
+; IoOpenDeviceRegistryKey(PLUGPLAY_REGKEY_DEVICE), qui ouvre exactement la clé matérielle
+; que cette section alimente. 0x10001 = FLG_ADDREG_TYPE_DWORD.
+;
+; Les trois défauts sont ENGENDRÉS depuis conduit_kmd_core::params, par
+; Param::default_value. Les modifier ici ne servirait à rien : le pilote garde les siens,
+; et le test defauts_de_parametres_identiques_au_pilote signale la divergence.
+;
+; Aucune de ces valeurs n'est nécessaire au chargement : absente, d'un autre type ou hors
+; bornes, elle est remplacée par le défaut et consignée au journal d'événements. Elles
+; sont écrites pour que `regedit` montre à l'administrateur ce qu'il peut régler.
+HKR,,ReserveSize,0x10001,16
+HKR,,Channels,0x10001,2
+HKR,,BufferMs,0x10001,10
+
 ; Interfaces KS des sous-périphériques, câble par câble. Le deuxième champ est le nom de
 ; référence du sous-périphérique, tel que PcRegisterSubdevice le reçoit : il doit
 ; correspondre exactement aux constantes de `portcls::adapter`

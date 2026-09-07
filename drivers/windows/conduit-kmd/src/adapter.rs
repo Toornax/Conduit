@@ -1,4 +1,5 @@
-//! `StartDevice` de l'adaptateur (driver-design.md §4.1) : pour chaque câble, création
+//! `StartDevice` de l'adaptateur (driver-design.md §4.1) : lecture des paramètres de
+//! registre ([`crate::registry`], M1b-01), puis, pour chaque câble de la réserve, création
 //! des quatre ports PortCls, initialisation avec leur miniport, enregistrement des
 //! sous-périphériques puis des connexions physiques entre broches bridge.
 //!
@@ -41,12 +42,20 @@ use crate::descriptors::{
     TOPO_CAPTURE_PIN_BRIDGE, TOPO_RENDER_PIN_BRIDGE, WAVE_CAPTURE_PIN_BRIDGE,
     WAVE_RENDER_PIN_BRIDGE,
 };
+use crate::eventlog::EventLog;
+use crate::registry;
 use crate::topo::{TopoCapture, TopoRender};
 use crate::wave::{WaveCapture, WaveRender};
 
 /// Un sous-périphérique enregistré : l'`IUnknown` de son port, tel que
 /// `PcRegisterPhysicalConnection` l'attend.
 type Subdevice = ComRef<IUnknown>;
+
+// La réserve maximale que le registre peut demander ne dépasse pas le nombre de câbles
+// statiques. Les deux constantes valent 16 et disent la même limite de SPEC F-06, mais
+// depuis deux crates différents : si l'une bougeait sans l'autre, `start_device`
+// demanderait un câble inexistant (à la hausse) ou en laisserait dormir (à la baisse).
+const _: () = assert!(conduit_kmd_core::params::MAX_RESERVE <= cable::CABLE_COUNT);
 
 /// Journalise `what` et l'échec `status`, puis le rend en `Err`.
 fn fail<T>(what: &str, status: NtStatus) -> Result<T, NtStatus> {
@@ -222,11 +231,25 @@ unsafe fn install_cable(
     Ok(())
 }
 
-/// `StartDevice` : enregistre les sous-périphériques de tous les câbles
-/// (`cable::CABLE_COUNT`) auprès de `device`.
+/// `StartDevice` : lit les paramètres de registre, puis enregistre les
+/// sous-périphériques des `reserve` premiers câbles auprès de `device`.
 ///
 /// `resources` nul → `STATUS_INVALID_PARAMETER` (PortCls fournit toujours une liste,
 /// vide pour un périphérique racine).
+///
+/// # Ce que la réserve commande, et ce qu'elle ne commande pas
+///
+/// La réserve lue au registre (M1b-01) décide **combien** des `cable::CABLE_COUNT` câbles
+/// statiques sont enregistrés : la boucle va de 0 à `reserve`. Les seize jeux de
+/// descripteurs et les seize jeux d'interfaces de l'INF restent en place ; ceux qu'on
+/// n'enregistre pas ne produisent simplement aucun endpoint.
+///
+/// Elle ne touche **pas** à `crate::MAX_MINIPORTS`, qui doit rester le maximum statique :
+/// voir la mise en garde portée par cette constante.
+///
+/// Le nombre de canaux, lui, est lu et validé mais **pas appliqué** : `descriptors`
+/// scelle `CHANNELS` dans les tables KS et dans des assertions à la compilation, et le
+/// rendre dynamique est le sujet de M1b-05.
 ///
 /// # Safety
 ///
@@ -244,11 +267,28 @@ pub unsafe fn start_device(
         return STATUS_INVALID_PARAMETER;
     };
     let resources = ResourceList::from_ref(resources);
-    for n in 0..cable::CABLE_COUNT {
+
+    // SAFETY: `device` est l'objet de périphérique de `StartDevice` (contrat), vivant
+    // pendant tout l'appel — donc au-delà du dernier usage de `log`.
+    let log = unsafe { EventLog::new(device) };
+    // SAFETY: idem ; `StartDevice` s'exécute à `PASSIVE_LEVEL`, ce qu'exigent
+    // `IoOpenDeviceRegistryKey` et `ZwQueryValueKey`.
+    let params = unsafe { registry::read_params(device, log) };
+
+    // `sanitize` a déjà écrêté la réserve dans `1..=MAX_RESERVE`, et une assertion à la
+    // compilation aligne ce plafond sur le nombre de câbles statiques : le `min` est une
+    // ceinture, pas une correction — il garantit que la boucle ne demande jamais un câble
+    // que `cable::cable(n)` ne connaît pas.
+    let reserve = u32::from(params.reserve).min(cable::CABLE_COUNT);
+    for n in 0..reserve {
         // SAFETY: contrat de la fonction relayé.
         if let Err(status) = unsafe { install_cable(device, irp, &resources, n) } {
             return status;
         }
     }
+    kmd_log!(
+        "StartDevice : {reserve} câbles enregistrés sur {}",
+        cable::CABLE_COUNT
+    );
     STATUS_SUCCESS
 }

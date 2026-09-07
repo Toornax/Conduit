@@ -9,6 +9,7 @@
 //! | nom de référence d'un `AddInterface` | `WAVE_RENDER_NAMES[n]`… passé à `PcRegisterSubdevice` | le périphérique s'installe, **aucun endpoint** n'apparaît |
 //! | `GUID.PinName.Cable<n>` | `pin_name_guid(n)` = `KsPinDescriptor.Name` | l'endpoint s'appelle « Haut-parleurs » / « Ligne » |
 //! | `%KSCATEGORY_*%` | `portcls_sys::KSCATEGORY_*` (en-têtes du WDK) | interface publiée dans la mauvaise classe |
+//! | `HKR,,ReserveSize`… (`.HW`) | `conduit_kmd_core::params` (M1b-01) | le poste est réglé sur une valeur que le pilote ne tient pas pour son défaut |
 //!
 //! Ces pannes ne se voient que dans une VM, et mal. Ce test les transforme en échec de
 //! `cargo test -p portcls`, donc de `tools/check.ps1` et de la CI.
@@ -59,6 +60,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+use conduit_kmd_core::params::Param;
 use portcls::{
     CABLE_COUNT, TOPO_CAPTURE_NAMES, TOPO_RENDER_NAMES, WAVE_CAPTURE_NAMES, WAVE_RENDER_NAMES,
     pin_name_guid,
@@ -420,6 +422,21 @@ HKR,,DeviceType,0x10001,0x0000001D
 HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GRGWGX;;;BA)(A;;GRGWGX;;;WD)(A;;GRGWGX;;;RC)"
 "#;
 
+/// Commentaire des valeurs de paramètres, qui prolongent `[ConduitCable_HW_AddReg]`.
+const ENTETE_PARAMETRES: &str = r#"
+; Paramètres du pilote (M1b-01). `conduit_kmd::registry` les lit au démarrage par
+; IoOpenDeviceRegistryKey(PLUGPLAY_REGKEY_DEVICE), qui ouvre exactement la clé matérielle
+; que cette section alimente. 0x10001 = FLG_ADDREG_TYPE_DWORD.
+;
+; Les trois défauts sont ENGENDRÉS depuis conduit_kmd_core::params, par
+; Param::default_value. Les modifier ici ne servirait à rien : le pilote garde les siens,
+; et le test defauts_de_parametres_identiques_au_pilote signale la divergence.
+;
+; Aucune de ces valeurs n'est nécessaire au chargement : absente, d'un autre type ou hors
+; bornes, elle est remplacée par le défaut et consignée au journal d'événements. Elles
+; sont écrites pour que `regedit` montre à l'administrateur ce qu'il peut régler.
+"#;
+
 /// Commentaire et en-tête de `[…NT.Interfaces]`.
 const ENTETE_INTERFACES: &str = r#"
 ; Interfaces KS des sous-périphériques, câble par câble. Le deuxième champ est le nom de
@@ -437,6 +454,25 @@ const ENTETE_FRIENDLY_NAMES: &str = r#"
 ; périphérique, pas celui de l'endpoint (§4.2). Il sert au diagnostic (Get-PnpDevice
 ; -Class MEDIA, regedit) : chacun nomme le câble et le rôle du filtre.
 "#;
+
+/// Les lignes `HKR` des trois paramètres, avec leur valeur par défaut.
+///
+/// Source unique : `conduit_kmd_core::params`, le module que le pilote consulte pour
+/// valider ce qu'il lit. Un défaut de l'INF différent d'un défaut du pilote donnerait un
+/// poste réglé sur une valeur que le code ne considère jamais comme « la valeur par
+/// défaut » — une divergence qu'aucun symptôme ne trahirait.
+fn parametres_attendus() -> Vec<String> {
+    Param::ALL
+        .iter()
+        .map(|param| {
+            format!(
+                "HKR,,{},0x10001,{}",
+                param.value_name(),
+                param.default_value()
+            )
+        })
+        .collect()
+}
 
 /// Les lignes d'un bloc littéral, sans le saut de ligne de mise en page initial.
 fn bloc(texte: &str) -> impl Iterator<Item = &str> {
@@ -492,6 +528,11 @@ fn inf_attendu() -> String {
     ajouter(&mut std::iter::once(String::new()));
 
     ajouter(&mut bloc(SERVICE_ET_SECURITE).map(str::to_owned));
+
+    // Trois `HKR` de plus dans la même section : les défauts des paramètres (M1b-01).
+    ajouter(&mut std::iter::once(String::new()));
+    ajouter(&mut bloc(ENTETE_PARAMETRES).map(str::to_owned));
+    ajouter(&mut parametres_attendus().into_iter());
     ajouter(&mut std::iter::once(String::new()));
 
     // Dix `AddInterface` par câble, groupés par câble.
@@ -699,6 +740,42 @@ fn regenerer_inx() {
     std::fs::write(&chemin, octets_utf16le(&inf_attendu()))
         .unwrap_or_else(|e| panic!("écriture de {} : {e}", chemin.display()));
     println!("{} régénéré ({CABLE_COUNT} câbles)", chemin.display());
+}
+
+/// `[ConduitCable_HW_AddReg]` : les défauts des paramètres (M1b-01) sont ceux du pilote,
+/// et toute la section reste en `HKR`.
+#[test]
+fn defauts_de_parametres_identiques_au_pilote() {
+    let inx = lire_inx();
+    let section = section(&inx, "ConduitCable_HW_AddReg");
+
+    for param in Param::ALL {
+        let attendue = format!(
+            "HKR,,{},0x10001,{}",
+            param.value_name(),
+            param.default_value()
+        );
+        assert!(
+            section.contains(&attendue.as_str()),
+            "[ConduitCable_HW_AddReg] : « {attendue} » manquante. Le pilote lit \
+             « {} » dans la clé matérielle et retient {} à défaut : l'INF doit écrire \
+             exactement cette valeur.\nSection commitée : {section:#?}",
+            param.value_name(),
+            param.default_value()
+        );
+    }
+
+    // F-52 (désinstallation propre) : PnP retire les `HKR` de la clé matérielle avec le
+    // périphérique. Une écriture `HKLM` survivrait à la désinstallation et laisserait le
+    // registre sale — et `infverif /w` la refuserait si elle visait une clé hors du
+    // périphérique.
+    for ligne in &section {
+        assert!(
+            ligne.starts_with("HKR,"),
+            "[ConduitCable_HW_AddReg] : « {ligne} » n'est pas un HKR ; PnP ne la \
+             retirerait pas à la désinstallation (F-52)"
+        );
+    }
 }
 
 #[test]
