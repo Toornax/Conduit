@@ -13,6 +13,9 @@
 //! - les périodes de notification ([`notify`]) : quand signaler les événements
 //!   enregistrés par `IMiniportWaveRTStreamNotification`, à partir de la position
 //!   absolue, bouclage compris ;
+//! - les bornes des paramètres de registre ([`params`]) : réserve de câbles, canaux et
+//!   durée de tampon, écrêtés vers leur borne avec un rapport de ce qui a été corrigé,
+//!   pour qu'un registre aberrant ne fasse jamais échouer le chargement (M1b-01) ;
 //! - le plan de copie de la boucle locale ([`loopback`]) : à chaque tick du timer du
 //!   câble, quelles trames de rendu écrire à quelles trames de capture, quand écrire
 //!   du silence, et quand le tick est trop en retard pour rattraper.
@@ -64,6 +67,7 @@ extern crate std;
 pub mod format;
 pub mod loopback;
 pub mod notify;
+pub mod params;
 pub mod position;
 pub mod ring;
 
@@ -73,5 +77,6 @@ pub use format::{
 };
 pub use loopback::{CopyOp, Loopback, Plan, SilenceOp, StreamView, LEAD_MS};
 pub use notify::{align_frames, boundaries_crossed, Notifier};
+pub use params::{sanitize, Correction, Fix, Param, Params, RawParams, Report};
 pub use position::{byte_offset, StreamPosition, VirtualClock};
 pub use ring::{copy_frames, silence, FrameLayout, RingError, SampleFormat};
