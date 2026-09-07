@@ -12,7 +12,7 @@
 //! conduit-looptest --json --repeat 10   # sortie machine
 //! conduit-looptest --self-test          # test de l'outil, sans périphérique
 //! conduit-looptest --loopback           # capture en écho : le moteur délivre-t-il ?
-//! conduit-looptest --list --show-volume # les endpoints, volume et coupure compris
+//! conduit-looptest --list --show-volume # les endpoints, volume, coupure et plage
 //! conduit-looptest --set-volume 0.5 --unmute   # règle, affiche, et sort
 //! ```
 //!
@@ -30,6 +30,12 @@
 //! sans signal imprime la **session Windows** du processus : dans la session des
 //! services (session 0), il n'y a pas d'audio d'utilisateur et la mesure n'a aucun
 //! sens.
+//!
+//! `--show-volume` relève en outre la **plage** de chaque endpoint en décibels
+//! (minimum, maximum, pas). Ce n'est pas un diagnostic mais une mesure, et elle a
+//! une question à trancher : celle de l'échelle de `KSPROPERTY_AUDIO_VOLUMELEVEL`
+//! que le pilote Conduit exposera (voir [`volume`]). Le relevé est passif —
+//! aucun flux n'est ouvert, aucun son n'est émis.
 //!
 //! Codes de retour : `0` toutes les passes passent, `1` au moins une échoue,
 //! `2` l'environnement ne permet pas le test (endpoints absents, backend

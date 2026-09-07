@@ -34,7 +34,7 @@ use conduit_core::types::SampleRate;
 
 use crate::analysis::{self, SineSpec};
 use crate::cli::Args;
-use crate::volume::{Level, Reading, State};
+use crate::volume::{Level, Range, RangeState, Reading, State};
 
 /// Préfixe du nom des endpoints du câble Conduit (`devices::cable_id_from_name`).
 const CABLE_PREFIX: &str = "Conduit 1";
@@ -173,7 +173,8 @@ impl Session {
         })
     }
 
-    /// Volume et coupure des endpoints que la mesure va utiliser.
+    /// Volume, coupure et plage en décibels des endpoints que la mesure va
+    /// utiliser.
     ///
     /// Relevé **avant** la première passe : un endpoint coupé ou à zéro rend toute
     /// mesure silencieuse, et cela ressemble trait pour trait à un pilote muet. En
@@ -181,6 +182,10 @@ impl Session {
     ///
     /// Une lecture qui échoue devient un [`State::Unreadable`], jamais une erreur :
     /// un diagnostic ne doit pas empêcher la mesure qu'il commente.
+    ///
+    /// La plage (`GetVolumeRange`) s'y ajoute : elle ne sert pas au diagnostic mais
+    /// à la mesure — c'est l'échelle en décibels que le pilote de l'endpoint
+    /// déclare. Comme le reste de ce relevé, elle n'ouvre aucun flux.
     pub fn levels(&self) -> Vec<Reading> {
         let mut endpoints = vec![("rendu", &self.render)];
         if let Some(capture) = &self.capture {
@@ -199,7 +204,10 @@ impl Session {
         };
         endpoints
             .into_iter()
-            .map(|(role, device)| Reading::new(role, &device.name, read(&control, &device.id)))
+            .map(|(role, device)| {
+                Reading::new(role, &device.name, read(&control, &device.id))
+                    .with_range(read_range(&control, &device.id))
+            })
             .collect()
     }
 
@@ -368,6 +376,24 @@ fn read(control: &EndpointVolumeControl, id: &conduit_backend::DeviceId) -> Stat
     }
 }
 
+/// Relève la plage en décibels d'un endpoint, sans jamais échouer ni rien ouvrir.
+///
+/// `GetVolumeRange` est une interrogation en lecture seule de l'endpoint : aucun
+/// flux n'est ouvert, aucun son n'est émis. Un endpoint qui n'annonce pas sa plage
+/// donne un [`RangeState::NoControl`], une panne un [`RangeState::Unreadable`] —
+/// jamais une erreur : la plage renseigne, elle ne commande rien.
+fn read_range(control: &EndpointVolumeControl, id: &conduit_backend::DeviceId) -> RangeState {
+    match control.read_range(id) {
+        Ok(Some(range)) => RangeState::Known(Range {
+            min_db: range.min_db,
+            max_db: range.max_db,
+            increment_db: range.increment_db,
+        }),
+        Ok(None) => RangeState::NoControl,
+        Err(e) => RangeState::Unreadable(e.to_string()),
+    }
+}
+
 /// Affiche les endpoints (`--list`), avec leur volume si `show_volume`.
 ///
 /// # Erreurs
@@ -404,8 +430,12 @@ pub fn list(show_volume: bool) -> Result<String, String> {
                 device.direction.to_string(),
                 &device.name,
                 read(control, &device.id),
-            );
+            )
+            .with_range(read_range(control, &device.id));
             out.push_str(&format!("      volume {}\n", reading.describe()));
+            if let Some(range) = reading.range_line() {
+                out.push_str(&format!("      {range}\n"));
+            }
         }
         out.push_str(&format!("      id {}\n", device.id));
     }

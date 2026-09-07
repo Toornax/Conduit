@@ -9,6 +9,21 @@
 //! depuis le pilote, et cela ressemble trait pour trait à une panne du pilote :
 //! l'outil doit donc le nommer **avant** la mesure, et dire quelle option le
 //! corrige.
+//!
+//! À côté du niveau, l'outil relève la **plage** de l'endpoint en décibels
+//! ([`Range`], `IAudioEndpointVolume::GetVolumeRange`) : minimum, maximum et pas.
+//! Ce n'est pas un diagnostic, c'est une **mesure**, et elle a une question
+//! précise à trancher. Le pilote Conduit exposera un nœud `KSNODETYPE_VOLUME` ;
+//! `KSPROPERTY_AUDIO_VOLUMELEVEL` y est, dit la documentation Microsoft (et le
+//! disent les constantes de SYSVAD), un `LONG` en unités de 1/65536 dB — un point
+//! fixe 16.16 où le pas usuel `0x8000` vaut 0,5 dB et le minimum usuel
+//! `-96 * 0x10000` vaut −96 dB. **Ce dépôt ne tient pas une affirmation non
+//! mesurée pour un fait.** Une fois notre nœud en place, ce relevé la tranchera :
+//! −96,0 dB / 0,0 dB / 0,5 dB la confirme, un −6 291 456 dB ou un −0,0015 dB
+//! l'infirme et la conception change. D'ici là, la plage d'une vraie carte son
+//! montre la forme attendue d'un pilote qui fait les choses correctement.
+//!
+//! Ce relevé est **passif** : il n'ouvre aucun flux et n'émet aucun son.
 
 #![forbid(unsafe_code)]
 
@@ -45,6 +60,80 @@ impl Level {
     }
 }
 
+/// Un décibel tel que l'outil l'écrit : au dixième, comme le reste de la sortie.
+///
+/// Sauf une valeur trop fine pour ce dixième, qui s'écrirait « 0,0 » : elle reçoit
+/// alors assez de décimales pour deux chiffres significatifs. C'est tout l'objet de
+/// ce relevé — une plage de −0,0015 dB infirmerait l'échelle supposée de
+/// `KSPROPERTY_AUDIO_VOLUMELEVEL`, et l'arrondir à zéro effacerait précisément la
+/// réponse qu'on est venu chercher. Les grandes valeurs, elles, s'écrivent en
+/// entier : un −6 291 456 dB doit se voir tel quel.
+fn db(value: f32) -> String {
+    let value = f64::from(value);
+    // Écarte aussi le zéro négatif, qui s'imprimerait « -0,0 ».
+    if value == 0.0 {
+        return fr(0.0, 1);
+    }
+    let decimals = if value.abs() >= 0.05 {
+        1
+    } else {
+        // `log10` d'une valeur finie non nulle : l'exposant décimal, dont on déduit
+        // le rang du deuxième chiffre significatif. Borné, faute de quoi une valeur
+        // dénormale demanderait des centaines de décimales.
+        (1 - value.abs().log10().floor() as i32).clamp(1, 12) as usize
+    };
+    fr(value, decimals)
+}
+
+/// Plage du contrôle de volume d'un endpoint, en décibels, telle que l'outil
+/// l'affiche : l'échelle que le pilote de cet endpoint déclare.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Range {
+    /// Atténuation minimale, en dB.
+    pub min_db: f32,
+    /// Atténuation maximale, en dB.
+    pub max_db: f32,
+    /// Pas entre deux crans, en dB.
+    pub increment_db: f32,
+}
+
+impl Range {
+    /// « -96,0 dB à 0,0 dB, pas 0,5 dB ».
+    pub fn describe(&self) -> String {
+        format!(
+            "{} dB à {} dB, pas {} dB",
+            db(self.min_db),
+            db(self.max_db),
+            db(self.increment_db)
+        )
+    }
+}
+
+/// Ce que l'outil a pu savoir de la plage d'un endpoint.
+///
+/// Les trois cas se distinguent comme ceux de [`State`], et pour la même raison :
+/// un endpoint qui n'annonce pas sa plage a répondu, un appel en panne non.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RangeState {
+    /// Plage relevée.
+    Known(Range),
+    /// L'endpoint n'annonce pas de plage.
+    NoControl,
+    /// La lecture a échoué ; le message dit pourquoi.
+    Unreadable(String),
+}
+
+impl RangeState {
+    /// La plage, ou la raison de son absence.
+    fn describe(&self) -> String {
+        match self {
+            Self::Known(range) => format!("plage : {}", range.describe()),
+            Self::NoControl => "plage : non annoncée par cet endpoint".to_string(),
+            Self::Unreadable(why) => format!("plage illisible ({why})"),
+        }
+    }
+}
+
 /// Ce que l'outil a pu savoir du volume d'un endpoint.
 ///
 /// « Pas de contrôle » et « illisible » sont distingués à dessein : le premier est
@@ -69,16 +158,36 @@ pub struct Reading {
     pub name: String,
     /// Le volume, ou ce qui en tient lieu.
     pub state: State,
+    /// La plage en décibels, quand elle a été demandée ; `None` si l'outil ne l'a
+    /// pas relevée — ce qui n'est pas la même chose qu'un endpoint qui n'en a pas.
+    pub range: Option<RangeState>,
 }
 
 impl Reading {
-    /// Relevé d'un endpoint.
+    /// Relevé d'un endpoint, sans sa plage.
     pub fn new(role: impl Into<String>, name: impl Into<String>, state: State) -> Self {
         Self {
             role: role.into(),
             name: name.into(),
             state,
+            range: None,
         }
+    }
+
+    /// Le même relevé, avec la plage en décibels.
+    #[must_use]
+    pub fn with_range(mut self, range: RangeState) -> Self {
+        self.range = Some(range);
+        self
+    }
+
+    /// « plage : -96,0 dB à 0,0 dB, pas 0,5 dB », ou la raison de son absence ;
+    /// `None` quand la plage n'a pas été relevée.
+    ///
+    /// Une plage illisible se dit et ne fait rien échouer : tous les endpoints ne
+    /// l'annoncent pas, et le niveau, lui, a été lu.
+    pub fn range_line(&self) -> Option<String> {
+        self.range.as_ref().map(RangeState::describe)
     }
 
     /// Le volume, ou la raison de son absence : ce que `--show-volume` affiche.
@@ -128,15 +237,24 @@ impl Reading {
 
 /// Bloc « volume » des endpoints que la mesure va utiliser (`--show-volume`) ;
 /// `None` s'il n'y a rien à montrer.
+///
+/// La plage, quand elle a été relevée, va sous le niveau de son endpoint, décalée
+/// d'un cran de plus : elle le précise, elle ne le remplace pas.
 pub fn levels_block(readings: &[Reading]) -> Option<String> {
-    let mut lines = readings.iter().map(Reading::line);
-    let first = lines.next()?;
-    let mut out = format!("volume  : {first}");
-    for line in lines {
-        out.push_str("\n          ");
-        out.push_str(&line);
+    let mut out = String::new();
+    for reading in readings {
+        if out.is_empty() {
+            out.push_str(&format!("volume  : {}", reading.line()));
+        } else {
+            out.push_str("\n          ");
+            out.push_str(&reading.line());
+        }
+        if let Some(range) = reading.range_line() {
+            out.push_str("\n            ");
+            out.push_str(&range);
+        }
     }
-    Some(out)
+    (!out.is_empty()).then_some(out)
 }
 
 /// Les avertissements de tous les endpoints relevés, dans l'ordre.
@@ -242,6 +360,103 @@ mod tests {
             }
             assert!(message.contains("pas le pilote"), "{message}");
         }
+    }
+
+    /// La forme qu'on attend d'un pilote qui suit l'échelle supposée de
+    /// `KSPROPERTY_AUDIO_VOLUMELEVEL` : −96 dB, 0 dB, pas de 0,5 dB.
+    #[test]
+    fn la_plage_s_ecrit_en_decibels_a_la_francaise() {
+        let range = Range {
+            min_db: -96.0,
+            max_db: 0.0,
+            increment_db: 0.5,
+        };
+        assert_eq!(range.describe(), "-96,0 dB à 0,0 dB, pas 0,5 dB");
+        assert_eq!(
+            RangeState::Known(range).describe(),
+            "plage : -96,0 dB à 0,0 dB, pas 0,5 dB"
+        );
+    }
+
+    /// Le point de la mesure est l'ordre de grandeur : une plage de −0,0015 dB
+    /// infirmerait l'échelle supposée, et l'arrondir au dixième l'écrirait
+    /// « 0,0 » — soit exactement la réponse qu'on est venu chercher, effacée.
+    #[test]
+    fn une_plage_trop_fine_ne_s_arrondit_pas_a_zero() {
+        let range = Range {
+            min_db: -0.0015,
+            max_db: 0.0,
+            // 1/65536 dB : le pas que rendrait un endpoint dont l'échelle serait
+            // prise pour des unités entières là où elle est en point fixe 16.16.
+            increment_db: 1.0 / 65536.0,
+        };
+        let dit = range.describe();
+        assert_eq!(dit, "-0,0015 dB à 0,0 dB, pas 0,000015 dB");
+        assert!(!dit.contains("0,0 dB, pas 0,0 dB"), "{dit}");
+
+        // Une plage démesurée reste lisible telle quelle, sans notation savante.
+        let enorme = Range {
+            min_db: -6_291_456.0,
+            max_db: 0.0,
+            increment_db: 32768.0,
+        };
+        assert!(enorme.describe().contains("-6291456,0 dB"), "{enorme:?}");
+
+        // Le zéro négatif ne doit pas s'imprimer « -0,0 ».
+        assert_eq!(db(-0.0), "0,0");
+    }
+
+    #[test]
+    fn sans_plage_relevee_rien_ne_s_imprime() {
+        assert_eq!(reading("rendu", 1.0, false).range_line(), None);
+    }
+
+    /// Un endpoint qui n'annonce pas sa plage, ou dont la lecture échoue, le dit
+    /// sans rien faire échouer : le niveau, lui, a bien été lu.
+    #[test]
+    fn une_plage_absente_ou_illisible_le_dit_sans_masquer_le_niveau() {
+        let sans = reading("rendu", 0.5, false).with_range(RangeState::NoControl);
+        assert_eq!(sans.describe(), "50 % (0,500), non coupé");
+        assert!(
+            sans.range_line().expect("plage").contains("non annoncée"),
+            "{sans:?}"
+        );
+        assert_eq!(sans.warning(), None);
+
+        let panne = reading("capture", 0.5, false)
+            .with_range(RangeState::Unreadable("E_ACCESSDENIED".to_string()));
+        let ligne = panne.range_line().expect("plage");
+        assert!(ligne.contains("illisible"), "{ligne}");
+        assert!(ligne.contains("E_ACCESSDENIED"), "{ligne}");
+        assert_eq!(panne.warning(), None);
+    }
+
+    #[test]
+    fn le_bloc_place_la_plage_sous_le_niveau_de_son_endpoint() {
+        let range = RangeState::Known(Range {
+            min_db: -96.0,
+            max_db: 0.0,
+            increment_db: 0.5,
+        });
+        let bloc = levels_block(&[
+            reading("rendu", 1.0, false).with_range(range),
+            reading("capture", 0.5, false),
+        ])
+        .expect("bloc");
+        let lignes: Vec<&str> = bloc.lines().collect();
+        assert_eq!(lignes.len(), 3);
+        assert_eq!(
+            lignes[0],
+            "volume  : rendu « Conduit 1 » : 100 % (1,000), non coupé"
+        );
+        assert_eq!(
+            lignes[1],
+            "            plage : -96,0 dB à 0,0 dB, pas 0,5 dB"
+        );
+        assert_eq!(
+            lignes[2],
+            "          capture « Conduit 1 » : 50 % (0,500), non coupé"
+        );
     }
 
     #[test]
