@@ -60,8 +60,9 @@ pub struct Args {
     /// Liste les endpoints et sort.
     #[arg(long)]
     pub list: bool,
-    /// Affiche le volume et l'état de coupure : avec `--list`, pour chaque
-    /// endpoint listé ; sinon, pour ceux que la mesure va utiliser.
+    /// Affiche le volume, l'état de coupure et la plage en décibels (minimum,
+    /// maximum, pas) : avec `--list`, pour chaque endpoint listé ; sinon, pour
+    /// ceux que la mesure va utiliser. Ne fait que lire, n'ouvre aucun flux.
     #[arg(long = "show-volume")]
     pub show_volume: bool,
     /// Règle le volume maître (0 à 1) des endpoints de `--render` et `--capture`,

@@ -9,6 +9,11 @@
 //!
 //! Aucun son n'est émis : rien n'ouvre de flux.
 //!
+//! [`la_plage_du_rendu_par_defaut_se_releve_en_decibels`] n'écrit rien du tout et
+//! ne fait qu'interroger la carte ; il est `#[ignore]` parce qu'il n'a de sens que
+//! sur du matériel réel, et qu'il sert à **lire** un relevé, pas à garder un
+//! invariant.
+//!
 //! Tout se saute proprement s'il n'y a pas de périphérique de rendu par défaut, ou
 //! si celui-ci n'expose pas de contrôle de volume.
 
@@ -111,6 +116,53 @@ fn le_volume_du_rendu_par_defaut_se_lit_s_ecrit_et_se_restaure() {
         initial.scalar
     );
     assert_eq!(restored.muted, initial.muted);
+}
+
+/// La **plage** en décibels du rendu par défaut, telle que la carte la déclare.
+///
+/// C'est la mesure qui doit trancher l'échelle de `KSPROPERTY_AUDIO_VOLUMELEVEL`
+/// que le pilote Conduit exposera : la documentation Microsoft et les constantes
+/// de SYSVAD la disent en unités de 1/65536 dB (pas de 0,5 dB pour `0x8000`,
+/// minimum de −96 dB pour `-96 * 0x10000`), mais ce dépôt ne tient pas une
+/// affirmation non mesurée pour un fait. Sur une vraie carte, ce test imprime la
+/// forme attendue d'un pilote qui fait les choses correctement ; le jour où le
+/// nœud `KSNODETYPE_VOLUME` de Conduit existe, le même relevé sur l'endpoint
+/// `Conduit 1` confirmera l'échelle ou l'infirmera.
+///
+/// Le test n'affirme donc **pas** la valeur attendue — il la relève et vérifie sa
+/// seule cohérence interne. Rien n'est ouvert, rien n'est écrit, rien ne sonne :
+/// `GetVolumeRange` est une interrogation en lecture seule.
+#[test]
+#[ignore = "interroge la carte son de la machine (lecture seule, aucun son) : à lancer à la main (cargo test … -- --ignored)"]
+fn la_plage_du_rendu_par_defaut_se_releve_en_decibels() {
+    let Some(id) = default_render() else { return };
+    let control = EndpointVolumeControl::new().expect("contrôle du volume");
+
+    let Some(range) = control.read_range(&id).expect("lecture de la plage") else {
+        eprintln!("test sauté : le rendu par défaut n'annonce pas de plage de volume");
+        return;
+    };
+    eprintln!(
+        "plage du rendu par défaut : {} dB à {} dB, pas {} dB",
+        range.min_db, range.max_db, range.increment_db
+    );
+
+    assert!(
+        range.min_db.is_finite() && range.max_db.is_finite() && range.increment_db.is_finite(),
+        "plage non finie : {range:?}"
+    );
+    assert!(
+        range.min_db < range.max_db,
+        "minimum au-dessus du maximum : {range:?}"
+    );
+    assert!(
+        range.increment_db > 0.0,
+        "pas nul ou négatif : {range:?} — le curseur n'aurait aucun cran"
+    );
+    assert!(
+        range.increment_db <= range.max_db - range.min_db,
+        "pas plus large que la plage entière : {range:?}"
+    );
 }
 
 #[test]

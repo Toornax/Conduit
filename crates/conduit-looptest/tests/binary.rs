@@ -43,10 +43,13 @@ fn liste_les_volumes_sans_rien_changer() {
     let (code, out, err) = run(&["--list", "--show-volume"]);
     assert_eq!(code, Some(0), "{err}");
     assert!(out.contains("endpoint(s) actif(s)"), "{out}");
-    // Sur une machine sans aucune carte, il n'y a rien à décrire : on n'exige la
-    // ligne de volume que s'il y a au moins un endpoint.
+    // Sur une machine sans aucune carte, il n'y a rien à décrire : on n'exige les
+    // lignes de volume et de plage que s'il y a au moins un endpoint.
     if out.contains("      id ") {
         assert!(out.contains("      volume "), "{out}");
+        // La plage se relève toujours : soit elle s'affiche, soit l'outil dit
+        // pourquoi il n'a pas pu — mais elle ne disparaît jamais en silence.
+        assert!(out.contains("      plage"), "{out}");
     }
 }
 

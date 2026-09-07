@@ -6,6 +6,11 @@
 //! en écho —, ce qui en fait la première cause d'une mesure silencieuse, et la
 //! moins soupçonnée.
 //!
+//! La même interface rend aussi la **plage** du contrôle, elle en décibels
+//! ([`VolumeRange`], `GetVolumeRange`) : minimum, maximum et pas. C'est l'échelle
+//! que le pilote de l'endpoint déclare, telle que Windows la présente aux
+//! applications — une interrogation en lecture seule, qui n'ouvre aucun flux.
+//!
 //! L'interface s'obtient par [`IMMDevice::Activate`], comme l'`IAudioClient` : un
 //! endpoint est activable en plusieurs interfaces, chacune servant un usage.
 //!
@@ -72,6 +77,33 @@ impl EndpointVolume {
             scalar.clamp(0.0, 1.0)
         }
     }
+}
+
+/// Plage du contrôle de volume d'un endpoint, en **décibels**, telle
+/// qu'`IAudioEndpointVolume::GetVolumeRange` la rend.
+///
+/// Contrairement au volume scalaire d'[`EndpointVolume`], qui n'est qu'une
+/// position de curseur, ce sont les vraies bornes de l'atténuation : ce que le
+/// pilote de l'endpoint déclare, et donc ce qu'on peut **mesurer** de lui depuis
+/// l'espace utilisateur, sans le croire sur parole.
+///
+/// C'est pourquoi ce relevé existe. Le pilote Conduit exposera un nœud
+/// `KSNODETYPE_VOLUME`, dont la valeur de `KSPROPERTY_AUDIO_VOLUMELEVEL` est —
+/// d'après la documentation Microsoft et les constantes de SYSVAD — un `LONG` en
+/// unités de 1/65536 dB (point fixe 16.16 : le pas usuel `0x8000` vaut 0,5 dB, le
+/// minimum usuel `-96 * 0x10000` vaut −96 dB). Cette affirmation n'est pas
+/// mesurée. Une fois le nœud en place, cette plage la tranchera : −96,0 / 0,0 /
+/// 0,5 dB la confirme, tout autre ordre de grandeur l'infirme et change la
+/// conception. En attendant, la plage d'une vraie carte son donne la forme
+/// attendue d'un pilote qui fait les choses correctement.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VolumeRange {
+    /// Atténuation minimale, en dB (négative : le volume le plus faible).
+    pub min_db: f32,
+    /// Atténuation maximale, en dB (0 sur la plupart des endpoints).
+    pub max_db: f32,
+    /// Pas entre deux crans, en dB.
+    pub increment_db: f32,
 }
 
 /// Lecture et écriture du volume des endpoints audio.
@@ -145,6 +177,26 @@ impl EndpointVolumeControl {
     pub fn read(&self, id: &DeviceId) -> Result<Option<EndpointVolume>, BackendError> {
         match self.activate(id)? {
             Some(volume) => read_volume(&volume),
+            None => Ok(None),
+        }
+    }
+
+    /// Plage du contrôle de volume de l'endpoint `id`, en décibels.
+    ///
+    /// **Lecture seule, et rien d'autre** : aucun flux n'est ouvert (ni
+    /// `IAudioClient::Initialize`, ni mode exclusif, ni lecture), aucun réglage
+    /// n'est écrit, aucun son n'est émis. C'est une interrogation de l'endpoint,
+    /// au même titre que [`Self::read`].
+    ///
+    /// `Ok(None)` quand l'endpoint n'expose pas de contrôle de volume, ou qu'il en
+    /// expose un sans annoncer sa plage : c'est une réponse, pas une panne.
+    ///
+    /// # Erreurs
+    ///
+    /// Comme [`Self::read`].
+    pub fn read_range(&self, id: &DeviceId) -> Result<Option<VolumeRange>, BackendError> {
+        match self.activate(id)? {
+            Some(volume) => read_range(&volume),
             None => Ok(None),
         }
     }
@@ -256,6 +308,26 @@ fn read_volume(volume: &IAudioEndpointVolume) -> Result<Option<EndpointVolume>, 
         scalar: EndpointVolume::clamp_scalar(scalar),
         muted,
     }))
+}
+
+/// Lit la plage en décibels ; `None` si le périphérique ne l'annonce pas.
+fn read_range(volume: &IAudioEndpointVolume) -> Result<Option<VolumeRange>, BackendError> {
+    let mut min_db = 0.0f32;
+    let mut max_db = 0.0f32;
+    let mut increment_db = 0.0f32;
+    // SAFETY: interface valide, rendue par `Activate`. Les trois pointeurs de
+    // sortie visent des `f32` de cette pile, vivants pendant tout l'appel et
+    // écrits par l'appelé seul. `GetVolumeRange` interroge l'endpoint sans rien
+    // régler ni ouvrir.
+    match unsafe { volume.GetVolumeRange(&mut min_db, &mut max_db, &mut increment_db) } {
+        Ok(()) => Ok(Some(VolumeRange {
+            min_db,
+            max_db,
+            increment_db,
+        })),
+        Err(e) if is_unsupported(e.code()) => Ok(None),
+        Err(e) => Err(platform_error("IAudioEndpointVolume::GetVolumeRange", &e)),
+    }
 }
 
 /// Vrai pour les `HRESULT` qui disent « ce périphérique n'a pas de contrôle de

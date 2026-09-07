@@ -45,7 +45,11 @@
 //! `IAudioEndpointVolume` et lit ou écrit le volume maître scalaire (0 à 1) et la
 //! coupure. Un volume nul ou un endpoint coupé explique à lui seul toute chaîne
 //! muette, écho compris : c'est la première hypothèse à écarter avant d'accuser le
-//! pilote. Le module `session` répond à la deuxième question de la même enquête —
+//! pilote. Le même contrôle rend aussi la **plage** de l'endpoint en décibels
+//! (`VolumeRange`, `read_range`) : minimum, maximum et pas, c'est-à-dire l'échelle
+//! que le pilote de cet endpoint déclare — de quoi mesurer, plutôt que supposer,
+//! celle que notre propre pilote exposera. Le module `session` répond à la
+//! deuxième question de la même enquête —
 //! le processus tourne-t-il seulement dans une session qui a de l'audio ? Ni l'un
 //! ni l'autre n'entre dans le trait `Backend`, portable.
 //!
@@ -130,4 +134,4 @@ pub use session::{current_session_id, SERVICES_SESSION};
 #[cfg(windows)]
 pub use stream::{ClockStats, WasapiHandle};
 #[cfg(windows)]
-pub use volume::{EndpointVolume, EndpointVolumeControl};
+pub use volume::{EndpointVolume, EndpointVolumeControl, VolumeRange};
