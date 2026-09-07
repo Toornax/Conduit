@@ -6,9 +6,29 @@
 //! (`descriptors::topo_render_filter(n)`, `topo_capture_filter(n)` : broche bridge,
 //! broche endpoint nommée par le GUID du câble, nœud de volume, nœud de
 //! sourdine) et servent les propriétés de ces nœuds en déléguant au [`NodeState`] du bon
-//! sens dans le câble. `Init` ne conserve rien : le port topologie et la liste de
-//! ressources reçus sont relâchés en sortie (`Drop` des enveloppes). Jack : M1b-03 ;
-//! `DataRangeIntersection` reste au défaut (PortCls intersecte lui-même).
+//! sens dans le câble. Ils implémentent aussi `portcls::JackInfo`, la propriété de
+//! **filtre** `KSPROPERTY_JACK_DESCRIPTION` (M1b-03). `Init` ne conserve rien : le port
+//! topologie et la liste de ressources reçus sont relâchés en sortie (`Drop` des
+//! enveloppes). `DataRangeIntersection` reste au défaut (PortCls intersecte lui-même).
+//!
+//! # Le jack : quelle broche, et quelle cartographie
+//!
+//! Deux valeurs seulement distinguent les deux sens, et toutes deux sont des pièges.
+//!
+//! **La broche.** [`JackInfo::jack_pin`] désigne la broche qui **fait face à
+//! l'extérieur** — celle dont Windows tire l'endpoint, celle qui porte le nom du câble :
+//! [`TOPO_RENDER_PIN_ENDPOINT`] (1) au rendu, [`TOPO_CAPTURE_PIN_ENDPOINT`] (0) à la
+//! capture. Ce n'est **pas** la broche que `descriptors::bridge_pin` construit, malgré le
+//! vocabulaire de la documentation Microsoft, qui appelle « bridge pin » la broche à prise.
+//! Se tromper ne casse rien de visible : la propriété répond, mais par une description
+//! vide, et l'endpoint garde l'état de connexion par défaut de Windows. D'où les
+//! assertions `const` ci-dessous.
+//!
+//! **La cartographie.** `KSJACK_DESCRIPTION::ChannelMapping` doit être non nul « *only for
+//! analog rendering pins* » : `KSAUDIO_SPEAKER_STEREO` au rendu, **0** à la capture.
+//!
+//! L'état de connexion, lui, est **par câble** et commun aux deux sens
+//! ([`Cable::is_connected`]) : un câble débranché l'est de ses deux bouts.
 //!
 //! # Le volume est mémorisé, pas appliqué
 //!
@@ -36,18 +56,50 @@
 //! « canal 0 », c'est le `Reserved` qu'on lit. Vide en release (`kmd_log!`).
 
 use portcls::conduit_com::{ComRef, NtStatus, STATUS_SUCCESS};
-use portcls::{AudioNodes, MiniportTopology, PortTopology, ResourceList, Trace};
-use portcls_sys::{IUnknown, PCFILTER_DESCRIPTOR};
+use portcls::{
+    AudioNodes, JackInfo, JackTrace, MiniportTopology, PortTopology, ResourceList, Trace,
+};
+use portcls_sys::{IUnknown, KSAUDIO_SPEAKER_STEREO, PCFILTER_DESCRIPTOR, ULONG};
 
 use crate::cable::{Cable, Direction, MAX_CHANNELS, NodeState};
 use crate::descriptors::{
-    CHANNELS, topo_capture_filter, topo_capture_filter_0, topo_render_filter, topo_render_filter_0,
+    CHANNELS, PIN_COUNT, TOPO_CAPTURE_PIN_ENDPOINT, TOPO_RENDER_PIN_ENDPOINT, topo_capture_filter,
+    topo_capture_filter_0, topo_render_filter, topo_render_filter_0,
 };
 
 const _: () = assert!(
     CHANNELS as usize <= MAX_CHANNELS,
     "le nœud de volume déclare plus de canaux que `NodeState` n'en mémorise"
 );
+
+/// Nombre de broches d'un filtre de topologie, du type que `JackInfo::pin_count` rend.
+///
+/// Doit valoir `PCFILTER_DESCRIPTOR::PinCount` : c'est lui qui sépare « broche existante
+/// sans prise » (réponse vide, `STATUS_SUCCESS`) de « broche inexistante »
+/// (`STATUS_INVALID_PARAMETER`).
+const BROCHES: u32 = PIN_COUNT as u32;
+
+/// `KSJACK_DESCRIPTION::ChannelMapping` du sens **rendu** : les deux canaux avant.
+///
+/// `KSAUDIO_SPEAKER_STEREO` vaut `SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT` (3) : autant de
+/// bits que [`CHANNELS`], ce que l'assertion ci-dessous vérifie. Une divergence — un câble
+/// à six canaux qui annoncerait encore une cartographie stéréo — se verrait dans le nom des
+/// canaux affiché par Windows, et nulle part ailleurs.
+const MAPPING_RENDU: ULONG = KSAUDIO_SPEAKER_STEREO;
+
+/// `KSJACK_DESCRIPTION::ChannelMapping` du sens **capture** : nul, comme la documentation
+/// l'exige pour toute broche qui n'est pas une broche de rendu analogique.
+const MAPPING_CAPTURE: ULONG = 0;
+
+const _: () = {
+    // La broche à prise est l'endpoint, celle qui fait face à l'extérieur — jamais la
+    // broche bridge vers le filtre WaveRT (voir l'en-tête de module).
+    assert!(TOPO_RENDER_PIN_ENDPOINT == 1 && TOPO_CAPTURE_PIN_ENDPOINT == 0);
+    assert!(TOPO_RENDER_PIN_ENDPOINT < BROCHES && TOPO_CAPTURE_PIN_ENDPOINT < BROCHES);
+    // Autant de bits à 1 dans la cartographie que de canaux déclarés.
+    assert!(MAPPING_RENDU.count_ones() == CHANNELS);
+    assert!(MAPPING_CAPTURE == 0);
+};
 
 /// Miniport topologie du filtre `TopoRender<n>`.
 #[derive(Debug)]
@@ -121,6 +173,33 @@ impl AudioNodes for TopoRender {
     }
 }
 
+impl JackInfo for TopoRender {
+    // IRQL: PASSIVE_LEVEL
+    fn pin_count(&self) -> u32 {
+        BROCHES
+    }
+
+    // IRQL: PASSIVE_LEVEL — la broche endpoint, pas la broche bridge (en-tête de module).
+    fn jack_pin(&self) -> u32 {
+        TOPO_RENDER_PIN_ENDPOINT
+    }
+
+    // IRQL: PASSIVE_LEVEL — broche de rendu analogique : cartographie non nulle.
+    fn channel_mapping(&self) -> u32 {
+        MAPPING_RENDU
+    }
+
+    // IRQL: quelconque — l'état de connexion est par câble, commun aux deux sens.
+    fn is_connected(&self) -> bool {
+        self.cable.is_connected()
+    }
+
+    // IRQL: PASSIVE_LEVEL
+    fn trace(&self, trace: &JackTrace<'_>) {
+        kmd_log!("TopoRender{} : {trace:?}", self.n);
+    }
+}
+
 /// Miniport topologie du filtre `TopoCapture<n>`.
 #[derive(Debug)]
 pub struct TopoCapture {
@@ -184,6 +263,34 @@ impl AudioNodes for TopoCapture {
 
     // IRQL: PASSIVE_LEVEL
     fn trace(&self, trace: &Trace<'_>) {
+        kmd_log!("TopoCapture{} : {trace:?}", self.n);
+    }
+}
+
+impl JackInfo for TopoCapture {
+    // IRQL: PASSIVE_LEVEL
+    fn pin_count(&self) -> u32 {
+        BROCHES
+    }
+
+    // IRQL: PASSIVE_LEVEL — l'endpoint est ici la broche d'**entrée** (en-tête de module).
+    fn jack_pin(&self) -> u32 {
+        TOPO_CAPTURE_PIN_ENDPOINT
+    }
+
+    // IRQL: PASSIVE_LEVEL — broche de capture : cartographie **nulle**, la documentation
+    // l'exige.
+    fn channel_mapping(&self) -> u32 {
+        MAPPING_CAPTURE
+    }
+
+    // IRQL: quelconque — le même atomique que le sens rendu, un câble ayant deux bouts.
+    fn is_connected(&self) -> bool {
+        self.cable.is_connected()
+    }
+
+    // IRQL: PASSIVE_LEVEL
+    fn trace(&self, trace: &JackTrace<'_>) {
         kmd_log!("TopoCapture{} : {trace:?}", self.n);
     }
 }

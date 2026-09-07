@@ -84,12 +84,16 @@ int main(void)
     TAILLE(UNICODE_STRING);
 
     /* Structures de propriétés KS que M1b sérialise à la main (BasicSupport et
-     * propriétés de nœud : volume, mute). */
+     * propriétés de nœud : volume, mute) puis, pour M1b-03, la propriété de broche
+     * KSPROPERTY_JACK_DESCRIPTION : sa réponse est un KSMULTIPLE_ITEM suivi de N
+     * KSJACK_DESCRIPTION, et son instance est la queue d'un KSP_PIN. */
     TAILLE(KSPROPERTY_DESCRIPTION);
     TAILLE(KSPROPERTY_MEMBERSHEADER);
     TAILLE(KSPROPERTY_STEPPING_LONG);
     TAILLE(KSNODEPROPERTY);
     TAILLE(KSNODEPROPERTY_AUDIO_CHANNEL);
+    TAILLE(KSMULTIPLE_ITEM);
+    TAILLE(KSP_PIN);
 
     /* Vtables COM plates : slots × 8. */
     TAILLE(IUnknownVtbl);
@@ -134,6 +138,22 @@ int main(void)
     DECALAGE(KSNODEPROPERTY_AUDIO_CHANNEL, NodeProperty);
     DECALAGE(KSNODEPROPERTY_AUDIO_CHANNEL, Channel);
     DECALAGE(KSNODEPROPERTY_AUDIO_CHANNEL, Reserved);
+    /* M1b-03. KSP_PIN : PortCls en retire l'en-tête KSPROPERTY et ne laisse dans
+     * Instance que la queue — PinId d'abord —, comme il le fait du Channel des
+     * propriétés de nœud. Le décalage 24 de PinId le démontre : il vaut exactement
+     * sizeof(KSPROPERTY). (Reserved est dans une union anonyme, que offset_of! ne sait
+     * pas nommer côté Rust : non mesuré.) */
+    DECALAGE(KSMULTIPLE_ITEM, Size);
+    DECALAGE(KSMULTIPLE_ITEM, Count);
+    DECALAGE(KSJACK_DESCRIPTION, ChannelMapping);
+    DECALAGE(KSJACK_DESCRIPTION, Color);
+    DECALAGE(KSJACK_DESCRIPTION, ConnectionType);
+    DECALAGE(KSJACK_DESCRIPTION, GeoLocation);
+    DECALAGE(KSJACK_DESCRIPTION, GenLocation);
+    DECALAGE(KSJACK_DESCRIPTION, PortConnection);
+    DECALAGE(KSJACK_DESCRIPTION, IsConnected);
+    DECALAGE(KSP_PIN, Property);
+    DECALAGE(KSP_PIN, PinId);
     DECALAGE(PCNODE_DESCRIPTOR, Flags);
     DECALAGE(PCNODE_DESCRIPTOR, AutomationTable);
     DECALAGE(PCNODE_DESCRIPTOR, Type);

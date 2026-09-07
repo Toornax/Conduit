@@ -32,6 +32,8 @@ sizeof	KSPROPERTY_MEMBERSHEADER	16
 sizeof	KSPROPERTY_STEPPING_LONG	16
 sizeof	KSNODEPROPERTY	32
 sizeof	KSNODEPROPERTY_AUDIO_CHANNEL	40
+sizeof	KSMULTIPLE_ITEM	8
+sizeof	KSP_PIN	32
 sizeof	IUnknownVtbl	24
 sizeof	IMiniportVtbl	40
 sizeof	IMiniportWaveRTVtbl	64
@@ -64,6 +66,17 @@ offset	KSNODEPROPERTY.Reserved	28
 offset	KSNODEPROPERTY_AUDIO_CHANNEL.NodeProperty	0
 offset	KSNODEPROPERTY_AUDIO_CHANNEL.Channel	32
 offset	KSNODEPROPERTY_AUDIO_CHANNEL.Reserved	36
+offset	KSMULTIPLE_ITEM.Size	0
+offset	KSMULTIPLE_ITEM.Count	4
+offset	KSJACK_DESCRIPTION.ChannelMapping	0
+offset	KSJACK_DESCRIPTION.Color	4
+offset	KSJACK_DESCRIPTION.ConnectionType	8
+offset	KSJACK_DESCRIPTION.GeoLocation	12
+offset	KSJACK_DESCRIPTION.GenLocation	16
+offset	KSJACK_DESCRIPTION.PortConnection	20
+offset	KSJACK_DESCRIPTION.IsConnected	24
+offset	KSP_PIN.Property	0
+offset	KSP_PIN.PinId	24
 offset	PCNODE_DESCRIPTOR.Flags	0
 offset	PCNODE_DESCRIPTOR.AutomationTable	8
 offset	PCNODE_DESCRIPTOR.Type	16

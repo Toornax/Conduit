@@ -58,6 +58,14 @@
 //! Les deux précautions sont nécessaires : sans l'attribut, la garde refuse des objets
 //! légitimes dès qu'on optimise (voir la documentation de `topology::vtbl_of`, et les
 //! tests de `tests/property.rs`, qui le démontrent en `--release`).
+//!
+//! # Sérialisation : `Champs` et `ecrire_description`
+//!
+//! Les deux briques de sérialisation que tout gestionnaire de ce crate réutilise vivent
+//! ici plutôt que chez le premier qui en a eu besoin ([`crate::audio`]) : l'écrivain de
+//! champs à décalage absolu, et la `KSPROPERTY_DESCRIPTION` commune à toute réponse
+//! `BASICSUPPORT`. Un second jeu de décalages `D_*` recopié ailleurs serait la panne
+//! silencieuse classique — deux copies qui divergent d'un octet.
 
 use core::ffi::c_void;
 use core::fmt;
@@ -371,4 +379,117 @@ where
     } else {
         STATUS_INVALID_DEVICE_REQUEST
     }
+}
+
+// ---------------------------------------------------------------------------------
+// Sérialisation champ par champ, partagée par les gestionnaires du crate.
+//
+// Décalages recopiés de portcls-sys/tests/layout.golden (oracle cl.exe). Chaque champ est
+// écrit à son décalage nommé : le code se relit en regard du golden.
+// ---------------------------------------------------------------------------------
+
+/// Écrivain de champs à décalage **absolu** dans le tampon `Value`.
+///
+/// Jamais de transtypage vers un `*mut` de structure : `Value` n'est aligné sur rien
+/// (frontière de confiance en tête de module), et une écriture désalignée par un pointeur
+/// de structure est un comportement indéfini en Rust même là où x64 la tolère. Chaque
+/// champ est copié par `get_mut(a..b)` + `copy_from_slice(&x.to_ne_bytes())`, à un
+/// décalage nommé recopié du golden.
+pub(crate) struct Champs<'a> {
+    /// Le tampon `Value`, de taille et d'alignement quelconques.
+    pub(crate) dest: &'a mut [u8],
+}
+
+impl Champs<'_> {
+    /// Copie `src` au décalage `offset`. Ne fait rien si la place manque : les appelants
+    /// choisissent leur palier avant d'écrire, cette garde n'est là que pour qu'aucun
+    /// chemin ne puisse déborder ni paniquer.
+    pub(crate) fn octets(&mut self, offset: usize, src: &[u8]) {
+        let Some(fin) = offset.checked_add(src.len()) else {
+            return;
+        };
+        if let Some(place) = self.dest.get_mut(offset..fin) {
+            place.copy_from_slice(src);
+        }
+    }
+
+    /// Un `ULONG` au décalage `offset`.
+    pub(crate) fn u32(&mut self, offset: usize, valeur: u32) {
+        self.octets(offset, &valeur.to_ne_bytes());
+    }
+
+    /// Un `LONG` au décalage `offset`.
+    pub(crate) fn i32(&mut self, offset: usize, valeur: i32) {
+        self.octets(offset, &valeur.to_ne_bytes());
+    }
+
+    /// Un `GUID` au décalage `offset`, champ par champ dans l'ordre de `guiddef.h`
+    /// (`Data1: ULONG`, `Data2: USHORT`, `Data3: USHORT`, `Data4: [UCHAR; 8]`).
+    pub(crate) fn guid(&mut self, offset: usize, valeur: &GUID) {
+        self.u32(offset, valeur.Data1);
+        // Décalages internes du GUID : 4, 6, 8. Écrits en dur plutôt que calculés, comme
+        // partout ici, pour rester lisibles en regard de `guiddef.h`.
+        let Some(base) = offset.checked_add(4) else {
+            return;
+        };
+        self.octets(base, &valeur.Data2.to_ne_bytes());
+        let Some(base) = offset.checked_add(6) else {
+            return;
+        };
+        self.octets(base, &valeur.Data3.to_ne_bytes());
+        let Some(base) = offset.checked_add(8) else {
+            return;
+        };
+        self.octets(base, &valeur.Data4);
+    }
+}
+
+/// `KSPROPERTY_DESCRIPTION::AccessFlags` (`ULONG`).
+pub(crate) const D_ACCESSFLAGS: usize = 0;
+/// `KSPROPERTY_DESCRIPTION::DescriptionSize` (`ULONG`).
+pub(crate) const D_DESCRIPTIONSIZE: usize = 4;
+/// `KSPROPERTY_DESCRIPTION::PropTypeSet.Set` : le `GUID` du `KSIDENTIFIER`.
+pub(crate) const D_PROPTYPESET_SET: usize = 8;
+/// `KSPROPERTY_DESCRIPTION::PropTypeSet.Id` : la variante (`VT_I4`, `VT_BOOL`, ou 0 pour
+/// une propriété de taille variable, cf. `VT_ILLEGAL`).
+pub(crate) const D_PROPTYPESET_ID: usize = 24;
+/// `KSPROPERTY_DESCRIPTION::PropTypeSet.Flags`.
+pub(crate) const D_PROPTYPESET_FLAGS: usize = 28;
+/// `KSPROPERTY_DESCRIPTION::MembersListCount` — **32**, pas 24 ni 16 : `PropTypeSet` est
+/// un `KSIDENTIFIER` de 24 octets, pas un `GUID` de 16.
+pub(crate) const D_MEMBERSLISTCOUNT: usize = 32;
+/// `KSPROPERTY_DESCRIPTION::Reserved`.
+pub(crate) const D_RESERVED: usize = 36;
+
+/// `sizeof(ULONG)` : le premier palier de `BASICSUPPORT`, les seuls `AccessFlags`.
+pub(crate) const TAILLE_ACCESSFLAGS: usize = 4;
+/// `sizeof(KSPROPERTY_DESCRIPTION)` (golden).
+pub(crate) const TAILLE_DESCRIPTION: usize = 40;
+
+const _: () = assert!(D_MEMBERSLISTCOUNT == 32 && TAILLE_DESCRIPTION == 40);
+
+/// Écrit la `KSPROPERTY_DESCRIPTION` (40 octets) en tête d'une réponse `BASICSUPPORT`.
+///
+/// `taille_totale` est la taille **complète** de la description (celle des membres
+/// comprise), écrite même quand on n'a la place que pour les 40 premiers octets : c'est
+/// ce qui dit au client quoi redemander. `type_set`/`variante` décrivent le type de la
+/// valeur (`KSPROPTYPESETID_General` + une `VARENUM`, ou `GUID_NULL` + 0 pour une valeur
+/// de taille variable). `membres` est le nombre d'éléments de la liste qui suit.
+pub(crate) fn ecrire_description(
+    champs: &mut Champs<'_>,
+    access_flags: u32,
+    taille_totale: u32,
+    type_set: &GUID,
+    variante: u32,
+    membres: u32,
+) {
+    champs.u32(D_ACCESSFLAGS, access_flags);
+    champs.u32(D_DESCRIPTIONSIZE, taille_totale);
+    // PropTypeSet : KSIDENTIFIER de 24 octets — GUID, puis Id, puis Flags. C'est de là
+    // que vient le décalage 32 de MembersListCount.
+    champs.guid(D_PROPTYPESET_SET, type_set);
+    champs.u32(D_PROPTYPESET_ID, variante);
+    champs.u32(D_PROPTYPESET_FLAGS, 0);
+    champs.u32(D_MEMBERSLISTCOUNT, membres);
+    champs.u32(D_RESERVED, 0);
 }

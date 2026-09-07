@@ -105,6 +105,8 @@ tailles! {
     KSPROPERTY_STEPPING_LONG => KSPROPERTY_STEPPING_LONG,
     KSNODEPROPERTY => KSNODEPROPERTY,
     KSNODEPROPERTY_AUDIO_CHANNEL => KSNODEPROPERTY_AUDIO_CHANNEL,
+    KSMULTIPLE_ITEM => KSMULTIPLE_ITEM,
+    KSP_PIN => KSP_PIN,
     IUnknownVtbl => IUnknownVtbl,
     IMiniportVtbl => IMiniportVtbl,
     IMiniportWaveRTVtbl => IMiniportWaveRTVtbl,
@@ -149,6 +151,23 @@ decalages! {
         NodeProperty,
         Channel,
         Reserved,
+    },
+    KSMULTIPLE_ITEM {
+        Size,
+        Count,
+    },
+    KSJACK_DESCRIPTION {
+        ChannelMapping,
+        Color,
+        ConnectionType,
+        GeoLocation,
+        GenLocation,
+        PortConnection,
+        IsConnected,
+    },
+    KSP_PIN {
+        Property,
+        PinId,
     },
     PCNODE_DESCRIPTOR {
         Flags,

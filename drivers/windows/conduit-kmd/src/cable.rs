@@ -51,6 +51,13 @@
 //! Le loger dans le miniport de topologie marcherait aujourd'hui et coûterait un
 //! déménagement demain.
 //!
+//! Depuis M1b-03, il porte de la même façon son **état de connexion**
+//! ([`Cable::is_connected`]) : `KSJACK_DESCRIPTION::IsConnected`, ce qui fait la différence
+//! entre un endpoint listé dans les réglages Son et un endpoint rangé sous
+//! « Périphériques déconnectés ». Il est **par câble** et non par sens : un câble
+//! débranché l'est de ses deux bouts, et les deux filtres de topologie lisent le même
+//! atomique.
+//!
 //! Ces champs sont des **atomiques, pas des champs sous le verrou du câble** : le
 //! gestionnaire de propriété KS tourne à `PASSIVE_LEVEL` sur un fil quelconque, la lecture
 //! éventuelle viendrait du tick à `DISPATCH_LEVEL`, un chargement 32 bits aligné ne se
@@ -480,10 +487,15 @@ pub struct Cable {
     render_nodes: NodeState,
     /// Nœuds volume et sourdine du filtre `TopoCapture<n>`.
     capture_nodes: NodeState,
+    /// `KSJACK_DESCRIPTION::IsConnected` des **deux** filtres de topologie du câble : 0 ou
+    /// 1 (hors verrou, comme [`NodeState`] ; un `AtomicU32` plutôt qu'un `AtomicBool` pour
+    /// que l'aligné 32 bits se relise sans surprise dans un vidage mémoire).
+    connected: AtomicU32,
 }
 
 impl Cable {
-    /// Câble `index`, sans flux ni timer, nœuds au repos.
+    /// Câble `index`, sans flux ni timer, nœuds au repos, connecté si son index est
+    /// inférieur à [`CONNECTED_BY_DEFAULT`].
     pub const fn new(index: u32) -> Self {
         Self {
             index,
@@ -492,7 +504,33 @@ impl Cable {
             counters: Counters::new(),
             render_nodes: NodeState::new(),
             capture_nodes: NodeState::new(),
+            connected: AtomicU32::new(if connected_by_default(index) { 1 } else { 0 }),
         }
+    }
+
+    /// L'état de connexion du câble, celui que `KSJACK_DESCRIPTION::IsConnected` porte.
+    ///
+    /// `false` range l'endpoint sous « Périphériques déconnectés » dans les réglages Son,
+    /// des deux côtés du câble à la fois.
+    ///
+    /// IRQL : quelconque.
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Relaxed) != 0
+    }
+
+    /// Fixe l'état de connexion du câble.
+    ///
+    /// **Personne ne l'appelle encore** : M1b-03 se contente d'exposer l'état de départ,
+    /// M1b-04 branchera dessus une propriété KS privée. Ce jour-là, il faudra **aussi**
+    /// émettre `KSEVENT_PINCAPS_JACKINFOCHANGE` sur les deux filtres de topologie du
+    /// câble — Windows n'interroge pas le jack en boucle, et sans cet événement
+    /// l'interface restera figée sur l'état du démarrage (voir `portcls::jack`).
+    ///
+    /// IRQL : quelconque.
+    #[allow(dead_code)] // point d'accroche de M1b-04, documenté ci-dessus
+    pub fn set_connected(&self, connected: bool) {
+        self.connected
+            .store(u32::from(connected), Ordering::Relaxed);
     }
 
     /// Les nœuds volume et sourdine du sens `direction`.
@@ -531,7 +569,9 @@ impl Cable {
     ///
     /// Les [`NodeState`] ne sont **pas** remis à zéro : Windows repousse sa valeur par
     /// défaut dans le nœud dès qu'il recrée l'endpoint, et ce que le nœud mémorise
-    /// n'agit de toute façon sur rien.
+    /// n'agit de toute façon sur rien. L'état de connexion non plus : c'est un réglage de
+    /// l'utilisateur, pas un état de session, et il doit survivre à un cycle
+    /// `StopDevice`/`StartDevice` (une mise en veille, par exemple).
     ///
     /// IRQL : `PASSIVE_LEVEL`.
     pub fn start(&self) -> Result<(), NtStatus> {
@@ -854,6 +894,40 @@ pub fn cable(index: u32) -> Option<&'static Cable> {
 /// M1b-01 la rendra configurable (lecture du registre au démarrage) ; elle reste une
 /// constante pour l'instant.
 pub const CABLE_COUNT: u32 = portcls::CABLE_COUNT as u32;
+
+/// Nombre de câbles **connectés au démarrage** : les deux premiers, « Conduit 1 » et
+/// « Conduit 2 ».
+///
+/// Les seize câbles s'énumèrent toujours tous — un endpoint apparaît pour chacun d'eux —
+/// mais quatorze se présentent à Windows comme des prises vides et se rangent sous
+/// « Périphériques déconnectés », hors de la liste des périphériques utilisables. C'est ce
+/// qui rend un pilote à seize câbles supportable dans le panneau de son sans rien changer
+/// à l'énumération PnP.
+///
+/// M1b-04 le rendra modifiable câble par câble ([`Cable::set_connected`]) ; cette
+/// constante ne restera alors que l'**état de départ**.
+pub const CONNECTED_BY_DEFAULT: u32 = 2;
+
+/// Le câble `index` est-il connecté au démarrage ?
+///
+/// Une fonction plutôt qu'un `if` en ligne dans [`Cable::new`] : l'état de départ n'est
+/// pas relisible depuis un contexte `const` (il vit dans un atomique), c'est donc ce
+/// prédicat que les assertions ci-dessous vérifient. Une inversion de comparaison
+/// donnerait quatorze câbles connectés et deux masqués — visible seulement en machine,
+/// sinon.
+pub const fn connected_by_default(index: u32) -> bool {
+    index < CONNECTED_BY_DEFAULT
+}
+
+const _: () = {
+    assert!(
+        CONNECTED_BY_DEFAULT <= CABLE_COUNT,
+        "on ne peut pas connecter plus de câbles qu'il n'en existe"
+    );
+    assert!(CONNECTED_BY_DEFAULT == 2, "« Conduit 1 » et « Conduit 2 »");
+    assert!(connected_by_default(0) && connected_by_default(1));
+    assert!(!connected_by_default(2) && !connected_by_default(CABLE_COUNT.wrapping_sub(1)));
+};
 
 /// Supprime les timers de tous les câbles : à appeler une fois au déchargement du
 /// pilote, avant de rendre la main à PortCls.

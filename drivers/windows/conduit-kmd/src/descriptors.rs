@@ -22,8 +22,26 @@
 //!   — index [`NODE_VOLUME`] `KSNODETYPE_VOLUME`, index [`NODE_MUTE`] `KSNODETYPE_MUTE` —
 //!   chacun avec sa table d'automatisation d'une propriété, et trois connexions
 //!   ([`TOPO_CONNECTIONS`]) qui les mettent en série entre les deux broches. La table
-//!   d'automatisation du *filtre*, elle, reste vide : les propriétés sont sur les nœuds.
-//!   Jack : M1b-03.
+//!   d'automatisation du *filtre* porte, depuis M1b-03, la **seule** propriété qui ne soit
+//!   ni de nœud ni de broche : `KSPROPERTY_JACK_DESCRIPTION`.
+//!
+//! # Le jack est une propriété du **filtre** (M1b-03)
+//!
+//! Contre-intuitif, et la documentation Microsoft y insiste : la valeur décrit une broche,
+//! mais « *the property is a property of the filter, not of the pin* ». L'entrée va donc
+//! dans `PCFILTER_DESCRIPTOR::AutomationTable` ([`TOPO_RENDER_AUTOMATION`],
+//! [`TOPO_CAPTURE_AUTOMATION`]) et le `PCPIN_DESCRIPTOR::AutomationTable` de toutes nos
+//! broches reste **nul** — ce qui n'est pas qu'une question de conformité : une broche
+//! bridge ne s'instancie pas (`MaxInstanceCount = 0`), une table posée là ne serait jamais
+//! atteinte. Le client interroge le filtre et désigne la broche par un `KSP_PIN` dont
+//! `PortCls` laisse le `PinId` dans `Instance`.
+//!
+//! La broche décrite est la broche **endpoint** ([`TOPO_RENDER_PIN_ENDPOINT`],
+//! [`TOPO_CAPTURE_PIN_ENDPOINT`]) : c'est elle qui fait face au périphérique d'extrémité,
+//! c'est d'elle que Windows tire l'endpoint, et c'est elle que la documentation appelle
+//! « bridge pin ». Notre [`bridge_pin`] à nous désigne autre chose — la broche interne vers
+//! le filtre WaveRT —, et cette collision de vocabulaire est le piège de M1b-03 : la
+//! propriété répondrait quand même, mais toujours par une description vide.
 //!
 //! # Pourquoi ces nœuds existent (M1b-03b, driver-design.md §5.5)
 //!
@@ -86,7 +104,9 @@ use core::mem::size_of;
 use core::ptr;
 
 use conduit_kmd_core::{M1A_FORMATS, SampleFormat};
-use portcls::{CABLE_COUNT, PIN_NAME_GUIDS, mute_item, volume_item};
+use portcls::{
+    CABLE_COUNT, JACK_ACCESS_FLAGS, PIN_NAME_GUIDS, jack_description_item, mute_item, volume_item,
+};
 use portcls_sys::{
     GUID, IMiniportTopologyVtbl, KSCATEGORY_AUDIO, KSDATAFORMAT, KSDATAFORMAT__bindgen_ty_1,
     KSDATAFORMAT_SPECIFIER_NONE, KSDATAFORMAT_SPECIFIER_WAVEFORMATEX, KSDATAFORMAT_SUBTYPE_ANALOG,
@@ -451,23 +471,32 @@ const fn wave_filter<const P: usize, const C: usize>(
 
 /// **Forme topologie** : filtre de topologie avec ses nœuds.
 ///
-/// La table d'automatisation du filtre reste **vide** : les propriétés sont portées par les
-/// nœuds (`PCNODE_DESCRIPTOR::AutomationTable`), pas par le filtre. PortCls route
-/// `KSPROPERTY_AUDIO_*` vers le nœud désigné par `PCPROPERTY_REQUEST::Node`.
+/// `automation` est la table du **filtre** : elle ne porte que
+/// `KSPROPERTY_JACK_DESCRIPTION` (voir l'en-tête de module), et se dédouble par sens
+/// comme celles des nœuds. Les propriétés audio, elles, restent sur les nœuds
+/// (`PCNODE_DESCRIPTOR::AutomationTable`) : PortCls route `KSPROPERTY_AUDIO_*` vers le nœud
+/// désigné par `PCPROPERTY_REQUEST::Node`, et les propriétés de filtre vers cette table-ci.
 const fn topo_filter<const P: usize, const N: usize, const C: usize>(
+    automation: &'static Shared<PCAUTOMATION_TABLE>,
     pins: &'static [PCPIN_DESCRIPTOR; P],
     nodes: &'static Shared<[PCNODE_DESCRIPTOR; N]>,
     connections: &'static Shared<[PCCONNECTION_DESCRIPTOR; C]>,
 ) -> PCFILTER_DESCRIPTOR {
-    filter::<P, N, C>(&EMPTY_AUTOMATION, pins, nodes, connections)
+    filter::<P, N, C>(automation, pins, nodes, connections)
 }
 
-/// Table d'automatisation d'un nœud audio : une seule propriété, aucune méthode, aucun
-/// événement.
+/// Table d'automatisation à une propriété : celle des nœuds audio, et celle des filtres de
+/// topologie depuis M1b-03. Aucune méthode, aucun événement.
 ///
 /// Les `*ItemSize` sont renseignés même à compte nul, comme dans [`EMPTY_AUTOMATION`] :
 /// PortCls s'en sert pour avancer dans les tableaux, et une taille nulle avec un compte nul
 /// est un piège inutile à laisser.
+///
+/// `EventCount = 0` est ce que **M1b-04 devra changer** : dès que l'état de connexion d'un
+/// câble deviendra modifiable, il faudra y déclarer un `PCEVENT_ITEM`
+/// `KSEVENT_PINCAPS_JACKINFOCHANGE` sur les filtres de topologie, faute de quoi Windows
+/// n'ira jamais relire le jack et l'interface restera figée sur l'état du démarrage (voir
+/// `portcls::jack`).
 const fn one_property_automation(
     properties: &'static Shared<[PCPROPERTY_ITEM; 1]>,
 ) -> PCAUTOMATION_TABLE {
@@ -612,6 +641,23 @@ static RENDER_VOLUME_PROPERTIES: Shared<[PCPROPERTY_ITEM; 1]> = Shared(RENDER_VO
 static RENDER_MUTE_PROPERTIES: Shared<[PCPROPERTY_ITEM; 1]> = Shared(RENDER_MUTE_ITEMS);
 static CAPTURE_VOLUME_PROPERTIES: Shared<[PCPROPERTY_ITEM; 1]> = Shared(CAPTURE_VOLUME_ITEMS);
 static CAPTURE_MUTE_PROPERTIES: Shared<[PCPROPERTY_ITEM; 1]> = Shared(CAPTURE_MUTE_ITEMS);
+
+/// `KSPROPERTY_JACK_DESCRIPTION` du **filtre** `TopoRender` (M1b-03).
+const RENDER_JACK_ITEMS: [PCPROPERTY_ITEM; 1] =
+    [jack_description_item::<IMiniportTopologyVtbl, TopoRender>()];
+/// `KSPROPERTY_JACK_DESCRIPTION` du **filtre** `TopoCapture`.
+const CAPTURE_JACK_ITEMS: [PCPROPERTY_ITEM; 1] =
+    [jack_description_item::<IMiniportTopologyVtbl, TopoCapture>()];
+
+static RENDER_JACK_PROPERTIES: Shared<[PCPROPERTY_ITEM; 1]> = Shared(RENDER_JACK_ITEMS);
+static CAPTURE_JACK_PROPERTIES: Shared<[PCPROPERTY_ITEM; 1]> = Shared(CAPTURE_JACK_ITEMS);
+
+/// Table d'automatisation du filtre `TopoRender<n>` : le jack, et rien d'autre.
+static TOPO_RENDER_AUTOMATION: Shared<PCAUTOMATION_TABLE> =
+    Shared(one_property_automation(&RENDER_JACK_PROPERTIES));
+/// Table d'automatisation du filtre `TopoCapture<n>`.
+static TOPO_CAPTURE_AUTOMATION: Shared<PCAUTOMATION_TABLE> =
+    Shared(one_property_automation(&CAPTURE_JACK_PROPERTIES));
 
 static RENDER_VOLUME_AUTOMATION: Shared<PCAUTOMATION_TABLE> =
     Shared(one_property_automation(&RENDER_VOLUME_PROPERTIES));
@@ -762,6 +808,7 @@ const fn pins_row(
 /// Descripteur du filtre `TopoRender<n>` du câble `cable`.
 const fn topo_render_filter_of(cable: usize) -> PCFILTER_DESCRIPTOR {
     topo_filter(
+        &TOPO_RENDER_AUTOMATION,
         pins_row(&TOPO_RENDER_PINS_TABLE, cable),
         &TOPO_RENDER_NODES_TABLE,
         &TOPO_CONNECTIONS_TABLE,
@@ -771,6 +818,7 @@ const fn topo_render_filter_of(cable: usize) -> PCFILTER_DESCRIPTOR {
 /// Descripteur du filtre `TopoCapture<n>` du câble `cable`.
 const fn topo_capture_filter_of(cable: usize) -> PCFILTER_DESCRIPTOR {
     topo_filter(
+        &TOPO_CAPTURE_AUTOMATION,
         pins_row(&TOPO_CAPTURE_PINS_TABLE, cable),
         &TOPO_CAPTURE_NODES_TABLE,
         &TOPO_CONNECTIONS_TABLE,
@@ -1214,9 +1262,29 @@ const fn automation_is_well_formed(table: &PCAUTOMATION_TABLE, properties: usize
 }
 
 const _: () = {
-    // La table de filtre, vide : c'est PortCls qui répond à `KSPROPSETID_Pin` et
+    // La table des filtres **wave**, vide : c'est PortCls qui répond à `KSPROPSETID_Pin` et
     // `KSPROPSETID_Topology`.
     assert!(automation_is_well_formed(&EMPTY_AUTOMATION_TABLE, 0));
+
+    // Les deux tables de filtre **topologie** : le jack, et rien d'autre.
+    assert!(automation_is_well_formed(
+        &one_property_automation(&RENDER_JACK_PROPERTIES),
+        1
+    ));
+    assert!(automation_is_well_formed(
+        &one_property_automation(&CAPTURE_JACK_PROPERTIES),
+        1
+    ));
+    assert!(property_items_are_well_formed(&RENDER_JACK_ITEMS));
+    assert!(property_items_are_well_formed(&CAPTURE_JACK_ITEMS));
+
+    // `GET | BASICSUPPORT`, et surtout **pas** `SET` : `KSPROPERTY_JACK_DESCRIPTION` est en
+    // lecture seule (« Get: Yes, Set: No »). Un `SET` déclaré par erreur ferait croire au
+    // client qu'il peut brancher le câble par cette propriété-là, alors que c'est M1b-04 et
+    // une propriété privée qui s'en chargeront.
+    assert!(RENDER_JACK_ITEMS[0].Flags == JACK_ACCESS_FLAGS);
+    assert!(CAPTURE_JACK_ITEMS[0].Flags == JACK_ACCESS_FLAGS);
+    assert!(JACK_ACCESS_FLAGS & portcls_sys::KSPROPERTY_TYPE_SET == 0);
 
     // Les quatre tables de nœud : une propriété chacune, réellement pointée.
     assert!(automation_is_well_formed(

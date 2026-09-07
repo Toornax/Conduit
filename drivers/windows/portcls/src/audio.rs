@@ -59,9 +59,10 @@
 //! # Les décalages viennent du golden, pas de l'intuition
 //!
 //! `drivers/windows/portcls-sys/tests/layout.golden` les tient de `cl.exe` sur les
-//! en-têtes du WDK ; les constantes `D_*`, `M_*` et `S_*` de ce module les recopient une à
-//! une, et chaque champ est écrit **à son décalage nommé**, pour que le code se relise en
-//! regard du golden.
+//! en-têtes du WDK ; les constantes `M_*` et `S_*` de ce module — et les `D_*` de
+//! [`crate::property`], partagées avec [`crate::jack`] — les recopient une à une, et
+//! chaque champ est écrit **à son décalage nommé**, pour que le code se relise en regard
+//! du golden.
 //!
 //! | Structure | Champ → décalage | Taille |
 //! |---|---|---|
@@ -117,7 +118,10 @@ use portcls_sys::{
     KSPROPERTY_TYPE_SET, KSPROPSETID_Audio, KSPROPTYPESETID_General, PCPROPERTY_ITEM, VARENUM,
 };
 
-use crate::property::{self, PropertyHandler, Request, TargetVtbl};
+use crate::property::{
+    self, Champs, D_ACCESSFLAGS, PropertyHandler, Request, TAILLE_ACCESSFLAGS, TAILLE_DESCRIPTION,
+    TargetVtbl, ecrire_description,
+};
 use crate::status::STATUS_BUFFER_TOO_SMALL;
 
 // ---------------------------------------------------------------------------------
@@ -169,24 +173,10 @@ const TAILLE_VALEUR: usize = 4;
 
 // ---------------------------------------------------------------------------------
 // Décalages recopiés de portcls-sys/tests/layout.golden (oracle cl.exe). Chaque champ
-// est écrit à son décalage nommé : le code se relit en regard du golden.
+// est écrit à son décalage nommé : le code se relit en regard du golden. Ceux de
+// `KSPROPERTY_DESCRIPTION` (`D_*`) vivent dans `crate::property`, partagés avec
+// `crate::jack`.
 // ---------------------------------------------------------------------------------
-
-/// `KSPROPERTY_DESCRIPTION::AccessFlags` (`ULONG`).
-const D_ACCESSFLAGS: usize = 0;
-/// `KSPROPERTY_DESCRIPTION::DescriptionSize` (`ULONG`).
-const D_DESCRIPTIONSIZE: usize = 4;
-/// `KSPROPERTY_DESCRIPTION::PropTypeSet.Set` : le `GUID` du `KSIDENTIFIER`.
-const D_PROPTYPESET_SET: usize = 8;
-/// `KSPROPERTY_DESCRIPTION::PropTypeSet.Id` : la variante (`VT_I4`, `VT_BOOL`).
-const D_PROPTYPESET_ID: usize = 24;
-/// `KSPROPERTY_DESCRIPTION::PropTypeSet.Flags`.
-const D_PROPTYPESET_FLAGS: usize = 28;
-/// `KSPROPERTY_DESCRIPTION::MembersListCount` — **32**, pas 24 ni 16 : `PropTypeSet` est
-/// un `KSIDENTIFIER` de 24 octets, pas un `GUID` de 16.
-const D_MEMBERSLISTCOUNT: usize = 32;
-/// `KSPROPERTY_DESCRIPTION::Reserved`.
-const D_RESERVED: usize = 36;
 
 /// `KSPROPERTY_MEMBERSHEADER::MembersFlags`, à la suite de la description (40 + 0).
 const M_MEMBERSFLAGS: usize = 40;
@@ -206,10 +196,6 @@ const S_MINIMUM: usize = 64;
 /// `KSPROPERTY_STEPPING_LONG::Bounds.SignedMaximum` (56 + 12).
 const S_MAXIMUM: usize = 68;
 
-/// `sizeof(ULONG)` : le premier palier de `BASICSUPPORT`, les seuls `AccessFlags`.
-const TAILLE_ACCESSFLAGS: usize = 4;
-/// `sizeof(KSPROPERTY_DESCRIPTION)` (golden).
-const TAILLE_DESCRIPTION: usize = 40;
 /// `sizeof(KSPROPERTY_MEMBERSHEADER)` (golden).
 const TAILLE_MEMBERSHEADER: usize = 16;
 /// `sizeof(KSPROPERTY_STEPPING_LONG)` (golden).
@@ -218,7 +204,6 @@ const TAILLE_STEPPING_LONG: usize = 16;
 const TAILLE_BASICSUPPORT_VOLUME: usize =
     TAILLE_DESCRIPTION + TAILLE_MEMBERSHEADER + TAILLE_STEPPING_LONG;
 
-const _: () = assert!(D_MEMBERSLISTCOUNT == 32);
 const _: () = assert!(TAILLE_DESCRIPTION == 40 && TAILLE_BASICSUPPORT_VOLUME == 72);
 
 // ---------------------------------------------------------------------------------
@@ -398,78 +383,6 @@ fn normaliser(demande: i32) -> i32 {
 // Sérialisation champ par champ.
 // ---------------------------------------------------------------------------------
 
-/// Écrivain de champs à décalage **absolu** dans le tampon `Value`.
-///
-/// Jamais de transtypage vers un `*mut` de structure : `Value` n'est aligné sur rien
-/// (frontière de confiance de [`crate::property`]), et une écriture désalignée par un
-/// pointeur de structure est un comportement indéfini en Rust même là où x64 la tolère.
-/// Chaque champ est copié par `get_mut(a..b)` + `copy_from_slice(&x.to_ne_bytes())`, à un
-/// décalage nommé recopié du golden.
-struct Champs<'a> {
-    dest: &'a mut [u8],
-}
-
-impl Champs<'_> {
-    /// Copie `src` au décalage `offset`. Ne fait rien si la place manque : les appelants
-    /// choisissent leur palier avant d'écrire, cette garde n'est là que pour qu'aucun
-    /// chemin ne puisse déborder ni paniquer.
-    fn octets(&mut self, offset: usize, src: &[u8]) {
-        let Some(fin) = offset.checked_add(src.len()) else {
-            return;
-        };
-        if let Some(place) = self.dest.get_mut(offset..fin) {
-            place.copy_from_slice(src);
-        }
-    }
-
-    /// Un `ULONG` au décalage `offset`.
-    fn u32(&mut self, offset: usize, valeur: u32) {
-        self.octets(offset, &valeur.to_ne_bytes());
-    }
-
-    /// Un `LONG` au décalage `offset`.
-    fn i32(&mut self, offset: usize, valeur: i32) {
-        self.octets(offset, &valeur.to_ne_bytes());
-    }
-
-    /// Un `GUID` au décalage `offset`, champ par champ dans l'ordre de `guiddef.h`
-    /// (`Data1: ULONG`, `Data2: USHORT`, `Data3: USHORT`, `Data4: [UCHAR; 8]`).
-    fn guid(&mut self, offset: usize, valeur: &GUID) {
-        self.u32(offset, valeur.Data1);
-        // Décalages internes du GUID : 4, 6, 8. Écrits en dur plutôt que calculés, comme
-        // partout ici, pour rester lisibles en regard de `guiddef.h`.
-        let Some(base) = offset.checked_add(4) else {
-            return;
-        };
-        self.octets(base, &valeur.Data2.to_ne_bytes());
-        let Some(base) = offset.checked_add(6) else {
-            return;
-        };
-        self.octets(base, &valeur.Data3.to_ne_bytes());
-        let Some(base) = offset.checked_add(8) else {
-            return;
-        };
-        self.octets(base, &valeur.Data4);
-    }
-}
-
-/// Écrit la `KSPROPERTY_DESCRIPTION` (40 octets) commune aux deux propriétés.
-///
-/// `taille_totale` est la taille **complète** de la description (72 pour le volume, 40
-/// pour la sourdine), écrite même quand on n'a la place que pour les 40 premiers octets :
-/// c'est ce qui dit au client quoi redemander.
-fn ecrire_description(champs: &mut Champs<'_>, taille_totale: u32, variante: u32, membres: u32) {
-    champs.u32(D_ACCESSFLAGS, ACCESS_FLAGS);
-    champs.u32(D_DESCRIPTIONSIZE, taille_totale);
-    // PropTypeSet : KSIDENTIFIER de 24 octets — GUID, puis Id, puis Flags. C'est de là
-    // que vient le décalage 32 de MembersListCount.
-    champs.guid(D_PROPTYPESET_SET, &KSPROPTYPESETID_General);
-    champs.u32(D_PROPTYPESET_ID, variante);
-    champs.u32(D_PROPTYPESET_FLAGS, 0);
-    champs.u32(D_MEMBERSLISTCOUNT, membres);
-    champs.u32(D_RESERVED, 0);
-}
-
 /// Réponse à `KSPROPERTY_TYPE_BASICSUPPORT`, en paliers (voir la documentation du module).
 ///
 /// `avec_plage` : `true` pour le volume (72 octets, un `KSPROPERTY_MEMBERSHEADER` et un
@@ -498,7 +411,14 @@ fn basic_support_ks(value: &mut [u8], variante: u32, avec_plage: bool) -> Result
     // Le palier intermédiaire, celui qu'on oublie : la place d'une description mais pas
     // des membres. On écrit 40 octets et on rend 40 — avec `DescriptionSize` à sa valeur
     // complète, pour que le client sache redemander 72.
-    ecrire_description(&mut champs, taille as u32, variante, membres);
+    ecrire_description(
+        &mut champs,
+        ACCESS_FLAGS,
+        taille as u32,
+        &KSPROPTYPESETID_General,
+        variante,
+        membres,
+    );
     if !avec_plage || champs.dest.len() < TAILLE_BASICSUPPORT_VOLUME {
         return Ok(TAILLE_DESCRIPTION as u32);
     }
