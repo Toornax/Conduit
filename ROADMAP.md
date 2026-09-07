@@ -486,6 +486,15 @@ signé par attestation, HLK audio passé, latence conforme à SPEC §5.6, endura
   deux hypothèses de conception vérifiées : l'échelle est bien 1/65536 dB (plage annoncée
   −96,0 / 0,0 dB au pas de 0,5), et le canal est bien le premier `LONG` de l'instance
   (Windows interroge canal 0 puis canal 1).
+*Non-régression du lot M1b-01/02/03, mesurée le 2026-09-08* : `conduit-looptest --repeat 10`
+sur Conduit 1, en session console, **deux séries de dix passes sur dix**, 440,000 Hz,
+amplitude 0,500, aucun saut de phase, aucun trou — avec les seize câbles enregistrés, le
+nœud de volume et l'état de jack en place.
+Le **débogueur noyau attaché fausse cette mesure** : à version, machine et séquence
+identiques, il donne 17 passes sur 20 (sauts de phase et un trou de 384 trames) contre
+20 sur 20 une fois détaché. Chaque trace part par le canal série, et le moteur audio
+interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
+
 - [ ] **M1b-04** `feat(driver): propriété KS privée de configuration (activer, désactiver, canaux)`
   Jeu de propriétés KS privé `KSPROPSETID_Conduit` exposé par le filtre de topologie de
   chaque câble, et non un objet de périphérique de contrôle séparé

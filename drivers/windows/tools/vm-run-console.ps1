@@ -39,6 +39,16 @@
 .PARAMETER Path
   Exécutable local à copier dans l'invité. Facultatif s'il y est déjà : indiquer alors
   -RemoteExecutable.
+
+  L'INVITÉ N'A PAS LE RUNTIME VISUAL C++. Un binaire Rust construit normalement dépend de
+  VCRUNTIME140.dll et meurt dans l'invité avec le code -1073741515 (0xC0000135,
+  STATUS_DLL_NOT_FOUND), sans dire quelle DLL manque. Construire avec le CRT statique :
+
+    $env:RUSTFLAGS = "-C target-feature=+crt-static"
+    cargo build -p conduit-looptest --target-dir target\static
+
+  (Le -target-dir séparé évite de reconstruire tout le workspace au changement de
+  RUSTFLAGS.) Le pilote, lui, est déjà en CRT statique : wdk-build l'exige.
 .PARAMETER RemoteExecutable
   Exécutable DANS l'invité (nom relatif à -RemoteDirectory, ou chemin complet). Par défaut,
   le nom de fichier de -Path.

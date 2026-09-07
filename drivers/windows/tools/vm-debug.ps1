@@ -25,6 +25,17 @@
   « erreur », le seul armé par défaut, et arrivent donc sans configuration. Les masques
   restent ouverts pour les traces des AUTRES composants (voir -InitialCommands).
 
+  ATTENTION — LE DÉBOGUEUR FAUSSE LES MESURES AUDIO. Chaque trace part par le canal série
+  et coûte cher ; avec l'état de jack (M1b-03), le moteur audio interroge la broche en
+  boucle et le pilote trace à chaque requête. Mesuré le 2026-09-08 sur la même machine,
+  la même version et la même séquence, une seule variable :
+
+    débogueur attaché  -> 17 passes sur 20 (sauts de phase, un trou de 384 trames)
+    débogueur détaché  -> 20 passes sur 20
+
+  Ces trois échecs n'étaient pas dans le pilote. Détacher kd avant toute mesure de
+  transport ; le garder pour les mesures de comportement (chargement, propriétés, état).
+
   Ce script ne touche jamais au débogage de l'hôte : il ne lance ni bcdedit, ni verifier.
 .PARAMETER Name
   Nom de la VM (ConduitTest). Utilisé seulement avec -StartVM.
@@ -57,9 +68,12 @@ param(
   [switch]$Follow,
   # NOS TRACES NE DÉPENDENT PLUS DE CES MASQUES. kmd_log!
   # (drivers\windows\conduit-kmd\src\log.rs) émet par DbgPrintEx sur le composant
-  # DPFLTR_IHVAUDIO_ID au niveau DPFLTR_ERROR_LEVEL — le niveau 0, bit 0, le SEUL armé
-  # par défaut pour tous les composants. Les kmd_log! arrivent donc sans configuration :
-  # ni ces commandes, ni la valeur de registre posée par vm-prepare.ps1.
+  # DPFLTR_DEFAULT_ID au niveau DPFLTR_ERROR_LEVEL. Le bit 0 du masque n'est PAS armé par
+  # défaut « pour tous les composants », contrairement à ce que laisse croire la
+  # documentation courante : seul le masque de DPFLTR_DEFAULT_ID vaut 0x1 au démarrage,
+  # celui de DPFLTR_IHVAUDIO_ID vaut zéro et n'a jamais rien laissé sortir en deux
+  # séances. C'est ce qui a fait choisir DEFAULT. Les kmd_log! arrivent donc sans
+  # configuration : ni ces commandes, ni la valeur de registre posée par vm-prepare.ps1.
   #
   # Les deux masques restent ouverts parce qu'ils gardent leur utilité pour les traces des
   # AUTRES composants (PortCls, ks, PnP…) pendant une séance, et qu'ils ne coûtent rien.
