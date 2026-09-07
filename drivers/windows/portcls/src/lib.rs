@@ -18,8 +18,9 @@
 //! | [`wavert`] | trait [`MiniportWaveRT`] ↔ `IMiniportWaveRTVtbl`, [`StreamObject`] (flux à type effacé rendu à `NewStream`) |
 //! | [`stream`] | traits [`MiniportWaveRTStream`] / [`MiniportWaveRTStreamNotification`] ↔ leurs vtables, [`AudioBuffer`] |
 //! | [`received`] | enveloppes des interfaces reçues : [`ResourceList`], [`PortTopology`], [`PortWaveRT`], [`PortWaveRTStream`], [`RegistryKey`] |
+//! | [`property`] | trait [`PropertyHandler`] ↔ `PCPROPERTY_ITEM`/`PCPROPERTY_REQUEST` : les propriétés KS d'un miniport |
 //! | [`adapter`] | côté adaptateur : `PcNewPort`, `IPort::Init`, `PcRegisterSubdevice`, `PcRegisterPhysicalConnection` (feature `kernel`), noms des sous-périphériques et GUID de nom de broche partagés avec l'INF |
-//! | [`status`] | `STATUS_BUFFER_OVERFLOW`, `STATUS_BUFFER_TOO_SMALL`, `STATUS_NOT_SUPPORTED` |
+//! | [`status`] | les codes `NTSTATUS` du contrat PortCls absents de `conduit-com` |
 //!
 //! # Feature `kernel`
 //!
@@ -37,6 +38,14 @@
 //! instanciés pour `T`. `ComObject::new(&T::VTBL, …)` obtient le `&'static` requis par
 //! **promotion de constante** (la vtable est une valeur `const` sans mutabilité
 //! intérieure ni destructeur) ; ni `static` par type, ni macro.
+//!
+//! Pour les deux vtables de miniport, `&T::VTBL` n'est **pas** écrit à l'endroit de
+//! l'appel mais dans une fonction dédiée — [`topology::vtbl_of`], [`wavert::vtbl_of`] —
+//! marquée `#[inline(never)]`. La garde de vtable de [`property::handler`] compare des
+//! **adresses** de vtable, et une constante promue est `unnamed_addr` : sans occurrence
+//! unique et non inlinée, l'allocation se duplique d'une unité de génération de code à
+//! l'autre et la garde refuse des objets légitimes dès qu'on optimise. Voir la
+//! documentation de [`topology::vtbl_of`].
 //!
 //! # Contrat `'static` et durée de vie
 //!
@@ -70,6 +79,7 @@ extern crate std;
 pub mod adapter;
 pub mod miniport;
 pub mod power;
+pub mod property;
 pub mod received;
 pub mod status;
 pub mod stream;
@@ -89,10 +99,14 @@ pub use adapter::{new_port, register_physical_connection, register_subdevice};
 pub use power::{
     AdapterPowerManagement, PowerObject, PowerVtbl, new_power_object, try_new_power_object,
 };
+pub use property::{PropertyHandler, Request, TargetVtbl};
 pub use received::{
     PortTopology, PortWaveRT, PortWaveRTStream, RegistryKey, ResourceList, physical_address,
 };
-pub use status::{STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL, STATUS_NOT_SUPPORTED};
+pub use status::{
+    STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_DEVICE_REQUEST,
+    STATUS_NOT_FOUND, STATUS_NOT_SUPPORTED, STATUS_PRIVILEGE_NOT_HELD,
+};
 pub use stream::{
     AudioBuffer, MiniportWaveRTStream, MiniportWaveRTStreamNotification, StreamNotificationPtr,
     StreamNotificationVtbl, StreamPtr, StreamVtbl, new_stream_notification_object,

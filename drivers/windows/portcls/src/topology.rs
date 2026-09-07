@@ -20,6 +20,7 @@ use portcls_sys::{
 };
 
 use crate::miniport::{self, MiniportSlots};
+use crate::property::TargetVtbl;
 use crate::received::{PortTopology, ResourceList};
 use crate::unknown;
 
@@ -112,17 +113,55 @@ impl<T: MiniportTopology> TopologyVtbl for T {
 /// Objet COM `IMiniportTopology` possédé côté Rust.
 pub type TopologyObject<T> = ComPtr<IMiniportTopologyVtbl, T>;
 
+/// **Unique** occurrence de `&T::VTBL` pour `IMiniportTopology` : l'adresse que porte tout
+/// `ComObject<IMiniportTopologyVtbl, T>` du crate.
+///
+/// C'est le point d'appui de la garde de vtable de [`crate::property::handler`], et il
+/// demande deux précautions, l'une et l'autre nécessaires :
+///
+/// 1. **Une seule occurrence de `&T::VTBL` dans tout le crate**, ici. `T::VTBL` est une
+///    constante associée ; `&T::VTBL` est donc une **constante promue**, et deux
+///    occurrences dans deux fonctions monomorphisées différentes ne sont pas garanties de
+///    partager une allocation. Les deux constructeurs ci-dessous et
+///    [`TargetVtbl::vtbl`](crate::property::TargetVtbl::vtbl) passent tous par ici.
+/// 2. **`#[inline(never)]`**, et ce n'est pas une optimisation : une constante promue est
+///    émise en `unnamed_addr`, c'est-à-dire que le compilateur a le droit d'en dupliquer
+///    l'allocation. Si cette fonction est inlinée, chaque unité de génération de code peut
+///    recevoir sa propre copie de la vtable, et la comparaison d'adresses de la garde
+///    échoue alors sur des objets pourtant légitimes — pilote muet, aucune propriété KS ne
+///    répond. Le cas est réel : sans cet attribut, `cargo test -p portcls --release`
+///    (opt-level 3 + LTO, le profil du pilote) fait tomber douze des tests de
+///    `tests/property.rs` avec `STATUS_INVALID_DEVICE_REQUEST`, alors qu'en `dev`, faute
+///    d'inlining, tout passe. `#[inline(never)]` garde une définition unique de la
+///    fonction, donc une seule allocation promue, et tous les appelants reçoivent la même
+///    adresse.
+#[inline(never)]
+pub fn vtbl_of<T: MiniportTopology>() -> &'static IMiniportTopologyVtbl {
+    &T::VTBL
+}
+
+// SAFETY: `vtbl_of::<T>()` est l'unique occurrence de `&T::VTBL` du crate pour cette
+// vtable, et `#[inline(never)]` lui garantit une allocation unique ; c'est elle que les
+// deux constructeurs ci-dessous passent à `ComObject`. L'adresse rendue est donc
+// exactement celle que porte tout `ComObject<IMiniportTopologyVtbl, T>` vivant, et aucun
+// objet d'un autre type ne la porte.
+unsafe impl<T: MiniportTopology> TargetVtbl<T> for IMiniportTopologyVtbl {
+    fn vtbl() -> &'static Self {
+        vtbl_of::<T>()
+    }
+}
+
 /// Alloue l'objet COM `IMiniportTopology` de `inner` (compte de références 1).
 ///
 /// Panique via l'allocateur global en cas d'échec d'allocation : dans le pilote,
 /// préférer [`try_new_topology_object`].
 pub fn new_topology_object<T: MiniportTopology>(inner: T) -> TopologyObject<T> {
-    ComObject::new(&T::VTBL, inner)
+    ComObject::new(vtbl_of::<T>(), inner)
 }
 
 /// Comme [`new_topology_object`], mais renvoie `None` si l'allocation échoue.
 pub fn try_new_topology_object<T: MiniportTopology>(inner: T) -> Option<TopologyObject<T>> {
-    ComObject::try_new(&T::VTBL, inner)
+    ComObject::try_new(vtbl_of::<T>(), inner)
 }
 
 /// `IMiniportTopology::Init`.

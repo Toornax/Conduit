@@ -34,6 +34,7 @@ use portcls_sys::{
 };
 
 use crate::miniport::{self, MiniportSlots};
+use crate::property::TargetVtbl;
 use crate::received::{PortWaveRT, PortWaveRTStream, ResourceList};
 use crate::unknown;
 
@@ -216,17 +217,37 @@ impl<T: MiniportWaveRT> WaveRTVtbl for T {
 /// Objet COM `IMiniportWaveRT` possédé côté Rust.
 pub type WaveRTObject<T> = ComPtr<IMiniportWaveRTVtbl, T>;
 
+/// **Unique** occurrence de `&T::VTBL` pour `IMiniportWaveRT` : même rôle, mêmes raisons
+/// et même `#[inline(never)]` obligatoire que
+/// [`topology::vtbl_of`](crate::topology::vtbl_of), dont la documentation détaille le
+/// piège de la constante promue.
+#[inline(never)]
+pub fn vtbl_of<T: MiniportWaveRT>() -> &'static IMiniportWaveRTVtbl {
+    &T::VTBL
+}
+
+// SAFETY: `vtbl_of::<T>()` est l'unique occurrence de `&T::VTBL` du crate pour cette
+// vtable, et `#[inline(never)]` lui garantit une allocation unique ; c'est elle que les
+// deux constructeurs ci-dessous passent à `ComObject`. L'adresse rendue est donc
+// exactement celle que porte tout `ComObject<IMiniportWaveRTVtbl, T>` vivant, et aucun
+// objet d'un autre type ne la porte.
+unsafe impl<T: MiniportWaveRT> TargetVtbl<T> for IMiniportWaveRTVtbl {
+    fn vtbl() -> &'static Self {
+        vtbl_of::<T>()
+    }
+}
+
 /// Alloue l'objet COM `IMiniportWaveRT` de `inner` (compte de références 1).
 ///
 /// Panique via l'allocateur global en cas d'échec d'allocation : dans le pilote,
 /// préférer [`try_new_wavert_object`].
 pub fn new_wavert_object<T: MiniportWaveRT>(inner: T) -> WaveRTObject<T> {
-    ComObject::new(&T::VTBL, inner)
+    ComObject::new(vtbl_of::<T>(), inner)
 }
 
 /// Comme [`new_wavert_object`], mais renvoie `None` si l'allocation échoue.
 pub fn try_new_wavert_object<T: MiniportWaveRT>(inner: T) -> Option<WaveRTObject<T>> {
-    ComObject::try_new(&T::VTBL, inner)
+    ComObject::try_new(vtbl_of::<T>(), inner)
 }
 
 /// `IMiniportWaveRT::Init`.
