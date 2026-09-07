@@ -247,6 +247,31 @@ async fn state_persists_across_restart() {
     d.shutdown().await;
 }
 
+/// Un démon doit pouvoir reprendre le même socket / named pipe aussitôt après l'arrêt du
+/// précédent, y compris quand celui-ci avait un client connecté et abonné. Sous Windows,
+/// chaque session cliente détient sa propre instance du named pipe : si `shutdown()` rendait
+/// la main avant leur fin, la création de la *première* instance du nom échouait pour le
+/// démon suivant (ERROR_ACCESS_DENIED, os error 5) — un échec intermittent, visible surtout
+/// sous charge. La boucle répète le cycle pour attraper la course.
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_on_the_same_socket_is_immediate() {
+    let dir = tempfile::tempdir().unwrap();
+    let null = null_with_speakers();
+    for i in 0..10 {
+        // `spawn` panique ici (« démon ») si le pipe/socket du tour précédent est encore pris.
+        let d = spawn(dir.path(), &null, Config::default(), false).await;
+        let mut c = client(&d, &format!("c{i}")).await;
+        // Abonnement + commande : la session est bien vivante côté démon au moment de l'arrêt.
+        c.subscribe().await.unwrap();
+        assert!(matches!(
+            c.call(Command::Status).await.unwrap(),
+            Reply::Status(_)
+        ));
+        d.shutdown().await;
+        drop(c);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn autoconnect_rule_applies_to_new_device_and_pending_links() {
     let dir = tempfile::tempdir().unwrap();
