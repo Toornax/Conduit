@@ -129,9 +129,12 @@ pub unsafe fn register_subdevice(
     if name.last() != Some(&0) {
         return STATUS_INVALID_PARAMETER;
     }
-    // SAFETY: `name` est une chaîne UTF-16 terminée par NUL (vérifié), que PortCls ne
-    // modifie pas (il en fait une copie : le `cast_mut` satisfait le prototype `PWSTR`) ;
-    // `unknown` est vivant le temps de l'appel ; `device` est celui de `StartDevice`.
+    // SAFETY: `name` est une chaîne UTF-16 terminée par NUL (vérifié) que PortCls **ne
+    // copie pas** : la documentation de `PcRegisterSubdevice` exige que le tampon reste
+    // valide pendant toute la vie de l'objet périphérique. Les appelants passent des
+    // tranches de `static`/`const` promus, jamais de tampon de pile. Le `cast_mut`
+    // satisfait le prototype `PWSTR` sans qu'aucune écriture n'ait lieu ; `unknown` est
+    // vivant le temps de l'appel ; `device` est celui de `StartDevice`.
     unsafe { PcRegisterSubdevice(device, name.as_ptr().cast_mut(), unknown.as_ptr()) }
 }
 

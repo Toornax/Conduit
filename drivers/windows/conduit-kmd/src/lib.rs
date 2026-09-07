@@ -75,8 +75,19 @@ static GLOBAL_ALLOCATOR: wdk_alloc::WdkAllocator = wdk_alloc::WdkAllocator;
 
 /// Nombre maximal de sous-périphériques par adaptateur, passé à `PcAddAdapterDevice` :
 /// quatre par câble (`WaveRender`, `TopoRender`, `WaveCapture`, `TopoCapture`,
-/// driver-design.md §4). Un seul câble en M1a ; M1b-02 multipliera par la réserve.
-const MAX_MINIPORTS: ULONG = 4;
+/// driver-design.md §4), pour toute la réserve.
+///
+/// **Ce plafond est dur.** `PcRegisterSubdevice` refuse le sous-périphérique au-delà, avec
+/// `STATUS_ALLOTTED_SPACE_EXCEEDED` — mesuré le 2026-09-07 : avec la valeur de M1a (4), le
+/// câble 0 s'enregistrait entièrement et le **cinquième** sous-périphérique échouait, quel
+/// que soit le nombre de câbles déclarés par ailleurs. Le symptôme est trompeur : l'INF,
+/// les noms et les descripteurs sont tous corrects, et rien ne dit que le plafond vient
+/// d'ici.
+const MAX_MINIPORTS: ULONG = SUBDEVICES_PER_CABLE * cable::CABLE_COUNT;
+
+/// Sous-périphériques enregistrés par câble : `WaveRender`, `TopoRender`, `WaveCapture`,
+/// `TopoCapture`. C'est [`adapter::install_cable`] qui en fait foi.
+const SUBDEVICES_PER_CABLE: ULONG = 4;
 
 /// Emplacement du `DriverUnload` installé par PortCls, que le nôtre enchaîne.
 ///
