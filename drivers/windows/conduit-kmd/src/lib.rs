@@ -23,9 +23,19 @@
 //! [`cable::Cable::on_tick`] applique le plan de `conduit_kmd_core::loopback` (copie
 //! rendu → capture, silence, ou rien) puis signale les notifications des deux flux.
 //!
+//! État (M1b-01) : `StartDevice` commence par lire les paramètres de la clé matérielle du
+//! périphérique ([`registry`]) — `ReserveSize`, `Channels`, `BufferMs`, dont l'INF écrit
+//! les défauts — et les valide par `conduit_kmd_core::params`. La lecture est **totale** :
+//! clé illisible, valeur absente, d'un autre type ou hors bornes se replient sur la valeur
+//! par défaut et n'empêchent jamais le chargement. Seule la réserve est appliquée (elle
+//! borne la boucle d'enregistrement des câbles) ; le nombre de canaux est lu et journalisé,
+//! mais son câblage dans les descripteurs appartient à M1b-05.
+//!
 //! Le gestionnaire de panique est maison (`panic.rs`) : une panique en noyau se traduit
 //! par un bug check, jamais par une boucle infinie. La journalisation passe par
-//! `kmd_log!` (`log.rs`), vide en release.
+//! `kmd_log!` (`log.rs`), vide en release — et, pour les seules anomalies de
+//! configuration, par le journal d'événements système ([`eventlog`]), qui lui survit à la
+//! release.
 //!
 //! Ce crate ne se teste pas en mode utilisateur (`wdk-sys` lie les bibliothèques noyau
 //! même sous `cargo test`) : l'allocateur et le gestionnaire de panique sont retirés sous
@@ -44,6 +54,8 @@ mod adapter;
 mod cable;
 mod clock;
 mod descriptors;
+mod eventlog;
+mod registry;
 mod stream;
 mod sync;
 mod timer;
@@ -83,6 +95,13 @@ static GLOBAL_ALLOCATOR: wdk_alloc::WdkAllocator = wdk_alloc::WdkAllocator;
 /// que soit le nombre de câbles déclarés par ailleurs. Le symptôme est trompeur : l'INF,
 /// les noms et les descripteurs sont tous corrects, et rien ne dit que le plafond vient
 /// d'ici.
+///
+/// **Ne le liez jamais à la réserve lue au registre** (M1b-01). `AddDevice` court avant
+/// `StartDevice`, donc avant toute lecture du registre ; et même si l'ordre le permettait,
+/// une réserve réduite à 2 fixerait le plafond à 8 pour toute la vie du périphérique,
+/// alors qu'un `ReserveSize` remis à 16 n'exige aucun redémarrage du *pilote*. Le plafond
+/// est le maximum **statique**, la réserve n'est qu'une borne de boucle
+/// ([`adapter::start_device`]) : enregistrer moins que le plafond est toujours permis.
 const MAX_MINIPORTS: ULONG = SUBDEVICES_PER_CABLE * cable::CABLE_COUNT;
 
 /// Sous-périphériques enregistrés par câble : `WaveRender`, `TopoRender`, `WaveCapture`,

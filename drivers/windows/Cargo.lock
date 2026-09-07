@@ -406,6 +406,7 @@ name = "portcls"
 version = "0.1.0"
 dependencies = [
  "conduit-com",
+ "conduit-kmd-core",
  "portcls-sys",
 ]
 
