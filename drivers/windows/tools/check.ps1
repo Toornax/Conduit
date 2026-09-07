@@ -16,6 +16,20 @@
   pin_name_guid(0), GUID de catégorie contre portcls_sys::KSCATEGORY_*, et encodage
   UTF-16 LE de la copie de travail. Une divergence y est une panne muette dans la VM
   (périphérique installé, aucun endpoint, ou endpoint mal nommé) : elle échoue ici.
+
+  portcls est testé DEUX FOIS, en `dev` puis en `--release`. Ce n'est pas une redondance :
+  la garde de vtable de portcls\src\property.rs compare des ADRESSES de vtable, et
+  `&T::VTBL` est une constante promue, donc `unnamed_addr`, donc duplicable d'une unité de
+  génération de code à l'autre. Seul le `#[inline(never)]` porté par topology::vtbl_of et
+  wavert::vtbl_of lui garantit une allocation unique — et cet attribut n'est *load-bearing*
+  qu'une fois l'inlining actif. Symptôme mesuré si on le retire : DOUZE tests de
+  portcls\tests\property.rs tombent sous `cargo test -p portcls --release` (opt-level 3 +
+  LTO, le profil du pilote livré) avec STATUS_INVALID_DEVICE_REQUEST là où
+  STATUS_SUCCESS/STATUS_BUFFER_OVERFLOW est attendu, et AUCUN ne tombe en `dev`, faute
+  d'inlining. Sans cette passe, la régression traverserait l'intégration continue sans un
+  bruit et ne se manifesterait que dans la VM, en pilote muet à toutes ses propriétés
+  (volume et sourdine compris). Ne pas la supprimer pour gagner du temps de compilation :
+  c'est le seul endroit où ce défaut est visible.
 #>
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -32,6 +46,10 @@ try {
     @("test", "-p", "portcls-sys"),
     @("test", "-p", "portcls-sys", "--features", "com"),
     @("test", "-p", "portcls"),
+    # Voir .DESCRIPTION : la garde de vtable de property.rs ne peut échouer qu'une fois
+    # l'inlining actif. Douze tests de tests/property.rs tombent en --release, zéro en
+    # dev, si `#[inline(never)]` disparaît de topology::vtbl_of / wavert::vtbl_of.
+    @("test", "-p", "portcls", "--release"),
     @("build", "-p", "portcls", "--features", "kernel"),
     @("build", "-p", "conduit-kmd")
   )
