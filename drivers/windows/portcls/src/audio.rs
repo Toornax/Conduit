@@ -8,29 +8,28 @@
 //! `conduit-kmd`, dans des atomiques ; c'est lui qui implémentera [`AudioNodes`] pour
 //! `TopoRender` et `TopoCapture`.
 //!
-//! # L'échelle de volume : 1/65536 dB, documentée et pas encore mesurée
+//! # L'échelle de volume : 1/65536 dB, mesurée le 2026-09-07
 //!
 //! `KSPROPERTY_AUDIO_VOLUMELEVEL` transporte un `LONG` en unités de **1/65536 dB**
 //! (virgule fixe 16.16), **et non en centièmes de décibel** — c'est l'erreur classique,
 //! et elle est silencieuse : l'endpoint fonctionne, mais le curseur de Windows parcourt
 //! une plage absurde. D'où [`VOLUME_MIN`], [`VOLUME_MAX`] et [`VOLUME_DELTA`], appuyés
-//! sur **deux sources concordantes**, et une **vérification qui reste à faire** :
+//! sur deux sources documentaires **et confirmés par la mesure** :
 //!
 //! - la documentation Microsoft de `KSPROPERTY_AUDIO_VOLUMELEVEL` (« *in units of
 //!   1/65536 decibel* ») ;
 //! - les constantes de SYSVAD (`VOLUME_STEPPING_DELTA`, `VOLUME_SIGNED_MAXIMUM`,
 //!   `VOLUME_SIGNED_MINIMUM` dans son `minwavert.h`), qui décrivent la même plage ;
-//! - **à faire, une fois le nœud câblé** : `conduit-looptest --list --show-volume` sur
-//!   l'endpoint « Conduit 1 » doit rendre `−96,0 / 0,0 / 0,5` dB. Tant que ce relevé
-//!   n'existe pas, l'échelle est une lecture de documentation et rien de plus.
+//! - **le relevé sur notre propre nœud**, une fois câblé :
+//!   `conduit-looptest --list --show-volume` sur « Conduit 1 » rend
+//!   `plage : -96,0 dB à 0,0 dB, pas 0,5 dB`, des deux côtés du câble. `VOLUME_DELTA`
+//!   valant `0x8000`, un pas de 0,5 dB **démontre** l'unité de 1/65536 dB : en centièmes
+//!   de décibel le même pas vaudrait 327,68 dB.
 //!
-//! Le relevé du 2026-09-07 sur les cartes de la machine hôte donne bien `−96,0 / 0,0`
-//! comme bornes, mais un pas de **1,5 dB** — et les trois cartes, matériels sans rapport,
-//! annoncent une plage rigoureusement identique. C'est donc le volume **logiciel** de
-//! Windows qui répond, faute de nœud dans leur topologie : la mesure conforte les bornes
-//! et ne dit rien du pas d'un vrai nœud. C'est le test de `BASICSUPPORT` complet
-//! (palier 72) qui fige ce que nous annonçons, et la plage qu'il décrit est
-//! *littéralement* ce que le moteur audio affichera.
+//! Le relevé du même jour sur les cartes de la machine hôte donne les mêmes bornes mais
+//! un pas de **1,5 dB**, identique sur trois matériels sans rapport : c'est le volume
+//! **logiciel** de Windows qui répond là, faute de nœud dans leur topologie. Il confortait
+//! les bornes sans rien dire du pas — d'où l'intérêt d'avoir refait la mesure sur le nôtre.
 //!
 //! # `KSPROPERTY_TYPE_BASICSUPPORT` n'est pas optionnel
 //!
@@ -88,10 +87,9 @@
 //! `Instance` et le canal qu'on en a décodé (voir [`Trace`]). Le pilote la câble sur
 //! `kmd_log!` en une ligne, et le premier essai en machine tranche tout de suite :
 //!
-//! - **attendu** sur un endpoint stéréo — Windows interroge canal `0` puis canal `1`, et
-//!   écrit avec canal `-1` ;
-//! - **le décalage est faux** si la trace ne montre que des « canal 0 » : c'est le
-//!   `Reserved`, toujours nul, qu'on est en train de lire.
+//! - **constaté le 2026-09-07** sur l'endpoint stéréo « Conduit 1 » : Windows interroge
+//!   canal `0` **puis canal `1`**, des deux côtés du câble. Le décalage est donc le bon —
+//!   si l'on lisait le `Reserved`, toujours nul, la trace ne montrerait que « canal 0 ».
 //!
 //! Aucune capture, aucun débogueur pas à pas : deux lignes de journal suffisent à conclure.
 //!
