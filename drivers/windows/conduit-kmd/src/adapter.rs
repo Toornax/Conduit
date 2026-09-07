@@ -125,9 +125,13 @@ unsafe fn install_cable(
     else {
         return fail("nom de sous-périphérique", STATUS_INVALID_PARAMETER);
     };
-    // Oublie les flux d'un éventuel cycle précédent et crée le timer haute résolution de
-    // la boucle locale (§5.3) : sans lui, le câble ne transporterait rien.
-    if let Err(status) = cable.start() {
+    // Oublie les flux d'un éventuel cycle précédent, mémorise l'objet de périphérique (par
+    // lequel M1b-04 persistera l'état actif) et crée le timer haute résolution de la
+    // boucle locale (§5.3) : sans lui, le câble ne transporterait rien.
+    // SAFETY: `device` est l'objet de périphérique de `StartDevice` (contrat), vivant au
+    // moins jusqu'au retrait du périphérique — donc au-delà de toute propriété KS routée
+    // vers un miniport de ce câble.
+    if let Err(status) = unsafe { cable.start(device) } {
         return fail("démarrage du câble (timer haute résolution)", status);
     }
 
@@ -274,6 +278,14 @@ pub unsafe fn start_device(
     // SAFETY: idem ; `StartDevice` s'exécute à `PASSIVE_LEVEL`, ce qu'exigent
     // `IoOpenDeviceRegistryKey` et `ZwQueryValueKey`.
     let params = unsafe { registry::read_params(device, log) };
+
+    // État actif des câbles (M1b-04, F-05) : relu du registre et appliqué **avant** le
+    // moindre enregistrement de sous-périphérique, pour qu'un endpoint apparaisse d'emblée
+    // dans le bon état plutôt que de basculer sous les yeux de l'utilisateur. La lecture ne
+    // peut pas échouer : elle se replie sur le masque par défaut et journalise.
+    // SAFETY: idem.
+    let masque = unsafe { registry::read_active_cables(device, log) };
+    cable::apply_active_mask(masque);
 
     // `sanitize` a déjà écrêté la réserve dans `1..=MAX_RESERVE`, et une assertion à la
     // compilation aligne ce plafond sur le nombre de câbles statiques : le `min` est une

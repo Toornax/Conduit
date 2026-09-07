@@ -7,9 +7,21 @@
 //! broche endpoint nommée par le GUID du câble, nœud de volume, nœud de
 //! sourdine) et servent les propriétés de ces nœuds en déléguant au [`NodeState`] du bon
 //! sens dans le câble. Ils implémentent aussi `portcls::JackInfo`, la propriété de
-//! **filtre** `KSPROPERTY_JACK_DESCRIPTION` (M1b-03). `Init` ne conserve rien : le port
+//! **filtre** `KSPROPERTY_JACK_DESCRIPTION` (M1b-03), et `portcls::CableConfig`, le jeu de
+//! propriétés **privé** `KSPROPSETID_Conduit` (M1b-04). `Init` ne conserve rien : le port
 //! topologie et la liste de ressources reçus sont relâchés en sortie (`Drop` des
 //! enveloppes). `DataRangeIntersection` reste au défaut (PortCls intersecte lui-même).
+//!
+//! # Les deux sens implémentent le **même** état de configuration
+//!
+//! `CableConfig` est implémenté à l'identique par [`TopoRender`] et [`TopoCapture`], et
+//! délègue au même [`Cable`] : un câble débranché l'est de ses deux bouts. Le service
+//! d'assistance (M1b-20) peut donc s'adresser à l'un ou à l'autre filtre — c'est délibéré,
+//! et ça évite d'avoir à documenter « le côté rendu est celui qui commande ». Les deux
+//! implémentations restent écrites en toutes lettres plutôt que factorisées par une macro :
+//! `portcls::property` monomorphise ses gestionnaires **par type de miniport** (la garde de
+//! vtable compare l'adresse de `T::VTBL`), et deux implémentations distinctes sont
+//! exactement ce que le reste du fichier fait déjà pour `AudioNodes` et `JackInfo`.
 //!
 //! # Le jack : quelle broche, et quelle cartographie
 //!
@@ -57,7 +69,8 @@
 
 use portcls::conduit_com::{ComRef, NtStatus, STATUS_SUCCESS};
 use portcls::{
-    AudioNodes, JackInfo, JackTrace, MiniportTopology, PortTopology, ResourceList, Trace,
+    AudioNodes, CableConfig, ConfigTrace, JackInfo, JackTrace, MiniportTopology, PortTopology,
+    ResourceList, Trace,
 };
 use portcls_sys::{IUnknown, KSAUDIO_SPEAKER_STEREO, PCFILTER_DESCRIPTOR, ULONG};
 
@@ -66,6 +79,7 @@ use crate::descriptors::{
     CHANNELS, PIN_COUNT, TOPO_CAPTURE_PIN_ENDPOINT, TOPO_RENDER_PIN_ENDPOINT, topo_capture_filter,
     topo_capture_filter_0, topo_render_filter, topo_render_filter_0,
 };
+use crate::privilege;
 
 const _: () = assert!(
     CHANNELS as usize <= MAX_CHANNELS,
@@ -200,6 +214,39 @@ impl JackInfo for TopoRender {
     }
 }
 
+impl CableConfig for TopoRender {
+    // IRQL: PASSIVE_LEVEL
+    fn cable_index(&self) -> u32 {
+        self.cable.index
+    }
+
+    // IRQL: PASSIVE_LEVEL — la valeur scellée de M1a ; M1b-05 la rendra dynamique.
+    fn channels(&self) -> u32 {
+        CHANNELS
+    }
+
+    // IRQL: quelconque — l'état de connexion est par câble, commun aux deux sens.
+    fn is_connected(&self) -> bool {
+        self.cable.is_connected()
+    }
+
+    // IRQL: PASSIVE_LEVEL — applique en mémoire puis persiste ; l'`Err` ne dit que l'échec
+    // de la persistance, et `portcls::config` ne le propage pas à l'appelant.
+    fn set_connected(&self, connected: bool) -> Result<(), NtStatus> {
+        self.cable.set_connected(connected)
+    }
+
+    // IRQL: PASSIVE_LEVEL — voir la réserve sur le contexte de fil dans `crate::privilege`.
+    fn may_configure(&self) -> bool {
+        privilege::may_load_driver()
+    }
+
+    // IRQL: PASSIVE_LEVEL
+    fn trace(&self, trace: &ConfigTrace<'_>) {
+        kmd_log!("TopoRender{} : {trace:?}", self.n);
+    }
+}
+
 /// Miniport topologie du filtre `TopoCapture<n>`.
 #[derive(Debug)]
 pub struct TopoCapture {
@@ -291,6 +338,38 @@ impl JackInfo for TopoCapture {
 
     // IRQL: PASSIVE_LEVEL
     fn trace(&self, trace: &JackTrace<'_>) {
+        kmd_log!("TopoCapture{} : {trace:?}", self.n);
+    }
+}
+
+impl CableConfig for TopoCapture {
+    // IRQL: PASSIVE_LEVEL
+    fn cable_index(&self) -> u32 {
+        self.cable.index
+    }
+
+    // IRQL: PASSIVE_LEVEL — la valeur scellée de M1a ; M1b-05 la rendra dynamique.
+    fn channels(&self) -> u32 {
+        CHANNELS
+    }
+
+    // IRQL: quelconque — le même atomique que le sens rendu, un câble ayant deux bouts.
+    fn is_connected(&self) -> bool {
+        self.cable.is_connected()
+    }
+
+    // IRQL: PASSIVE_LEVEL — voir `TopoRender` : même câble, même effet des deux côtés.
+    fn set_connected(&self, connected: bool) -> Result<(), NtStatus> {
+        self.cable.set_connected(connected)
+    }
+
+    // IRQL: PASSIVE_LEVEL — voir la réserve sur le contexte de fil dans `crate::privilege`.
+    fn may_configure(&self) -> bool {
+        privilege::may_load_driver()
+    }
+
+    // IRQL: PASSIVE_LEVEL
+    fn trace(&self, trace: &ConfigTrace<'_>) {
         kmd_log!("TopoCapture{} : {trace:?}", self.n);
     }
 }

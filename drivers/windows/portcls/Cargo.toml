@@ -15,12 +15,12 @@ publish = false
 [dependencies]
 conduit-com = { path = "../../../crates/conduit-com" }
 portcls-sys = { path = "../portcls-sys", features = ["com"] }
-
-# `tests/inf.rs` engendre conduit_kmd.inx depuis les constantes Rust ; les défauts des
-# paramètres de registre (M1b-01) sont ceux de `conduit_kmd_core::params`, source unique
-# partagée avec le pilote. Dépendance de test seulement : `portcls` lui-même n'en a pas
-# besoin.
-[dev-dependencies]
+# Contrat du jeu de propriétés privé (M1b-04) : `src/config.rs` en tire le GUID du jeu, la
+# structure d'échange et TOUT son parseur. Le crate est `no_std`, sans dépendance, et sans
+# `unsafe` : c'est ce qui rend la validation fuzzable en mode utilisateur (M1b-08), donc
+# elle ne doit pas être réécrite ici. `tests/inf.rs` s'en sert aussi pour engendrer les
+# défauts de `[ConduitCable_HW_AddReg]` depuis `conduit_kmd_core::params` et
+# `conduit_kmd_core::config`.
 conduit-kmd-core = { path = "../../../crates/conduit-kmd-core" }
 
 # `kernel` : enveloppes des fonctions `Pc*` de `portcls.sys` (`adapter::new_port`,

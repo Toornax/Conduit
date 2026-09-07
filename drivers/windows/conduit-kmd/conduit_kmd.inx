@@ -154,6 +154,21 @@ HKR,,ReserveSize,0x10001,16
 HKR,,Channels,0x10001,2
 HKR,,BufferMs,0x10001,10
 
+; État actif des câbles (M1b-04, F-05). Masque de bits : le bit n vaut « câble n+1
+; connecté ». 0x00000003 = « Conduit 1 » et « Conduit 2 » actifs, les quatorze autres
+; rangés sous « Périphériques déconnectés ».
+;
+; À la DIFFÉRENCE des trois valeurs ci-dessus, celle-ci n'est pas un réglage
+; d'administrateur : c'est de l'ÉTAT, que le pilote RÉÉCRIT lui-même à chaque changement
+; demandé par la propriété KS privée KSPROPSETID_Conduit. La modifier à la main marche (le
+; pilote la relit au démarrage suivant) mais elle sera écrasée à la première demande du
+; service d'assistance.
+;
+; Une seule valeur plutôt que seize : une écriture indivisible du point de vue d'un
+; lecteur, et une seule valeur à retirer. En HKR, donc supprimée par PnP avec le
+; périphérique (F-52). Défaut ENGENDRÉ depuis conduit_kmd_core::config.
+HKR,,ActiveCables,0x10001,0x00000003
+
 ; Interfaces KS des sous-périphériques, câble par câble. Le deuxième champ est le nom de
 ; référence du sous-périphérique, tel que PcRegisterSubdevice le reçoit : il doit
 ; correspondre exactement aux constantes de `portcls::adapter`

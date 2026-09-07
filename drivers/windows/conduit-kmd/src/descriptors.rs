@@ -22,8 +22,9 @@
 //!   — index [`NODE_VOLUME`] `KSNODETYPE_VOLUME`, index [`NODE_MUTE`] `KSNODETYPE_MUTE` —
 //!   chacun avec sa table d'automatisation d'une propriété, et trois connexions
 //!   ([`TOPO_CONNECTIONS`]) qui les mettent en série entre les deux broches. La table
-//!   d'automatisation du *filtre* porte, depuis M1b-03, la **seule** propriété qui ne soit
-//!   ni de nœud ni de broche : `KSPROPERTY_JACK_DESCRIPTION`.
+//!   d'automatisation du *filtre* porte, depuis M1b-03, les propriétés qui ne sont ni de
+//!   nœud ni de broche : `KSPROPERTY_JACK_DESCRIPTION`, puis les deux propriétés du jeu
+//!   privé `KSPROPSETID_Conduit` de M1b-04 (état du câble, version du contrat).
 //!
 //! # Le jack est une propriété du **filtre** (M1b-03)
 //!
@@ -105,7 +106,8 @@ use core::ptr;
 
 use conduit_kmd_core::{M1A_FORMATS, SampleFormat};
 use portcls::{
-    CABLE_COUNT, JACK_ACCESS_FLAGS, PIN_NAME_GUIDS, jack_description_item, mute_item, volume_item,
+    CABLE_COUNT, CABLE_STATE_ACCESS_FLAGS, JACK_ACCESS_FLAGS, PIN_NAME_GUIDS, VERSION_ACCESS_FLAGS,
+    cable_state_item, jack_description_item, mute_item, version_item, volume_item,
 };
 use portcls_sys::{
     GUID, IMiniportTopologyVtbl, KSCATEGORY_AUDIO, KSDATAFORMAT, KSDATAFORMAT__bindgen_ty_1,
@@ -485,24 +487,30 @@ const fn topo_filter<const P: usize, const N: usize, const C: usize>(
     filter::<P, N, C>(automation, pins, nodes, connections)
 }
 
-/// Table d'automatisation à une propriété : celle des nœuds audio, et celle des filtres de
-/// topologie depuis M1b-03. Aucune méthode, aucun événement.
+/// Table d'automatisation de `P` propriétés, sans méthode ni événement.
+///
+/// Deux usages : les nœuds audio (une propriété chacun) et les filtres de topologie (le
+/// jack de M1b-03, plus les deux propriétés privées de M1b-04). Le nombre est **déduit du
+/// tableau** par `const` générique plutôt que passé à part : une `PropertyCount` qui ne
+/// vaudrait pas la longueur du tableau ferait lire à PortCls des `PCPROPERTY_ITEM` qui
+/// n'existent pas, ou rendrait muettes les propriétés du bout — et rien ne le signalerait.
 ///
 /// Les `*ItemSize` sont renseignés même à compte nul, comme dans [`EMPTY_AUTOMATION`] :
 /// PortCls s'en sert pour avancer dans les tableaux, et une taille nulle avec un compte nul
 /// est un piège inutile à laisser.
 ///
-/// `EventCount = 0` est ce que **M1b-04 devra changer** : dès que l'état de connexion d'un
-/// câble deviendra modifiable, il faudra y déclarer un `PCEVENT_ITEM`
-/// `KSEVENT_PINCAPS_JACKINFOCHANGE` sur les filtres de topologie, faute de quoi Windows
-/// n'ira jamais relire le jack et l'interface restera figée sur l'état du démarrage (voir
-/// `portcls::jack`).
-const fn one_property_automation(
-    properties: &'static Shared<[PCPROPERTY_ITEM; 1]>,
+/// `EventCount = 0` reste la **dette de M1b-04** : maintenant que l'état de connexion est
+/// modifiable, il faut y déclarer un `PCEVENT_ITEM` `KSEVENT_PINCAPS_JACKINFOCHANGE` sur
+/// les filtres de topologie, faute de quoi Windows n'ira jamais relire le jack et
+/// l'interface restera figée sur l'état du démarrage (voir `portcls::jack`). La brique
+/// d'événements est construite à part ; le point d'émission est marqué dans
+/// `cable::Cable::set_connected`.
+const fn property_automation<const P: usize>(
+    properties: &'static Shared<[PCPROPERTY_ITEM; P]>,
 ) -> PCAUTOMATION_TABLE {
     PCAUTOMATION_TABLE {
         PropertyItemSize: size_of::<PCPROPERTY_ITEM>() as ULONG,
-        PropertyCount: 1,
+        PropertyCount: P as ULONG,
         Properties: ptr::from_ref(properties).cast::<PCPROPERTY_ITEM>(),
         MethodItemSize: size_of::<PCMETHOD_ITEM>() as ULONG,
         MethodCount: 0,
@@ -642,31 +650,49 @@ static RENDER_MUTE_PROPERTIES: Shared<[PCPROPERTY_ITEM; 1]> = Shared(RENDER_MUTE
 static CAPTURE_VOLUME_PROPERTIES: Shared<[PCPROPERTY_ITEM; 1]> = Shared(CAPTURE_VOLUME_ITEMS);
 static CAPTURE_MUTE_PROPERTIES: Shared<[PCPROPERTY_ITEM; 1]> = Shared(CAPTURE_MUTE_ITEMS);
 
-/// `KSPROPERTY_JACK_DESCRIPTION` du **filtre** `TopoRender` (M1b-03).
-const RENDER_JACK_ITEMS: [PCPROPERTY_ITEM; 1] =
-    [jack_description_item::<IMiniportTopologyVtbl, TopoRender>()];
-/// `KSPROPERTY_JACK_DESCRIPTION` du **filtre** `TopoCapture`.
-const CAPTURE_JACK_ITEMS: [PCPROPERTY_ITEM; 1] =
-    [jack_description_item::<IMiniportTopologyVtbl, TopoCapture>()];
+/// Les trois propriétés du **filtre** `TopoRender` : le jack (M1b-03), puis l'état et la
+/// version du jeu privé `KSPROPSETID_Conduit` (M1b-04).
+///
+/// L'ordre n'a pas d'importance pour PortCls, qui cherche par `Set`/`Id`, mais celui-ci se
+/// lit dans l'ordre d'apparition des tâches.
+const RENDER_FILTER_ITEMS: [PCPROPERTY_ITEM; FILTER_PROPERTY_COUNT] = [
+    jack_description_item::<IMiniportTopologyVtbl, TopoRender>(),
+    cable_state_item::<IMiniportTopologyVtbl, TopoRender>(),
+    version_item::<IMiniportTopologyVtbl, TopoRender>(),
+];
+/// Les trois mêmes propriétés du **filtre** `TopoCapture`, monomorphisées sur son type.
+const CAPTURE_FILTER_ITEMS: [PCPROPERTY_ITEM; FILTER_PROPERTY_COUNT] = [
+    jack_description_item::<IMiniportTopologyVtbl, TopoCapture>(),
+    cable_state_item::<IMiniportTopologyVtbl, TopoCapture>(),
+    version_item::<IMiniportTopologyVtbl, TopoCapture>(),
+];
 
-static RENDER_JACK_PROPERTIES: Shared<[PCPROPERTY_ITEM; 1]> = Shared(RENDER_JACK_ITEMS);
-static CAPTURE_JACK_PROPERTIES: Shared<[PCPROPERTY_ITEM; 1]> = Shared(CAPTURE_JACK_ITEMS);
+/// Nombre de propriétés portées par un filtre de topologie : jack, état, version.
+///
+/// Nommée plutôt qu'écrite trois fois : c'est elle que `PCAUTOMATION_TABLE::PropertyCount`
+/// reçoit, par déduction du tableau dans [`property_automation`].
+const FILTER_PROPERTY_COUNT: usize = 3;
 
-/// Table d'automatisation du filtre `TopoRender<n>` : le jack, et rien d'autre.
+static RENDER_FILTER_PROPERTIES: Shared<[PCPROPERTY_ITEM; FILTER_PROPERTY_COUNT]> =
+    Shared(RENDER_FILTER_ITEMS);
+static CAPTURE_FILTER_PROPERTIES: Shared<[PCPROPERTY_ITEM; FILTER_PROPERTY_COUNT]> =
+    Shared(CAPTURE_FILTER_ITEMS);
+
+/// Table d'automatisation du filtre `TopoRender<n>` : le jack et le jeu privé.
 static TOPO_RENDER_AUTOMATION: Shared<PCAUTOMATION_TABLE> =
-    Shared(one_property_automation(&RENDER_JACK_PROPERTIES));
+    Shared(property_automation(&RENDER_FILTER_PROPERTIES));
 /// Table d'automatisation du filtre `TopoCapture<n>`.
 static TOPO_CAPTURE_AUTOMATION: Shared<PCAUTOMATION_TABLE> =
-    Shared(one_property_automation(&CAPTURE_JACK_PROPERTIES));
+    Shared(property_automation(&CAPTURE_FILTER_PROPERTIES));
 
 static RENDER_VOLUME_AUTOMATION: Shared<PCAUTOMATION_TABLE> =
-    Shared(one_property_automation(&RENDER_VOLUME_PROPERTIES));
+    Shared(property_automation(&RENDER_VOLUME_PROPERTIES));
 static RENDER_MUTE_AUTOMATION: Shared<PCAUTOMATION_TABLE> =
-    Shared(one_property_automation(&RENDER_MUTE_PROPERTIES));
+    Shared(property_automation(&RENDER_MUTE_PROPERTIES));
 static CAPTURE_VOLUME_AUTOMATION: Shared<PCAUTOMATION_TABLE> =
-    Shared(one_property_automation(&CAPTURE_VOLUME_PROPERTIES));
+    Shared(property_automation(&CAPTURE_VOLUME_PROPERTIES));
 static CAPTURE_MUTE_AUTOMATION: Shared<PCAUTOMATION_TABLE> =
-    Shared(one_property_automation(&CAPTURE_MUTE_PROPERTIES));
+    Shared(property_automation(&CAPTURE_MUTE_PROPERTIES));
 
 /// Nœuds de `TopoRender` : volume à l'index [`NODE_VOLUME`], sourdine à [`NODE_MUTE`].
 const TOPO_RENDER_NODES: [PCNODE_DESCRIPTOR; NODE_COUNT] = [
@@ -1266,41 +1292,55 @@ const _: () = {
     // `KSPROPSETID_Topology`.
     assert!(automation_is_well_formed(&EMPTY_AUTOMATION_TABLE, 0));
 
-    // Les deux tables de filtre **topologie** : le jack, et rien d'autre.
+    // Les deux tables de filtre **topologie** : le jack, l'état et la version.
     assert!(automation_is_well_formed(
-        &one_property_automation(&RENDER_JACK_PROPERTIES),
-        1
+        &property_automation(&RENDER_FILTER_PROPERTIES),
+        FILTER_PROPERTY_COUNT
     ));
     assert!(automation_is_well_formed(
-        &one_property_automation(&CAPTURE_JACK_PROPERTIES),
-        1
+        &property_automation(&CAPTURE_FILTER_PROPERTIES),
+        FILTER_PROPERTY_COUNT
     ));
-    assert!(property_items_are_well_formed(&RENDER_JACK_ITEMS));
-    assert!(property_items_are_well_formed(&CAPTURE_JACK_ITEMS));
+    assert!(property_items_are_well_formed(&RENDER_FILTER_ITEMS));
+    assert!(property_items_are_well_formed(&CAPTURE_FILTER_ITEMS));
 
     // `GET | BASICSUPPORT`, et surtout **pas** `SET` : `KSPROPERTY_JACK_DESCRIPTION` est en
-    // lecture seule (« Get: Yes, Set: No »). Un `SET` déclaré par erreur ferait croire au
-    // client qu'il peut brancher le câble par cette propriété-là, alors que c'est M1b-04 et
-    // une propriété privée qui s'en chargeront.
-    assert!(RENDER_JACK_ITEMS[0].Flags == JACK_ACCESS_FLAGS);
-    assert!(CAPTURE_JACK_ITEMS[0].Flags == JACK_ACCESS_FLAGS);
+    // lecture seule (« Get: Yes, Set: No »). C'est le jeu privé de M1b-04, deux entrées
+    // plus loin dans la même table, qui porte l'écriture.
+    assert!(RENDER_FILTER_ITEMS[0].Flags == JACK_ACCESS_FLAGS);
+    assert!(CAPTURE_FILTER_ITEMS[0].Flags == JACK_ACCESS_FLAGS);
     assert!(JACK_ACCESS_FLAGS & portcls_sys::KSPROPERTY_TYPE_SET == 0);
+
+    // Le jeu privé `KSPROPSETID_Conduit` (M1b-04) : l'état s'écrit, la version non. Une
+    // version déclarée en écriture laisserait croire au service d'assistance qu'il peut
+    // faire changer d'avis le pilote sur sa propre version.
+    assert!(RENDER_FILTER_ITEMS[1].Flags == CABLE_STATE_ACCESS_FLAGS);
+    assert!(CAPTURE_FILTER_ITEMS[1].Flags == CABLE_STATE_ACCESS_FLAGS);
+    assert!(CABLE_STATE_ACCESS_FLAGS & portcls_sys::KSPROPERTY_TYPE_SET != 0);
+    assert!(RENDER_FILTER_ITEMS[2].Flags == VERSION_ACCESS_FLAGS);
+    assert!(CAPTURE_FILTER_ITEMS[2].Flags == VERSION_ACCESS_FLAGS);
+    assert!(VERSION_ACCESS_FLAGS & portcls_sys::KSPROPERTY_TYPE_SET == 0);
+    // Les trois entrées d'un filtre portent bien trois `Id` distincts : PortCls sert la
+    // **première** entrée de même `Set`/`Id`, et deux entrées confondues rendraient une
+    // propriété inatteignable sans le moindre message.
+    assert!(RENDER_FILTER_ITEMS[1].Id != RENDER_FILTER_ITEMS[2].Id);
+    assert!(CAPTURE_FILTER_ITEMS[1].Id != CAPTURE_FILTER_ITEMS[2].Id);
 
     // Les quatre tables de nœud : une propriété chacune, réellement pointée.
     assert!(automation_is_well_formed(
-        &one_property_automation(&RENDER_VOLUME_PROPERTIES),
+        &property_automation(&RENDER_VOLUME_PROPERTIES),
         1
     ));
     assert!(automation_is_well_formed(
-        &one_property_automation(&RENDER_MUTE_PROPERTIES),
+        &property_automation(&RENDER_MUTE_PROPERTIES),
         1
     ));
     assert!(automation_is_well_formed(
-        &one_property_automation(&CAPTURE_VOLUME_PROPERTIES),
+        &property_automation(&CAPTURE_VOLUME_PROPERTIES),
         1
     ));
     assert!(automation_is_well_formed(
-        &one_property_automation(&CAPTURE_MUTE_PROPERTIES),
+        &property_automation(&CAPTURE_MUTE_PROPERTIES),
         1
     ));
 
