@@ -34,6 +34,15 @@
 //! rendu, et on lit et écrit là. La vérification que les deux côtés coïncident appartient
 //! à l'outil de mesure (`conduit-looptest --cable-cote`), pas au service.
 //!
+//! # Deux ordres ne descendent pas jusqu'au pilote (M1b-21)
+//!
+//! `renommer` et `nom par défaut` écrivent le nom de l'endpoint dans
+//! `HKLM\...\MMDevices\Audio`, ce que `LocalSystem` fait de plein droit : ils n'ouvrent
+//! aucun filtre de topologie, n'arment **pas** `SeLoadDriverPrivilege`, et leur travail
+//! est entièrement dans [`crate::registre`]. C'est l'application du principe qui commande
+//! la conception : ce qui peut être fait hors du noyau y est fait, et le pilote ne connaît
+//! toujours que la connexion et les canaux.
+//!
 //! # Aucun flux audio, aucun son
 //!
 //! `IOCTL_KS_PROPERTY` est une requête de contrôle sur un filtre de topologie. Ce module
@@ -131,6 +140,69 @@ pub fn executer(requete: Requete, appelant: &Appelant, journal: &Journal) -> Rep
         Requete::Activer(cable) => ecrire_connexion(code, cable, true, appelant, journal),
         Requete::Desactiver(cable) => ecrire_connexion(code, cable, false, appelant, journal),
         Requete::Canaux { cable, canaux } => regler_canaux(code, cable, canaux, appelant, journal),
+        Requete::Renommer { cable, ref nom } => {
+            ecrire_nom(code, cable, Some(nom), appelant, journal)
+        }
+        Requete::NomDefaut(cable) => ecrire_nom(code, cable, None, appelant, journal),
+    }
+}
+
+/// Écrit le nom d'un câble dans le registre, ou le lui rend (M1b-21).
+///
+/// **Ne touche pas au pilote et n'arme aucun privilège** : le nom d'un endpoint vit dans
+/// `HKLM\...\MMDevices\Audio`, et y écrire est un droit de `LocalSystem`. Tout le travail
+/// est dans [`crate::registre`] ; ce qui suit ne fait que traduire son issue en
+/// [`Reponse`] et journaliser, avec l'identité de l'appelant comme tout ordre qui
+/// modifie l'état.
+///
+/// Le nom a déjà été validé **deux fois** avant d'arriver ici : par le démon
+/// (`controle::ControleCables::rename`) et par le parseur du protocole, qui appelle l'un
+/// et l'autre `conduit_backend::cable::validate_cable_name`. Le service ne rejuge donc
+/// pas la règle — il l'aurait fait avec le même verdict.
+fn ecrire_nom(
+    code: u8,
+    cable: CableId,
+    voulu: Option<&str>,
+    appelant: &Appelant,
+    journal: &Journal,
+) -> Reponse {
+    let verbe = match voulu {
+        Some(_) => "renommer",
+        None => "rendre son nom d'origine à",
+    };
+    match crate::registre::appliquer(cable, voulu) {
+        Ok(cotes) => {
+            journal.info(&format!(
+                "{verbe} le câble {} par {appelant} : « {} » écrit sur {cotes} côté(s)",
+                cable.0,
+                voulu.unwrap_or(&crate::registre::nom_d_origine(cable))
+            ));
+            // L'état des câbles est relu comme après toute écriture : la réponse décrit
+            // la machine, pas l'intention. Le renommage ne change ni les masques ni les
+            // canaux, mais un client qui vient de renommer doit pouvoir constater que le
+            // câble est toujours là.
+            reponse_de_lecture(code, Statut::Succes, 0)
+        }
+        Err(erreur) => {
+            journal.erreur(&format!(
+                "{verbe} le câble {} par {appelant} : {erreur}",
+                cable.0
+            ));
+            Reponse::refus_detaille(code, statut_registre(&erreur), erreur.detail())
+        }
+    }
+}
+
+/// Le statut qui correspond à un refus du registre.
+///
+/// Un endpoint absent est le cas **bénin et courant** — le câble est déconnecté, Windows
+/// n'a rien publié — et il a son propre statut pour que le message dise « activez-le
+/// d'abord » plutôt que « refus du système ». Tout le reste est un code Win32 rendu tel
+/// quel.
+fn statut_registre(erreur: &crate::registre::ErreurRegistre) -> Statut {
+    match erreur {
+        crate::registre::ErreurRegistre::Aucun { .. } => Statut::EndpointAbsent,
+        _ => Statut::ErreurSysteme,
     }
 }
 

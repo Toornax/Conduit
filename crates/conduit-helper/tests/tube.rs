@@ -90,7 +90,7 @@ impl Drop for ServeurDeTest {
 fn l_aller_retour_nominal_traverse_le_canal() {
     let _serveur = ServeurDeTest::demarrer();
 
-    let reponse = tube::demander(Requete::Version).expect("le service répond");
+    let reponse = tube::demander(&Requete::Version).expect("le service répond");
     assert_eq!(reponse.ordre, conduit_helper::protocole::ORDRE_VERSION);
     // Sans le pilote, la lecture des câbles échoue et le statut le dit — ce qui est le
     // bon comportement, pas un échec du canal.
@@ -104,7 +104,7 @@ fn l_aller_retour_nominal_traverse_le_canal() {
         );
     }
 
-    let reponse = tube::demander(Requete::Lister).expect("le service répond");
+    let reponse = tube::demander(&Requete::Lister).expect("le service répond");
     assert_eq!(reponse.ordre, conduit_helper::protocole::ORDRE_LISTER);
     // Un câble annoncé actif est forcément annoncé présent : l'inverse serait un masque
     // construit de travers.
@@ -126,10 +126,10 @@ fn les_trames_hostiles_sont_refusees_avec_leur_cause() {
     let cas: [(&str, Vec<u8>, Statut); 6] = [
         // Une version que ce service ne sert pas.
         (
-            "version 2",
+            "version 99",
             {
-                let mut brut = valide;
-                brut[0] = 2;
+                let mut brut = valide.clone();
+                brut[0] = 99;
                 encadrer(&brut)
             },
             Statut::VersionInconnue,
@@ -138,7 +138,7 @@ fn les_trames_hostiles_sont_refusees_avec_leur_cause() {
         (
             "ordre 200",
             {
-                let mut brut = valide;
+                let mut brut = valide.clone();
                 brut[1] = 200;
                 encadrer(&brut)
             },
@@ -148,7 +148,7 @@ fn les_trames_hostiles_sont_refusees_avec_leur_cause() {
         (
             "9 octets",
             {
-                let mut brut = valide.to_vec();
+                let mut brut = valide.clone();
                 brut.push(0);
                 encadrer(&brut)
             },
@@ -160,7 +160,7 @@ fn les_trames_hostiles_sont_refusees_avec_leur_cause() {
         (
             "câble parasite",
             {
-                let mut brut = valide;
+                let mut brut = valide.clone();
                 brut[2] = 1;
                 encadrer(&brut)
             },
@@ -191,8 +191,8 @@ fn les_trames_hostiles_sont_refusees_avec_leur_cause() {
 
     // Une version étrangère reçoit **la version servie** dans le détail : c'est le seul
     // refus qui dit au client comment se corriger.
-    let mut brut = valide;
-    brut[0] = 2;
+    let mut brut = valide.clone();
+    brut[0] = 99;
     let charge = tube::demander_octets(&encadrer(&brut)).expect("le service répond");
     let reponse = Reponse::from_bytes(&charge).expect("réponse lisible");
     assert_eq!(reponse.detail, u32::from(PROTOCOLE_VERSION));

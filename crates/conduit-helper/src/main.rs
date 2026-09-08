@@ -67,6 +67,11 @@ mod windows {
                 cable: CableId(cable),
                 canaux,
             }),
+            Commande::Renommer { cable, nom } => client(Requete::Renommer {
+                cable: CableId(cable),
+                nom,
+            }),
+            Commande::NomDefaut { cable } => client(Requete::NomDefaut(CableId(cable))),
         };
         match resultat {
             Ok(()) => ExitCode::SUCCESS,
@@ -138,8 +143,8 @@ mod windows {
     /// servi : un ordre refusé par le pilote est un échec du point de vue de qui l'a
     /// tapé, même si l'échange s'est parfaitement déroulé.
     fn client(requete: Requete) -> Result<(), String> {
-        let reponse = tube::demander(requete).map_err(|e| e.to_string())?;
-        print!("{}", rapport::rendre(requete, &reponse));
+        let reponse = tube::demander(&requete).map_err(|e| e.to_string())?;
+        print!("{}", rapport::rendre(&requete, &reponse));
         if reponse.statut.succes() {
             Ok(())
         } else {

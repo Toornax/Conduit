@@ -56,13 +56,19 @@ conduit-backend-wasapi = { path = "../conduit-backend-wasapi", version = "0.1.0"
 # - `Win32_System_Services` : le contrôleur de services (installation,
 #   désinstallation, dispatcher, SetServiceStatus) ;
 # - `Win32_System_Memory` : LocalFree, qui libère le descripteur de sécurité ;
-# - `Win32_System_SystemInformation` : GetLocalTime, l'horodatage du journal.
+# - `Win32_System_SystemInformation` : GetLocalTime, l'horodatage du journal ;
+# - `Win32_System_Registry` : RegOpenKeyExW, RegEnumKeyExW, RegQueryValueExW,
+#   RegSetValueExW, RegDeleteValueW — le nom d'endpoint sous
+#   HKLM\...\MMDevices\Audio (M1b-21, module `registre`). Écrire là exige d'être
+#   LocalSystem, pas d'armer un privilège : c'est pour cela que le renommage passe
+#   par le service et non par le démon.
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Pipes",
+    "Win32_System_Registry",
     "Win32_System_Services",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
