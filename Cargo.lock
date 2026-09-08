@@ -793,6 +793,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "conduit-helper"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "conduit-backend",
+ "conduit-backend-wasapi",
+ "conduit-kmd-core",
+ "proptest",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "conduit-kmd-core"
 version = "0.1.0"
 dependencies = [

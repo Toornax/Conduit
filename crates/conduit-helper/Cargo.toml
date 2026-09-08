@@ -1,0 +1,72 @@
+[package]
+name = "conduit-helper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Conduit — service d'assistance Windows : écrit la propriété KS privée du pilote pour le démon"
+publish = false
+
+[lib]
+name = "conduit_helper"
+path = "src/lib.rs"
+
+[[bin]]
+name = "conduit-helper"
+path = "src/main.rs"
+
+[dependencies]
+# `CableId`, le numéro **affiché** d'un câble (« Conduit 1 » = `CableId(1)`). Le crate
+# est portable : le protocole s'en sert sur toutes les plateformes.
+conduit-backend.workspace = true
+# Le contrat partagé avec le pilote : bornes du numéro de câble (`CABLE_MAX`), bornes
+# et défaut des canaux (`params`), disposition de `CableState`. `no_std`, sans
+# dépendance, portable — d'où un protocole dont les domaines ne sont pas recopiés.
+conduit-kmd-core = { path = "../conduit-kmd-core", version = "0.1.0" }
+clap = { version = "4", features = ["derive"] }
+
+# Tout ce qui touche à Windows est ici : le service, le canal nommé, le transport KS.
+# Ailleurs, le binaire se contente d'expliquer qu'il est spécifique à Windows, et
+# `cargo check --workspace` reste vert sur Linux et macOS (ADR-012, §2 de
+# docs/driver-design.md).
+[target.'cfg(windows)'.dependencies]
+# Le transport déjà écrit et **vérifié en machine** (M1b-04) : énumération des
+# interfaces `KSCATEGORY_TOPOLOGY`, appariement exact de la chaîne de référence,
+# `IOCTL_KS_PROPERTY`, armement de `SeLoadDriverPrivilege` et sa restauration par
+# garde. Rien n'en est recopié ici.
+conduit-backend-wasapi = { path = "../conduit-backend-wasapi", version = "0.1.0" }
+# Les features sont le strict nécessaire de ce crate :
+# - `Win32_Foundation` : HANDLE, CloseHandle, GetLastError, WIN32_ERROR ;
+# - `Win32_Security` : SECURITY_ATTRIBUTES, GetSecurityDescriptorDacl (le contrôle
+#   anti-DACL-nulle), TOKEN_USER, GetTokenInformation, LookupAccountSidW,
+#   RevertToSelf — l'identité de l'appelant pour le journal ;
+# - `Win32_Security_Authorization` : ConvertStringSecurityDescriptorToSecurityDescriptorW
+#   (le descripteur de sécurité du canal, construit depuis un SDDL explicite) et
+#   ConvertSidToStringSidW ;
+# - `Win32_System_Pipes` : CreateNamedPipeW, ConnectNamedPipe, DisconnectNamedPipe,
+#   ImpersonateNamedPipeClient, GetNamedPipeClientProcessId ;
+# - `Win32_Storage_FileSystem` : CreateFileW (côté client), ReadFile, WriteFile,
+#   FlushFileBuffers ;
+# - `Win32_System_Threading` : GetCurrentThread, OpenThreadToken ;
+# - `Win32_System_Services` : le contrôleur de services (installation,
+#   désinstallation, dispatcher, SetServiceStatus) ;
+# - `Win32_System_Memory` : LocalFree, qui libère le descripteur de sécurité ;
+# - `Win32_System_SystemInformation` : GetLocalTime, l'horodatage du journal.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_Services",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

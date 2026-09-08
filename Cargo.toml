@@ -15,6 +15,7 @@ members = [
     "crates/conduit-kmd-core",
     "crates/conduit-com",
     "crates/conduit-looptest",
+    "crates/conduit-helper",
 ]
 # `drivers/windows` est le workspace noyau, indépendant (ADR-012).
 exclude = ["crates/conduit-protocol/fuzz", "drivers/windows"]
