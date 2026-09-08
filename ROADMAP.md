@@ -621,8 +621,24 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   format client par le chemin conversion), horodatage QPC commun aux flux ; latence
   estimée `write_ahead_frames` ; `clock_now()` ; `tests/two_devices.rs` (60 s : base
   commune à 43 µs, dérive Realtek − G27QC = −18 ppm ; `#[ignore]` 1 h avec le moteur).
-- [ ] **M1b-34** `feat(wasapi): CableControl via le helper`
+- [x] **M1b-34** `feat(wasapi): CableControl via le helper`
   *Fait quand* : `conduitctl cable add` fonctionne de bout en bout (F-01, F-03).
+  *Mesuré le 2026-09-08*, dans la VM, démon et `conduitctl` en session **non élevée** :
+  `cable add` rend `câble 5 « Conduit 5 » stéréo : rendu {0.0.0.…}, capture {0.0.1.…}` —
+  de vrais identifiants MMDevice, donc l'endpoint existe vraiment ; `cable list` le montre
+  actif ; `cable remove 5` le repasse inactif. Le démon journalise au démarrage
+  « service d'assistance Conduit présent : les câbles sont pilotables ».
+  `cable add --name Musique` **refuse** en nommant M1b-21, plutôt que d'ignorer le nom en
+  silence ou de paniquer.
+  *Décisions prises et écrites* : tout passe par le service, **y compris `list`** — une
+  réponse porte les seize câbles d'un coup là où une lecture directe ouvrirait seize
+  filtres, et une source unique empêche un `list` de contredire l'`add` qui précède ; sans
+  service, `list` rend une erreur qui nomme `conduit-helper installer`, jamais une liste
+  vide. `create` sur un câble déjà actif rend l'état existant sans erreur, parce que
+  `ensure_cables` rejoue la configuration à chaque démarrage.
+  *Contrainte de dépendances* : `conduit-helper` dépend du dorsal WASAPI pour le transport
+  KS, donc le dorsal ne peut pas dépendre du helper. Le `CableControl` vit dans
+  `conduit-helper::controle`, et `conduitd` — seul à voir les deux — l'injecte.
 - [x] **M1b-35** `feat(daemon): démarrage à l'ouverture de session et instance unique`
   Tâche planifiée par utilisateur (ADR-013), détection d'instance unique par le named pipe,
   arrêt propre à la fermeture de session. **Pas** de service SCM pour le démon.
