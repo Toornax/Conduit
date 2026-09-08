@@ -10,6 +10,7 @@ use conduit_backend::{
 };
 use conduit_core::types::ChannelCount;
 
+use crate::devices::{cable_name, CableName, EndpointInfo};
 use crate::exclusive::ExclusivePolicy;
 use crate::mmdevice_thread::{Command, Message};
 use crate::stream::WasapiHandle;
@@ -141,11 +142,33 @@ impl WasapiBackend {
             .ok_or_else(|| CableError::Unavailable(SANS_CONTROLE.to_owned()))
     }
 
-    /// Remplace les identifiants d'endpoint **de repli** par ceux que MMDevice publie.
+    /// L'énumération **complète** : ce que publie [`Backend::devices`], plus la
+    /// description de chaque endpoint (voir `devices::EndpointInfo`).
+    fn endpoints(&self) -> Result<Vec<EndpointInfo>, BackendError> {
+        self.request(|reply| Command::Enumerate { reply }, "énumération")?
+    }
+
+    /// Remplace les identifiants d'endpoint **de repli** par ceux que MMDevice publie, et
+    /// le nom canonique par celui que le câble affiche vraiment.
     ///
     /// Le service ne connaît que les filtres de topologie du pilote ; les endpoints,
     /// eux, sont l'affaire de ce crate. Une énumération suffit pour tous les câbles :
     /// chaque [`DeviceInfo`] porte déjà son [`CableId`] (`devices::cable_id_from_endpoint`).
+    ///
+    /// # Le nom, et pourquoi il vient d'ici
+    ///
+    /// La réponse du protocole du service est de **taille fixe** et ne transporte aucun
+    /// nom : `CableControl::list` rend donc « Conduit *N* », le nom canonique, même pour
+    /// un câble renommé « Musique ». Le dorsal, lui, lit la description des endpoints
+    /// (`devices::EndpointInfo::description`), c'est-à-dire exactement la valeur que le
+    /// renommage de M1b-21 écrit. C'est donc lui qui complète le nom, comme il complète
+    /// déjà les identifiants.
+    ///
+    /// Quand les deux sens portent des noms **différents** — un renommage à moitié fait,
+    /// que `registre::appliquer` ne produit pas mais qu'une interruption peut laisser —,
+    /// le rendu l'emporte et la divergence est **journalisée** : la taire ferait passer
+    /// cet état anormal pour la normale, et c'est précisément le genre de silence qui
+    /// coûte une enquête.
     ///
     /// Un endpoint introuvable laisse le repli en place, et c'est la vérité : le câble
     /// est inactif — ses endpoints n'existent pas — ou Windows ne les a pas encore
@@ -156,15 +179,35 @@ impl WasapiBackend {
         if cables.is_empty() {
             return;
         }
-        let Ok(devices) = self.devices() else {
+        let Ok(endpoints) = self.endpoints() else {
             return;
         };
         for info in cables.iter_mut() {
-            for device in devices.iter().filter(|d| d.cable == Some(info.id)) {
-                match device.direction {
-                    DeviceDirection::Render => info.render = device.id.clone(),
-                    DeviceDirection::Capture => info.capture = device.id.clone(),
+            let (mut rendu, mut capture) = (None, None);
+            for endpoint in endpoints.iter().filter(|e| e.info.cable == Some(info.id)) {
+                match endpoint.info.direction {
+                    DeviceDirection::Render => {
+                        info.render = endpoint.info.id.clone();
+                        rendu = endpoint.description.as_deref();
+                    }
+                    DeviceDirection::Capture => {
+                        info.capture = endpoint.info.id.clone();
+                        capture = endpoint.description.as_deref();
+                    }
                 }
+            }
+            let nom = cable_name(rendu, capture);
+            if let CableName::Divergent { retenu, ecarte } = nom {
+                tracing::warn!(
+                    "câble {numero} : le rendu s'appelle « {retenu} » et la capture \
+                     « {ecarte} » — renommage à moitié fait ; « {retenu} » est retenu. \
+                     `conduitctl cable rename {numero} \"{retenu}\"` remettra les deux \
+                     côtés d'accord.",
+                    numero = info.id.0
+                );
+            }
+            if let Some(nom) = nom.retenu() {
+                info.name = nom.to_owned();
             }
         }
     }
@@ -288,7 +331,11 @@ impl Backend for WasapiBackend {
     }
 
     fn devices(&self) -> Result<Vec<DeviceInfo>, BackendError> {
-        self.request(|reply| Command::Enumerate { reply }, "énumération")?
+        Ok(self
+            .endpoints()?
+            .into_iter()
+            .map(|endpoint| endpoint.info)
+            .collect())
     }
 
     fn default_device(&self, direction: DeviceDirection) -> Option<DeviceId> {
@@ -343,13 +390,15 @@ impl Backend for WasapiBackend {
     }
 }
 
-/// Le contrôle des câbles du dorsal : les ordres partent au service, les **endpoints**
-/// sont résolus ici (M1b-34).
+/// Le contrôle des câbles du dorsal : les ordres partent au service, les **endpoints** et
+/// le **nom affiché** sont résolus ici (M1b-34).
 ///
 /// Le partage suit ce que chacun sait : le service connaît les filtres de topologie du
-/// pilote et l'état de connexion, le dorsal connaît les endpoints MMDevice. Chaque
-/// [`CableInfo`] traverse donc `WasapiBackend::resoudre_endpoints` avant d'être rendu,
-/// et l'appelant reçoit les identifiants qu'il pourrait ouvrir — pas des noms de repli.
+/// pilote et l'état de connexion, le dorsal connaît les endpoints MMDevice — leurs
+/// identifiants comme le nom que Windows leur donne. Chaque [`CableInfo`] traverse donc
+/// `WasapiBackend::resoudre_endpoints` avant d'être rendu, et l'appelant reçoit les
+/// identifiants qu'il pourrait ouvrir — pas des jetons de repli — et le nom que
+/// l'utilisateur voit dans les réglages Son, non le « Conduit *N* » canonique.
 impl CableControl for WasapiBackend {
     fn max_cables(&self) -> usize {
         // Sans contrôle installé, aucun câble n'est pilotable : le dire par 0 vaut mieux

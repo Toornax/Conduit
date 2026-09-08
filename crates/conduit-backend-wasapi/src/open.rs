@@ -242,7 +242,10 @@ pub(crate) fn open(
             })
         }
     };
-    let info = describe(&device, &Defaults::query(enumerator)?)?;
+    // Seul le `DeviceInfo` sert ici : la description d'endpoint ne concerne que le
+    // rattachement d'un câble à ses endpoints (`backend::resoudre_endpoints`), pas
+    // l'ouverture d'un flux.
+    let info = describe(&device, &Defaults::query(enumerator)?)?.info;
     if loopback {
         // Refusés avant tout appel COM : un écho ne se prend que sur un endpoint de
         // rendu, et seulement en mode partagé (module `loopback`).

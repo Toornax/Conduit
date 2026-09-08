@@ -140,7 +140,9 @@ pub use clock::{ClockSource, ClockUnits};
 #[cfg(windows)]
 pub use convert::SampleType;
 #[cfg(windows)]
-pub use devices::{cable_id_from_endpoint, cable_id_from_name, PROBED_RATES};
+pub use devices::{
+    cable_id_from_endpoint, cable_id_from_name, cable_name, CableName, PROBED_RATES,
+};
 #[cfg(windows)]
 pub use exclusive::{aligned_period_hns, ExclusivePolicy, ShareMode};
 #[cfg(windows)]

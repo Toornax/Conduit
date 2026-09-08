@@ -80,6 +80,16 @@
 //! les deux sens, une interruption entre les deux écritures laisse un endpoint qui est
 //! encore retrouvable — jamais un endpoint anonyme.
 //!
+//! **Les deux bouts la lisent.** Ce module la relit dans le registre ([`cable_designe`],
+//! pour retrouver les clés d'un câble qu'on renomme une seconde fois) et le dorsal WASAPI
+//! la lit dans le magasin de propriétés de l'endpoint
+//! (`conduit_backend_wasapi::cable_id_from_endpoint`, par `IPropertyStore` — le dorsal n'a
+//! pas à connaître ce chemin `HKLM`), pour remplir `DeviceInfo::cable`. Les deux
+//! appliquent la même priorité, marque puis description, et le test
+//! `nos_lectures_de_marque_coincident` les tient d'accord. Sans cette lecture côté dorsal,
+//! un câble renommé restait actif mais n'était plus rattachable à ses endpoints, et
+//! `cable list` rendait des jetons de repli.
+//!
 //! # F-52 : le renommage ne survit pas à la désinstallation, parce qu'on l'efface
 //!
 //! **Décision, écrite ici parce qu'elle est contre-intuitive.** Les clés MMDevices ne
@@ -132,7 +142,7 @@
 //! `tests/registre.rs` se limite à des lectures.
 
 use conduit_backend::CableId;
-use conduit_kmd_core::config::{ConfigGuid, KSPROPSETID_CONDUIT};
+use conduit_kmd_core::config::{ConfigGuid, KSPROPSETID_CONDUIT, PID_MARQUE_CABLE};
 
 use crate::controle::{cable_nomme, nom, Cote};
 
@@ -168,7 +178,12 @@ pub const PID_DEVICE_FRIENDLY_NAME: u32 = 14;
 /// Le `pid` de la marque de Conduit dans le `fmtid` de Conduit.
 ///
 /// 1 et non 0 : un `pid` de 0 est réservé par le système de propriétés Windows.
-pub const PID_MARQUE: u32 = 1;
+///
+/// La valeur vient de [`conduit_kmd_core::config::PID_MARQUE_CABLE`], avec le GUID dont
+/// elle dépend : ce module l'**écrit** dans le registre, et le dorsal WASAPI la **lit**
+/// par `IPropertyStore` (`devices::MARQUE_KEY`) — deux crates que rien ne relie
+/// autrement, et un `1` recopié dans chacun finirait par diverger.
+pub const PID_MARQUE: u32 = PID_MARQUE_CABLE;
 
 /// Le nom d'une valeur de magasin de propriétés : `{fmtid},pid`.
 ///
@@ -847,6 +862,68 @@ mod tests {
             cable_designe(Some("Conduit 5"), Some("Conduit 2")),
             Some(CableId(2))
         );
+    }
+
+    /// **Le côté qui écrit et le côté qui lit tranchent pareil.**
+    ///
+    /// Ce module écrit la marque dans le registre ; le dorsal WASAPI la relit par
+    /// `IPropertyStore` et en tire le [`CableId`] de chaque endpoint
+    /// (`devices::cable_id_from_endpoint`). Deux règles de priorité qui divergeraient
+    /// rendraient un câble rattachable pour l'un et pas pour l'autre — c'est-à-dire le
+    /// défaut qu'on vient de corriger, revenu par l'autre bout.
+    ///
+    /// Le dorsal a un troisième argument, le nom **composé** que Windows affiche : il
+    /// n'entre en jeu que sans marque **ni** description, cas que le registre ne
+    /// distingue pas (une valeur absente est absente). On lui passe donc le nom composé
+    /// du câble, qu'il doit refuser exactement comme ce module refuse `None`.
+    ///
+    /// Sous Windows seulement : `conduit_backend_wasapi` n'y compile rien ailleurs.
+    #[cfg(windows)]
+    #[test]
+    fn nos_lectures_de_marque_coincident() {
+        const COMPOSE: &str = "Conduit 3 (Conduit — câbles audio virtuels)";
+        let cas: [(Option<&str>, Option<&str>); 9] = [
+            // Renommé : la description ne dit plus rien, la marque si.
+            (Some("Musique"), Some("Conduit 3")),
+            // Le cas piège : renommé du nom d'un autre câble.
+            (Some("Conduit 5"), Some("Conduit 2")),
+            // Jamais renommé.
+            (Some("Conduit 3"), None),
+            // Revenu à son nom d'origine : la marque a été supprimée.
+            (Some("Conduit 3"), None),
+            // Marque illisible : aucun repli sur la description, des deux côtés.
+            (Some("Conduit 3"), Some("n'importe quoi")),
+            (Some("Conduit 3"), Some("")),
+            // Ni l'un ni l'autre ne désigne un câble.
+            (Some("Casque USB"), None),
+            (Some(COMPOSE), None),
+            (None, None),
+        ];
+        for (description, marque) in cas {
+            assert_eq!(
+                cable_designe(description, marque),
+                conduit_backend_wasapi::cable_id_from_endpoint(marque, description, COMPOSE),
+                "description {description:?}, marque {marque:?}"
+            );
+        }
+        // Et sur les seize câbles renommés, la marque rattache des deux côtés.
+        for numero in 1..=CABLE_MAX {
+            let marque = nom_d_origine(CableId(numero));
+            assert_eq!(
+                cable_designe(Some("Musique"), Some(&marque)),
+                Some(CableId(numero)),
+                "câble {numero}"
+            );
+            assert_eq!(
+                conduit_backend_wasapi::cable_id_from_endpoint(
+                    Some(&marque),
+                    Some("Musique"),
+                    "Musique (Conduit — câbles audio virtuels)"
+                ),
+                Some(CableId(numero)),
+                "câble {numero}, côté dorsal"
+            );
+        }
     }
 
     /// Le nom d'origine se **déduit** du numéro : rien n'est mémorisé.

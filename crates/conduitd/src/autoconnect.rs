@@ -298,6 +298,41 @@ target = { node = "Haut-parleurs", ports = ["FL", "FR"] }"#,
         assert_eq!(plan[1].dst_port, "FR");
     }
 
+    /// **Une règle `cable = N` suit le câble, pas son nom.**
+    ///
+    /// Après `conduitctl cable rename 1 Musique`, les endpoints du câble 1 s'appellent
+    /// « Musique » : leur description a changé, mais le dorsal les rattache par la
+    /// **marque** que le service a écrite, et `DeviceInfo::cable` vaut toujours 1. La
+    /// règle de connexion automatique de la configuration continue donc de mordre —
+    /// sans quoi renommer un câble aurait silencieusement débranché tout le montage.
+    #[test]
+    fn une_regle_sur_le_cable_survit_au_renommage() {
+        let rule: AutoConnectRule = toml::from_str(
+            r#"match = { cable = 1, direction = "capture" }
+target = { node = "Haut-parleurs", ports = ["FL", "FR"] }"#,
+        )
+        .unwrap();
+        rule.validate().unwrap();
+        // Le nom affiché ne contient plus « Conduit » : seul `cable` l'identifie.
+        let renomme = device(
+            "{0.0.1.00000000}.{c615a124}",
+            "Musique (Conduit — câbles audio virtuels)",
+            DeviceDirection::Capture,
+            2,
+            Some(1),
+        );
+        assert!(rule.matches(&renomme), "{}", renomme.label);
+        // Et un autre câble, renommé lui aussi, ne se fait pas prendre pour le premier.
+        let autre = device(
+            "{0.0.1.00000000}.{d726b235}",
+            "Musique (Conduit — câbles audio virtuels)",
+            DeviceDirection::Capture,
+            2,
+            Some(2),
+        );
+        assert!(!rule.matches(&autre));
+    }
+
     #[test]
     fn reverse_direction_and_port_filtering() {
         // Le déclencheur est un périphérique de rendu : la cible (capture) l'alimente.

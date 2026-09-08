@@ -117,6 +117,34 @@ pub const KSPROPERTY_CONDUIT_CABLE_STATE: u32 = 0;
 /// qu'elle change), ni un second GUID de jeu.
 pub const KSPROPERTY_CONDUIT_VERSION: u32 = 1;
 
+/// Le `pid` de la **marque de câble** dans le magasin de propriétés d'un endpoint
+/// MMDevices : la valeur `{3f1b27a4-8c6e-4d02-9b75-e4a0d61c8f3b},1`.
+///
+/// # Ce que la marque est, et pourquoi elle existe
+///
+/// Renommer un câble écrase `PKEY_Device_DeviceDesc`, la description par laquelle on
+/// retrouvait « Conduit *N* ». La marque est écrite **avant** ce renommage, dans la même
+/// clé, et porte le nom d'origine du câble (`Conduit 3`) : c'est elle qui rattache un
+/// endpoint renommé à son numéro. Un identifiant déduit d'un texte d'affichage ne
+/// survit pas au changement de ce texte ; celui-ci, si.
+///
+/// # Espace de nommage
+///
+/// Ce n'est **pas** un `KSPROPERTY` : les `pid` d'un `PROPERTYKEY` de magasin de
+/// propriétés Windows et les `Id` d'un `KSPROPERTY` sont deux numérotations
+/// indépendantes, et la valeur 1 partagée avec [`KSPROPERTY_CONDUIT_VERSION`] n'est pas
+/// une collision — le pilote ne voit jamais cette clé, et personne ne la lui envoie. Le
+/// `pid` 0 est en revanche réservé par le système de propriétés Windows, d'où 1.
+///
+/// # Pourquoi ici
+///
+/// La marque a **deux** lecteurs en espace utilisateur : `conduit-helper` l'écrit dans le
+/// registre (`registre::valeur_marque`) et le dorsal WASAPI la lit par `IPropertyStore`
+/// (`devices::MARQUE_KEY`). Elle vit donc avec le GUID dont elle dépend, plutôt que
+/// recopiée dans chacun des deux — le crate est portable et sans dépendance, les deux y
+/// accèdent.
+pub const PID_MARQUE_CABLE: u32 = 1;
+
 /// Version du contrat rendue par [`KSPROPERTY_CONDUIT_VERSION`].
 ///
 /// À incrémenter **à chaque** changement observable de [`CableState`] — un champ ajouté,
@@ -604,6 +632,19 @@ mod tests {
              PortCls cherche la première entrée de même Set/Id et servirait la mauvaise"
         );
         assert_eq!(CONFIG_VERSION, 1);
+    }
+
+    /// Le `pid` de la marque : celui qu'écrit le service et celui que lit le dorsal.
+    ///
+    /// Il vit ici parce que **deux** crates s'y donnent rendez-vous ; si quelqu'un le
+    /// change, `registre::valeur_marque` et `devices::MARQUE_KEY` bougent ensemble, et
+    /// les endpoints déjà renommés d'une machine deviennent orphelins — d'où la valeur
+    /// écrite en toutes lettres.
+    #[test]
+    fn le_pid_de_la_marque_est_grave() {
+        assert_eq!(PID_MARQUE_CABLE, 1);
+        // Le `pid` 0 est réservé par le système de propriétés Windows.
+        assert_ne!(PID_MARQUE_CABLE, 0);
     }
 
     /// La disposition : seize octets, quatre `ULONG`, aucun trou.

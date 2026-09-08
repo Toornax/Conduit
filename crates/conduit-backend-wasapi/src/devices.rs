@@ -17,6 +17,7 @@
 
 use conduit_backend::{BackendError, CableId, DeviceDirection, DeviceId, DeviceInfo};
 use conduit_core::types::SampleRate;
+use conduit_kmd_core::config::{ConfigGuid, KSPROPSETID_CONDUIT, PID_MARQUE_CABLE};
 use windows::core::HRESULT;
 use windows::core::{Interface, GUID};
 use windows::Win32::Devices::FunctionDiscovery::{
@@ -264,27 +265,134 @@ pub fn cable_id_from_name(name: &str) -> Option<CableId> {
     digits.parse().ok().filter(|n| *n > 0).map(CableId)
 }
 
-/// Identité de câble d'un endpoint, à partir des deux noms que Windows publie
-/// séparément.
+/// Traduit un [`ConfigGuid`] du contrat en `GUID` de `guiddef.h`.
+///
+/// Les deux structures ont la même disposition (`conduit_kmd_core` l'affirme par
+/// assertion `const`) ; on recopie les quatre champs plutôt que de transtyper, ce qui
+/// reste une `const fn` et n'engage aucun `unsafe`.
+const fn guid_from_config(guid: &ConfigGuid) -> GUID {
+    GUID {
+        data1: guid.data1,
+        data2: guid.data2,
+        data3: guid.data3,
+        data4: guid.data4,
+    }
+}
+
+/// Le `PROPERTYKEY` de la **marque de câble** que le service écrit sur un endpoint
+/// avant de le renommer : `{3f1b27a4-8c6e-4d02-9b75-e4a0d61c8f3b},1`.
+///
+/// Le `fmtid` est [`KSPROPSETID_CONDUIT`] et le `pid` [`PID_MARQUE_CABLE`], tous deux
+/// **pris dans `conduit-kmd-core`** et non recopiés : le service d'assistance écrit
+/// exactement cette valeur dans le registre (`conduit_helper::registre`), et deux
+/// écritures en dur du même GUID finiraient par diverger en silence — la marque
+/// deviendrait introuvable, sans le moindre message.
+///
+/// Elle se lit dans le magasin de propriétés de l'endpoint, comme les autres clés : ce
+/// crate n'a pas à connaître le chemin `HKLM` sous lequel Windows range ce magasin.
+pub(crate) const MARQUE_KEY: PROPERTYKEY = PROPERTYKEY {
+    fmtid: guid_from_config(&KSPROPSETID_CONDUIT),
+    pid: PID_MARQUE_CABLE,
+};
+
+/// Identité de câble d'un endpoint, à partir de ce que sa clé porte : notre **marque**
+/// d'abord, la description ensuite, le nom en dernier recours.
+///
+/// # Pourquoi la marque prime
 ///
 /// Windows **compose** le nom convivial (`PKEY_Device_FriendlyName`) : le nom de
 /// l'endpoint suivi de celui du périphérique qui le porte. Relevé dans la machine
-/// virtuelle sur les deux côtés du câble 1 :
+/// virtuelle sur les deux côtés du câble 1, avant tout renommage :
 ///
 /// ```text
 /// PKEY_Device_FriendlyName : Conduit 1 (Conduit — câbles audio virtuels)
 /// PKEY_Device_DeviceDesc   : Conduit 1
 /// ```
 ///
-/// C'est donc la **description** qui identifie le câble, et le nom composé qui
-/// s'affiche — c'est lui que l'utilisateur reconnaît dans les réglages Son.
+/// La description identifiait donc le câble — **tant que personne ne renomme**. Or
+/// renommer un câble écrit précisément dans cette description : après
+/// `conduit-helper renommer 1 Musique`, elle vaut « Musique » et le pont est rompu. Le
+/// service écrit pour cette raison, dans la même clé et **avant** la description, une
+/// valeur qui lui appartient et qui dit ce que la description disait ([`MARQUE_KEY`],
+/// « Conduit 1 »).
 ///
-/// Sans description (propriété absente ou illisible), on retombe sur le nom : sur
-/// un endpoint dont Windows ne compose pas le nom, il suffit ; sur un nom composé,
-/// [`cable_id_from_name`] le refuse, ce qui est le bon résultat — mieux vaut « pas
-/// de câble » qu'un câble deviné.
-pub fn cable_id_from_endpoint(description: Option<&str>, name: &str) -> Option<CableId> {
-    cable_id_from_name(description.unwrap_or(name))
+/// C'est la **même famille de défaut** que le nom composé : un identifiant déduit d'un
+/// texte d'affichage. Le texte d'affichage change ; l'identité, non. La marque est donc
+/// consultée en premier, et un endpoint renommé « Conduit 5 » alors qu'il est le câble 3
+/// se reconnaît comme le **3** — c'est sa marque qui compte, pas ce qu'il affiche.
+///
+/// # Ce qui ne retombe pas sur le repli
+///
+/// Une marque **présente mais illisible** ne fait pas relire la description : quelqu'un a
+/// écrit dans notre valeur, et deviner à sa place vaudrait moins que ne rien faire.
+/// C'est la règle exacte de `conduit_helper::registre::cable_designe`, du côté qui écrit ;
+/// le test `nos_lectures_de_marque_coincident` la vérifie des deux côtés à la fois.
+///
+/// Sans marque **ni** description, on retombe sur le nom : sur un endpoint dont Windows
+/// ne compose pas le nom, il suffit ; sur un nom composé, [`cable_id_from_name`] le
+/// refuse, ce qui est le bon résultat — mieux vaut « pas de câble » qu'un câble deviné.
+pub fn cable_id_from_endpoint(
+    marque: Option<&str>,
+    description: Option<&str>,
+    name: &str,
+) -> Option<CableId> {
+    match marque {
+        Some(marque) => cable_id_from_name(marque),
+        None => cable_id_from_name(description.unwrap_or(name)),
+    }
+}
+
+/// Le nom d'un câble, tel que ses deux endpoints le portent.
+///
+/// Le nom **affiché** d'un câble n'est connu que de Windows : le service ne transporte
+/// que des numéros, et `CableControl::list` rend donc le nom canonique « Conduit *N* ».
+/// C'est le dorsal qui lit les deux descriptions et tranche — voir
+/// [`WasapiBackend::resoudre_endpoints`](crate::WasapiBackend).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CableName<'a> {
+    /// Aucun des deux sens n'a publié de nom : on garde celui du service.
+    Inconnu,
+    /// Les deux sens s'accordent, ou un seul est publié.
+    Accord(&'a str),
+    /// Les deux sens portent des noms **différents** : un renommage à moitié fait, que
+    /// `registre::appliquer` ne produit pas (il exige les deux côtés avant d'écrire) mais
+    /// qu'une interruption ou une modification manuelle peut laisser.
+    Divergent {
+        /// Celui qu'on retient : le rendu.
+        retenu: &'a str,
+        /// L'autre, celui du côté capture, journalisé et non retenu.
+        ecarte: &'a str,
+    },
+}
+
+impl<'a> CableName<'a> {
+    /// Le nom à publier, s'il y en a un.
+    #[must_use]
+    pub const fn retenu(self) -> Option<&'a str> {
+        match self {
+            Self::Inconnu => None,
+            Self::Accord(nom) | Self::Divergent { retenu: nom, .. } => Some(nom),
+        }
+    }
+}
+
+/// Le nom d'un câble d'après les descriptions de ses deux endpoints.
+///
+/// Le **rendu** l'emporte quand les deux divergent : c'est le côté où les applications
+/// jouent, celui que l'utilisateur voit en premier dans les réglages Son de Windows, et
+/// il fallait trancher de façon reproductible plutôt que selon l'ordre d'énumération.
+/// L'appelant journalise la divergence — la taire ferait passer un renommage à moitié
+/// fait pour un état normal.
+#[must_use]
+pub fn cable_name<'a>(render: Option<&'a str>, capture: Option<&'a str>) -> CableName<'a> {
+    match (render, capture) {
+        (Some(rendu), Some(capture)) if rendu != capture => CableName::Divergent {
+            retenu: rendu,
+            ecarte: capture,
+        },
+        (Some(nom), _) | (None, Some(nom)) => CableName::Accord(nom),
+        (None, None) => CableName::Inconnu,
+    }
 }
 
 /// Identifiants des périphériques par défaut (`eConsole`) au moment de
@@ -352,8 +460,30 @@ pub(crate) fn default_endpoint_id(
     endpoint_id(&device).map(Some)
 }
 
+/// Un endpoint tel que ce module l'a lu : ce que le trait [`Backend`] publie, et la
+/// **description** que Windows range à part.
+///
+/// [`DeviceInfo::name`] est le nom **composé** que Windows affiche (« Musique (Conduit —
+/// câbles audio virtuels) ») ; `description` est le nom d'endpoint seul (« Musique »),
+/// c'est-à-dire celui que le renommage de M1b-21 écrit et celui qu'un câble doit
+/// remonter dans `CableInfo::name`. Le trait `Backend` est portable et n'a pas à gagner
+/// cette notion Windows, d'où un type interne au crate plutôt qu'un champ de plus sur
+/// [`DeviceInfo`].
+///
+/// [`Backend`]: conduit_backend::Backend
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EndpointInfo {
+    /// Ce que le dorsal publie.
+    pub(crate) info: DeviceInfo,
+    /// `PKEY_Device_DeviceDesc` : le nom d'endpoint seul, `None` si Windows n'en range
+    /// pas (l'endpoint n'a alors que son nom composé).
+    pub(crate) description: Option<String>,
+}
+
 /// Énumère les endpoints actifs des deux sens.
-pub(crate) fn enumerate(enumerator: &IMMDeviceEnumerator) -> Result<Vec<DeviceInfo>, BackendError> {
+pub(crate) fn enumerate(
+    enumerator: &IMMDeviceEnumerator,
+) -> Result<Vec<EndpointInfo>, BackendError> {
     let defaults = Defaults::query(enumerator)?;
     let mut devices = Vec::new();
     for direction in [DeviceDirection::Render, DeviceDirection::Capture] {
@@ -398,7 +528,7 @@ pub(crate) fn find_active(
 pub(crate) fn describe_id(
     enumerator: &IMMDeviceEnumerator,
     id: &str,
-) -> Result<Option<DeviceInfo>, BackendError> {
+) -> Result<Option<EndpointInfo>, BackendError> {
     let Some(device) = find_active(enumerator, id)? else {
         return Ok(None);
     };
@@ -452,7 +582,7 @@ fn text_property(store: &IPropertyStore, key: &PROPERTYKEY, what: &str) -> Optio
 pub(crate) fn describe(
     device: &IMMDevice,
     defaults: &Defaults,
-) -> Result<DeviceInfo, BackendError> {
+) -> Result<EndpointInfo, BackendError> {
     let id = endpoint_id(device)?;
     let endpoint: IMMEndpoint = device
         .cast()
@@ -467,11 +597,13 @@ pub(crate) fn describe(
     // SAFETY: interface valide ; lecture seule du magasin.
     let store = unsafe { device.OpenPropertyStore(STGM_READ) }
         .map_err(|e| platform_error("IMMDevice::OpenPropertyStore", &e))?;
-    // Deux noms, deux rôles. Le nom convivial est la composition que Windows
+    // Trois valeurs, trois rôles. Le nom convivial est la composition que Windows
     // affiche (« Conduit 1 (Conduit — câbles audio virtuels) ») : c'est celui qu'on
     // publie, celui que l'utilisateur retrouve dans les réglages Son. La
-    // description est le nom d'endpoint seul (« Conduit 1 ») : c'est celle qui
-    // identifie le câble. Voir `cable_id_from_endpoint`.
+    // description est le nom d'endpoint seul (« Conduit 1 », « Musique » après un
+    // renommage) : c'est le nom que le câble remonte. La marque est notre valeur,
+    // celle qui **survit** au renommage et qui seule identifie le câble. Voir
+    // `cable_id_from_endpoint`.
     let name = text_property(
         &store,
         &PKEY_Device_FriendlyName,
@@ -479,6 +611,7 @@ pub(crate) fn describe(
     )
     .unwrap_or_else(|| id.clone());
     let description = text_property(&store, &PKEY_Device_DeviceDesc, "PKEY_Device_DeviceDesc");
+    let marque = text_property(&store, &MARQUE_KEY, "marque de câble Conduit");
 
     // `IAudioClient` donne le format de mixage et la période. Un échec d'activation
     // n'empêche pas de décrire le périphérique : on retombe sur le format du
@@ -524,16 +657,19 @@ pub(crate) fn describe(
         .and_then(|client| device_period(client).ok().map(|p| p.default))
         .unwrap_or(DEFAULT_PERIOD_HNS);
 
-    Ok(DeviceInfo {
-        is_default: defaults.id_for(direction) == Some(id.as_str()),
-        cable: cable_id_from_endpoint(description.as_deref(), &name),
-        id: DeviceId::new(id),
-        name,
-        direction,
-        channels,
-        sample_rate,
-        sample_rates,
-        default_block: frames_from_period(period_hns, sample_rate),
+    Ok(EndpointInfo {
+        info: DeviceInfo {
+            is_default: defaults.id_for(direction) == Some(id.as_str()),
+            cable: cable_id_from_endpoint(marque.as_deref(), description.as_deref(), &name),
+            id: DeviceId::new(id),
+            name,
+            direction,
+            channels,
+            sample_rate,
+            sample_rates,
+            default_block: frames_from_period(period_hns, sample_rate),
+        },
+        description,
     })
 }
 
@@ -770,8 +906,8 @@ mod tests {
     fn le_nom_compose_n_identifie_pas_le_cable() {
         const COMPOSE: &str = "Conduit 1 (Conduit — câbles audio virtuels)";
         assert_eq!(cable_id_from_name(COMPOSE), None);
-        // Description absente : le repli sur le nom composé ne devine rien.
-        assert_eq!(cable_id_from_endpoint(None, COMPOSE), None);
+        // Ni marque ni description : le repli sur le nom composé ne devine rien.
+        assert_eq!(cable_id_from_endpoint(None, None, COMPOSE), None);
     }
 
     /// Description et nom composé jouent des rôles différents : l'une identifie le
@@ -780,19 +916,182 @@ mod tests {
     fn la_description_identifie_le_cable_pas_le_nom_affiche() {
         const COMPOSE: &str = "Conduit 3 (Conduit — câbles audio virtuels)";
         assert_eq!(
-            cable_id_from_endpoint(Some("Conduit 3"), COMPOSE),
+            cable_id_from_endpoint(None, Some("Conduit 3"), COMPOSE),
             Some(CableId(3))
         );
         // Sans description, on retombe sur le nom : suffisant s'il n'est pas composé.
-        assert_eq!(cable_id_from_endpoint(None, "Conduit 3"), Some(CableId(3)));
+        assert_eq!(
+            cable_id_from_endpoint(None, None, "Conduit 3"),
+            Some(CableId(3))
+        );
         // Une description vide n'arrive pas jusqu'ici (`text_property` la filtre),
         // mais une description qui n'est pas un câble n'en invente pas un, même si
         // le nom affiché commence par « Conduit ».
-        assert_eq!(cable_id_from_endpoint(Some("Casque USB"), COMPOSE), None);
+        assert_eq!(
+            cable_id_from_endpoint(None, Some("Casque USB"), COMPOSE),
+            None
+        );
         // Un endpoint qui n'est pas un câble Conduit n'a pas d'identité de câble.
         assert_eq!(
-            cable_id_from_endpoint(Some("Haut-parleurs"), "Haut-parleurs (Realtek Audio)"),
+            cable_id_from_endpoint(None, Some("Haut-parleurs"), "Haut-parleurs (Realtek Audio)"),
             None
+        );
+    }
+
+    /// **La marque prime sur la description** : c'est elle qui fait survivre le lien
+    /// entre un câble et ses endpoints au renommage.
+    ///
+    /// La table est celle du défaut mesuré dans la machine virtuelle : après
+    /// `conduit-helper renommer 1 Musique`, les deux endpoints du câble 1 portent
+    /// `description = « Musique »` et `marque = « Conduit 1 »`, et `cable list` rendait
+    /// des jetons de repli parce que le rattachement ne lisait que la description.
+    #[test]
+    fn la_marque_prime_sur_la_description() {
+        /// Le nom composé d'un endpoint renommé, tel que Windows le fabrique.
+        fn compose(affiche: &str) -> String {
+            format!("{affiche} (Conduit — câbles audio virtuels)")
+        }
+        /// Un cas de la table : marque, description, nom affiché, câble attendu.
+        type Cas<'a> = (Option<&'a str>, Option<&'a str>, &'a str, Option<CableId>);
+        let cas: [Cas<'_>; 10] = [
+            // Le cas mesuré : renommé « Musique », marqué « Conduit 1 ».
+            (
+                Some("Conduit 1"),
+                Some("Musique"),
+                "Musique",
+                Some(CableId(1)),
+            ),
+            // **Le cas piège** : un endpoint renommé du nom d'un *autre* câble. C'est sa
+            // marque qui compte — il est le 3, pas le 5.
+            (
+                Some("Conduit 3"),
+                Some("Conduit 5"),
+                "Conduit 5",
+                Some(CableId(3)),
+            ),
+            // Jamais renommé : pas de marque, la description suffit.
+            (None, Some("Conduit 2"), "Conduit 2", Some(CableId(2))),
+            // Renommé puis rendu à son nom d'origine : la marque a été supprimée, la
+            // description est redevenue « Conduit 4 ». Les deux disent la même chose.
+            (None, Some("Conduit 4"), "Conduit 4", Some(CableId(4))),
+            // Marque et description d'accord : le cas d'un renommage vers le même nom.
+            (
+                Some("Conduit 6"),
+                Some("Conduit 6"),
+                "Conduit 6",
+                Some(CableId(6)),
+            ),
+            // Une marque illisible ne retombe **pas** sur la description : quelqu'un a
+            // écrit dans notre valeur, et deviner à sa place vaudrait moins que rien.
+            (Some("n'importe quoi"), Some("Conduit 7"), "Conduit 7", None),
+            // Le nom **composé** n'est pas davantage une marque valable.
+            (
+                Some("Conduit 8 (Conduit — câbles audio virtuels)"),
+                Some("Musique"),
+                "Musique",
+                None,
+            ),
+            // Un endpoint qui n'est ni marqué ni nommé « Conduit N » n'a pas de câble,
+            // même renommé « Conduit 9 » par l'utilisateur dans mmsys.cpl : sans notre
+            // marque, rien ne le rattache — et c'est bien un câble qu'il n'est pas.
+            (None, Some("Casque USB"), "Casque USB (Realtek Audio)", None),
+            // Ni marque ni description : le nom composé ne devine rien.
+            (
+                None,
+                None,
+                "Conduit 1 (Conduit — câbles audio virtuels)",
+                None,
+            ),
+            // Ni marque ni description, nom non composé : le dernier recours joue.
+            (None, None, "Conduit 16", Some(CableId(16))),
+        ];
+        for (marque, description, nom, attendu) in cas {
+            assert_eq!(
+                cable_id_from_endpoint(marque, description, nom),
+                attendu,
+                "marque {marque:?}, description {description:?}, nom « {nom} »"
+            );
+        }
+        // Sur les seize câbles, un renommage quelconque ne change rien à l'identité.
+        for numero in 1..=16u32 {
+            let marque = format!("Conduit {numero}");
+            let affiche = compose("Musique");
+            assert_eq!(
+                cable_id_from_endpoint(Some(&marque), Some("Musique"), &affiche),
+                Some(CableId(numero)),
+                "câble {numero} renommé"
+            );
+        }
+    }
+
+    /// La clé de la marque est **exactement** celle que le service écrit.
+    ///
+    /// Le service range `{3f1b27a4-8c6e-4d02-9b75-e4a0d61c8f3b},1` dans la clé
+    /// `Properties` de l'endpoint (`conduit_helper::registre::valeur_marque`). Les deux
+    /// bouts prennent leur GUID et leur `pid` dans `conduit-kmd-core` ; ce test le
+    /// vérifie champ par champ, parce qu'une clé fausse ne se manifesterait par aucun
+    /// message — la marque serait simplement introuvable et le défaut reviendrait tel
+    /// quel.
+    #[test]
+    fn la_cle_de_la_marque_est_celle_que_le_service_ecrit() {
+        assert_eq!(MARQUE_KEY.pid, PID_MARQUE_CABLE);
+        assert_eq!(MARQUE_KEY.fmtid.data1, KSPROPSETID_CONDUIT.data1);
+        assert_eq!(MARQUE_KEY.fmtid.data2, KSPROPSETID_CONDUIT.data2);
+        assert_eq!(MARQUE_KEY.fmtid.data3, KSPROPSETID_CONDUIT.data3);
+        assert_eq!(MARQUE_KEY.fmtid.data4, KSPROPSETID_CONDUIT.data4);
+        // La valeur littérale, celle que `regedit` montre : elle attrape un GUID modifié
+        // par accident, que la comparaison ci-dessus ne verrait pas.
+        assert_eq!(
+            format!("{:?}", MARQUE_KEY.fmtid).to_ascii_lowercase(),
+            "3f1b27a4-8c6e-4d02-9b75-e4a0d61c8f3b"
+        );
+        // Ce n'est aucune des clés du système que ce module lit par ailleurs.
+        assert_ne!(MARQUE_KEY.fmtid, PKEY_Device_DeviceDesc.fmtid);
+        assert_ne!(MARQUE_KEY.fmtid, PKEY_Device_FriendlyName.fmtid);
+    }
+
+    /// Le nom d'un câble se lit sur ses deux endpoints, et une divergence se voit.
+    #[test]
+    fn le_nom_du_cable_vient_des_deux_sens() {
+        // Les deux sens d'accord — le cas normal, renommé ou non.
+        assert_eq!(
+            cable_name(Some("Musique"), Some("Musique")),
+            CableName::Accord("Musique")
+        );
+        assert_eq!(
+            cable_name(Some("Conduit 1"), Some("Conduit 1")),
+            CableName::Accord("Conduit 1")
+        );
+        // Un seul côté publié : le câble est peut-être à moitié apparu (77 ms mesurées
+        // entre l'écriture et la publication des endpoints). Ce n'est pas une divergence.
+        assert_eq!(
+            cable_name(Some("Musique"), None),
+            CableName::Accord("Musique")
+        );
+        assert_eq!(
+            cable_name(None, Some("Musique")),
+            CableName::Accord("Musique")
+        );
+        // Aucun côté : on garde le nom du service.
+        assert_eq!(cable_name(None, None), CableName::Inconnu);
+        assert_eq!(cable_name(None, None).retenu(), None);
+        // Divergence : le rendu l'emporte, et l'écarté part au journal.
+        assert_eq!(
+            cable_name(Some("Musique"), Some("Conduit 1")),
+            CableName::Divergent {
+                retenu: "Musique",
+                ecarte: "Conduit 1",
+            }
+        );
+        assert_eq!(
+            cable_name(Some("Musique"), Some("Conduit 1")).retenu(),
+            Some("Musique")
+        );
+        // Le choix ne dépend pas de l'ordre des arguments : inverser les deux côtés
+        // change le retenu, ce qui est bien la preuve que c'est le **rendu** qui décide.
+        assert_eq!(
+            cable_name(Some("Conduit 1"), Some("Musique")).retenu(),
+            Some("Conduit 1")
         );
     }
 

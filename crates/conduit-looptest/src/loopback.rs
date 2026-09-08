@@ -44,8 +44,9 @@ use crate::volume::{Level, Range, RangeState, Reading, State};
 /// préfixe fait tomber le rendu et la capture sur le premier venu dans l'ordre
 /// d'énumération, donc potentiellement sur deux câbles différents, et la mesure ne
 /// rend que du silence sans que rien ne l'explique. Le champ
-/// [`DeviceInfo::cable`] — que le backend lit dans la description de l'endpoint —
-/// tranche exactement.
+/// [`DeviceInfo::cable`] — que le backend lit dans la **marque** de l'endpoint, ou
+/// dans sa description tant qu'il n'a jamais été renommé — tranche exactement, et
+/// continue de trancher sur un câble que l'utilisateur a rebaptisé.
 const DEFAULT_CABLE: CableId = CableId(1);
 
 /// Marge de tampon d'enregistrement, en secondes : la capture tourne un peu plus
@@ -673,6 +674,22 @@ mod tests {
         }
     }
 
+    /// Côté de câble **renommé** : le nom affiché ne contient plus « Conduit N », mais
+    /// le dorsal a lu la marque de l'endpoint et a rempli `cable` correctement.
+    ///
+    /// C'est l'état que produit `conduit-helper renommer N Musique` : la description de
+    /// l'endpoint vaut « Musique », le nom composé « Musique (Conduit — câbles audio
+    /// virtuels) », et seule notre marque dit encore que c'est le câble N.
+    fn cable_renomme(n: u32, direction: DeviceDirection) -> DeviceInfo {
+        DeviceInfo {
+            cable: Some(CableId(n)),
+            ..device(
+                &format!("Musique {n} (Conduit — câbles audio virtuels)"),
+                direction,
+            )
+        }
+    }
+
     fn devices() -> Vec<DeviceInfo> {
         vec![
             device(
@@ -727,6 +744,37 @@ mod tests {
         assert!(!rendu.name.starts_with("Conduit 10"), "{}", rendu.name);
         // Et les deux côtés retenus sont bien ceux du même câble.
         assert!(check_same_cable(&rendu, &capture).is_ok());
+    }
+
+    /// **Un câble renommé reste choisi et reste reconnu.**
+    ///
+    /// Rien ici ne lit le nom : ni [`choose`] sans fragment, qui compare `cable`, ni
+    /// [`check_same_cable`], ni le marqueur « ← câble Conduit N » de `list`, qui vient du
+    /// `Display` de [`CableId`]. C'est tout l'intérêt de rattacher les endpoints par la
+    /// marque : `conduit-looptest` marche sur un câble que l'utilisateur a rebaptisé.
+    #[test]
+    fn un_cable_renomme_reste_choisi_et_reconnu() {
+        let d = vec![
+            device("Microphone (Realtek)", DeviceDirection::Capture),
+            cable_renomme(1, DeviceDirection::Render),
+            cable_renomme(1, DeviceDirection::Capture),
+        ];
+        let rendu = choose(&d, DeviceDirection::Render, None).unwrap();
+        let capture = choose(&d, DeviceDirection::Capture, None).unwrap();
+        assert_eq!(rendu.cable, Some(DEFAULT_CABLE), "{}", rendu.name);
+        assert_eq!(capture.cable, Some(DEFAULT_CABLE), "{}", capture.name);
+        // Le nom, lui, ne dit plus « Conduit » : c'est bien le renommage qu'on simule.
+        assert!(!rendu.name.contains("Conduit 1 "), "{}", rendu.name);
+        assert!(check_same_cable(&rendu, &capture).is_ok());
+        // Le marqueur de `--list` nomme toujours le câble, pas l'endpoint.
+        assert_eq!(rendu.cable.unwrap().to_string(), "Conduit 1");
+        // Et un renommage n'apparie pas deux câbles différents pour autant.
+        let err =
+            check_same_cable(&rendu, &cable_renomme(2, DeviceDirection::Capture)).unwrap_err();
+        assert!(
+            err.contains("Conduit 1") && err.contains("Conduit 2"),
+            "{err}"
+        );
     }
 
     /// Deux câbles différents de part et d'autre : refus, et le message nomme les

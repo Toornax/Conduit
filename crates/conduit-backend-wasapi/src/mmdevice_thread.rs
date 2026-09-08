@@ -14,7 +14,7 @@ use std::sync::mpsc;
 
 use conduit_backend::event::EventBroadcaster;
 use conduit_backend::{
-    BackendError, DeviceDirection, DeviceEvent, DeviceId, DeviceInfo, EventReceiver, StreamFormat,
+    BackendError, DeviceDirection, DeviceEvent, DeviceId, EventReceiver, StreamFormat,
 };
 use windows::Win32::Media::Audio::{
     eConsole, IMMDeviceEnumerator, IMMNotificationClient, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
@@ -22,7 +22,9 @@ use windows::Win32::Media::Audio::{
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 
 use crate::com::{platform_error, ComApartment};
-use crate::devices::{default_endpoint_id, describe_id, direction_from_flow, enumerate};
+use crate::devices::{
+    default_endpoint_id, describe_id, direction_from_flow, enumerate, EndpointInfo,
+};
 use crate::exclusive::ExclusivePolicy;
 use crate::notify::{Notification, NotificationClient};
 use crate::open::Opened;
@@ -30,8 +32,13 @@ use crate::open::Opened;
 /// Ordre envoyé par le [`WasapiBackend`](crate::WasapiBackend).
 pub(crate) enum Command {
     /// Énumérer les endpoints actifs.
+    ///
+    /// La réponse porte des [`EndpointInfo`] et non des `DeviceInfo` : le dorsal a
+    /// besoin de la **description** de chaque endpoint pour rendre à un câble renommé le
+    /// nom qu'il affiche, et une seconde énumération pour aller la chercher coûterait un
+    /// aller-retour COM par appel.
     Enumerate {
-        reply: mpsc::Sender<Result<Vec<DeviceInfo>, BackendError>>,
+        reply: mpsc::Sender<Result<Vec<EndpointInfo>, BackendError>>,
     },
     /// Périphérique par défaut (`eConsole`) d'un sens.
     DefaultDevice {
@@ -140,8 +147,8 @@ struct State {
 }
 
 impl State {
-    fn remember(&mut self, devices: &[DeviceInfo]) {
-        self.known = devices.iter().map(|d| d.id.clone()).collect();
+    fn remember(&mut self, devices: &[EndpointInfo]) {
+        self.known = devices.iter().map(|d| d.info.id.clone()).collect();
     }
 
     fn handle_command(&mut self, command: Command) {
@@ -215,9 +222,9 @@ impl State {
         if self.known.contains(&device_id) {
             return;
         }
-        if let Ok(Some(info)) = describe_id(&self.enumerator, &id) {
-            self.known.insert(info.id.clone());
-            self.events.send(DeviceEvent::Added(info));
+        if let Ok(Some(endpoint)) = describe_id(&self.enumerator, &id) {
+            self.known.insert(endpoint.info.id.clone());
+            self.events.send(DeviceEvent::Added(endpoint.info));
         }
     }
 

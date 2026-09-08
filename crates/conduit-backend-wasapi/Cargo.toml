@@ -67,6 +67,12 @@ windows-core = "0.62"
 # Vue `&mut [f32]` du tampon WASAPI (`try_cast_slice_mut`, repli par copie si
 # l'alignement n'est pas celui attendu).
 bytemuck = "1"
+# La **façade** de journalisation, et rien de plus : le crate n'installe aucun
+# collecteur — c'est `conduitd` qui en pose un. Un seul message la justifie
+# aujourd'hui, celui qui signale deux côtés de câble renommés différemment
+# (`backend::resoudre_endpoints`) : un état anormal qu'il faut dire, et que ni
+# `CableInfo` ni le trait `CableControl` (tous deux portables) ne sauraient porter.
+tracing = "0.1"
 
 [target.'cfg(windows)'.dev-dependencies]
 # Test d'endurance `two_devices` : le moteur pilote une carte et absorbe la
