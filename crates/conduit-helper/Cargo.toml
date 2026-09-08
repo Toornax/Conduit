@@ -18,9 +18,12 @@ name = "conduit-helper"
 path = "src/main.rs"
 
 [dependencies]
-# `CableId`, le numéro **affiché** d'un câble (« Conduit 1 » = `CableId(1)`). Le crate
-# est portable : le protocole s'en sert sur toutes les plateformes.
+# `CableId`, le numéro **affiché** d'un câble (« Conduit 1 » = `CableId(1)`), et le
+# trait `CableControl` qu'implémente le module `controle` (M1b-34). Le crate est
+# portable : le protocole s'en sert sur toutes les plateformes.
 conduit-backend.workspace = true
+# `ChannelCount`, le nombre de canaux d'un `CableInfo`. Portable lui aussi.
+conduit-core.workspace = true
 # Le contrat partagé avec le pilote : bornes du numéro de câble (`CABLE_MAX`), bornes
 # et défaut des canaux (`params`), disposition de `CableState`. `no_std`, sans
 # dépendance, portable — d'où un protocole dont les domaines ne sont pas recopiés.

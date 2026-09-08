@@ -88,6 +88,12 @@ pub fn build_engine(mut backend: Box<dyn Backend>, config: &Config) -> Result<En
 }
 
 /// Crée les câbles manquants de la configuration et applique les alias (F-01).
+///
+/// « Manquant » a deux sens selon la plateforme, et les deux sont traités. Là où les
+/// câbles sont créés à la demande (backend `null`), un câble absent de la liste est
+/// créé. Sous Windows le pilote a une **réserve fixe** de seize câbles (SPEC §5.4) :
+/// ils sont tous listés, actifs ou non, et « manquant » veut dire **déconnecté** —
+/// `create` est alors la façon de le connecter (M1b-34).
 fn ensure_cables(backend: &mut dyn Backend, config: &Config) {
     let Some(cc) = backend.cable_control() else {
         if !config.cables.is_empty() {
@@ -100,6 +106,17 @@ fn ensure_cables(backend: &mut dyn Backend, config: &Config) {
         let channels = ChannelCount::new(c.channels).unwrap_or_default();
         match existing.iter().find(|e| e.id.0 == c.id) {
             Some(e) => {
+                // Présent mais déconnecté : le connecter en le désignant par son nom,
+                // pour ne pas activer le premier câble libre à sa place.
+                if !e.active {
+                    match cc.create(CableSpec {
+                        name: Some(e.name.clone()),
+                        channels,
+                    }) {
+                        Ok(info) => tracing::info!("câble activé : {}", info.name),
+                        Err(err) => tracing::warn!("câble {} : {err}", c.id),
+                    }
+                }
                 if e.channels != channels {
                     let _ = cc.set_channels(e.id, channels);
                 }

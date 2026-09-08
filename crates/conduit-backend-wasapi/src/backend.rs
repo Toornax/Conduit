@@ -5,9 +5,10 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use conduit_backend::{
-    AudioCallback, Backend, BackendError, CableControl, DeviceDirection, DeviceHandle, DeviceId,
-    DeviceInfo, EventReceiver, StreamFormat,
+    AudioCallback, Backend, BackendError, CableControl, CableError, CableId, CableInfo, CableSpec,
+    DeviceDirection, DeviceHandle, DeviceId, DeviceInfo, EventReceiver, StreamFormat,
 };
+use conduit_core::types::ChannelCount;
 
 use crate::exclusive::ExclusivePolicy;
 use crate::mmdevice_thread::{Command, Message};
@@ -20,6 +21,16 @@ use crate::stream::WasapiHandle;
 /// loin de cette borne.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Ce que rend une opération sur les câbles quand personne n'a appelé
+/// [`WasapiBackend::set_cable_control`].
+///
+/// Le cas n'arrive que si le dorsal est construit sans être relié au service : c'est un
+/// défaut de montage, pas une panne de la machine, et le message le dit. Le démon, lui,
+/// fait la liaison au démarrage (`conduitd`, `native_backend`).
+const SANS_CONTROLE: &str =
+    "ce dorsal n'a pas reçu de contrôle des câbles : le démon ne l'a pas relié au service \
+     d'assistance Conduit";
+
 /// Backend Windows (MMDevice + WASAPI).
 ///
 /// Créé par [`WasapiBackend::new`], qui ne rend la main qu'une fois le fil MMDevice
@@ -31,6 +42,8 @@ pub struct WasapiBackend {
     thread: Option<JoinHandle<()>>,
     /// Ce que les prochaines ouvertures font du mode exclusif (M1b-32).
     policy: ExclusivePolicy,
+    /// Le contrôle des câbles, **injecté** : voir [`WasapiBackend::set_cable_control`].
+    cables: Option<Box<dyn CableControl + Send>>,
 }
 
 impl core::fmt::Debug for WasapiBackend {
@@ -38,6 +51,7 @@ impl core::fmt::Debug for WasapiBackend {
         f.debug_struct("WasapiBackend")
             .field("thread_alive", &self.thread.is_some())
             .field("exclusive_policy", &self.policy)
+            .field("cable_control", &self.cables.is_some())
             .finish()
     }
 }
@@ -64,6 +78,7 @@ impl WasapiBackend {
                 sender,
                 thread: Some(thread),
                 policy: ExclusivePolicy::default(),
+                cables: None,
             }),
             Ok(Err(e)) => {
                 let _ = thread.join();
@@ -99,6 +114,65 @@ impl WasapiBackend {
     /// Politique de mode exclusif en vigueur ([`Self::set_exclusive_policy`]).
     pub fn exclusive_policy(&self) -> ExclusivePolicy {
         self.policy
+    }
+
+    /// Installe le contrôle des câbles que [`Backend::cable_control`] rendra (M1b-34).
+    ///
+    /// # Pourquoi une injection, et pas un `CableControl` écrit ici
+    ///
+    /// Le contrôle des câbles passe par le **service d'assistance** `ConduitHelper` : le
+    /// démon tourne sans privilèges et le pilote exige `SeLoadDriverPrivilege` armé pour
+    /// toute écriture (mesuré, `conduit_helper::cables`). Son client vit donc dans
+    /// `conduit-helper`, qui dépend déjà de ce crate pour le transport KS — l'inverse
+    /// ferait un cycle entre les deux paquets, ce que Cargo refuse. C'est donc
+    /// `conduitd`, qui dépend des deux, qui relie les bouts en appelant cette méthode.
+    ///
+    /// Un dorsal qui n'a rien reçu rend `None` : les câbles ne sont alors pas pilotables
+    /// et le moteur le dit (`EngineError::NoCableControl`).
+    pub fn set_cable_control(&mut self, controle: Box<dyn CableControl + Send>) {
+        self.cables = Some(controle);
+    }
+
+    /// Le contrôle injecté, ou l'erreur qui dit que le montage n'a pas été fait.
+    fn cables(&self) -> Result<&dyn CableControl, CableError> {
+        self.cables
+            .as_deref()
+            .map(|controle| controle as &dyn CableControl)
+            .ok_or_else(|| CableError::Unavailable(SANS_CONTROLE.to_owned()))
+    }
+
+    /// Remplace les identifiants d'endpoint **de repli** par ceux que MMDevice publie.
+    ///
+    /// Le service ne connaît que les filtres de topologie du pilote ; les endpoints,
+    /// eux, sont l'affaire de ce crate. Une énumération suffit pour tous les câbles :
+    /// chaque [`DeviceInfo`] porte déjà son [`CableId`] (`devices::cable_id_from_endpoint`).
+    ///
+    /// Un endpoint introuvable laisse le repli en place, et c'est la vérité : le câble
+    /// est inactif — ses endpoints n'existent pas — ou Windows ne les a pas encore
+    /// publiés (77 ms mesurées entre l'écriture et l'apparition). Une énumération qui
+    /// échoue ne fait pas échouer l'opération : le câble est bien activé, seuls les deux
+    /// noms manquent.
+    fn resoudre_endpoints(&self, cables: &mut [CableInfo]) {
+        if cables.is_empty() {
+            return;
+        }
+        let Ok(devices) = self.devices() else {
+            return;
+        };
+        for info in cables.iter_mut() {
+            for device in devices.iter().filter(|d| d.cable == Some(info.id)) {
+                match device.direction {
+                    DeviceDirection::Render => info.render = device.id.clone(),
+                    DeviceDirection::Capture => info.capture = device.id.clone(),
+                }
+            }
+        }
+    }
+
+    /// [`Self::resoudre_endpoints`] pour un seul câble.
+    fn resoudre_un(&self, mut info: CableInfo) -> CableInfo {
+        self.resoudre_endpoints(core::slice::from_mut(&mut info));
+        info
     }
 
     /// Comme [`Backend::open`], mais rend le type concret : utile pour
@@ -257,8 +331,85 @@ impl Backend for WasapiBackend {
             })
     }
 
-    /// Le contrôle des câbles passe par le service d'assistance (M1b-34).
+    /// Le contrôle des câbles, s'il a été installé par
+    /// [`Self::set_cable_control`] (M1b-34).
+    ///
+    /// `None` tant que personne ne l'a relié au service d'assistance : le dorsal seul ne
+    /// peut pas activer un câble, faute de `SeLoadDriverPrivilege`.
     fn cable_control(&mut self) -> Option<&mut dyn CableControl> {
-        None
+        self.cables
+            .is_some()
+            .then_some(self as &mut dyn CableControl)
+    }
+}
+
+/// Le contrôle des câbles du dorsal : les ordres partent au service, les **endpoints**
+/// sont résolus ici (M1b-34).
+///
+/// Le partage suit ce que chacun sait : le service connaît les filtres de topologie du
+/// pilote et l'état de connexion, le dorsal connaît les endpoints MMDevice. Chaque
+/// [`CableInfo`] traverse donc `WasapiBackend::resoudre_endpoints` avant d'être rendu,
+/// et l'appelant reçoit les identifiants qu'il pourrait ouvrir — pas des noms de repli.
+impl CableControl for WasapiBackend {
+    fn max_cables(&self) -> usize {
+        // Sans contrôle installé, aucun câble n'est pilotable : le dire par 0 vaut mieux
+        // qu'annoncer une réserve qu'on ne saurait pas servir.
+        self.cables.as_ref().map_or(0, |c| c.max_cables())
+    }
+
+    fn list(&self) -> Result<Vec<CableInfo>, CableError> {
+        let mut cables = self.cables()?.list()?;
+        self.resoudre_endpoints(&mut cables);
+        Ok(cables)
+    }
+
+    fn create(&mut self, spec: CableSpec) -> Result<CableInfo, CableError> {
+        // Le bloc ferme l'emprunt mutable du contrôle avant que `resoudre_un` ne
+        // réemprunte le dorsal pour énumérer.
+        let info = {
+            let controle = self
+                .cables
+                .as_mut()
+                .ok_or_else(|| CableError::Unavailable(SANS_CONTROLE.to_owned()))?;
+            controle.create(spec)?
+        };
+        Ok(self.resoudre_un(info))
+    }
+
+    fn remove(&mut self, id: CableId) -> Result<(), CableError> {
+        self.cables
+            .as_mut()
+            .ok_or_else(|| CableError::Unavailable(SANS_CONTROLE.to_owned()))?
+            .remove(id)
+    }
+
+    fn set_channels(
+        &mut self,
+        id: CableId,
+        channels: ChannelCount,
+    ) -> Result<CableInfo, CableError> {
+        let info = {
+            let controle = self
+                .cables
+                .as_mut()
+                .ok_or_else(|| CableError::Unavailable(SANS_CONTROLE.to_owned()))?;
+            controle.set_channels(id, channels)?
+        };
+        Ok(self.resoudre_un(info))
+    }
+
+    fn rename(&mut self, id: CableId, name: &str) -> Result<CableInfo, CableError> {
+        let info = {
+            let controle = self
+                .cables
+                .as_mut()
+                .ok_or_else(|| CableError::Unavailable(SANS_CONTROLE.to_owned()))?;
+            controle.rename(id, name)?
+        };
+        Ok(self.resoudre_un(info))
+    }
+
+    fn get(&self, id: CableId) -> Result<CableInfo, CableError> {
+        Ok(self.resoudre_un(self.cables()?.get(id)?))
     }
 }

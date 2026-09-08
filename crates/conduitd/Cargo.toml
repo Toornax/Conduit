@@ -31,6 +31,11 @@ clap = { version = "4", features = ["derive"] }
 # Backend natif Windows (MMDevice + WASAPI) : `--backend auto` le choisit sous Windows.
 [target.'cfg(windows)'.dependencies]
 conduit-backend-wasapi = { workspace = true }
+# Le client du service d'assistance : `conduit_helper::controle::ControleCables` est le
+# `CableControl` que le démon installe dans le dorsal WASAPI (M1b-34). Le démon est le
+# seul à dépendre des deux, et c'est lui qui les relie — le dorsal ne peut pas dépendre
+# du service, qui dépend déjà du dorsal pour le transport KS.
+conduit-helper = { workspace = true }
 # Fenêtre cachée de premier niveau qui reçoit `WM_QUERYENDSESSION` / `WM_ENDSESSION`
 # (module `session_end`) : c'est le seul moyen pour un processus sans console lancé par
 # une tâche planifiée d'être prévenu de la fermeture de session.

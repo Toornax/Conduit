@@ -81,6 +81,13 @@ pub enum CableError {
     /// Nom refusé.
     #[error("nom invalide : {0}")]
     InvalidName(String),
+    /// Le service ou le démon dont dépend le contrôle des câbles ne répond pas.
+    ///
+    /// Distinct de [`Self::Driver`] : le pilote n'a rien refusé, on n'a pas pu lui
+    /// parler. Sous Windows c'est le service d'assistance `ConduitHelper` qui manque
+    /// (M1b-20) ; le message dit alors quoi installer.
+    #[error("service indisponible : {0}")]
+    Unavailable(String),
     /// Erreur du pilote ou de l'OS.
     #[error("erreur du pilote : {0}")]
     Driver(String),
@@ -180,6 +187,14 @@ mod tests {
         assert!(CableError::NotFound(CableId(9))
             .to_string()
             .contains("Conduit 9"));
+        // Un service absent ne se confond pas avec un refus du pilote : ce sont deux
+        // conduites différentes pour l'utilisateur (installer, ou rapporter un bogue).
+        let indisponible = CableError::Unavailable("le service n'est pas démarré".into());
+        assert!(indisponible.to_string().starts_with("service indisponible"));
+        assert_ne!(
+            indisponible,
+            CableError::Driver("le service n'est pas démarré".into())
+        );
         assert_eq!(CableSpec::default().channels, ChannelCount::STEREO);
     }
 }

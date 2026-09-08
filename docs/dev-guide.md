@@ -374,9 +374,27 @@ test `conduitd_binary_auto_backend_is_wasapi_on_windows` (`crates/conduitd/tests
 lance le binaire et vérifie que le graphe contient chaque endpoint énuméré ; il se
 saute si WASAPI est indisponible ou qu'aucune carte n'est active.
 
-Ce qui manque encore : `CableControl` par le helper (M1b-34 — d'ici là le démon
-ignore la section `[[cable]]` avec un avertissement), et l'exposition du mode
-exclusif dans la configuration du démon (il ouvre tout en partagé pour l'instant).
+**Câbles.** Depuis M1b-34, `conduitd` relie le dorsal au service d'assistance : au
+démarrage il appelle `WasapiBackend::set_cable_control` avec
+`conduit_helper::controle::ControleCables`, puis interroge le canal une fois et
+journalise « service d'assistance absent : les câbles ne pourront pas être activés »
+plutôt que de laisser l'erreur surgir au premier ordre. L'injection vient du démon et
+non du dorsal parce que `conduit-helper` dépend déjà de `conduit-backend-wasapi` pour
+le transport KS : l'inverse ferait un cycle entre paquets. `create` **active** le
+premier câble libre de la réserve fixe de seize (SPEC §5.4) et rend l'état existant si
+le câble visé est déjà actif ; `remove` **désactive** ; `rename` rend une erreur qui
+nomme M1b-21 ; `set_channels` propage le refus du pilote, qui n'applique que deux
+canaux tant que M1b-05 n'est pas faite. Le bout en bout se vérifie en machine
+virtuelle, service installé et pilote chargé :
+
+```powershell
+conduitctl cable add          # -> câble 1 « Conduit 1 » 2 : rendu …, capture …
+conduitctl cable list
+conduitctl cable remove 1
+```
+
+Ce qui manque encore : l'exposition du mode exclusif dans la configuration du démon
+(il ouvre tout en partagé pour l'instant).
 Les tests d'intégration (`tests/wasapi.rs`, `tests/stream.rs`, `tests/no_alloc.rs`,
 `tests/exclusive.rs` — chaque carte de rendu en partagé puis en exclusif, résultat
 imprimé, latences comparées —, `tests/two_devices.rs` — 60 s sur deux cartes de

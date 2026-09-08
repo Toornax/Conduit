@@ -17,11 +17,12 @@
 //! ne peut donc pas écrire lui-même. Ce service tourne en `LocalSystem` et fait
 //! l'écriture pour lui, sur ordre reçu par un canal nommé.
 //!
-//! # Les sept modules, et ce que chacun garantit
+//! # Les huit modules, et ce que chacun garantit
 //!
 //! | Module | Rôle | Testé sans Windows ? |
 //! |---|---|---|
 //! | [`protocole`] | le format des trames, le parseur, les domaines | **oui**, entièrement |
+//! | [`controle`] | le `CableControl` du démon (M1b-34) | oui, sauf l'aller-retour |
 //! | [`rapport`] | la mise en forme des réponses à l'écran | **oui**, entièrement |
 //! | [`cli`] | les sous-commandes du binaire | **oui**, entièrement |
 //! | [`journal`] | l'horodatage, les niveaux, l'identité de l'appelant | oui, sauf l'heure du système |
@@ -75,6 +76,7 @@
 // Portables : leurs tests tournent sur Linux et macOS, ce qui est tout l'intérêt de les
 // avoir écrits purs.
 pub mod cli;
+pub mod controle;
 pub mod journal;
 pub mod protocole;
 pub mod rapport;

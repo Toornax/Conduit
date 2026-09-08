@@ -33,6 +33,7 @@ conduit-core = { path = "crates/conduit-core", version = "0.1.0", default-featur
 conduit-engine = { path = "crates/conduit-engine", version = "0.1.0" }
 conduit-backend = { path = "crates/conduit-backend", version = "0.1.0" }
 conduit-backend-wasapi = { path = "crates/conduit-backend-wasapi", version = "0.1.0" }
+conduit-helper = { path = "crates/conduit-helper", version = "0.1.0" }
 conduit-protocol = { path = "crates/conduit-protocol", version = "0.1.0" }
 conduit-testing = { path = "crates/conduit-testing", version = "0.1.0" }
 

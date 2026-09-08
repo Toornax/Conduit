@@ -9,9 +9,11 @@
 
 use std::time::{Duration, Instant};
 
-use conduit_backend::{Backend, DeviceDirection, DeviceEvent};
+use conduit_backend::{
+    Backend, CableControl, CableError, CableId, CableInfo, CableSpec, DeviceDirection, DeviceEvent,
+};
 use conduit_backend_wasapi::WasapiBackend;
-use conduit_core::types::SampleRate;
+use conduit_core::types::{ChannelCount, SampleRate};
 
 /// Un poste sans aucune sortie audio (session distante, VM sans carte son) ne peut
 /// pas exercer ces tests : on le dit plutôt que d'échouer.
@@ -131,10 +133,66 @@ fn enumeration_is_stable() {
     assert_eq!(first, second);
 }
 
+/// Un dorsal neuf n'a pas de contrôle des câbles : c'est le démon qui l'installe (M1b-34).
+///
+/// Le contrôle vit dans `conduit-helper`, qui dépend déjà de ce crate pour le transport
+/// KS ; l'inverse ferait un cycle entre paquets. Ce test vérifie les deux moitiés du
+/// contrat sans parler au service : rien n'est installé, aucun canal n'est ouvert, et le
+/// faux contrôle ne connaît aucun câble.
 #[test]
-fn cable_control_waits_for_the_helper() {
+fn cable_control_is_installed_by_the_daemon() {
     let mut backend = backend_or_skip!();
-    assert!(backend.cable_control().is_none());
+    assert!(
+        backend.cable_control().is_none(),
+        "un dorsal neuf ne pilote aucun câble"
+    );
+    assert_eq!(CableControl::max_cables(&backend), 0);
+    // Une opération sur un dorsal non câblé dit **le montage manquant**, pas une panne.
+    let refus = CableControl::list(&backend).expect_err("aucun contrôle installé");
+    assert!(matches!(refus, CableError::Unavailable(_)), "{refus:?}");
+    assert!(
+        refus.to_string().contains("service d'assistance"),
+        "{refus}"
+    );
+
+    backend.set_cable_control(Box::new(SansCable));
+    assert!(backend.cable_control().is_some());
+    assert_eq!(CableControl::max_cables(&backend), 16);
+    assert_eq!(CableControl::list(&backend).expect("liste"), Vec::new());
+    assert!(matches!(
+        CableControl::get(&backend, CableId(1)),
+        Err(CableError::NotFound(CableId(1)))
+    ));
+}
+
+/// Un contrôle des câbles qui ne connaît aucun câble : de quoi vérifier le câblage du
+/// dorsal sans service, sans pilote et sans rien installer.
+#[derive(Debug)]
+struct SansCable;
+
+impl CableControl for SansCable {
+    fn max_cables(&self) -> usize {
+        16
+    }
+    fn list(&self) -> Result<Vec<CableInfo>, CableError> {
+        Ok(Vec::new())
+    }
+    fn create(&mut self, _spec: CableSpec) -> Result<CableInfo, CableError> {
+        Err(CableError::LimitReached { max: 0 })
+    }
+    fn remove(&mut self, id: CableId) -> Result<(), CableError> {
+        Err(CableError::NotFound(id))
+    }
+    fn set_channels(
+        &mut self,
+        id: CableId,
+        _channels: ChannelCount,
+    ) -> Result<CableInfo, CableError> {
+        Err(CableError::NotFound(id))
+    }
+    fn rename(&mut self, id: CableId, _name: &str) -> Result<CableInfo, CableError> {
+        Err(CableError::NotFound(id))
+    }
 }
 
 /// `DeviceInfo` décrit le format de mixage : tout périphérique dont l'`IAudioClient`

@@ -147,8 +147,22 @@ const BACKEND_CHOICES: &str = "auto ou null";
 #[cfg(windows)]
 fn native_backend() -> Option<Box<dyn Backend>> {
     match conduit_backend_wasapi::WasapiBackend::new() {
-        Ok(wasapi) => {
+        Ok(mut wasapi) => {
             tracing::info!("backend wasapi (MMDevice + WASAPI, mode partagé)");
+            // M1b-34 : le dorsal ne peut pas activer un câble lui-même — le pilote exige
+            // `SeLoadDriverPrivilege` armé, que cette session n'a pas. On lui installe
+            // donc le client du service d'assistance, seul à pouvoir écrire.
+            wasapi.set_cable_control(Box::new(conduit_helper::controle::ControleCables::nouveau()));
+            // Le canal est interrogé **maintenant** : un service absent est une
+            // information du démarrage, pas une surprise au premier `cable add`.
+            if conduit_helper::controle::ControleCables::service_repond() {
+                tracing::info!("service d'assistance Conduit présent : les câbles sont pilotables");
+            } else {
+                tracing::warn!(
+                    "service d'assistance absent : les câbles ne pourront pas être activés — \
+                     installez-le par « conduit-helper installer » (session élevée)"
+                );
+            }
             Some(Box::new(wasapi))
         }
         Err(e) => {
