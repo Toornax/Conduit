@@ -170,6 +170,11 @@ impl Daemon {
     }
 
     /// Arrête le serveur IPC puis le service.
+    ///
+    /// Au retour, la boucle d'acceptation **et** toutes les sessions clientes sont
+    /// terminées : le socket Unix est supprimé et plus aucune instance du named pipe
+    /// n'est ouverte. Un démon peut donc être relancé aussitôt sur le même chemin, sans
+    /// attente ni nouvelle tentative.
     pub async fn shutdown(mut self) {
         let _ = self.shutdown.send(true);
         if let Some(s) = self.server.take() {

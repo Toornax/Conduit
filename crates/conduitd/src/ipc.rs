@@ -192,6 +192,18 @@ pub async fn serve(
             }
         }
     }
+    // Sous Windows, `accept` crée une instance de named pipe par client, et chaque session
+    // garde la sienne ouverte jusqu'à sa fin ; l'écouteur, lui, en détient une de plus,
+    // en attente de connexion. Tant qu'il en reste une seule, un démon relancé sur le même
+    // chemin échoue à créer la *première* instance du nom (ERROR_ACCESS_DENIED, os error 5).
+    // On ferme donc l'écouteur, puis on attend les sessions : le redémarrage devient
+    // déterministe au lieu de dépendre de l'ordonnancement des tâches.
+    drop(listener);
+    // Chaque session détient un permis jusqu'à sa fin : reprendre les `MAX_CLIENTS` permis
+    // n'est possible qu'une fois toutes les sessions terminées. Attente sans sondage ni
+    // délai — et volontairement non bornée, puisque `handle_client` sélectionne déjà
+    // `shutdown.changed()` et rend la main dès le signal (après avoir notifié le client).
+    let _ = clients.acquire_many(MAX_CLIENTS as u32).await;
     tracing::info!("serveur IPC arrêté");
 }
 
