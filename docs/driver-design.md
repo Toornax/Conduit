@@ -12,6 +12,17 @@ Statut : brouillon 0.1 (2026-09-05), à ajuster par ADR à mesure que le spike a
 
 - **Pilote bête** (ADR-007) : boucle locale rendu → capture par câble, aucune donnée
   audio vers le démon, une seule surface de contrôle (activer, désactiver, canaux).
+- **Le pilote le plus léger possible** (2026-09-08) : **tout ce qui peut être fait en
+  espace utilisateur y sera fait**, même quand le faire dans le pilote serait plus direct.
+  La raison est asymétrique : un défaut noyau est un écran bleu, se débogue mal et se
+  corrige lentement ; le même défaut dans le service d'assistance est un processus qui
+  redémarre. À chaque tâche du pilote, la première question est donc « le service
+  (`crates/conduit-helper`, `LocalSystem`) ou le démon peuvent-ils la porter ? ».
+  Déjà tranché ainsi : la validation des paramètres vit dans `conduit-kmd-core`, portable
+  et fuzzable ; le renommage d'endpoint (M1b-21) passe par le registre depuis le service,
+  **sans une ligne de pilote** ; et le pilote se contente de lire son registre et de
+  recopier des trames sans les transformer. Point de vigilance connu : les seize minuteurs
+  à 1 ms, un par câble, sont ce qu'il y a de plus lourd dans le pilote (§5.3).
 - **Réserve fixe** (ADR-004) : 16 câbles enregistrés au démarrage, inactifs masqués par
   l'état de jack. Le spike M1a n'en enregistre qu'un ; la réserve arrive en M1b-02.
 - **Rust d'abord** (ADR-003) : `windows-drivers-rs` (crates publiés `wdk-sys`/`wdk-build`

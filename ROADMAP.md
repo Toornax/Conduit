@@ -542,6 +542,11 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   *Fait quand* : 1 h de fuzzing sans panique.
 - [ ] **M1b-09** `test(driver): 1000 cycles activation/désactivation et 48 h de stress`
   *Fait quand* : aucune fuite (pool tags stables), aucun BSOD, Driver Verifier actif.
+  **Reporté (2026-09-08)** : la priorité va au fonctionnel. La campagne d'une heure sous
+  Driver Verifier de M1a-11 (360 tours, zéro vidage, zéro bugcheck) tient lieu de garde-fou
+  en attendant. C'est aussi cette tâche qui dira si les seize minuteurs à 1 ms doivent
+  devenir un minuteur global — voir le principe « pilote le plus léger possible »
+  ([driver-design.md](docs/driver-design.md) §1).
 - [ ] **M1b-10** `test(driver): passage des tests HLK audio`
   *Fait quand* : rapport HLK sans échec bloquant.
 
