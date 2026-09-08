@@ -547,9 +547,32 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
 
 ### M1b.B — Service d'assistance
 
-- [ ] **M1b-20** `feat(helper): service Windows minimal exposant la propriété KS au démon`
+- [x] **M1b-20** `feat(helper): service Windows minimal exposant la propriété KS au démon`
   Named pipe à interface fixe (activer, désactiver, canaux, lister), validation, journal.
   *Fait quand* : tests unitaires de validation ; le démon non-admin active un câble via le helper.
+  *Mesuré le 2026-09-08*, dans la VM : service `ConduitHelper` installé en `LocalSystem`,
+  et **`conduit-helper activer 3` depuis la session console non élevée réussit** — le
+  câble passe à connecté et son endpoint apparaît. Le service existe pour une raison
+  mesurée et non théorique : le pilote exige `SeLoadDriverPrivilege` **actif**, que le
+  démon n'a pas.
+  Le canal est le vrai sujet de sécurité — un service `LocalSystem` qui accepte des ordres
+  par canal nommé est une élévation de privilège s'il est mal fermé. Descripteur explicite,
+  jamais nul, **relu** après pose (le service refuse de démarrer s'il ne peut pas constater
+  que la DACL n'est ni absente ni nulle) :
+  `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00100083;;;IU)`.
+  `INTERACTIVE` reçoit un masque **numérique** et non `GRGW` : `GENERIC_WRITE` s'étend en
+  `FILE_GENERIC_WRITE`, qui contient `FILE_APPEND_DATA` — sur un canal nommé, c'est
+  `FILE_CREATE_PIPE_INSTANCE`, et l'accorder laisserait n'importe quel utilisateur
+  connecté **squatter le nom du canal**. Ce détail a été trouvé par un test de bout en
+  bout, qui a fait tomber la première version : elle créait une instance par client et le
+  second `CreateNamedPipeW` rendait `ERROR_ACCESS_DENIED` — le descripteur se refusait à
+  lui-même le droit qu'il refuse aux autres. Le serveur sert désormais une seule instance
+  en recouvrement.
+  Chaque ordre modifiant l'état journalise **l'identité de l'appelant** (nom, SID, pid) :
+  on doit pouvoir dire qui a activé un câble.
+  *Conséquence à ne pas oublier* : le client doit porter le SID `INTERACTIVE`. Une tâche
+  planifiée « exécuter même si l'utilisateur n'est pas connecté » ouvre une session `BATCH`
+  et se verrait refuser le canal — ADR-013 choisit bien « à l'ouverture de session ».
 - [ ] **M1b-21** `feat(helper): renommage d'endpoint via le registre`
   *Fait quand* : renommage visible dans les réglages Son après rafraîchissement (F-02).
 
