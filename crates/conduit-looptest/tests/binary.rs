@@ -118,6 +118,39 @@ fn options_incoherentes_donnent_le_code_environnement() {
     assert!(err.contains("--amplitude"), "{err}");
 }
 
+/// Les actions `--cable-*` ne doivent **jamais** écrire par défaut : sans `--cable`,
+/// l'outil refuse au lieu de retomber sur « Conduit 1 ».
+#[test]
+fn ecrire_un_cable_sans_le_nommer_est_refuse() {
+    for args in [
+        vec!["--cable-set", "deconnecte"],
+        vec!["--cable-invalide"],
+        vec!["--cable", "0", "--cable-invalide"],
+        vec!["--cable", "17", "--cable-invalide"],
+    ] {
+        let (code, _, err) = run(&args);
+        assert_eq!(code, Some(2), "{args:?} : {err}");
+        assert!(err.contains("--cable"), "{args:?} : {err}");
+    }
+}
+
+/// Lire l'état des seize câbles ne demande ni pilote ni privilège : sur une machine
+/// sans Conduit, l'outil le dit et sort proprement.
+#[test]
+fn l_etat_des_cables_se_lit_sans_rien_changer() {
+    let (code, out, err) = run(&["--cable-etat"]);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("Conduit  1"), "{out}");
+    assert!(out.contains("Conduit 16"), "{out}");
+    // Le décalage de un est affiché, pour que la mesure en VM se relise sans calcul.
+    assert!(out.contains("index pilote 0"), "{out}");
+    assert!(out.contains("index pilote 15"), "{out}");
+    // Sans pilote Conduit, aucun filtre : l'outil nomme la cause au lieu de se taire.
+    if out.contains("0 filtre(s)") {
+        assert!(out.contains("pilote n'est pas chargé"), "{out}");
+    }
+}
+
 #[test]
 fn echo_et_capture_se_contredisent() {
     let (code, _, err) = run(&["--loopback", "--capture", "Conduit 1"]);

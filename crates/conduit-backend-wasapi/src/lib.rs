@@ -63,9 +63,18 @@
 //! ne se résoudrait pas quand la documentation est produite sur une autre
 //! plateforme — ce que `cargo doc` traite en erreur (`-D warnings`).
 //!
+//! Le **jeu de propriétés KS privé du pilote** (module `cable`, M1b-04) est la
+//! cinquième chose que ce crate sait faire, et la première qui ne passe ni par COM
+//! ni par MMDevice : il ouvre par `CreateFileW` l'interface `KSCATEGORY_TOPOLOGY`
+//! d'un câble — reconnue à sa **chaîne de référence** `TopoRender<n>` /
+//! `TopoCapture<n>` — et lui envoie `IOCTL_KS_PROPERTY` pour lire ou écrire
+//! `KSPROPERTY_CONDUIT_CABLE_STATE` et lire `KSPROPERTY_CONDUIT_VERSION`. Le
+//! contrat (GUID, identifiants, disposition, parseur) vient de `conduit-kmd-core`,
+//! partagé avec le pilote : rien n'en est recopié. C'est le transport que le
+//! `CableControl` de M1b-34 utilisera ; il n'ouvre aucun flux et n'émet aucun son.
+//!
 //! Ce crate ne compile de code que sous Windows ; ailleurs il n'expose rien, pour
-//! que `cargo check --workspace` reste vert sur toutes les cibles. Le contrôle des
-//! câbles (M1b-34) viendra ensuite.
+//! que `cargo check --workspace` reste vert sur toutes les cibles.
 //!
 //! ```no_run
 //! # #[cfg(windows)]
@@ -93,6 +102,8 @@
 #[cfg(windows)]
 mod backend;
 #[cfg(windows)]
+pub mod cable;
+#[cfg(windows)]
 mod clock;
 #[cfg(windows)]
 mod com;
@@ -119,6 +130,11 @@ mod volume;
 
 #[cfg(windows)]
 pub use backend::WasapiBackend;
+#[cfg(windows)]
+pub use cable::{
+    cable_id, driver_index, matches_reference, topology_interfaces, BadInput, CableConfigError,
+    FilterSide, OsError, TopologyFilter,
+};
 #[cfg(windows)]
 pub use clock::{ClockSource, ClockUnits};
 #[cfg(windows)]

@@ -1,9 +1,50 @@
 //! Définition `clap` des options de `conduit-looptest`.
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use conduit_core::types::SampleRate;
+// Le nombre de câbles adressables vient du **contrat** partagé avec le pilote, pas
+// d'un 16 recopié ici : c'est la même constante que celle qui borne `CableState::cable`.
+use conduit_kmd_core::config::CABLE_MAX;
 
 use crate::analysis::{AnalysisOptions, SineSpec, Tolerances};
+
+/// L'état de connexion à écrire dans un câble (`--cable-set`).
+///
+/// Les deux valeurs sont sans accent : elles se tapent à la ligne de commande.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum EtatCable {
+    /// Câble connecté : ses deux endpoints apparaissent.
+    Connecte,
+    /// Câble déconnecté : ses deux endpoints se rangent sous « Périphériques
+    /// déconnectés ».
+    Deconnecte,
+}
+
+impl EtatCable {
+    /// Vrai pour [`EtatCable::Connecte`].
+    #[must_use]
+    pub const fn connecte(self) -> bool {
+        matches!(self, Self::Connecte)
+    }
+
+    /// Le mot à afficher.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Connecte => "connecté",
+            Self::Deconnecte => "déconnecté",
+        }
+    }
+}
+
+/// Le côté du câble dont on ouvre le filtre de topologie (`--cable-cote`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CoteCable {
+    /// `TopoRender<n>` : le côté où les applications jouent.
+    Rendu,
+    /// `TopoCapture<n>` : le côté où les applications lisent.
+    Capture,
+}
 
 /// Test de boucle du pilote Conduit : joue un sinus sur un endpoint de rendu,
 /// capture ce qui revient, vérifie fréquence, continuité de phase et absence de
@@ -73,6 +114,43 @@ pub struct Args {
     /// coupure), affiche le résultat, et sort sans rien mesurer.
     #[arg(long)]
     pub unmute: bool,
+    /// Lit et affiche l'état des seize câbles par le jeu de propriétés KS privé du
+    /// pilote, plus la version du contrat qu'il sert. Ne change rien.
+    #[arg(long = "cable-etat")]
+    pub cable_etat: bool,
+    /// Câble visé par `--cable-set` et `--cable-invalide` : son numéro affiché, de 1
+    /// à 16 (« Conduit 1 » est le câble 1).
+    #[arg(long = "cable", value_name = "1..16")]
+    pub cable: Option<u32>,
+    /// Écrit l'état de connexion du câble `--cable` (propriété
+    /// `KSPROPERTY_CONDUIT_CABLE_STATE`). L'état est affiché avant et après.
+    #[arg(long = "cable-set", value_name = "connecte|deconnecte")]
+    pub cable_set: Option<EtatCable>,
+    /// Avec `--cable-set` : chronomètre le délai entre l'écriture et l'apparition (ou
+    /// la disparition) des endpoints MMDevice du câble. C'est le critère F-01,
+    /// « endpoint visible en moins d'une seconde, sans PnP ».
+    #[arg(long = "cable-chrono")]
+    pub cable_chrono: bool,
+    /// Attente maximale du chronomètre, en millisecondes.
+    #[arg(
+        long = "cable-chrono-max-ms",
+        default_value_t = 3_000,
+        value_name = "MS"
+    )]
+    pub cable_chrono_max_ms: u64,
+    /// Envoie au câble `--cable` la batterie d'entrées **volontairement invalides**
+    /// (15 octets, 17 octets, champ réservé non nul, connected = 2, index d'un autre
+    /// câble, index hors domaine) et affiche le code d'erreur Win32 de chaque refus.
+    #[arg(long = "cable-invalide")]
+    pub cable_invalide: bool,
+    /// Côté du câble dont on ouvre le filtre de topologie : les deux portent la même
+    /// propriété, en changer sert à vérifier qu'ils s'accordent.
+    #[arg(
+        long = "cable-cote",
+        default_value = "rendu",
+        value_name = "rendu|capture"
+    )]
+    pub cable_cote: CoteCable,
     /// Test de l'outil lui-même : aucun périphérique n'est ouvert, la boucle est
     /// simulée en mémoire.
     #[arg(long = "self-test", hide = true)]
@@ -138,6 +216,26 @@ impl Args {
     /// pour effet de bord d'émettre du son.
     pub fn adjusts_volume(&self) -> bool {
         self.set_volume.is_some() || self.unmute
+    }
+
+    /// Vrai si l'outil doit parler au **jeu de propriétés KS privé** du pilote au
+    /// lieu de mesurer une boucle (`--cable-etat`, `--cable-set`,
+    /// `--cable-invalide`).
+    ///
+    /// C'est une action à part entière, comme `--list` et `--set-volume` : elle
+    /// s'exécute, affiche son compte rendu et sort. Aucun flux n'est ouvert, aucun
+    /// son n'est émis — configurer un câble ne doit pas avoir cet effet de bord.
+    ///
+    /// Les trois se combinent dans un seul appel, et s'exécutent dans cet ordre :
+    /// lecture de l'état, écriture, batterie d'entrées invalides.
+    pub fn controls_cable(&self) -> bool {
+        self.cable_etat || self.cable_set.is_some() || self.cable_invalide
+    }
+
+    /// Le numéro de câble visé par `--cable-set` et `--cable-invalide`, une fois
+    /// [`Self::validate`] passé.
+    pub fn cable_vise(&self) -> Option<u32> {
+        self.cable
     }
 
     /// Trame à retirer en `--self-test`, si `--inject-glitch` a été donné (sans
@@ -210,6 +308,7 @@ impl Args {
                 );
             }
         }
+        self.validate_cable()?;
         if self.loopback {
             if self.capture.is_some() {
                 return Err(
@@ -233,6 +332,60 @@ impl Args {
             }
         }
         Ok(rate)
+    }
+
+    /// Cohérence des options du jeu de propriétés (`--cable-*`).
+    ///
+    /// Séparée de [`Self::validate`] pour rester lisible : ces options forment une
+    /// action à part, qui n'a rien à voir avec la mesure de boucle.
+    fn validate_cable(&self) -> Result<(), String> {
+        if let Some(cable) = self.cable {
+            if cable == 0 || cable > CABLE_MAX {
+                return Err(format!(
+                    "--cable {cable} hors de [1, {CABLE_MAX}] : « Conduit 1 » est le câble 1"
+                ));
+            }
+        }
+        // Le câble n'a **pas** de défaut pour les actions qui écrivent : déconnecter
+        // « Conduit 1 » par omission serait la mauvaise surprise à ne pas offrir.
+        if self.cable.is_none() && (self.cable_set.is_some() || self.cable_invalide) {
+            return Err(
+                "--cable-set et --cable-invalide visent un câble précis : ajoutez --cable N \
+                 (1 à 16). --cable-etat, lui, les lit tous."
+                    .to_string(),
+            );
+        }
+        if self.cable_chrono && self.cable_set.is_none() {
+            return Err(
+                "--cable-chrono mesure le délai entre une écriture et l'endpoint qui suit : \
+                 il demande --cable-set connecte ou --cable-set deconnecte"
+                    .to_string(),
+            );
+        }
+        if self.cable_chrono_max_ms == 0 || self.cable_chrono_max_ms > 60_000 {
+            return Err(format!(
+                "--cable-chrono-max-ms {} hors de [1, 60000]",
+                self.cable_chrono_max_ms
+            ));
+        }
+        if !self.controls_cable() {
+            return Ok(());
+        }
+        for (interdit, option) in [
+            (self.list, "--list"),
+            (self.self_test, "--self-test"),
+            (self.adjusts_volume(), "--set-volume / --unmute"),
+            (self.loopback, "--loopback"),
+        ] {
+            if interdit {
+                return Err(format!(
+                    "les options --cable-* parlent au jeu de propriétés du pilote, affichent \
+                     leur compte rendu et sortent : {option} fait autre chose. Gardez l'un \
+                     des deux."
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -360,6 +513,96 @@ mod tests {
             let err = parse(&args).validate().expect_err(&format!("{args:?}"));
             assert!(err.contains(attendu), "{err}");
         }
+    }
+
+    #[test]
+    fn les_options_de_cable_forment_une_action_a_part() {
+        assert!(!parse(&[]).controls_cable());
+        assert!(parse(&["--cable-etat"]).controls_cable());
+        assert!(parse(&["--cable", "3", "--cable-set", "connecte"]).controls_cable());
+        assert!(parse(&["--cable", "3", "--cable-invalide"]).controls_cable());
+        // Les trois se combinent dans un seul appel.
+        let tout = parse(&[
+            "--cable-etat",
+            "--cable",
+            "2",
+            "--cable-set",
+            "deconnecte",
+            "--cable-invalide",
+        ]);
+        assert!(tout.validate().is_ok());
+        assert_eq!(tout.cable_vise(), Some(2));
+        assert_eq!(tout.cable_set, Some(EtatCable::Deconnecte));
+    }
+
+    #[test]
+    fn le_numero_de_cable_reste_dans_le_contrat() {
+        assert!(parse(&["--cable", "1", "--cable-invalide"])
+            .validate()
+            .is_ok());
+        assert!(parse(&["--cable", "16", "--cable-invalide"])
+            .validate()
+            .is_ok());
+        for hors in ["0", "17", "99"] {
+            let err = parse(&["--cable", hors, "--cable-invalide"])
+                .validate()
+                .expect_err(hors);
+            assert!(err.contains("--cable"), "{err}");
+        }
+        // Écrire sans dire quel câble : refusé plutôt que retombé sur « Conduit 1 ».
+        for args in [vec!["--cable-set", "deconnecte"], vec!["--cable-invalide"]] {
+            let err = parse(&args).validate().expect_err(&format!("{args:?}"));
+            assert!(err.contains("--cable N"), "{err}");
+        }
+        // Lire les seize, en revanche, ne vise personne.
+        assert!(parse(&["--cable-etat"]).validate().is_ok());
+    }
+
+    #[test]
+    fn le_chronometre_demande_une_ecriture() {
+        let err = parse(&["--cable-etat", "--cable-chrono"])
+            .validate()
+            .expect_err("chrono sans écriture");
+        assert!(err.contains("--cable-set"), "{err}");
+        assert!(
+            parse(&["--cable", "1", "--cable-set", "connecte", "--cable-chrono"])
+                .validate()
+                .is_ok()
+        );
+        for hors in ["0", "60001"] {
+            let err = parse(&["--cable-etat", "--cable-chrono-max-ms", hors])
+                .validate()
+                .expect_err(hors);
+            assert!(err.contains("--cable-chrono-max-ms"), "{err}");
+        }
+    }
+
+    #[test]
+    fn les_options_de_cable_excluent_les_autres_actions() {
+        for (args, attendu) in [
+            (vec!["--cable-etat", "--list"], "--list"),
+            (vec!["--cable-etat", "--self-test"], "--self-test"),
+            (vec!["--cable-etat", "--unmute"], "--set-volume"),
+            (vec!["--cable-etat", "--set-volume", "0.5"], "--set-volume"),
+            (vec!["--cable-etat", "--loopback"], "--loopback"),
+        ] {
+            let err = parse(&args).validate().expect_err(&format!("{args:?}"));
+            assert!(err.contains(attendu), "{err}");
+        }
+    }
+
+    #[test]
+    fn le_cote_du_cable_a_un_defaut() {
+        assert_eq!(parse(&[]).cable_cote, CoteCable::Rendu);
+        assert_eq!(
+            parse(&["--cable-cote", "capture"]).cable_cote,
+            CoteCable::Capture
+        );
+        assert!(Args::try_parse_from(["conduit-looptest", "--cable-cote", "les-deux"]).is_err());
+        assert!(EtatCable::Connecte.connecte());
+        assert!(!EtatCable::Deconnecte.connecte());
+        assert_eq!(EtatCable::Connecte.label(), "connecté");
+        assert_eq!(EtatCable::Deconnecte.label(), "déconnecté");
     }
 
     #[test]

@@ -14,7 +14,19 @@
 //! conduit-looptest --loopback           # capture en écho : le moteur délivre-t-il ?
 //! conduit-looptest --list --show-volume # les endpoints, volume, coupure et plage
 //! conduit-looptest --set-volume 0.5 --unmute   # règle, affiche, et sort
+//! conduit-looptest --cable-etat                # l'état des 16 câbles (propriété KS)
+//! conduit-looptest --cable 3 --cable-set connecte --cable-chrono
+//! conduit-looptest --cable 3 --cable-invalide  # la batterie d'entrées invalides
 //! ```
+//!
+//! Les options `--cable-*` ne mesurent rien : elles parlent au **jeu de propriétés KS
+//! privé** du pilote (`KSPROPSETID_Conduit`, M1b-04) par
+//! `conduit_backend_wasapi::cable`, affichent leur compte rendu et sortent. Elles
+//! servent les deux moitiés du critère de M1b-04 : `--cable-chrono` mesure le délai
+//! entre l'écriture et l'endpoint qui suit (F-01, « moins d'une seconde, sans PnP »), et
+//! `--cable-invalide` envoie ce que le contrat refuse en affichant le **code d'erreur
+//! Win32 brut** de chaque refus. Voir le module `cable` (Windows seulement, d'où le nom
+//! en code et non en lien).
 //!
 //! `--loopback` répond à l'autre moitié de la question. Au lieu d'ouvrir un
 //! endpoint de capture, l'outil ouvre l'endpoint de **rendu** en écho
@@ -52,6 +64,8 @@
 #![warn(missing_docs)]
 
 pub mod analysis;
+#[cfg(windows)]
+pub mod cable;
 pub mod cli;
 #[cfg(windows)]
 pub mod loopback;
@@ -134,6 +148,15 @@ pub fn run(args: &cli::Args) -> Result<ExitCode, String> {
     if args.adjusts_volume() {
         print!("{}", loopback::adjust_volume(args)?);
         return Ok(ExitCode::SUCCESS);
+    }
+    if args.controls_cable() {
+        let rapport = cable::run(args)?;
+        print!("{}", rapport.texte);
+        return Ok(if rapport.conforme {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(EXIT_FAILED)
+        });
     }
     if args.self_test {
         if !args.json {

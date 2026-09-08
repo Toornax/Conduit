@@ -21,6 +21,10 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 conduit-backend.workspace = true
 conduit-core.workspace = true
+# Le contrat du jeu de propriétés KS privé du pilote : bornes du numéro de câble et
+# structure d'échange. Crate `no_std`, sans dépendance, portable — la ligne de commande
+# le lit donc sur toutes les plateformes, comme le reste de `cli.rs`.
+conduit-kmd-core = { path = "../conduit-kmd-core", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = "1"
 

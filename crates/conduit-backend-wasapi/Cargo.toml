@@ -13,6 +13,10 @@ description = "Conduit — backend Windows : énumération MMDevice, notificatio
 [target.'cfg(windows)'.dependencies]
 conduit-core.workspace = true
 conduit-backend.workspace = true
+# Le contrat du jeu de propriétés KS privé du pilote (GUID, identifiants, disposition
+# de `CableState` et son parseur) : le module `cable` s'en sert au lieu d'en recopier
+# les décalages, comme le pilote lui-même. Crate `no_std` et sans dépendance.
+conduit-kmd-core = { path = "../conduit-kmd-core", version = "0.1.0" }
 # Le crate `windows` de Microsoft : liaisons COM sûres + macro `implement` pour
 # exposer un `IMMNotificationClient` écrit en Rust. Les features sont le strict
 # nécessaire de l'énumération MMDevice et des flux WASAPI :
@@ -31,15 +35,27 @@ conduit-backend.workspace = true
 # - `Win32_System_RemoteDesktop` : ProcessIdToSessionId, la session Windows du
 #   processus — la session 0 (services) n'a pas l'audio de l'utilisateur, et une
 #   mesure y est sans objet (module `session`).
+#
+# Le module `cable` (jeu de propriétés KS privé, M1b-04) en ajoute quatre :
+# - `Win32_Media_KernelStreaming` : KSCATEGORY_TOPOLOGY, IOCTL_KS_PROPERTY et les
+#   drapeaux GET/SET — pris chez Microsoft plutôt que recopiés à la main ;
+# - `Win32_Devices_DeviceAndDriverInstallation` : CM_Get_Device_Interface_List(_Size)W,
+#   l'énumération des interfaces de périphérique publiées par l'INF ;
+# - `Win32_Storage_FileSystem` : CreateFileW, pour ouvrir le filtre de topologie ;
+# - `Win32_System_IO` : DeviceIoControl, pour lui envoyer la requête.
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
+    "Win32_Media_KernelStreaming",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_Devices_FunctionDiscovery",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
     "Win32_System_Threading",
     "Win32_System_Performance",
     "Win32_System_RemoteDesktop",
