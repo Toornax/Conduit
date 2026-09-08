@@ -495,7 +495,7 @@ identiques, il donne 17 passes sur 20 (sauts de phase et un trou de 384 trames) 
 20 sur 20 une fois détaché. Chaque trace part par le canal série, et le moteur audio
 interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
 
-- [ ] **M1b-04** `feat(driver): propriété KS privée de configuration (activer, désactiver, canaux)`
+- [x] **M1b-04** `feat(driver): propriété KS privée de configuration (activer, désactiver, canaux)`
   Jeu de propriétés KS privé `KSPROPSETID_Conduit` exposé par le filtre de topologie de
   chaque câble, et non un objet de périphérique de contrôle séparé
   ([driver-design.md](docs/driver-design.md) §6, décision anticipée) : PortCls fait le
@@ -503,6 +503,34 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   tampon borné, fuzzable en mode utilisateur (M1b-08). Écriture soumise à
   `SeSinglePrivilegeCheck(SE_LOAD_DRIVER_PRIVILEGE)`, bascule du jack à chaud.
   *Fait quand* : activation → endpoint visible en < 1 s sans PnP (F-01) ; entrée invalide → `STATUS_INVALID_PARAMETER` sans effet.
+  *Mesuré le 2026-09-08*, dans la VM, par `conduit-looptest --cable-*` (client livré dans
+  `conduit-backend-wasapi`, que M1b-34 réutilisera) :
+
+  | Mesure | Résultat |
+  |---|---|
+  | Activation du câble 3 → endpoint **rendu** | **77 ms** |
+  | Activation du câble 3 → endpoint **capture** | **77 ms** |
+  | Désactivation → disparition | 21 ms et 31 ms |
+  | Six entrées invalides | **6 refus sur 6**, `ERROR_INVALID_PARAMETER`, état inchangé |
+  | Persistance (`ActiveCables` 0x3 → 0xB, redémarrage du périphérique) | état conservé |
+  | Les deux côtés du câble | s'accordent, seize filtres sur seize |
+
+  Les entrées éprouvées : charge utile de 15 puis 17 octets, champ réservé non nul,
+  `connected = 2`, index de câble d'un **autre** câble, index hors domaine.
+  **Deux incertitudes levées par la mesure**, toutes deux écrites comme incertaines dans le
+  code avant de l'être :
+  1. *Le contexte de thread du gestionnaire de propriété.* La documentation n'en dit rien
+     et le danger était asymétrique : sur un fil système, `ExGetPreviousMode()` rendrait
+     `KernelMode` et le contrôle de privilège **laisserait tout passer**. Il refuse — il
+     évalue donc le jeton de l'appelant en mode utilisateur.
+  2. *Le routage d'un item d'événement déclaré au niveau filtre vers une requête visant une
+     broche*, attesté par SYSVAD mais non spécifié. Les 77 ms le tranchent : l'événement
+     part. L'expérience de repli (une seconde table sur la broche endpoint) n'a pas eu à
+     être tentée.
+  Au passage, une règle Windows qui coûte cher à ignorer : `SeLoadDriverPrivilege` est
+  **présent mais désactivé** dans tout jeton neuf, **y compris celui de `LocalSystem`**.
+  Le pilote l'exige actif ; c'est au client de l'armer, et `AdjustTokenPrivileges` rend
+  `TRUE` même quand elle n'a rien armé — seul `ERROR_NOT_ALL_ASSIGNED` le dit.
 - [ ] **M1b-05** `feat(driver): formats 44,1/48/96 kHz, float32, PCM16 et PCM24`
   *Fait quand* : test de boucle pour chaque format (F-04).
 - [ ] **M1b-06** `feat(driver): gestion d'alimentation et arrêt propre`
