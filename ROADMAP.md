@@ -578,8 +578,34 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   *Conséquence à ne pas oublier* : le client doit porter le SID `INTERACTIVE`. Une tâche
   planifiée « exécuter même si l'utilisateur n'est pas connecté » ouvre une session `BATCH`
   et se verrait refuser le canal — ADR-013 choisit bien « à l'ouverture de session ».
-- [ ] **M1b-21** `feat(helper): renommage d'endpoint via le registre`
+- [x] **M1b-21** `feat(helper): renommage d'endpoint via le registre`
   *Fait quand* : renommage visible dans les réglages Son après rafraîchissement (F-02).
+  Première application du principe « pilote le plus léger possible »
+  ([driver-design.md](docs/driver-design.md) §1) : **pas une ligne de pilote**, tout se
+  fait depuis le service.
+  *Mesuré le 2026-09-08*, dans la VM : `conduitctl cable rename 1 Musique` et
+  `cable add --name Studio` depuis une session **non élevée**, et le nom apparaît
+  **immédiatement** — aucun rafraîchissement n'a été nécessaire, contrairement à ce que le
+  critère laissait craindre. Retour au nom d'origine et **zéro marque résiduelle** : la
+  désinstallation ne laisse rien (F-52).
+  *Ce que la documentation a tranché* : il n'existe **pas** de valeur « nom personnalisé »
+  séparée — renommer écrase `PKEY_Device_DeviceDesc` lui-même
+  (`{a45c254e-df1c-4efd-8020-67d146a850e0},2`). `PKEY_Device_FriendlyName` est `,14` du
+  **même** fmtid et n'est pas rangé mais composé à la volée ; le `{b3f8fa53-…},6` qu'on
+  pourrait croire équivalent est un espace privé du moteur audio dont la valeur est
+  **partagée par plusieurs endpoints** — l'écrire en renommerait plusieurs d'un coup.
+  *Le défaut que ça crée, et son remède* : la description est **aussi** le pont
+  câble ↔ endpoints. Après renommage, le dorsal ne rattachait plus rien — mesuré :
+  `cable list` rendait `conduit:cable1:rendu` au lieu des identifiants MMDevice, et les
+  règles d'auto-connexion filtrant sur `cable = N` auraient cessé de fonctionner dès qu'un
+  utilisateur renomme. Le service écrit donc une **marque** à nous dans la même clé,
+  `{3f1b27a4-…},1 = "Conduit N"` (le GUID de `KSPROPSETID_CONDUIT`), et
+  `cable_id_from_endpoint` la lit **avant** la description. Ordre d'écriture pensé pour
+  qu'une interruption laisse toujours un endpoint rattachable : marque puis description à
+  l'aller, description puis suppression au retour.
+  *Question ouverte* : deux câbles peuvent porter le même nom personnalisé (renommer vers
+  le nom **canonique** d'un autre câble est refusé, mais pas vers un même nom libre). À
+  trancher si l'interface le rend gênant.
 
 ### M1b.C — Backend WASAPI
 
