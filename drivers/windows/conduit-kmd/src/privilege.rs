@@ -19,7 +19,7 @@
 //! serait une fausse précision ; en exiger un plus commun (`SE_SHUTDOWN_PRIVILEGE`, par
 //! exemple) laisserait la porte à un utilisateur interactif ordinaire.
 //!
-//! # La réserve, et pourquoi elle est écrite ici plutôt que tue
+//! # La réserve qu'il y avait ici, et ce que la mesure en a fait
 //!
 //! `SeSinglePrivilegeCheck` interroge le jeton du **fil courant**, avec le mode d'appel
 //! qu'on lui donne. Deux façons de se tromper, et elles rendraient le contrôle *pire
@@ -33,23 +33,30 @@
 //!   dire le jeton `System`, qui détient `SeLoadDriverPrivilege`. Forcer le mode ne
 //!   répare donc rien.
 //!
-//! **Ce que la documentation dit, vérifié plutôt que supposé** : elle ne dit **rien** du
-//! contexte de fil des gestionnaires PortCls. `portcls.h` ne documente que la propriété du
-//! `PCPROPERTY_REQUEST` et la possibilité de rendre `STATUS_PENDING` ; la page
-//! `PCPROPERTY_ITEM` a un champ IRQL **vide** ; et il n'existe pas de page dédiée à
-//! `PCPFNPROPERTY_HANDLER`. Le raisonnement qui rend le contrôle crédible — un
-//! `IOCTL_KS_PROPERTY` est une `IRP_MJ_DEVICE_CONTROL` que la routine de répartition traite
-//! en ligne, donc dans le fil qui a appelé `DeviceIoControl` — est solide et c'est celui
-//! que retient driver-design.md §6, mais il n'est **pas** documenté, et rien n'interdit à
-//! PortCls de différer une requête.
+//! **Ce que la documentation dit** : elle ne dit toujours **rien** du contexte de fil des
+//! gestionnaires PortCls. `portcls.h` ne documente que la propriété du `PCPROPERTY_REQUEST`
+//! et la possibilité de rendre `STATUS_PENDING` ; la page `PCPROPERTY_ITEM` a un champ IRQL
+//! **vide** ; et il n'existe pas de page dédiée à `PCPFNPROPERTY_HANDLER`. Le raisonnement
+//! qui rend le contrôle crédible — un `IOCTL_KS_PROPERTY` est une `IRP_MJ_DEVICE_CONTROL`
+//! que la routine de répartition traite en ligne, donc dans le fil qui a appelé
+//! `DeviceIoControl` — est celui que retient driver-design.md §6, et il reste non documenté.
 //!
-//! Le contrôle reste donc en place, et la vérification en machine virtuelle est **à
-//! faire** : un `SET` depuis un processus non élevé doit rendre
-//! `STATUS_PRIVILEGE_NOT_HELD`, et la trace de `portcls::config` le montre en une ligne. Si
-//! ce n'était pas le cas, le repli est connu : passer par `PCPROPERTY_REQUEST::Irp`
-//! (`RequestorMode` pour le mode, `Tail.Overlay.Thread` puis `PsReferencePrimaryToken` et
-//! `SePrivilegeCheck` pour le jeton), ce qui coûte nettement plus d'`unsafe` et ne se
-//! justifie que si la mesure l'exige.
+//! **Ce que la mesure a établi.** En machine virtuelle, un `SET` venu de l'espace
+//! utilisateur est refusé par `STATUS_PRIVILEGE_NOT_HELD` (1314 côté client), dans les trois
+//! contextes essayés — y compris `LocalSystem` par tâche planifiée. Les deux pannes décrites
+//! plus haut sont donc écartées : ni `KernelMode`, ni le jeton d'un fil système privilégié
+//! ne se sont substitués à celui de l'appelant. **Ce qui est prouvé, exactement, c'est que
+//! le refus a lieu dans le contexte de l'appelant** — et c'est le sens qui compte pour la
+//! sécurité, la panne redoutée étant un contrôle qui laisse tout passer. Le repli par
+//! `PCPROPERTY_REQUEST::Irp` (`RequestorMode`, `Tail.Overlay.Thread`,
+//! `PsReferencePrimaryToken`, `SePrivilegeCheck`) n'a plus lieu d'être.
+//!
+//! Reste à mesurer la réciproque : qu'un appelant **réellement privilégié** soit accepté.
+//! Elle ne se lisait pas dans la mesure ci-dessus, et pour une raison qui n'a rien à voir
+//! avec ce module — Windows livre ses jetons avec les privilèges *présents mais désactivés*,
+//! `LocalSystem` compris, alors que cette routine les exige **actifs**. C'était au client
+//! d'armer, ce qu'il fait désormais (`conduit_backend_wasapi::cable::armer_privilege`, et
+//! `conduit-looptest --cable-privilege` pour lire l'état du jeton sans rien écrire).
 //!
 //! IRQL : `PASSIVE_LEVEL`.
 
@@ -77,10 +84,13 @@ const _: () = assert!(SE_LOAD_DRIVER.LowPart == 10, "SE_LOAD_DRIVER_PRIVILEGE");
 
 /// L'appelant courant détient-il `SeLoadDriverPrivilege`, **activé** ?
 ///
+/// **Activé**, et pas seulement détenu : un jeton qui porte le privilège sans l'avoir armé
+/// se fait refuser, ce qui est mesuré (voir l'en-tête de module). C'est au client d'armer.
+///
 /// Rend vrai pour un appelant en mode noyau : c'est la sémantique de
 /// `SeSinglePrivilegeCheck`, et elle est correcte pour un appel qui vient réellement du
-/// noyau. Lire la réserve en tête de module avant de s'y fier pour un appel qui vient
-/// d'ailleurs.
+/// noyau. Pour un appel qui vient d'ailleurs, la mesure a montré que c'est bien le jeton de
+/// l'appelant en mode utilisateur qui est évalué.
 ///
 /// IRQL : `PASSIVE_LEVEL`.
 pub(crate) fn may_load_driver() -> bool {

@@ -15,6 +15,7 @@
 //! conduit-looptest --list --show-volume # les endpoints, volume, coupure et plage
 //! conduit-looptest --set-volume 0.5 --unmute   # règle, affiche, et sort
 //! conduit-looptest --cable-etat                # l'état des 16 câbles (propriété KS)
+//! conduit-looptest --cable-privilege           # l'état du privilège d'écriture, seul
 //! conduit-looptest --cable 3 --cable-set connecte --cable-chrono
 //! conduit-looptest --cable 3 --cable-invalide  # la batterie d'entrées invalides
 //! ```
@@ -27,6 +28,15 @@
 //! `--cable-invalide` envoie ce que le contrat refuse en affichant le **code d'erreur
 //! Win32 brut** de chaque refus. Voir le module `cable` (Windows seulement, d'où le nom
 //! en code et non en lien).
+//!
+//! **Écrire demande `SeLoadDriverPrivilege` armé, pas seulement détenu.** Le pilote
+//! contrôle l'écriture par `SeSinglePrivilegeCheck`, qui exige le privilège *actif*, et
+//! Windows livre les jetons avec leurs privilèges désactivés — élévation et
+//! `LocalSystem` compris, ce que la mesure en machine virtuelle a établi. `--cable-set`
+//! et `--cable-invalide` l'arment donc eux-mêmes, le temps de leurs écritures, et
+//! restaurent le jeton ensuite. `--cable-privilege` n'arme rien : il ne fait que dire
+//! dans quel état est le privilège, ce qui sépare « mauvais compte » de « bogue du
+//! pilote » quand un refus 1314 persiste.
 //!
 //! `--loopback` répond à l'autre moitié de la question. Au lieu d'ouvrir un
 //! endpoint de capture, l'outil ouvre l'endpoint de **rendu** en écho

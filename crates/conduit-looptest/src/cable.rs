@@ -6,12 +6,23 @@
 //! `conduit-kmd-core`, partagé avec le pilote. Ce module ne fait que **choisir** les
 //! requêtes et mettre en forme le compte rendu.
 //!
-//! Quatre actions, combinables dans un seul appel et exécutées dans cet ordre :
+//! Cinq actions, combinables dans un seul appel et exécutées dans cet ordre :
 //!
-//! 1. `--cable-etat` : l'état des seize câbles, plus la version du contrat servi ;
-//! 2. `--cable-set` : l'écriture, affichée avant et après ;
-//! 3. `--cable-chrono` : le délai entre l'écriture et l'endpoint MMDevice qui suit ;
-//! 4. `--cable-invalide` : la batterie d'entrées volontairement invalides.
+//! 1. `--cable-privilege` : l'état de `SeLoadDriverPrivilege` dans ce processus, sans
+//!    rien écrire ni armer ;
+//! 2. `--cable-etat` : l'état des seize câbles, plus la version du contrat servi ;
+//! 3. `--cable-set` : l'écriture, affichée avant et après ;
+//! 4. `--cable-chrono` : le délai entre l'écriture et l'endpoint MMDevice qui suit ;
+//! 5. `--cable-invalide` : la batterie d'entrées volontairement invalides.
+//!
+//! # Le privilège est armé une fois, pour toute la durée des écritures
+//!
+//! Le pilote exige `SeLoadDriverPrivilege` **actif**, et Windows livre les jetons avec
+//! leurs privilèges désactivés — élévation et `LocalSystem` compris, ce que la mesure
+//! en machine virtuelle a établi. [`run`] appelle donc [`armer_privilege`] **une seule
+//! fois**, avant les actions qui écrivent, et garde le garde jusqu'à son retour : il
+//! restaure alors le jeton dans l'état où il l'a trouvé. Une lecture
+//! (`--cable-privilege`, `--cable-etat`) n'arme rien, parce qu'elle n'en a pas besoin.
 //!
 //! **Aucun flux audio n'est ouvert et aucun son n'émis** : `IOCTL_KS_PROPERTY` est une
 //! requête de contrôle, et le chronomètre ne fait qu'**énumérer** les endpoints. Les
@@ -26,8 +37,8 @@ use std::time::{Duration, Instant};
 
 use conduit_backend::{Backend, CableId, DeviceDirection};
 use conduit_backend_wasapi::cable::{
-    contract_version, topology_interfaces, BadInput, CableConfigError, CableState, FilterSide,
-    TopologyFilter, CABLE_MAX,
+    armer_privilege, contract_version, etat_privilege, topology_interfaces, Armement, BadInput,
+    CableConfigError, CableState, EtatPrivilege, FilterSide, TopologyFilter, CABLE_MAX,
 };
 use conduit_backend_wasapi::WasapiBackend;
 
@@ -68,30 +79,131 @@ impl From<CoteCable> for FilterSide {
 /// requête, lui, n'est pas une erreur d'environnement : il est affiché avec son code,
 /// puisque c'est précisément ce qu'on cherche à lire.
 pub fn run(args: &Args) -> Result<Rapport, String> {
-    let side = FilterSide::from(args.cable_cote);
-    let paths = topology_interfaces().map_err(|e| e.to_string())?;
     let mut texte = String::new();
     let mut conforme = true;
 
-    if args.cable_etat {
-        texte.push_str(&etat_des_cables(&paths, side));
+    // L'état du privilège se lit sans le pilote, et même sans câble : il passe donc
+    // **avant** l'énumération, pour que `--cable-privilege` réponde sur n'importe quelle
+    // machine — y compris celle où le diagnostic est le plus utile, celle où rien ne
+    // marche.
+    if args.cable_privilege {
+        pousser(&mut texte, &bloc_privilege(&etat_privilege()));
     }
+    if !(args.cable_etat || args.writes_cable()) {
+        return Ok(Rapport { texte, conforme });
+    }
+
+    let side = FilterSide::from(args.cable_cote);
+    let paths = topology_interfaces().map_err(|e| e.to_string())?;
+
+    if args.cable_etat {
+        pousser(&mut texte, &etat_des_cables(&paths, side));
+    }
+
+    // Une seule fois, pour toutes les écritures : le garde vit jusqu'au `return` de
+    // cette fonction et restaure alors le jeton. `constate` est l'état **après**
+    // tentative d'armement — c'est lui, et non un conseil d'élévation, qui explique un
+    // refus persistant.
+    let armement = if args.writes_cable() {
+        let (issue, garde) = armer_privilege().map_err(|e| e.to_string())?;
+        pousser(&mut texte, &bloc_armement(issue));
+        Some((issue, garde))
+    } else {
+        None
+    };
+    let constate = armement.as_ref().map(|(issue, _)| etat_apres(*issue));
 
     if let Some(vise) = args.cable_set {
         let cable = cible(args)?;
-        let (bloc, ok) = ecrire(&paths, cable, side, vise, args)?;
+        let (bloc, ok) = ecrire(&paths, cable, side, vise, args, constate)?;
         pousser(&mut texte, &bloc);
         conforme &= ok;
     }
 
     if args.cable_invalide {
         let cable = cible(args)?;
-        let (bloc, ok) = entrees_invalides(&paths, cable, side)?;
+        let (bloc, ok) = entrees_invalides(&paths, cable, side, constate)?;
         pousser(&mut texte, &bloc);
         conforme &= ok;
     }
 
     Ok(Rapport { texte, conforme })
+}
+
+/// L'état du privilège que l'issue d'un armement **établit**, sans relire le jeton.
+///
+/// Fonction pure : [`Armement`] porte déjà les trois cas, et les relire coûterait un
+/// appel de plus pour la même réponse.
+fn etat_apres(issue: Armement) -> EtatPrivilege {
+    match issue {
+        Armement::Arme => EtatPrivilege::Actif,
+        Armement::Absent => EtatPrivilege::Absent,
+        Armement::NonActivable { .. } => EtatPrivilege::Desactive,
+    }
+}
+
+/// `--cable-privilege` : l'état du privilège d'écriture, sans rien modifier.
+fn bloc_privilege(etat: &Result<EtatPrivilege, CableConfigError>) -> String {
+    match etat {
+        Ok(etat) => format!(
+            "privilège d'écriture SeLoadDriverPrivilege dans ce processus : {etat}\n{}\n",
+            explication_privilege(*etat)
+        ),
+        Err(e) => format!(
+            "privilège d'écriture SeLoadDriverPrivilege : état INCONNU — {e}\n    Sans cet \
+             état, un refus 1314 ne peut pas être attribué : ni au compte, ni au pilote.\n"
+        ),
+    }
+}
+
+/// Ce qu'un état de privilège veut dire, en français.
+///
+/// Pure, et c'est le seul endroit où le raisonnement est écrit : la mesure a montré que
+/// l'élévation ne suffit pas, il ne faut donc plus jamais conseiller « relancez élevé ».
+fn explication_privilege(etat: EtatPrivilege) -> &'static str {
+    match etat {
+        EtatPrivilege::Absent => {
+            "    Ce compte ne le détient pas : ni l'élévation ni un armement ne l'y ajouteront. \
+             Il faut un compte administrateur. Toute écriture sera refusée en 1314, et ce refus \
+             ne dira rien du pilote."
+        }
+        EtatPrivilege::Desactive => {
+            "    C'est l'état NORMAL au démarrage d'un processus, y compris élevé et y compris \
+             LocalSystem : Windows n'active pas un privilège tant que le processus ne l'a pas \
+             armé, et le pilote l'exige ACTIF (SeSinglePrivilegeCheck). Cette option, elle, \
+             n'arme rien : c'est --cable-set et --cable-invalide qui arment, le temps de leurs \
+             écritures."
+        }
+        EtatPrivilege::Actif => {
+            "    Armé : une écriture refusée en ERROR_PRIVILEGE_NOT_HELD ne s'explique plus par \
+             le compte."
+        }
+    }
+}
+
+/// Le bloc d'armement, en tête des actions qui écrivent.
+fn bloc_armement(issue: Armement) -> String {
+    let mut out = format!("armement du privilège d'écriture : {issue}\n");
+    let conseil = conseil_armement(issue);
+    if !conseil.is_empty() {
+        let _ = writeln!(out, "{conseil}");
+    }
+    out
+}
+
+/// Ce qu'il faut faire d'une issue d'armement ; vide quand il n'y a rien à dire.
+fn conseil_armement(issue: Armement) -> &'static str {
+    match issue {
+        Armement::Arme => "",
+        Armement::Absent => {
+            "    Les écritures qui suivent vont être refusées en ERROR_PRIVILEGE_NOT_HELD, et ce \
+             refus ne dira rien du pilote. Relancez depuis un compte administrateur."
+        }
+        Armement::NonActivable { .. } => {
+            "    Cas rare : le privilège est bien dans le jeton et l'activation n'a pas pris. \
+             Signalez-le tel quel ; les écritures qui suivent vont être refusées."
+        }
+    }
 }
 
 /// Ajoute un bloc au compte rendu, séparé du précédent par une ligne vide.
@@ -205,12 +317,17 @@ fn etat_des_cables(paths: &[String], side: FilterSide) -> String {
 
 /// `--cable-set` (et `--cable-chrono`) : écrit l'état, l'affiche avant et après, et
 /// chronomètre éventuellement les endpoints.
+///
+/// `constate` est l'état du privilège **après** la tentative d'armement : il n'entre
+/// dans le compte rendu qu'en cas de refus, et c'est alors le seul renseignement qui
+/// dise si c'est le compte ou le pilote qu'il faut regarder.
 fn ecrire(
     paths: &[String],
     cable: CableId,
     side: FilterSide,
     vise: EtatCable,
     args: &Args,
+    constate: Option<EtatPrivilege>,
 ) -> Result<(String, bool), String> {
     let filtre = ouvrir(paths, cable, side).map_err(|e| e.to_string())?;
     let index = filtre.index();
@@ -246,7 +363,7 @@ fn ecrire(
 
     if let Err(e) = filtre.write_state(vise.connecte()) {
         let _ = writeln!(out, "    écriture REFUSÉE : {e}");
-        let note = note_privilege(&e);
+        let note = note_privilege(&e, constate);
         if !note.is_empty() {
             let _ = writeln!(out, "{note}");
         }
@@ -405,6 +522,7 @@ fn entrees_invalides(
     paths: &[String],
     cable: CableId,
     side: FilterSide,
+    constate: Option<EtatPrivilege>,
 ) -> Result<(String, bool), String> {
     let filtre = ouvrir(paths, cable, side).map_err(|e| e.to_string())?;
     let index = filtre.index();
@@ -484,23 +602,58 @@ fn entrees_invalides(
     );
     let _ = writeln!(out, "    verdict : {refusees} refus sur {total}");
     if privileges == total {
-        out.push_str(
-            "    Note : les six refus sont des ERROR_PRIVILEGE_NOT_HELD. Le pilote contrôle \
-             le privilège AVANT de valider le contenu, par conception — relancez depuis un \
-             processus élevé pour éprouver la validation elle-même.\n",
+        let _ = writeln!(
+            out,
+            "    Note : les {total} refus sont des ERROR_PRIVILEGE_NOT_HELD. Le pilote contrôle \
+             le privilège AVANT de valider le contenu, par conception : cette batterie n'a donc \
+             éprouvé AUCUNE des validations qu'elle vise.\n{}",
+            diagnostic_privilege(constate)
         );
     }
     Ok((out, refusees == total && inchange))
 }
 
-/// Le mot à ajouter quand un refus d'écriture ressemble à un manque de privilège.
-fn note_privilege(erreur: &CableConfigError) -> &'static str {
+/// Le mot à ajouter quand un refus d'écriture est un `ERROR_PRIVILEGE_NOT_HELD` (1314).
+///
+/// **L'ancien conseil — « relancez depuis un processus élevé » — a été démenti par la
+/// mesure** : l'élévation ne suffit pas, et `LocalSystem` par tâche planifiée en
+/// `/rl HIGHEST` non plus. Les trois jetons essayés portaient bien
+/// `SeLoadDriverPrivilege`, mais **désactivé**, et `SeSinglePrivilegeCheck` l'exige
+/// actif. Ce que le message doit donc porter, c'est l'état **constaté** du privilège :
+/// c'est lui, et rien d'autre, qui sépare « mauvais compte » de « bogue du pilote ».
+fn note_privilege(erreur: &CableConfigError, constate: Option<EtatPrivilege>) -> String {
     match erreur {
-        CableConfigError::Requete { erreur, .. } if erreur.win32() == Some(1314) => {
-            "    L'écriture exige SE_LOAD_DRIVER_PRIVILEGE : relancez depuis un processus \
-             élevé (le service d'assistance de M1b-20 tournera en LocalSystem)."
+        CableConfigError::Requete { erreur, .. } if erreur.win32() == Some(1314) => format!(
+            "    L'écriture exige SeLoadDriverPrivilege ACTIF dans le jeton de l'appelant \
+             (SeSinglePrivilegeCheck, côté pilote) — le détenir ne suffit pas.\n{}",
+            diagnostic_privilege(constate)
+        ),
+        _ => String::new(),
+    }
+}
+
+/// Ce que l'état constaté du privilège permet de conclure d'un refus 1314.
+///
+/// Pure, et volontairement affirmative : chacun des quatre cas désigne **un** suspect.
+fn diagnostic_privilege(constate: Option<EtatPrivilege>) -> &'static str {
+    match constate {
+        None => {
+            "    État du privilège dans ce processus : non relevé. Relancez avec \
+             --cable-privilege pour le connaître ; sans lui, ce refus ne peut être attribué ni \
+             au compte ni au pilote."
         }
-        _ => "",
+        Some(EtatPrivilege::Absent) => {
+            "    État constaté : absent du jeton. C'est le COMPTE : il n'est pas administrateur, \
+             et aucune élévation ne l'y ajoutera. Le pilote est hors de cause."
+        }
+        Some(EtatPrivilege::Desactive) => {
+            "    État constaté : présent mais désactivé — l'armement n'a pas pris. C'est encore \
+             le jeton, pas le pilote ; voir le bloc d'armement ci-dessus."
+        }
+        Some(EtatPrivilege::Actif) => {
+            "    État constaté : ACTIF. Le compte est hors de cause : c'est le PILOTE qui refuse \
+             un appelant privilégié. Relevez la trace de portcls::config dans la VM."
+        }
     }
 }
 
@@ -542,19 +695,146 @@ mod tests {
         assert!(ligne.contains("déconnecté"), "{ligne}");
     }
 
-    #[test]
-    fn la_note_de_privilege_ne_sort_que_sur_1314() {
-        let refus = CableConfigError::Requete {
+    /// Un refus 1314, tel que le pilote le rend.
+    fn refus_1314() -> CableConfigError {
+        CableConfigError::Requete {
             propriete: "KSPROPERTY_CONDUIT_CABLE_STATE",
             verbe: "SET",
             erreur: OsError::Win32(1314),
-        };
-        assert!(note_privilege(&refus).contains("SE_LOAD_DRIVER_PRIVILEGE"));
+        }
+    }
+
+    #[test]
+    fn la_note_de_privilege_ne_sort_que_sur_1314() {
+        let note = note_privilege(&refus_1314(), Some(EtatPrivilege::Actif));
+        assert!(note.contains("SeLoadDriverPrivilege"), "{note}");
         let autre = CableConfigError::Requete {
             propriete: "KSPROPERTY_CONDUIT_CABLE_STATE",
             verbe: "SET",
             erreur: OsError::Win32(87),
         };
-        assert_eq!(note_privilege(&autre), "");
+        assert_eq!(note_privilege(&autre, Some(EtatPrivilege::Actif)), "");
+        assert_eq!(note_privilege(&autre, None), "");
+    }
+
+    /// Le conseil démenti par la mesure ne doit **jamais** revenir : l'élévation ne
+    /// suffisait pas, et `LocalSystem` non plus.
+    #[test]
+    fn plus_aucun_message_ne_conseille_l_elevation() {
+        let mut messages = vec![
+            note_privilege(&refus_1314(), None),
+            bloc_armement(Armement::Arme),
+            bloc_armement(Armement::Absent),
+            bloc_armement(Armement::NonActivable { code: 1300 }),
+        ];
+        for etat in [
+            EtatPrivilege::Absent,
+            EtatPrivilege::Desactive,
+            EtatPrivilege::Actif,
+        ] {
+            messages.push(note_privilege(&refus_1314(), Some(etat)));
+            messages.push(bloc_privilege(&Ok(etat)));
+        }
+        for message in &messages {
+            let minuscules = message.to_lowercase();
+            assert!(
+                !minuscules.contains("processus élevé"),
+                "un message conseille encore l'élévation : {message}"
+            );
+        }
+    }
+
+    /// Les quatre diagnostics d'un refus 1314 désignent chacun **un** suspect, et se
+    /// distinguent les uns des autres.
+    #[test]
+    fn le_diagnostic_d_un_refus_nomme_le_suspect() {
+        let inconnu = diagnostic_privilege(None);
+        assert!(inconnu.contains("--cable-privilege"), "{inconnu}");
+
+        let absent = diagnostic_privilege(Some(EtatPrivilege::Absent));
+        assert!(absent.contains("COMPTE"), "{absent}");
+        assert!(absent.contains("hors de cause"), "{absent}");
+
+        let dormant = diagnostic_privilege(Some(EtatPrivilege::Desactive));
+        assert!(dormant.contains("désactivé"), "{dormant}");
+
+        let actif = diagnostic_privilege(Some(EtatPrivilege::Actif));
+        assert!(actif.contains("PILOTE"), "{actif}");
+        assert!(actif.contains("portcls::config"), "{actif}");
+
+        let tous = [inconnu, absent, dormant, actif];
+        for (rang, texte) in tous.iter().enumerate() {
+            assert!(!texte.is_empty());
+            assert!(
+                !tous.iter().skip(rang + 1).any(|autre| autre == texte),
+                "deux diagnostics identiques : {texte}"
+            );
+        }
+    }
+
+    /// `--cable-privilege` doit dire l'état **et** ce qu'il implique, y compris quand
+    /// l'interrogation du jeton a échoué.
+    #[test]
+    fn le_bloc_de_privilege_explique_les_trois_etats() {
+        let dormant = bloc_privilege(&Ok(EtatPrivilege::Desactive));
+        assert!(dormant.contains("présent mais désactivé"), "{dormant}");
+        // Le point que la mesure a établi : élevé et LocalSystem sont dans ce cas.
+        assert!(dormant.contains("LocalSystem"), "{dormant}");
+        assert!(dormant.contains("ACTIF"), "{dormant}");
+
+        let absent = bloc_privilege(&Ok(EtatPrivilege::Absent));
+        assert!(absent.contains("absent du jeton"), "{absent}");
+        assert!(absent.contains("administrateur"), "{absent}");
+
+        let actif = bloc_privilege(&Ok(EtatPrivilege::Actif));
+        assert!(actif.contains("présent et actif"), "{actif}");
+
+        // L'échec de l'interrogation se dit, il ne se tait pas.
+        let inconnu = bloc_privilege(&Err(CableConfigError::Privilege {
+            appel: "OpenProcessToken",
+            erreur: OsError::Win32(5),
+        }));
+        assert!(inconnu.contains("INCONNU"), "{inconnu}");
+        assert!(inconnu.contains("OpenProcessToken"), "{inconnu}");
+
+        // Chaque bloc finit par un saut de ligne : `pousser` compte dessus.
+        for bloc in [&dormant, &absent, &actif, &inconnu] {
+            assert!(bloc.ends_with('\n'), "{bloc}");
+        }
+    }
+
+    /// L'issue d'un armement se traduit en état de jeton sans relire celui-ci.
+    #[test]
+    fn l_issue_de_l_armement_dit_l_etat_du_jeton() {
+        assert_eq!(etat_apres(Armement::Arme), EtatPrivilege::Actif);
+        assert_eq!(etat_apres(Armement::Absent), EtatPrivilege::Absent);
+        assert_eq!(
+            etat_apres(Armement::NonActivable { code: 1300 }),
+            EtatPrivilege::Desactive
+        );
+        // Seul l'armement réussi laisse le privilège actif.
+        for issue in [
+            Armement::Arme,
+            Armement::Absent,
+            Armement::NonActivable { code: 1300 },
+        ] {
+            assert_eq!(etat_apres(issue).actif(), issue.arme(), "{issue}");
+        }
+    }
+
+    /// Le bloc d'armement ne conseille rien quand il n'y a rien à faire, et nomme la
+    /// conduite à tenir dans les deux autres cas.
+    #[test]
+    fn le_bloc_d_armement_ne_conseille_que_s_il_y_a_lieu() {
+        assert_eq!(conseil_armement(Armement::Arme), "");
+        assert!(conseil_armement(Armement::Absent).contains("administrateur"));
+        assert!(conseil_armement(Armement::NonActivable { code: 1300 }).contains("rare"));
+
+        let arme = bloc_armement(Armement::Arme);
+        assert!(arme.contains("armé"), "{arme}");
+        assert!(arme.ends_with('\n'), "{arme}");
+        let absent = bloc_armement(Armement::Absent);
+        assert!(absent.contains("administrateur"), "{absent}");
+        assert!(absent.ends_with('\n'), "{absent}");
     }
 }

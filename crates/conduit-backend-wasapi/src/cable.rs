@@ -35,6 +35,20 @@
 //! celle attendue. Voir la documentation de cette fonction pour ce que coûterait un
 //! `ends_with`.
 //!
+//! # L'écriture demande un privilège **armé**, et c'est au client de l'armer
+//!
+//! Le pilote contrôle toute écriture par
+//! `SeSinglePrivilegeCheck(SE_LOAD_DRIVER_PRIVILEGE)`, qui exige le privilège
+//! **actif** dans le jeton de l'appelant. Or Windows livre un jeton avec ses
+//! privilèges *présents mais désactivés* : c'est vrai d'un processus élevé comme du
+//! jeton `LocalSystem`, et les deux se font refuser `ERROR_PRIVILEGE_NOT_HELD` (1314)
+//! tant qu'ils n'ont rien armé — mesuré en machine virtuelle, `whoami /priv` montrant
+//! « `SeLoadDriverPrivilege` … Désactivé » dans les trois contextes essayés.
+//!
+//! [`armer_privilege`] fait donc le travail que le pilote attend : ouvrir le jeton du
+//! processus, y chercher le privilège, l'activer, et rendre un garde qui **restaure**
+//! l'état précédent à sa destruction. [`etat_privilege`] le lit sans rien changer.
+//!
 //! # Ce que ce module n'ouvre pas
 //!
 //! Aucun flux audio, aucun `IAudioClient`, aucun son : `IOCTL_KS_PROPERTY` est une
@@ -58,13 +72,22 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_Device_Interface_ListW, CM_Get_Device_Interface_List_SizeW,
     CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CONFIGRET, CR_BUFFER_SMALL, CR_SUCCESS,
 };
-use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE};
+use windows::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_NOT_ALL_ASSIGNED as WIN32_NOT_ALL_ASSIGNED, GENERIC_READ,
+    GENERIC_WRITE, HANDLE, LUID,
+};
 use windows::Win32::Media::KernelStreaming::{
     IOCTL_KS_PROPERTY, KSCATEGORY_TOPOLOGY, KSPROPERTY_TYPE_GET, KSPROPERTY_TYPE_SET,
+};
+use windows::Win32::Security::{
+    AdjustTokenPrivileges, GetTokenInformation, LookupPrivilegeValueW, TokenPrivileges,
+    LUID_AND_ATTRIBUTES, SE_LOAD_DRIVER_NAME, SE_PRIVILEGE_ENABLED, TOKEN_ACCESS_MASK,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::System::IO::DeviceIoControl;
 
 // ---------------------------------------------------------------------------------
@@ -270,7 +293,7 @@ pub enum OsError {
 /// La table est courte **à dessein** : elle ne nomme que ce que le gestionnaire de
 /// propriété peut rendre (`portcls::config`) et ce que l'ouverture du filtre peut
 /// refuser. Un code absent s'affiche par son numéro, ce qui reste lisible.
-const CODES: [(u32, &str, Option<&str>); 11] = [
+const CODES: [(u32, &str, Option<&str>); 12] = [
     (
         1,
         "ERROR_INVALID_FUNCTION",
@@ -293,6 +316,9 @@ const CODES: [(u32, &str, Option<&str>); 11] = [
     ),
     (234, "ERROR_MORE_DATA", Some("STATUS_BUFFER_OVERFLOW")),
     (1168, "ERROR_NOT_FOUND", Some("STATUS_NOT_FOUND")),
+    // Pas un refus du pilote : le code qu'`AdjustTokenPrivileges` pose quand elle rend
+    // `TRUE` sans avoir rien armé. Il n'a pas de `NTSTATUS` derrière lui.
+    (1300, "ERROR_NOT_ALL_ASSIGNED", None),
     (
         1314,
         "ERROR_PRIVILEGE_NOT_HELD",
@@ -415,6 +441,15 @@ pub enum CableConfigError {
         /// Ce qui cloche, en français.
         cause: String,
     },
+    /// Un appel du système lié au **privilège** d'écriture a échoué : on ne sait donc
+    /// même pas dire dans quel état est le jeton, ce qui est un diagnostic à part
+    /// entière et non un refus du pilote.
+    Privilege {
+        /// L'appel fautif (`OpenProcessToken`, `LookupPrivilegeValueW`, …).
+        appel: &'static str,
+        /// Le code rendu, tel quel.
+        erreur: OsError,
+    },
 }
 
 impl fmt::Display for CableConfigError {
@@ -445,6 +480,11 @@ impl fmt::Display for CableConfigError {
                 erreur,
             } => write!(f, "{verbe} {propriete} refusé : {erreur}"),
             Self::Reponse { cause } => write!(f, "réponse inattendue du pilote : {cause}"),
+            Self::Privilege { appel, erreur } => write!(
+                f,
+                "{appel} a échoué : {erreur} — impossible de connaître ou d'armer \
+                 SeLoadDriverPrivilege dans le jeton de ce processus"
+            ),
         }
     }
 }
@@ -512,6 +552,437 @@ pub fn parse_version(buffer: &[u8], returned: usize) -> Result<u32, CableConfigE
 #[must_use]
 pub const fn contract_version() -> u32 {
     CONFIG_VERSION
+}
+
+// ---------------------------------------------------------------------------------
+// Le privilège d'écriture : présent ne veut pas dire actif.
+// ---------------------------------------------------------------------------------
+
+/// `ERROR_NOT_ALL_ASSIGNED` (1300) : **le seul signe** qu'`AdjustTokenPrivileges` n'a
+/// pas activé ce qu'on lui a demandé.
+///
+/// La valeur vient de la caisse `windows`, pas d'un 1300 recopié.
+pub const ERROR_NOT_ALL_ASSIGNED: u32 = WIN32_NOT_ALL_ASSIGNED.0;
+
+/// Taille d'un `LUID_AND_ATTRIBUTES` (`winnt.h`) : deux `ULONG` et un `LONG`.
+const LUID_ATTR_BYTES: usize = 12;
+/// Décalage de `PrivilegeCount` dans un `TOKEN_PRIVILEGES`.
+const O_PRIVILEGE_COUNT: usize = 0;
+/// Décalage du premier `LUID_AND_ATTRIBUTES` dans un `TOKEN_PRIVILEGES`.
+const O_PRIVILEGES: usize = 4;
+/// Décalage de `Luid.LowPart` dans un `LUID_AND_ATTRIBUTES`.
+const O_LUID_LOW: usize = 0;
+/// Décalage de `Luid.HighPart` dans un `LUID_AND_ATTRIBUTES`.
+const O_LUID_HIGH: usize = 4;
+/// Décalage d'`Attributes` dans un `LUID_AND_ATTRIBUTES`.
+const O_ATTRIBUTES: usize = 8;
+/// `SE_PRIVILEGE_ENABLED` : le bit qui distingue « détenu » d'« actif ».
+///
+/// De la caisse `windows` là encore. `SE_PRIVILEGE_ENABLED_BY_DEFAULT` (1) est un bit
+/// **différent** et ne veut pas dire actif : il dit seulement que l'ouverture de session
+/// l'aurait activé, ce qui n'est pas le cas de `SeLoadDriverPrivilege`.
+const ATTR_ENABLED: u32 = SE_PRIVILEGE_ENABLED.0;
+
+// Les tailles de `winnt.h`, vérifiées contre les types de la caisse `windows` : un
+// décalage faux ferait lire un privilège pour un autre, et le client annoncerait
+// « absent » à un administrateur.
+const _: () = assert!(size_of::<LUID_AND_ATTRIBUTES>() == LUID_ATTR_BYTES);
+const _: () = assert!(O_LUID_HIGH + 4 == O_ATTRIBUTES && O_ATTRIBUTES + 4 == LUID_ATTR_BYTES);
+const _: () = assert!(O_PRIVILEGE_COUNT + 4 == O_PRIVILEGES);
+const _: () = assert!(ATTR_ENABLED == 2);
+
+/// L'état de `SeLoadDriverPrivilege` dans un jeton.
+///
+/// Les trois cas ne se soignent pas de la même façon, et c'est tout l'intérêt de les
+/// distinguer : [`Self::Absent`] est un problème de **compte**, [`Self::Desactive`] un
+/// armement qui n'a pas été fait, [`Self::Actif`] le seul état que le pilote accepte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EtatPrivilege {
+    /// Le privilège n'est **pas** dans le jeton : ce compte ne le détient pas.
+    Absent,
+    /// Présent mais **désactivé**. C'est l'état normal au démarrage d'un processus, y
+    /// compris élevé et y compris `LocalSystem` : Windows n'active rien tout seul.
+    Desactive,
+    /// Présent et **actif** : le seul état que `SeSinglePrivilegeCheck` accepte.
+    Actif,
+}
+
+impl EtatPrivilege {
+    /// Le privilège est-il dans le jeton, actif ou non ?
+    #[must_use]
+    pub const fn present(self) -> bool {
+        !matches!(self, Self::Absent)
+    }
+
+    /// Le privilège est-il actif ?
+    #[must_use]
+    pub const fn actif(self) -> bool {
+        matches!(self, Self::Actif)
+    }
+
+    /// L'état, en français, pour l'affichage.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Absent => "absent du jeton",
+            Self::Desactive => "présent mais désactivé",
+            Self::Actif => "présent et actif",
+        }
+    }
+}
+
+impl fmt::Display for EtatPrivilege {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Lit un `ULONG` à `decalage` ; 0 si les quatre octets n'y sont pas.
+///
+/// Boutisme **natif** : ces octets viennent du noyau de la même machine.
+#[must_use]
+fn lire_u32(octets: &[u8], decalage: usize) -> u32 {
+    octets
+        .get(decalage..decalage.saturating_add(4))
+        .and_then(|mot| <[u8; 4]>::try_from(mot).ok())
+        .map_or(0, u32::from_ne_bytes)
+}
+
+/// Cherche le privilège de LUID (`low`, `high`) dans les octets d'un `TOKEN_PRIVILEGES`
+/// tel que `GetTokenInformation(TokenPrivileges)` le rend.
+///
+/// Disposition de `winnt.h` : `PrivilegeCount: ULONG`, puis `PrivilegeCount` entrées de
+/// douze octets (`Luid.LowPart: ULONG`, `Luid.HighPart: LONG`, `Attributes: ULONG`).
+///
+/// Le tampon est lu **octet par octet** plutôt que transtypé vers un
+/// `*const TOKEN_PRIVILEGES` : le type de la caisse `windows` déclare un tableau d'un
+/// seul `LUID_AND_ATTRIBUTES`, et le parcourir au-delà par arithmétique de pointeur est
+/// un comportement indéfini en Rust même là où le C le tolère. Ce faisant, la fonction
+/// devient **pure**, donc vérifiable en table de cas sans toucher au jeton du processus.
+///
+/// Un tampon tronqué, un compte plus grand que le tampon, ou un privilège absent
+/// rendent tous [`EtatPrivilege::Absent`] : c'est le verdict prudent, celui qui fait
+/// dire au client « ce compte ne l'a pas » plutôt que de laisser croire à un armement.
+#[must_use]
+pub fn chercher_privilege(octets: &[u8], low: u32, high: i32) -> EtatPrivilege {
+    if octets.len() < O_PRIVILEGES {
+        return EtatPrivilege::Absent;
+    }
+    let compte = lire_u32(octets, O_PRIVILEGE_COUNT) as usize;
+    let Some(corps) = octets.get(O_PRIVILEGES..) else {
+        return EtatPrivilege::Absent;
+    };
+    corps
+        .chunks_exact(LUID_ATTR_BYTES)
+        .take(compte)
+        .find(|entree| {
+            lire_u32(entree, O_LUID_LOW) == low && lire_u32(entree, O_LUID_HIGH) as i32 == high
+        })
+        .map_or(EtatPrivilege::Absent, |entree| {
+            if lire_u32(entree, O_ATTRIBUTES) & ATTR_ENABLED == ATTR_ENABLED {
+                EtatPrivilege::Actif
+            } else {
+                EtatPrivilege::Desactive
+            }
+        })
+}
+
+/// Ce qu'une tentative d'armement a donné.
+///
+/// Trois issues, parce que trois conduites : changer de compte, signaler une anomalie,
+/// ou poursuivre.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Armement {
+    /// Le privilège est **actif** : l'écriture peut partir.
+    Arme,
+    /// Le privilège n'est pas dans le jeton : ce compte ne l'obtiendra jamais, aucune
+    /// élévation n'y changera rien.
+    Absent,
+    /// Présent, mais l'activation n'a pas pris. Cas rare, à signaler tel quel.
+    NonActivable {
+        /// Le code Win32 constaté : `ERROR_NOT_ALL_ASSIGNED` (1300) quand l'appel a
+        /// « réussi » sans rien armer, celui du refus quand il a échoué franchement.
+        code: u32,
+    },
+}
+
+impl Armement {
+    /// L'écriture peut-elle partir ?
+    #[must_use]
+    pub const fn arme(self) -> bool {
+        matches!(self, Self::Arme)
+    }
+}
+
+impl fmt::Display for Armement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Arme => {
+                f.write_str("SeLoadDriverPrivilege armé (actif dans le jeton de ce processus)")
+            }
+            Self::Absent => f.write_str(
+                "SeLoadDriverPrivilege absent du jeton : ce compte ne le détient pas — il faut \
+                 un compte administrateur, l'élévation seule n'y changera rien",
+            ),
+            Self::NonActivable { code } => write!(
+                f,
+                "SeLoadDriverPrivilege présent dans le jeton mais impossible à activer : \
+                 AdjustTokenPrivileges a rendu {}",
+                OsError::Win32(*code)
+            ),
+        }
+    }
+}
+
+/// Classe ce qu'`AdjustTokenPrivileges` vient de faire, à partir du couple (valeur de
+/// retour, code d'erreur) et de ce que le jeton portait avant l'appel.
+///
+/// # Le piège de cette fonction, et pourquoi il tient dans ce classement
+///
+/// `AdjustTokenPrivileges` **réussit** (`TRUE`) même quand elle n'a activé aucun des
+/// privilèges demandés : le seul signe est `GetLastError() == ERROR_NOT_ALL_ASSIGNED`.
+/// Un client qui ne regarde que la valeur de retour croit avoir armé le privilège et se
+/// fait refuser l'écriture plus loin sans comprendre — c'est exactement le pas de côté
+/// qui a coûté trois contextes d'essai en machine virtuelle.
+///
+/// `present` vient de [`chercher_privilege`], lu **avant** l'appel : c'est lui qui
+/// sépare « ce compte n'a pas le privilège » de « il l'a, et l'activation a quand même
+/// échoué ». Le couple (valeur de retour, code d'erreur) rend le même `TRUE` + 1300
+/// dans les deux cas et ne peut donc pas les distinguer à lui seul.
+///
+/// `code` n'a de sens que si `reussi` : c'est le code que l'appel pose lui-même, à lire
+/// immédiatement après lui.
+#[must_use]
+pub const fn classer_armement(present: bool, reussi: bool, code: u32) -> Armement {
+    // Le seul cas où l'armement a pris : l'appel a réussi **et** n'a pas signalé qu'il
+    // laissait un privilège de côté.
+    if reussi && code != ERROR_NOT_ALL_ASSIGNED {
+        return Armement::Arme;
+    }
+    // Sinon rien n'a été activé, et c'est le jeton — pas le code d'erreur — qui dit
+    // lequel des deux diagnostics s'applique.
+    if present {
+        Armement::NonActivable { code }
+    } else {
+        Armement::Absent
+    }
+}
+
+/// Le jeton du processus courant, fermé à la destruction.
+struct Jeton(HANDLE);
+
+impl Jeton {
+    /// Ouvre le jeton du processus courant avec les accès demandés.
+    fn ouvrir(acces: TOKEN_ACCESS_MASK) -> Result<Self, CableConfigError> {
+        let mut handle = HANDLE::default();
+        // SAFETY: `GetCurrentProcess` rend un pseudo-handle constant, valide sans être
+        // fermé ; `handle` est une variable de cette pile, vivante pendant tout l'appel
+        // et écrite par l'appelé seul.
+        unsafe { OpenProcessToken(GetCurrentProcess(), acces, &mut handle) }.map_err(|e| {
+            CableConfigError::Privilege {
+                appel: "OpenProcessToken",
+                erreur: OsError::from_hresult(e.code().0),
+            }
+        })?;
+        Ok(Self(handle))
+    }
+}
+
+impl Drop for Jeton {
+    fn drop(&mut self) {
+        // SAFETY: handle rendu par `OpenProcessToken`, fermé une seule fois (le type
+        // n'est ni `Copy` ni clonable, et `Drop` ne s'exécute qu'une fois).
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// Le `LUID` de `SeLoadDriverPrivilege` sur cette machine.
+///
+/// Les privilèges bien connus ont partout le même LUID, mais on le demande quand même
+/// au système plutôt que d'écrire 10 : c'est l'appel que la documentation prescrit, et
+/// il ne coûte rien.
+fn luid_load_driver() -> Result<LUID, CableConfigError> {
+    let mut luid = LUID::default();
+    // SAFETY: `SE_LOAD_DRIVER_NAME` est une chaîne large constante terminée par NUL,
+    // publiée par la caisse `windows` ; `PCWSTR::null` est la façon documentée de dire
+    // « la machine locale » ; `luid` est une variable de cette pile, écrite par
+    // l'appelé seul.
+    unsafe { LookupPrivilegeValueW(PCWSTR::null(), SE_LOAD_DRIVER_NAME, &mut luid) }.map_err(
+        |e| CableConfigError::Privilege {
+            appel: "LookupPrivilegeValueW",
+            erreur: OsError::from_hresult(e.code().0),
+        },
+    )?;
+    Ok(luid)
+}
+
+/// Les octets du `TOKEN_PRIVILEGES` d'un jeton, par la paire d'appels documentée
+/// (taille d'abord, contenu ensuite).
+///
+/// Un `Vec<u8>` suffit : [`chercher_privilege`] lit ces octets champ par champ et ne
+/// transtype rien, donc l'alignement du tampon n'entre pas en jeu.
+fn octets_des_privileges(jeton: &Jeton) -> Result<Vec<u8>, CableConfigError> {
+    let mut taille: u32 = 0;
+    // SAFETY: premier appel de la paire : aucun tampon transmis, la seule sortie est
+    // `taille`, une variable de cette pile. L'échec est **attendu**
+    // (`ERROR_INSUFFICIENT_BUFFER`), d'où le résultat retenu pour le seul cas où il
+    // faudrait le rapporter.
+    let premier = unsafe { GetTokenInformation(jeton.0, TokenPrivileges, None, 0, &mut taille) };
+    if taille == 0 {
+        return Err(CableConfigError::Privilege {
+            appel: "GetTokenInformation",
+            erreur: premier
+                .err()
+                .map_or(OsError::Win32(0), |e| OsError::from_hresult(e.code().0)),
+        });
+    }
+    let mut tampon = vec![0u8; taille as usize];
+    let mut rendus: u32 = 0;
+    // SAFETY: `tampon` fait exactement `taille` octets — la taille que l'appel précédent
+    // a demandée — et vit pendant tout l'appel ; la longueur transmise est la sienne,
+    // c'est elle qui borne ce que le système écrit. `rendus` est une variable de cette
+    // pile.
+    unsafe {
+        GetTokenInformation(
+            jeton.0,
+            TokenPrivileges,
+            Some(tampon.as_mut_ptr().cast()),
+            taille,
+            &mut rendus,
+        )
+    }
+    .map_err(|e| CableConfigError::Privilege {
+        appel: "GetTokenInformation",
+        erreur: OsError::from_hresult(e.code().0),
+    })?;
+    tampon.truncate(rendus.min(taille) as usize);
+    Ok(tampon)
+}
+
+/// L'état de `SeLoadDriverPrivilege` dans le jeton du processus courant, **sans rien
+/// modifier**.
+///
+/// C'est le diagnostic à afficher quand une écriture est refusée : il sépare « mauvais
+/// compte » (privilège absent) de « privilège actif et le pilote refuse quand même »,
+/// deux conclusions que le seul code 1314 ne distingue pas.
+///
+/// # Erreurs
+///
+/// [`CableConfigError::Privilege`] si le système refuse d'ouvrir le jeton ou d'en
+/// rendre les privilèges.
+pub fn etat_privilege() -> Result<EtatPrivilege, CableConfigError> {
+    let jeton = Jeton::ouvrir(TOKEN_QUERY)?;
+    let luid = luid_load_driver()?;
+    let octets = octets_des_privileges(&jeton)?;
+    Ok(chercher_privilege(&octets, luid.LowPart, luid.HighPart))
+}
+
+/// `SeLoadDriverPrivilege` tel qu'il était **avant** l'armement : la destruction du
+/// garde restaure cet état.
+///
+/// Le garde tient le jeton ouvert, ce qui est nécessaire pour pouvoir restaurer. Il
+/// doit donc vivre au moins aussi longtemps que les écritures qu'il autorise — et pas
+/// plus : un privilège armé plus longtemps que nécessaire est une surface offerte pour
+/// rien.
+pub struct GardePrivilege {
+    /// Le jeton ouvert en `TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY`.
+    jeton: Jeton,
+    /// L'état précédent, tel qu'`AdjustTokenPrivileges` l'a elle-même écrit.
+    precedent: TOKEN_PRIVILEGES,
+    /// Faux quand il n'y a rien à défaire : jeton déjà armé, ou armement sans effet.
+    a_restaurer: bool,
+}
+
+impl fmt::Debug for GardePrivilege {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GardePrivilege")
+            .field("a_restaurer", &self.a_restaurer)
+            .field("privileges_precedents", &self.precedent.PrivilegeCount)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for GardePrivilege {
+    fn drop(&mut self) {
+        if !self.a_restaurer {
+            return;
+        }
+        // SAFETY: `self.jeton.0` est ouvert avec `TOKEN_ADJUST_PRIVILEGES` et vit encore
+        // (le champ n'est détruit qu'après ce corps) ; `self.precedent` est la structure
+        // qu'`AdjustTokenPrivileges` a elle-même écrite, transmise par adresse et non
+        // relue par nous. `bufferlength` peut valoir zéro puisqu'aucun état précédent
+        // n'est redemandé.
+        let _ = unsafe {
+            AdjustTokenPrivileges(
+                self.jeton.0,
+                false,
+                Some(&raw const self.precedent),
+                0,
+                None,
+                None,
+            )
+        };
+    }
+}
+
+/// Arme `SeLoadDriverPrivilege` dans le jeton du processus courant, et rend le garde
+/// qui restaurera l'état précédent.
+///
+/// Le garde est rendu **dans tous les cas**, y compris quand l'armement n'a pas pris :
+/// il ne restaure alors rien, et l'appelant n'a pas à distinguer deux formes de retour.
+///
+/// # Erreurs
+///
+/// [`CableConfigError::Privilege`] quand un appel du système échoue au point qu'on ne
+/// sache plus rien dire du jeton. Un privilège simplement **absent** n'est pas une
+/// erreur : c'est [`Armement::Absent`], un renseignement.
+pub fn armer_privilege() -> Result<(Armement, GardePrivilege), CableConfigError> {
+    let jeton = Jeton::ouvrir(TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY)?;
+    let luid = luid_load_driver()?;
+    let avant = chercher_privilege(&octets_des_privileges(&jeton)?, luid.LowPart, luid.HighPart);
+
+    let demande = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: luid,
+            Attributes: SE_PRIVILEGE_ENABLED,
+        }],
+    };
+    let mut precedent = TOKEN_PRIVILEGES::default();
+    let mut rendus: u32 = 0;
+    let taille = u32::try_from(size_of::<TOKEN_PRIVILEGES>()).unwrap_or(u32::MAX);
+    // SAFETY: `jeton` est ouvert avec `TOKEN_ADJUST_PRIVILEGES` et vit pendant tout
+    // l'appel ; `demande` et `precedent` sont des structures de cette pile, transmises
+    // par adresse avec la taille de `precedent` — c'est elle qui borne ce que le système
+    // y écrit. `rendus` est une variable de cette pile.
+    let resultat = unsafe {
+        AdjustTokenPrivileges(
+            jeton.0,
+            false,
+            Some(&raw const demande),
+            taille,
+            Some(&raw mut precedent),
+            Some(&mut rendus),
+        )
+    };
+    // **Le code d'erreur se lit ici et pas plus loin** : `AdjustTokenPrivileges` le pose
+    // elle-même (`ERROR_SUCCESS` ou `ERROR_NOT_ALL_ASSIGNED`) alors qu'elle a rendu
+    // `TRUE`, et tout autre appel du système l'écraserait. L'enveloppe de la caisse
+    // `windows` ne le consulte pas sur un `TRUE` : elle rend `Ok(())` sans y toucher.
+    let code = match &resultat {
+        // SAFETY: `GetLastError` ne prend aucun paramètre et lit le code du fil courant.
+        Ok(()) => unsafe { GetLastError() }.0,
+        Err(e) => OsError::from_hresult(e.code().0).win32().unwrap_or(0),
+    };
+    let issue = classer_armement(avant.present(), resultat.is_ok(), code);
+    let garde = GardePrivilege {
+        jeton,
+        precedent,
+        // Rien à défaire si le jeton était **déjà** armé (on n'a rien changé) ni si
+        // l'appel n'a pu écrire aucun état précédent.
+        a_restaurer: issue.arme() && !avant.actif() && precedent.PrivilegeCount != 0,
+    };
+    Ok((issue, garde))
 }
 
 // ---------------------------------------------------------------------------------
@@ -834,9 +1305,15 @@ impl TopologyFilter {
 
     /// Écrit [`KSPROPERTY_CONDUIT_CABLE_STATE`] : connecte ou déconnecte le câble.
     ///
-    /// L'écriture exige un privilège côté pilote
-    /// (`SeSinglePrivilegeCheck(SE_LOAD_DRIVER_PRIVILEGE)`) : un processus non élevé
-    /// reçoit `ERROR_PRIVILEGE_NOT_HELD` **avant** toute validation du contenu.
+    /// **L'appelant doit avoir armé [`armer_privilege`] avant** et en tenir le garde
+    /// pendant l'appel. Le pilote contrôle l'écriture par
+    /// `SeSinglePrivilegeCheck(SE_LOAD_DRIVER_PRIVILEGE)`, qui exige le privilège
+    /// **actif** : un jeton qui le détient sans l'avoir armé reçoit
+    /// `ERROR_PRIVILEGE_NOT_HELD` **avant** toute validation du contenu — c'est vrai
+    /// d'un processus élevé comme de `LocalSystem`. L'armement n'est pas fait ici parce
+    /// que ce type est un **transport** : modifier le jeton du processus est une
+    /// décision qui appartient au programme, pas à un envoi d'IOCTL, et le garde doit
+    /// couvrir toute la série d'écritures plutôt que chacune.
     ///
     /// # Erreurs
     ///
@@ -852,6 +1329,10 @@ impl TopologyFilter {
     /// C'est le point d'entrée de la batterie de [`BadInput`] : le client doit pouvoir
     /// envoyer ce que le contrat refuse, sinon il ne prouve rien de la validation du
     /// pilote. Rend le nombre d'octets que le pilote annonce avoir traités.
+    ///
+    /// Même exigence que [`Self::write_state`] : sans [`armer_privilege`], la batterie
+    /// entière se solde par des `ERROR_PRIVILEGE_NOT_HELD` et n'éprouve **aucune** des
+    /// validations qu'elle vise, le contrôle d'accès passant avant elles.
     ///
     /// # Erreurs
     ///
@@ -1258,6 +1739,234 @@ mod tests {
             "aucune interface KSCATEGORY_TOPOLOGY : machine sans carte son ?"
         );
         assert!(paths.iter().all(|p| reference_string(p).is_some()));
+    }
+
+    /// Un `TOKEN_PRIVILEGES` en octets, tel que `GetTokenInformation` le rend :
+    /// le compte, puis les entrées `(LowPart, HighPart, Attributes)`.
+    fn token_privileges(entrees: &[(u32, i32, u32)]) -> Vec<u8> {
+        let mut out = (entrees.len() as u32).to_ne_bytes().to_vec();
+        for (low, high, attributs) in entrees {
+            out.extend_from_slice(&low.to_ne_bytes());
+            out.extend_from_slice(&high.to_ne_bytes());
+            out.extend_from_slice(&attributs.to_ne_bytes());
+        }
+        out
+    }
+
+    /// Le LUID de `SeLoadDriverPrivilege` : partie basse 10, partie haute nulle.
+    const LOAD_DRIVER: (u32, i32) = (10, 0);
+
+    #[test]
+    fn le_privilege_se_trouve_et_son_activation_se_lit() {
+        let (low, high) = LOAD_DRIVER;
+
+        // Absent du jeton : ce compte ne le détient pas.
+        let sans = token_privileges(&[(19, 0, 2), (23, 0, 3)]);
+        assert_eq!(chercher_privilege(&sans, low, high), EtatPrivilege::Absent);
+
+        // Présent mais désactivé : c'est l'état mesuré dans les trois contextes
+        // essayés, `LocalSystem` compris.
+        let dormant = token_privileges(&[(19, 0, 2), (low, high, 0), (23, 0, 3)]);
+        assert_eq!(
+            chercher_privilege(&dormant, low, high),
+            EtatPrivilege::Desactive
+        );
+
+        // `SE_PRIVILEGE_ENABLED_BY_DEFAULT` (1) **seul** ne veut pas dire actif.
+        let par_defaut = token_privileges(&[(low, high, 1)]);
+        assert_eq!(
+            chercher_privilege(&par_defaut, low, high),
+            EtatPrivilege::Desactive
+        );
+
+        // Armé : le bit 2, seul ou accompagné.
+        for attributs in [ATTR_ENABLED, ATTR_ENABLED | 1, ATTR_ENABLED | 0x8000_0000] {
+            let arme = token_privileges(&[(low, high, attributs)]);
+            assert_eq!(
+                chercher_privilege(&arme, low, high),
+                EtatPrivilege::Actif,
+                "attributs {attributs:#x}"
+            );
+        }
+
+        // La partie haute compte : un LUID voisin n'est pas le nôtre.
+        let voisin = token_privileges(&[(low, 1, ATTR_ENABLED)]);
+        assert_eq!(
+            chercher_privilege(&voisin, low, high),
+            EtatPrivilege::Absent
+        );
+        let partie_haute_negative = token_privileges(&[(low, -1, ATTR_ENABLED)]);
+        assert_eq!(
+            chercher_privilege(&partie_haute_negative, low, -1),
+            EtatPrivilege::Actif
+        );
+
+        // Les états se résument sans ambiguïté.
+        assert!(!EtatPrivilege::Absent.present());
+        assert!(EtatPrivilege::Desactive.present() && !EtatPrivilege::Desactive.actif());
+        assert!(EtatPrivilege::Actif.present() && EtatPrivilege::Actif.actif());
+    }
+
+    /// Un tampon abîmé ne doit ni paniquer ni faire croire à un armement.
+    #[test]
+    fn un_tampon_de_privileges_abime_est_prudent() {
+        let (low, high) = LOAD_DRIVER;
+        let complet = token_privileges(&[(low, high, ATTR_ENABLED)]);
+
+        for taille in 0..complet.len() {
+            assert_eq!(
+                chercher_privilege(&complet[..taille], low, high),
+                EtatPrivilege::Absent,
+                "tampon de {taille} octets"
+            );
+        }
+        // Un compte plus grand que le tampon : `chunks_exact` s'arrête au dernier
+        // groupe complet, rien n'est lu au-delà.
+        let mut menteur = complet.clone();
+        menteur[0..4].copy_from_slice(&99u32.to_ne_bytes());
+        assert_eq!(
+            chercher_privilege(&menteur, low, high),
+            EtatPrivilege::Actif
+        );
+        // Un compte nul : les entrées présentes sont ignorées.
+        let mut muet = complet.clone();
+        muet[0..4].copy_from_slice(&0u32.to_ne_bytes());
+        assert_eq!(chercher_privilege(&muet, low, high), EtatPrivilege::Absent);
+        // Une entrée tronquée à la fin n'est pas lue à moitié.
+        let tronque = &complet[..complet.len() - 1];
+        assert_eq!(
+            chercher_privilege(tronque, low, high),
+            EtatPrivilege::Absent
+        );
+        assert_eq!(chercher_privilege(&[], low, high), EtatPrivilege::Absent);
+    }
+
+    /// **Le piège d'`AdjustTokenPrivileges`** : `TRUE` ne veut pas dire armé.
+    #[test]
+    fn le_succes_d_adjust_token_privileges_ne_suffit_pas() {
+        // Réussi et silencieux : armé, le seul cas où l'écriture peut partir.
+        assert_eq!(classer_armement(true, true, 0), Armement::Arme);
+        // Réussi (`TRUE`) mais 1300 : rien n'a été armé, malgré la valeur de retour.
+        // C'est ici que se joue tout l'intérêt de lire `GetLastError`.
+        assert_eq!(
+            classer_armement(true, true, ERROR_NOT_ALL_ASSIGNED),
+            Armement::NonActivable {
+                code: ERROR_NOT_ALL_ASSIGNED
+            }
+        );
+        // Même couple, jeton sans le privilège : ce n'est pas le même diagnostic.
+        assert_eq!(
+            classer_armement(false, true, ERROR_NOT_ALL_ASSIGNED),
+            Armement::Absent
+        );
+        // L'appel a franchement échoué : le jeton tranche encore.
+        assert_eq!(
+            classer_armement(true, false, 5),
+            Armement::NonActivable { code: 5 }
+        );
+        assert_eq!(classer_armement(false, false, 5), Armement::Absent);
+        // Un code d'erreur résiduel d'un appel précédent ne doit pas faire croire à un
+        // échec quand la fonction a réussi sans rien laisser de côté.
+        assert_eq!(classer_armement(true, true, 87), Armement::Arme);
+
+        assert!(Armement::Arme.arme());
+        assert!(!Armement::Absent.arme());
+        assert!(!Armement::NonActivable { code: 1300 }.arme());
+    }
+
+    /// Les trois messages doivent être distinguables par l'utilisateur : c'est ce qui
+    /// sépare « mauvais compte » de « bogue du pilote ».
+    #[test]
+    fn les_trois_issues_se_lisent_differemment() {
+        let arme = Armement::Arme.to_string();
+        assert!(arme.contains("armé"), "{arme}");
+
+        let absent = Armement::Absent.to_string();
+        assert!(absent.contains("absent du jeton"), "{absent}");
+        assert!(absent.contains("administrateur"), "{absent}");
+
+        let rate = Armement::NonActivable {
+            code: ERROR_NOT_ALL_ASSIGNED,
+        }
+        .to_string();
+        assert!(rate.contains("impossible à activer"), "{rate}");
+        assert!(rate.contains("ERROR_NOT_ALL_ASSIGNED"), "{rate}");
+        assert!(rate.contains("1300"), "{rate}");
+
+        // Les trois sont deux à deux différents.
+        assert_ne!(arme, absent);
+        assert_ne!(absent, rate);
+        assert_ne!(arme, rate);
+
+        // Et les états du jeton aussi.
+        let etats: Vec<String> = [
+            EtatPrivilege::Absent,
+            EtatPrivilege::Desactive,
+            EtatPrivilege::Actif,
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert_eq!(etats.len(), 3);
+        for (rang, texte) in etats.iter().enumerate() {
+            assert!(!texte.is_empty());
+            assert!(
+                !etats.iter().skip(rang + 1).any(|autre| autre == texte),
+                "{texte} apparaît deux fois"
+            );
+        }
+    }
+
+    /// L'erreur d'un appel de privilège nomme l'appel fautif et le code brut.
+    #[test]
+    fn l_erreur_de_privilege_nomme_l_appel() {
+        let erreur = CableConfigError::Privilege {
+            appel: "OpenProcessToken",
+            erreur: OsError::Win32(5),
+        };
+        let texte = erreur.to_string();
+        assert!(texte.contains("OpenProcessToken"), "{texte}");
+        assert!(texte.contains("ERROR_ACCESS_DENIED"), "{texte}");
+        assert!(texte.contains("SeLoadDriverPrivilege"), "{texte}");
+    }
+
+    /// Vérification du **branchement** de la lecture du jeton, à lancer à la main.
+    ///
+    /// `#[ignore]` parce qu'elle interroge le jeton du processus courant : elle ne le
+    /// modifie pas, mais son résultat dépend du compte qui lance la suite, ce qui n'a
+    /// pas sa place dans une suite déterministe. Aucun flux audio, aucun son.
+    #[test]
+    #[ignore = "interroge le jeton du processus courant"]
+    fn l_etat_du_privilege_se_lit_sur_cette_machine() {
+        let etat = etat_privilege().expect("lecture du jeton du processus");
+        std::println!("SeLoadDriverPrivilege : {etat}");
+        assert!(matches!(
+            etat,
+            EtatPrivilege::Absent | EtatPrivilege::Desactive | EtatPrivilege::Actif
+        ));
+    }
+
+    /// Vérification du **branchement** de l'armement, à lancer à la main.
+    ///
+    /// `#[ignore]` parce qu'elle **modifie** le jeton du processus courant — le garde le
+    /// restaure aussitôt, ce que le test vérifie. Aucun flux audio, aucun son, et aucune
+    /// écriture sur le pilote : seul le jeton de ce processus est touché.
+    #[test]
+    #[ignore = "modifie puis restaure le jeton du processus courant"]
+    fn l_armement_se_restaure() {
+        let avant = etat_privilege().expect("lecture du jeton du processus");
+        {
+            let (issue, garde) = armer_privilege().expect("armement");
+            std::println!("avant : {avant} / issue : {issue} / {garde:?}");
+            // Sur un compte qui le détient, l'armement doit prendre ; sur un compte qui
+            // ne l'a pas, l'issue doit le dire — mais jamais « armé » à tort.
+            assert_eq!(issue.arme(), etat_privilege().expect("relecture").actif());
+        }
+        assert_eq!(
+            etat_privilege().expect("relecture après restauration"),
+            avant,
+            "le garde n'a pas restauré l'état précédent du jeton"
+        );
     }
 
     #[test]

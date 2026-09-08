@@ -81,21 +81,30 @@
 //! n'apprend donc rien du format en le faisant varier. C'est aussi l'ordre le moins
 //! surprenant — on refuse l'accès avant de commenter la demande.
 //!
-//! **Réserve écrite, faute d'avoir pu l'établir.** `SeSinglePrivilegeCheck` n'a de sens que
-//! si le gestionnaire de propriété s'exécute dans le contexte du **fil appelant** : sur un
-//! fil système, `ExGetPreviousMode()` rendrait `KernelMode`, la routine rendrait vrai
+//! **La réserve est levée : c'est mesuré.** `SeSinglePrivilegeCheck` n'a de sens que si le
+//! gestionnaire de propriété s'exécute dans le contexte du **fil appelant** : sur un fil
+//! système, `ExGetPreviousMode()` rendrait `KernelMode`, la routine rendrait vrai
 //! inconditionnellement, et le contrôle serait pire qu'absent — il donnerait l'illusion
-//! d'une protection. Or **la documentation Microsoft ne dit rien du contexte de fil des
-//! gestionnaires PortCls** : `portcls.h` n'en parle pas, la page `PCPROPERTY_ITEM` a un
+//! d'une protection. **La documentation Microsoft ne dit toujours rien du contexte de fil
+//! des gestionnaires PortCls** : `portcls.h` n'en parle pas, la page `PCPROPERTY_ITEM` a un
 //! champ IRQL vide, et il n'existe pas de page dédiée à `PCPFNPROPERTY_HANDLER`. Le
-//! raisonnement qui rend le contrôle crédible — un `IOCTL_KS_PROPERTY` est une
+//! raisonnement qui rendait le contrôle crédible — un `IOCTL_KS_PROPERTY` est une
 //! `IRP_MJ_DEVICE_CONTROL` traitée en ligne par la routine de répartition, donc dans le fil
-//! qui a appelé `DeviceIoControl` — est solide mais **non documenté**, et rien n'interdit à
-//! PortCls de différer une requête. Le contrôle reste donc en place, et la vérification en
-//! machine virtuelle reste **à faire** : un `SET` depuis un processus non élevé doit rendre
-//! `STATUS_PRIVILEGE_NOT_HELD`. Si ce n'était pas le cas, il faudrait passer par
-//! `PCPROPERTY_REQUEST::Irp` (`RequestorMode`, `Tail.Overlay.Thread`) plutôt que par le fil
-//! courant.
+//! qui a appelé `DeviceIoControl` — reste non documenté, mais il n'est plus une supposition :
+//! en machine virtuelle, un `SET` depuis l'espace utilisateur rend bien
+//! `STATUS_PRIVILEGE_NOT_HELD` (`ERROR_PRIVILEGE_NOT_HELD`, 1314 côté client), dans trois
+//! contextes dont `LocalSystem` par tâche planifiée. Le gestionnaire ne s'est donc **pas**
+//! exécuté avec `ExGetPreviousMode() == KernelMode`, ni contre le jeton d'un fil système
+//! privilégié : il a évalué le jeton de l'appelant, en mode utilisateur.
+//!
+//! Ce que la mesure prouve, **exactement** : le **refus** a lieu dans le contexte de
+//! l'appelant. C'est le sens qui compte pour la sécurité — la panne redoutée était un
+//! contrôle qui laisse tout passer, et elle est écartée. La réciproque, qu'un appelant
+//! réellement privilégié soit accepté, se mesure séparément : elle demande un client qui
+//! **arme** `SeLoadDriverPrivilege` avant d'écrire, les jetons Windows livrant leurs
+//! privilèges présents mais désactivés (`conduit_backend_wasapi::cable::armer_privilege`,
+//! `conduit-looptest --cable-privilege`). Le repli par `PCPROPERTY_REQUEST::Irp`
+//! (`RequestorMode`, `Tail.Overlay.Thread`) n'a plus lieu d'être.
 //!
 //! # Ce que ce module ne fait pas
 //!
@@ -205,7 +214,8 @@ const _: () = assert!(O_RESERVED + 4 == CABLE_STATE_BYTES);
 /// en une minute, au premier essai en machine, ce qui n'est pour l'instant qu'un
 /// raisonnement. Deux choses en particulier — le contenu réel d'`Instance` (voir l'en-tête
 /// de module) et le verdict du contrôle de privilège, dont le contexte de fil n'est pas
-/// documenté.
+/// documenté. C'est cette trace qui a servi à établir le refus mesuré en machine virtuelle ;
+/// il reste à lui faire montrer l'**acceptation** d'un appelant qui a armé son privilège.
 #[derive(Debug)]
 pub struct ConfigTrace<'a> {
     /// La propriété : `"état"` ou `"version"`.

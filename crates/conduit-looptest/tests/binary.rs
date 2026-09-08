@@ -151,6 +151,31 @@ fn l_etat_des_cables_se_lit_sans_rien_changer() {
     }
 }
 
+/// `--cable-privilege` ne **lit** que le jeton du processus qu'il lance : il n'arme
+/// rien, n'écrit rien, et ne demande ni le pilote ni un câble. Il répond donc sur
+/// n'importe quelle machine, et c'est justement là son intérêt — séparer d'un seul
+/// appel « le compte n'a pas le privilège » de « le pilote refuse quand même ».
+#[test]
+fn l_etat_du_privilege_se_lit_sans_rien_armer() {
+    let (code, out, err) = run(&["--cable-privilege"]);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("SeLoadDriverPrivilege"), "{out}");
+    // L'un des trois états, et l'explication qui va avec — jamais un état muet.
+    let etats = [
+        "absent du jeton",
+        "présent mais désactivé",
+        "présent et actif",
+    ];
+    assert!(
+        etats.iter().any(|etat| out.contains(etat)) || out.contains("INCONNU"),
+        "{out}"
+    );
+    // Le conseil que la mesure a démenti ne doit plus jamais sortir.
+    assert!(!out.contains("processus élevé"), "{out}");
+    // Aucun câble n'est nécessaire : l'option se suffit à elle-même.
+    assert!(!out.contains("--cable N"), "{out}");
+}
+
 #[test]
 fn echo_et_capture_se_contredisent() {
     let (code, _, err) = run(&["--loopback", "--capture", "Conduit 1"]);
