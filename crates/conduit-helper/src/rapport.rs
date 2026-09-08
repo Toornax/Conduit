@@ -16,7 +16,7 @@ use crate::protocole::{Reponse, Requete, Statut};
 /// lorsqu'on en connaît au moins un : une liste vide de seize lignes « absent » serait
 /// du bruit devant le vrai message, « le pilote n'est pas là ».
 #[must_use]
-pub fn rendre(requete: Requete, reponse: &Reponse) -> String {
+pub fn rendre(requete: &Requete, reponse: &Reponse) -> String {
     let mut texte = String::new();
     let ordre = requete.label();
     if reponse.statut.succes() {
@@ -100,10 +100,19 @@ pub fn precision(reponse: &Reponse) -> Option<String> {
         Statut::Succes if reponse.canaux != 0 => {
             Some(format!("canaux du câble visé : {}", reponse.canaux))
         }
+        // M1b-21. Le message du statut dit déjà quoi faire (« activez le câble, puis
+        // renommez ») ; `detail` n'y ajoute que le nombre de côtés trouvés, qui distingue
+        // « rien de publié » de « un endpoint publié à moitié ».
+        Statut::EndpointAbsent => Some(format!(
+            "{} côté(s) de ce câble trouvé(s) sur 2 dans le registre",
+            reponse.detail
+        )),
         Statut::Succes
         | Statut::TrameInvalide
         | Statut::OrdreInconnu
         | Statut::CableInconnu
+        // Le message du statut porte déjà la règle du nom en entier.
+        | Statut::NomInvalide
         | Statut::CanauxInvalides => None,
     }
 }
@@ -129,7 +138,7 @@ mod tests {
     /// La liste nomme chaque câble présent, avec son état, et rien d'autre.
     #[test]
     fn la_liste_nomme_les_cables_presents() {
-        let texte = rendre(Requete::Lister, &peuplee());
+        let texte = rendre(&Requete::Lister, &peuplee());
         assert!(texte.contains("lister : succès"), "{texte}");
         assert!(texte.contains("Conduit 1 : connecté"), "{texte}");
         assert!(texte.contains("Conduit 2 : connecté"), "{texte}");
@@ -154,7 +163,7 @@ mod tests {
             version_ks: 0,
             ..peuplee()
         };
-        let texte = rendre(Requete::Lister, &vide);
+        let texte = rendre(&Requete::Lister, &vide);
         assert!(texte.contains("le pilote n'est pas chargé"), "{texte}");
         // Aucune ligne de câble : la phrase ci-dessus est le message, pas un en-tête de
         // liste vide.
@@ -164,7 +173,7 @@ mod tests {
         // Un refus « pilote absent » a sa propre précision, qui renvoie à la
         // documentation.
         let refus = Reponse::refus(crate::protocole::ORDRE_ACTIVER, Statut::PiloteAbsent);
-        let texte = rendre(Requete::Activer(CableId(1)), &refus);
+        let texte = rendre(&Requete::Activer(CableId(1)), &refus);
         assert!(texte.contains("activer :"), "{texte}");
         assert!(texte.contains("driver-dev.md"), "{texte}");
     }
@@ -213,20 +222,25 @@ mod tests {
             detail: u32::from(crate::protocole::PROTOCOLE_VERSION),
             ..peuplee()
         };
-        let texte = rendre(Requete::Version, &reponse);
+        let texte = rendre(&Requete::Version, &reponse);
+        // La version affichée est celle du protocole, pas un chiffre recopié : le test
+        // suit `PROTOCOLE_VERSION` quand elle bouge (2 depuis M1b-21).
         assert!(
-            texte.contains("protocole du service : version 1"),
+            texte.contains(&format!(
+                "protocole du service : version {}",
+                crate::protocole::PROTOCOLE_VERSION
+            )),
             "{texte}"
         );
 
         // Le même champ sur un autre ordre ne s'affiche pas comme une version.
-        let texte = rendre(Requete::Lister, &reponse);
+        let texte = rendre(&Requete::Lister, &reponse);
         assert!(!texte.contains("protocole du service"), "{texte}");
 
         // Ni sur un refus de `version`.
         let refus =
             Reponse::refus_detaille(crate::protocole::ORDRE_VERSION, Statut::ErreurSysteme, 1314);
-        let texte = rendre(Requete::Version, &refus);
+        let texte = rendre(&Requete::Version, &refus);
         assert!(!texte.contains("protocole du service"), "{texte}");
         assert!(texte.contains("1314"), "{texte}");
     }
@@ -241,7 +255,7 @@ mod tests {
                 Statut::ErreurSysteme,
                 code,
             );
-            let texte = rendre(Requete::Activer(CableId(1)), &reponse);
+            let texte = rendre(&Requete::Activer(CableId(1)), &reponse);
             assert!(texte.contains(&code.to_string()), "code {code} : {texte}");
         }
     }

@@ -9,10 +9,10 @@
 //!
 //! `conduit-protocol` est le protocole **utilisateur**, entre le démon et `conduitctl` :
 //! MessagePack, extensible, avec négociation de capacités. Celui-ci est autre chose —
-//! cinq ordres, deux structures de taille fixe, aucune extensibilité, et un serveur
-//! qui tourne en `LocalSystem`. Les mélanger ferait entrer un décodeur générique dans le
-//! processus le plus privilégié du produit ; on écrit donc le strict nécessaire, et on
-//! le refuse dès qu'il n'a pas exactement la forme attendue.
+//! sept ordres, deux structures presque toujours de taille fixe, aucune extensibilité,
+//! et un serveur qui tourne en `LocalSystem`. Les mélanger ferait entrer un décodeur
+//! générique dans le processus le plus privilégié du produit ; on écrit donc le strict
+//! nécessaire, et on le refuse dès qu'il n'a pas exactement la forme attendue.
 //!
 //! # Boutisme : petit-boutiste, et c'est un choix
 //!
@@ -35,7 +35,38 @@
 //! ([`ErreurRequete::ChampParasite`]). Un `Lister` qui porterait un numéro de câble est
 //! un client qui s'est trompé d'ordre ou un octet retourné en transit ; le laisser passer
 //! reviendrait à servir une requête qu'on n'a pas comprise.
+//!
+//! # L'exception : `renommer` porte une chaîne, et c'est la seule (M1b-21)
+//!
+//! [`Requete::Renommer`] est le **premier** ordre de ce protocole à porter une charge de
+//! longueur variable. La règle ne s'assouplit pas pour autant, elle se précise :
+//!
+//! - la longueur exigée devient *par ordre* — [`TAILLE_REQUETE`] pile pour les six
+//!   autres, `TAILLE_REQUETE + n` pour `renommer`, `n` dans `1..=`[`MAX_NOM_OCTETS`] ;
+//! - `n` est un **nombre d'octets**, borné par la borne du dépôt
+//!   ([`conduit_backend::cable::MAX_CABLE_NAME_LEN`] caractères, donc quatre fois plus
+//!   d'octets au pire en UTF-8) ; la longueur annoncée est confrontée à
+//!   [`MAX_TRAME_OCTETS`] **avant** toute allocation, comme avant ;
+//! - les octets du nom doivent être de l'UTF-8 valide, sans quoi la trame est refusée —
+//!   on ne remplace jamais un octet douteux par `U+FFFD`, ce qui reviendrait à écrire
+//!   dans le registre un nom que le client n'a pas demandé ;
+//! - les octets **en trop après un nom valide** n'existent pas : tout ce qui suit
+//!   l'en-tête *est* le nom, et sa longueur est celle de la trame. Un client qui ajoute
+//!   un `\0` de fin voit donc ce `\0` refusé par [`valider_nom`], caractère de contrôle.
+//!
+//! Les **règles** du nom (longueur en caractères, caractères de contrôle, `/\:*?"<>|`)
+//! ne sont pas réécrites ici : c'est [`conduit_backend::cable::validate_cable_name`] qui
+//! tranche, le même juge que `conduitctl` et que `CableSpec`. Ce module ne fait
+//! qu'appliquer les bornes du **format**.
+//!
+//! # Ce module alloue, désormais, et exactement une fois
+//!
+//! Un nom est possédé ([`Requete::Renommer::nom`]) : analyser une trame `renommer`
+//! alloue une `String` d'au plus [`MAX_NOM_OCTETS`] octets, après que la borne a été
+//! vérifiée. C'est la seule allocation d'analyse du module, et [`Requete`] n'est donc
+//! plus `Copy`.
 
+use conduit_backend::cable::{validate_cable_name, MAX_CABLE_NAME_LEN};
 use conduit_backend::CableId;
 use conduit_kmd_core::config::CABLE_MAX;
 use conduit_kmd_core::params::{DEFAULT_CHANNELS, MAX_CHANNELS, MIN_CHANNELS};
@@ -52,13 +83,42 @@ use core::fmt;
 /// toucher au pilote, et l'inverse. Un client d'une autre version reçoit
 /// [`Statut::VersionInconnue`] et la version servie dans [`Reponse::detail`] — un refus
 /// qui **dit quoi faire**, là où une trame mal comprise donnerait un octet aberrant.
-pub const PROTOCOLE_VERSION: u8 = 1;
+///
+/// # Pourquoi 2
+///
+/// La version 1 servait cinq ordres et n'acceptait qu'une requête de huit octets.
+/// **M1b-21** en ajoute deux ([`ORDRE_RENOMMER`], [`ORDRE_NOM_DEFAUT`]) et ouvre la
+/// requête à une charge de longueur variable : les deux changements sont observables par
+/// un client, et l'en-tête de module de la version 1 disait déjà « cinq ordres, et jamais
+/// un sixième sans changer `PROTOCOLE_VERSION` ».
+///
+/// Le service et le démon sont livrés ensemble et se déplacent ensemble : un démon v1
+/// devant un service v2 reçoit [`Statut::VersionInconnue`] et un message qui dit de les
+/// réinstaller tous les deux, ce qui vaut mieux qu'un `renommer` compris de travers.
+pub const PROTOCOLE_VERSION: u8 = 2;
 
 /// Taille de l'en-tête de trame : un `u32` petit-boutiste, la longueur de la charge.
 pub const EN_TETE_OCTETS: usize = 4;
 
-/// Taille d'une requête : **8 octets**, toujours.
+/// Taille de l'**en-tête** d'une requête : 8 octets, et la requête entière pour les six
+/// ordres qui ne portent pas de nom.
+///
+/// Seul [`Requete::Renommer`] fait suivre ces huit octets d'une charge : voir
+/// [`MAX_NOM_OCTETS`] et [`TAILLE_REQUETE_MAX`].
 pub const TAILLE_REQUETE: usize = 8;
+
+/// Longueur maximale, en **octets**, du nom que porte [`Requete::Renommer`].
+///
+/// Le domaine vient de [`conduit_backend::cable::MAX_CABLE_NAME_LEN`], qui compte des
+/// **caractères** ; un point de code UTF-8 en coûte jusqu'à quatre, d'où le facteur. La
+/// borne du format est donc légèrement plus large que la règle du nom, et c'est voulu :
+/// un nom de 64 caractères accentués doit passer le cadrage pour que
+/// [`validate_cable_name`] puisse le juger sur ses mérites, plutôt que d'être refusé
+/// pour une raison — sa taille en octets — que l'utilisateur ne peut pas voir.
+pub const MAX_NOM_OCTETS: usize = MAX_CABLE_NAME_LEN * 4;
+
+/// Taille de la plus longue requête : l'en-tête plus le plus long nom.
+pub const TAILLE_REQUETE_MAX: usize = TAILLE_REQUETE + MAX_NOM_OCTETS;
 
 /// Taille d'une réponse : **28 octets**, toujours.
 ///
@@ -66,18 +126,20 @@ pub const TAILLE_REQUETE: usize = 8;
 /// serveur n'a jamais à décider d'une longueur à partir de ce qu'il a reçu.
 pub const TAILLE_REPONSE: usize = 28;
 
-/// Charge utile maximale acceptée avant toute allocation : **64 octets**.
+/// Charge utile maximale acceptée avant toute allocation : la plus longue requête.
 ///
-/// Généreuse par rapport aux 8 et 28 octets réellement utilisés — de quoi absorber une
-/// v2 un peu plus large sans rouvrir ce fichier — et assez petite pour qu'un client
-/// hostile ne puisse rien faire réserver au service. La longueur annoncée est confrontée
-/// à cette borne **avant** que le moindre tampon ne soit alloué
+/// **Calculée, pas choisie** : c'est exactement [`TAILLE_REQUETE_MAX`], donc la borne
+/// suit `MAX_CABLE_NAME_LEN` si celle-ci bouge, et un client hostile ne peut faire
+/// réserver au service `LocalSystem` que quelques centaines d'octets. La longueur
+/// annoncée est confrontée à cette borne **avant** que le moindre tampon ne soit alloué
 /// ([`longueur_annoncee`]).
-pub const MAX_TRAME_OCTETS: usize = 64;
+pub const MAX_TRAME_OCTETS: usize = TAILLE_REQUETE_MAX;
 
 // Les deux structures tiennent dans la borne, avec de la marge.
 const _: () = assert!(TAILLE_REQUETE <= MAX_TRAME_OCTETS);
 const _: () = assert!(TAILLE_REPONSE <= MAX_TRAME_OCTETS);
+// La borne du format laisse passer le plus long nom que la règle du dépôt accepte.
+const _: () = assert!(MAX_NOM_OCTETS >= MAX_CABLE_NAME_LEN);
 
 /// Nom du canal nommé du service.
 ///
@@ -100,13 +162,23 @@ pub const ORDRE_ACTIVER: u8 = 2;
 pub const ORDRE_DESACTIVER: u8 = 3;
 /// Code de l'ordre `canaux`.
 pub const ORDRE_CANAUX: u8 = 4;
+/// Code de l'ordre `renommer` (M1b-21).
+pub const ORDRE_RENOMMER: u8 = 5;
+/// Code de l'ordre `nom-defaut` (M1b-21) : efface le nom personnalisé.
+pub const ORDRE_NOM_DEFAUT: u8 = 6;
+
+/// Le plus grand code d'ordre servi, pour les messages de refus.
+pub const ORDRE_MAX: u8 = ORDRE_NOM_DEFAUT;
 
 /// Une requête du démon au service : l'interface **fixe** du canal nommé.
 ///
-/// Cinq ordres, et jamais un sixième sans changer [`PROTOCOLE_VERSION`]. Deux ne
-/// modifient rien ([`Self::Version`], [`Self::Lister`]) ; les trois autres écrivent dans
-/// le pilote et sont donc journalisés avec l'identité de l'appelant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Sept ordres, et jamais un huitième sans changer [`PROTOCOLE_VERSION`]. Deux ne
+/// modifient rien ([`Self::Version`], [`Self::Lister`]) ; les cinq autres écrivent — dans
+/// le pilote pour trois d'entre eux, dans le registre pour les deux de M1b-21 — et sont
+/// donc journalisés avec l'identité de l'appelant.
+///
+/// **Non `Copy`** : [`Self::Renommer`] possède son nom. Voir l'en-tête de module.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Requete {
     /// La version de ce protocole et celle du contrat KS servi par le pilote.
     ///
@@ -129,6 +201,25 @@ pub enum Requete {
         /// Le nombre de canaux voulu, dans `MIN_CHANNELS..=MAX_CHANNELS`.
         canaux: u32,
     },
+    /// Donne au câble le nom `nom` dans les réglages Son (M1b-21).
+    ///
+    /// **N'atteint pas le pilote** : le nom d'un endpoint audio vit dans le registre, et
+    /// c'est le service qui l'y écrit parce que la clé est sous `HKLM`. Voir
+    /// [`crate::registre`].
+    Renommer {
+        /// Le câble visé.
+        cable: CableId,
+        /// Le nom voulu, déjà validé par
+        /// [`conduit_backend::cable::validate_cable_name`].
+        nom: String,
+    },
+    /// Rend au câble son nom d'origine, `Conduit N`, en **effaçant** le nom personnalisé
+    /// (M1b-21, F-52).
+    ///
+    /// C'est le pendant obligatoire de [`Self::Renommer`] : les clés MMDevices ne sont
+    /// pas des `HKR` du périphérique et survivent au retrait du pilote, donc Conduit doit
+    /// savoir défaire ce qu'il a écrit.
+    NomDefaut(CableId),
 }
 
 impl Requete {
@@ -141,6 +232,8 @@ impl Requete {
             Self::Activer(_) => ORDRE_ACTIVER,
             Self::Desactiver(_) => ORDRE_DESACTIVER,
             Self::Canaux { .. } => ORDRE_CANAUX,
+            Self::Renommer { .. } => ORDRE_RENOMMER,
+            Self::NomDefaut(_) => ORDRE_NOM_DEFAUT,
         }
     }
 
@@ -153,19 +246,45 @@ impl Requete {
             Self::Activer(_) => "activer",
             Self::Desactiver(_) => "désactiver",
             Self::Canaux { .. } => "canaux",
+            Self::Renommer { .. } => "renommer",
+            Self::NomDefaut(_) => "nom par défaut",
         }
     }
 
     /// Cette requête **modifie-t-elle** l'état de la machine ?
     ///
-    /// C'est ce prédicat qui décide de deux choses : armer ou non
-    /// `SeLoadDriverPrivilege` (un privilège armé pour une lecture est une surface
-    /// offerte pour rien), et journaliser ou non l'identité de l'appelant.
+    /// C'est ce prédicat qui décide de journaliser ou non l'identité de l'appelant : un
+    /// ordre qui change ce que l'utilisateur voit doit laisser une trace nominative, une
+    /// lecture non.
+    ///
+    /// Il ne décide **pas** de l'armement de `SeLoadDriverPrivilege` : celui-ci est armé
+    /// par `crate::cables::ecrire`, sur le seul chemin qui parle au pilote, et pour la
+    /// durée de cette écriture-là. Les deux ordres de M1b-21 modifient bel et bien la
+    /// machine sans jamais toucher au pilote — ils écrivent dans `HKLM`, ce que
+    /// `LocalSystem` fait de plein droit ([`Self::touche_le_pilote`]).
     #[must_use]
     pub const fn modifie(&self) -> bool {
         match self {
             Self::Version | Self::Lister => false,
+            Self::Activer(_)
+            | Self::Desactiver(_)
+            | Self::Canaux { .. }
+            | Self::Renommer { .. }
+            | Self::NomDefaut(_) => true,
+        }
+    }
+
+    /// Cet ordre passe-t-il par le jeu de propriétés KS du pilote ?
+    ///
+    /// Sépare les deux natures d'écriture du service : celles qui exigent
+    /// `SeLoadDriverPrivilege` armé (le pilote), et celles qui n'exigent que d'être
+    /// `LocalSystem` (le registre `HKLM`, M1b-21). Un privilège armé pour une écriture
+    /// de registre serait une surface offerte pour rien.
+    #[must_use]
+    pub const fn touche_le_pilote(&self) -> bool {
+        match self {
             Self::Activer(_) | Self::Desactiver(_) | Self::Canaux { .. } => true,
+            Self::Version | Self::Lister | Self::Renommer { .. } | Self::NomDefaut(_) => false,
         }
     }
 
@@ -174,18 +293,41 @@ impl Requete {
     pub const fn cable(&self) -> Option<CableId> {
         match self {
             Self::Version | Self::Lister => None,
-            Self::Activer(cable) | Self::Desactiver(cable) => Some(*cable),
-            Self::Canaux { cable, .. } => Some(*cable),
+            Self::Activer(cable) | Self::Desactiver(cable) | Self::NomDefaut(cable) => Some(*cable),
+            Self::Canaux { cable, .. } | Self::Renommer { cable, .. } => Some(*cable),
         }
     }
 
-    /// Sérialise la requête en [`TAILLE_REQUETE`] octets.
+    /// Le nom que porte cet ordre, s'il en porte un.
     #[must_use]
-    pub const fn to_bytes(&self) -> [u8; TAILLE_REQUETE] {
+    pub fn nom(&self) -> Option<&str> {
+        match self {
+            Self::Renommer { nom, .. } => Some(nom),
+            _ => None,
+        }
+    }
+
+    /// Sérialise la requête : [`TAILLE_REQUETE`] octets, suivis du nom pour
+    /// [`Self::Renommer`].
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(TAILLE_REQUETE + self.nom().map_or(0, str::len));
+        out.extend_from_slice(&self.en_tete());
+        if let Some(nom) = self.nom() {
+            out.extend_from_slice(nom.as_bytes());
+        }
+        out
+    }
+
+    /// L'en-tête de [`TAILLE_REQUETE`] octets, commun aux sept ordres.
+    #[must_use]
+    pub const fn en_tete(&self) -> [u8; TAILLE_REQUETE] {
         let (cable, canaux) = match self {
             Self::Version | Self::Lister => (0_u16, 0_u16),
-            Self::Activer(c) | Self::Desactiver(c) => (c.0 as u16, 0),
+            Self::Activer(c) | Self::Desactiver(c) | Self::NomDefaut(c) => (c.0 as u16, 0),
             Self::Canaux { cable, canaux } => (cable.0 as u16, *canaux as u16),
+            // Le nom ne voyage pas dans l'en-tête : sa longueur est celle de la trame.
+            Self::Renommer { cable, .. } => (cable.0 as u16, 0),
         };
         let cable = cable.to_le_bytes();
         let canaux = canaux.to_le_bytes();
@@ -210,18 +352,28 @@ impl Requete {
     /// **Le** parseur des requêtes : des octets hostiles vers un ordre valide, ou une
     /// cause de refus.
     ///
-    /// L'ordre des contrôles est celui des champs — longueur, version, ordre, puis les
-    /// champs de cet ordre — pour que la cause nommée soit la **première** anomalie et
+    /// L'ordre des contrôles est celui des champs — l'en-tête doit d'abord être là,
+    /// puis la version, le champ réservé, l'ordre, et enfin la longueur et les champs
+    /// **que cet ordre exige** — pour que la cause nommée soit la première anomalie et
     /// non une arbitraire.
+    ///
+    /// La longueur est vérifiée en deux temps depuis M1b-21 : le minimum
+    /// ([`TAILLE_REQUETE`]) avant de lire quoi que ce soit, puis la longueur exacte de
+    /// l'ordre reconnu. Les six ordres sans nom exigent toujours [`TAILLE_REQUETE`]
+    /// pile ; `renommer` exige l'en-tête plus 1 à [`MAX_NOM_OCTETS`] octets d'UTF-8
+    /// valide.
     ///
     /// # Erreurs
     ///
     /// [`ErreurRequete`], dont chaque variante porte ce qui a été trouvé.
     pub fn from_bytes(octets: &[u8]) -> Result<Self, ErreurRequete> {
-        let brut: [u8; TAILLE_REQUETE] =
-            octets.try_into().map_err(|_| ErreurRequete::Longueur {
+        let Some(tete) = octets.get(..TAILLE_REQUETE) else {
+            return Err(ErreurRequete::Longueur {
                 recus: octets.len(),
-            })?;
+            });
+        };
+        let brut: [u8; TAILLE_REQUETE] = tete.try_into().unwrap_or([0; TAILLE_REQUETE]);
+        let suite = octets.get(TAILLE_REQUETE..).unwrap_or(&[]);
         let version = brut[0];
         if version != PROTOCOLE_VERSION {
             return Err(ErreurRequete::Version { trouvee: version });
@@ -232,6 +384,28 @@ impl Requete {
         let reserve = u16::from_le_bytes([brut[6], brut[7]]);
         if reserve != 0 {
             return Err(ErreurRequete::Reserve { brut: reserve });
+        }
+        // Le code d'ordre est reconnu **avant** la longueur exacte : c'est lui qui dit
+        // quelle longueur exiger. Un ordre inconnu est donc signalé comme tel, quelle
+        // que soit la taille de la trame.
+        if !matches!(
+            ordre,
+            ORDRE_VERSION
+                | ORDRE_LISTER
+                | ORDRE_ACTIVER
+                | ORDRE_DESACTIVER
+                | ORDRE_CANAUX
+                | ORDRE_RENOMMER
+                | ORDRE_NOM_DEFAUT
+        ) {
+            return Err(ErreurRequete::Ordre { code: ordre });
+        }
+        // Les six ordres sans nom n'acceptent **rien** après l'en-tête : un préfixe
+        // valide suivi d'octets en trop reste une trame refusée.
+        if ordre != ORDRE_RENOMMER && !suite.is_empty() {
+            return Err(ErreurRequete::Longueur {
+                recus: octets.len(),
+            });
         }
         match ordre {
             ORDRE_VERSION | ORDRE_LISTER => {
@@ -258,7 +432,19 @@ impl Requete {
                 let canaux = valider_canaux(canaux)?;
                 Ok(Self::Canaux { cable, canaux })
             }
-            code => Err(ErreurRequete::Ordre { code }),
+            ORDRE_NOM_DEFAUT => {
+                let cable = valider_cable(cable)?;
+                exiger_nul("canaux", canaux)?;
+                Ok(Self::NomDefaut(cable))
+            }
+            // `ORDRE_RENOMMER` : le seul ordre dont la trame est plus longue que
+            // l'en-tête, et le seul qui alloue.
+            _ => {
+                let cable = valider_cable(cable)?;
+                exiger_nul("canaux", canaux)?;
+                let nom = valider_nom(suite)?;
+                Ok(Self::Renommer { cable, nom })
+            }
         }
     }
 }
@@ -283,6 +469,36 @@ const fn valider_cable(brut: u16) -> Result<CableId, ErreurRequete> {
         return Err(ErreurRequete::Cable { brut });
     }
     Ok(CableId(numero))
+}
+
+/// Valide le nom que porte un `renommer` : bornes du **format**, puis règle du dépôt.
+///
+/// Trois contrôles, dans cet ordre, parce que chacun rend le suivant possible :
+///
+/// 1. la charge n'est pas vide — un `renommer` sans nom n'existe pas, c'est
+///    [`Requete::NomDefaut`] qu'il fallait envoyer, et le dire vaut mieux qu'écrire une
+///    chaîne vide dans le registre ;
+/// 2. elle tient dans [`MAX_NOM_OCTETS`] — vérifié avant l'allocation de la `String` ;
+/// 3. c'est de l'UTF-8 valide — `from_utf8` et non `from_utf8_lossy` : un octet douteux
+///    remplacé par `U+FFFD` deviendrait un nom que personne n'a demandé, écrit dans une
+///    clé `HKLM` ;
+///
+/// puis la **règle du dépôt** : [`validate_cable_name`], le même juge que `conduitctl`
+/// et `CableSpec`. Elle n'est pas réécrite ici, et sa cause exacte n'est pas recopiée
+/// non plus — le message de refus est celui qu'elle rend, rendu par le service dans son
+/// journal ; la trame, elle, ne transporte que « ce nom est refusé ».
+fn valider_nom(octets: &[u8]) -> Result<String, ErreurRequete> {
+    if octets.is_empty() {
+        return Err(ErreurRequete::NomVide);
+    }
+    if octets.len() > MAX_NOM_OCTETS {
+        return Err(ErreurRequete::NomTropLong {
+            octets: octets.len(),
+        });
+    }
+    let nom = core::str::from_utf8(octets).map_err(|_| ErreurRequete::NomNonUtf8)?;
+    validate_cable_name(nom).map_err(|_| ErreurRequete::NomRefuse)?;
+    Ok(nom.to_owned())
 }
 
 /// Valide un nombre de canaux contre les bornes de [`conduit_kmd_core::params`].
@@ -334,6 +550,18 @@ pub enum ErreurRequete {
         /// La valeur trouvée.
         brut: u16,
     },
+    /// `renommer` sans nom : c'est `nom-defaut` qu'il fallait envoyer.
+    NomVide,
+    /// Le nom dépasse [`MAX_NOM_OCTETS`] octets.
+    NomTropLong {
+        /// Les octets reçus après l'en-tête.
+        octets: usize,
+    },
+    /// Les octets du nom ne sont pas de l'UTF-8 valide.
+    NomNonUtf8,
+    /// Le nom est bien formé mais refusé par
+    /// [`conduit_backend::cable::validate_cable_name`].
+    NomRefuse,
 }
 
 impl ErreurRequete {
@@ -345,6 +573,11 @@ impl ErreurRequete {
             Self::Ordre { .. } => Statut::OrdreInconnu,
             Self::Cable { .. } => Statut::CableInconnu,
             Self::Canaux { .. } => Statut::CanauxInvalides,
+            // Les quatre causes de nom disent la même chose au client — « ce nom-là ne
+            // sera pas écrit » — et appellent la même conduite : en donner un autre.
+            Self::NomVide | Self::NomTropLong { .. } | Self::NomNonUtf8 | Self::NomRefuse => {
+                Statut::NomInvalide
+            }
             Self::Longueur { .. } | Self::ChampParasite { .. } | Self::Reserve { .. } => {
                 Statut::TrameInvalide
             }
@@ -364,7 +597,7 @@ impl fmt::Display for ErreurRequete {
                 "protocole version {trouvee} : ce service sert la version \
                  {PROTOCOLE_VERSION}"
             ),
-            Self::Ordre { code } => write!(f, "ordre {code} inconnu (0 à {ORDRE_CANAUX})"),
+            Self::Ordre { code } => write!(f, "ordre {code} inconnu (0 à {ORDRE_MAX})"),
             Self::Cable { brut } => {
                 write!(
                     f,
@@ -379,6 +612,21 @@ impl fmt::Display for ErreurRequete {
                 "champ « {champ} » = {brut} alors que cet ordre ne l'utilise pas"
             ),
             Self::Reserve { brut } => write!(f, "champ réservé non nul ({brut:#06x})"),
+            Self::NomVide => f.write_str(
+                "« renommer » sans nom : pour rendre au câble son nom d'origine, c'est \
+                 l'ordre « nom par défaut » qu'il faut envoyer",
+            ),
+            Self::NomTropLong { octets } => write!(
+                f,
+                "nom de {octets} octets : maximum {MAX_NOM_OCTETS} \
+                 ({MAX_CABLE_NAME_LEN} caractères au plus)"
+            ),
+            Self::NomNonUtf8 => f.write_str("le nom n'est pas de l'UTF-8 valide"),
+            Self::NomRefuse => write!(
+                f,
+                "nom refusé : au plus {MAX_CABLE_NAME_LEN} caractères, ni caractère de \
+                 contrôle ni « /\\:*?\"<>| »"
+            ),
         }
     }
 }
@@ -430,11 +678,25 @@ pub enum Statut {
     PrivilegeAbsent,
     /// Le système a refusé ; [`Reponse::detail`] porte le code Win32 **tel quel**.
     ErreurSysteme,
+    /// Le nom demandé est refusé par la règle du dépôt
+    /// ([`conduit_backend::cable::validate_cable_name`]) ou par les bornes du format.
+    ///
+    /// Distinct de [`Self::TrameInvalide`] : la trame était bien formée, c'est le nom
+    /// qu'elle portait qui ne peut pas être écrit. La conduite est d'en donner un autre.
+    NomInvalide,
+    /// Aucun endpoint MMDevices ne correspond à ce câble : rien à renommer (M1b-21).
+    ///
+    /// Le cas courant et bénin : le câble est **déconnecté**, donc Windows n'a pas
+    /// publié ses endpoints et la clé de registre à écrire n'existe pas. La conduite est
+    /// d'activer le câble d'abord. [`Reponse::detail`] porte le nombre de côtés trouvés,
+    /// 0 ou 1 — un seul côté trouvé sur deux est le signe d'un endpoint à moitié publié,
+    /// et ce n'est pas la même panne qu'aucun.
+    EndpointAbsent,
 }
 
 impl Statut {
     /// Tous les statuts, dans l'ordre de leur code.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::Succes,
         Self::VersionInconnue,
         Self::TrameInvalide,
@@ -445,6 +707,8 @@ impl Statut {
         Self::PiloteAbsent,
         Self::PrivilegeAbsent,
         Self::ErreurSysteme,
+        Self::NomInvalide,
+        Self::EndpointAbsent,
     ];
 
     /// Le code de ce statut, tel qu'il voyage dans la trame.
@@ -461,6 +725,8 @@ impl Statut {
             Self::PiloteAbsent => 7,
             Self::PrivilegeAbsent => 8,
             Self::ErreurSysteme => 9,
+            Self::NomInvalide => 10,
+            Self::EndpointAbsent => 11,
         }
     }
 
@@ -480,6 +746,8 @@ impl Statut {
             7 => Self::PiloteAbsent,
             8 => Self::PrivilegeAbsent,
             9 => Self::ErreurSysteme,
+            10 => Self::NomInvalide,
+            11 => Self::EndpointAbsent,
             _ => return None,
         })
     }
@@ -510,6 +778,18 @@ impl fmt::Display for Statut {
                  LocalSystem"
             }
             Self::ErreurSysteme => "refus du système",
+            // La borne vient du dépôt, pas d'un 64 recopié.
+            Self::NomInvalide => {
+                return write!(
+                    f,
+                    "nom refusé : au plus {MAX_CABLE_NAME_LEN} caractères, ni caractère \
+                     de contrôle ni « /\\:*?\"<>| »"
+                )
+            }
+            Self::EndpointAbsent => {
+                "aucun endpoint audio pour ce câble : Windows ne les publie que lorsque \
+                 le câble est connecté — activez-le, puis renommez"
+            }
         };
         f.write_str(texte)
     }
@@ -856,9 +1136,9 @@ mod tests {
         [version, ordre, c[0], c[1], n[0], n[1], r[0], r[1]]
     }
 
-    /// Les cinq ordres font l'aller-retour, et le code d'ordre est celui qu'on a gravé.
+    /// Les sept ordres font l'aller-retour, et le code d'ordre est celui qu'on a gravé.
     #[test]
-    fn les_cinq_ordres_font_l_aller_retour() {
+    fn les_sept_ordres_font_l_aller_retour() {
         let cas = [
             (Requete::Version, ORDRE_VERSION),
             (Requete::Lister, ORDRE_LISTER),
@@ -871,18 +1151,212 @@ mod tests {
                 },
                 ORDRE_CANAUX,
             ),
+            (
+                Requete::Renommer {
+                    cable: CableId(2),
+                    nom: "Musique".to_owned(),
+                },
+                ORDRE_RENOMMER,
+            ),
+            (Requete::NomDefaut(CableId(7)), ORDRE_NOM_DEFAUT),
         ];
-        for (requete, code) in cas {
+        for (requete, code) in &cas {
             let octets = requete.to_bytes();
-            assert_eq!(octets.len(), TAILLE_REQUETE);
+            // Seul `renommer` dépasse l'en-tête, et exactement de la taille du nom.
+            assert_eq!(
+                octets.len(),
+                TAILLE_REQUETE + requete.nom().map_or(0, str::len),
+                "{requete:?}"
+            );
             assert_eq!(octets[0], PROTOCOLE_VERSION, "{requete:?}");
-            assert_eq!(octets[1], code, "{requete:?}");
-            assert_eq!(requete.code(), code);
-            assert_eq!(Requete::from_bytes(&octets), Ok(requete), "{requete:?}");
+            assert_eq!(octets[1], *code, "{requete:?}");
+            assert_eq!(requete.code(), *code);
+            assert_eq!(
+                Requete::from_bytes(&octets),
+                Ok(requete.clone()),
+                "{requete:?}"
+            );
         }
         // Les codes sont deux à deux distincts et contigus depuis 0.
         let codes: Vec<u8> = cas.iter().map(|(_, c)| *c).collect();
-        assert_eq!(codes, vec![0, 1, 2, 3, 4]);
+        assert_eq!(codes, vec![0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(ORDRE_MAX, 6);
+
+        // Le nom voyage **après** l'en-tête, tel quel, et nulle part ailleurs.
+        let octets = Requete::Renommer {
+            cable: CableId(2),
+            nom: "Musique".to_owned(),
+        }
+        .to_bytes();
+        assert_eq!(&octets[TAILLE_REQUETE..], "Musique".as_bytes());
+        // Les champs « canaux » et « réservé » de l'en-tête restent nuls.
+        assert_eq!(&octets[4..8], &[0, 0, 0, 0]);
+    }
+
+    /// **Les deux ordres de M1b-21 ne touchent pas au pilote**, et les trois autres
+    /// ordres modifiants si.
+    ///
+    /// C'est ce prédicat qui décide d'armer ou non `SeLoadDriverPrivilege` : le laisser
+    /// glisser vers « tout ce qui modifie » armerait un privilège pour une écriture de
+    /// registre.
+    #[test]
+    fn ce_qui_touche_le_pilote_et_ce_qui_modifie() {
+        let cas: [(Requete, bool, bool); 7] = [
+            (Requete::Version, false, false),
+            (Requete::Lister, false, false),
+            (Requete::Activer(CableId(1)), true, true),
+            (Requete::Desactiver(CableId(1)), true, true),
+            (
+                Requete::Canaux {
+                    cable: CableId(1),
+                    canaux: 2,
+                },
+                true,
+                true,
+            ),
+            (
+                Requete::Renommer {
+                    cable: CableId(1),
+                    nom: "Musique".to_owned(),
+                },
+                true,
+                false,
+            ),
+            (Requete::NomDefaut(CableId(1)), true, false),
+        ];
+        for (requete, modifie, pilote) in &cas {
+            assert_eq!(requete.modifie(), *modifie, "{requete:?}");
+            assert_eq!(requete.touche_le_pilote(), *pilote, "{requete:?}");
+            // Tout ce qui touche le pilote modifie ; l'inverse n'est plus vrai.
+            assert!(
+                !requete.touche_le_pilote() || requete.modifie(),
+                "{requete:?}"
+            );
+        }
+    }
+
+    /// Table du nom : ce qui passe, ce qui ne passe pas, et pourquoi.
+    ///
+    /// La règle du nom n'est pas réécrite ici — c'est
+    /// `conduit_backend::cable::validate_cable_name` qui tranche — mais elle doit être
+    /// **appliquée** par le parseur, sans quoi un nom impossible arriverait jusqu'au
+    /// registre.
+    #[test]
+    fn nom_table() {
+        /// Une trame `renommer` portant `nom` en octets bruts.
+        fn trame_renommer(octets: &[u8]) -> Vec<u8> {
+            let mut brut = brut(PROTOCOLE_VERSION, ORDRE_RENOMMER, 1, 0, 0).to_vec();
+            brut.extend_from_slice(octets);
+            brut
+        }
+
+        // Ce qui passe.
+        for nom in [
+            "Musique",
+            "M",
+            "Jeu vidéo — sortie",
+            "Conduit 1",
+            &"é".repeat(64),
+        ] {
+            assert_eq!(
+                Requete::from_bytes(&trame_renommer(nom.as_bytes())),
+                Ok(Requete::Renommer {
+                    cable: CableId(1),
+                    nom: nom.to_owned()
+                }),
+                "« {nom} »"
+            );
+        }
+
+        // Vide : c'est `nom-defaut` qu'il fallait envoyer, et le message le dit.
+        assert_eq!(
+            Requete::from_bytes(&trame_renommer(b"")),
+            Err(ErreurRequete::NomVide)
+        );
+        assert!(ErreurRequete::NomVide
+            .to_string()
+            .contains("nom par défaut"));
+
+        // Trop long **en octets** : refusé avant toute allocation.
+        let trop = vec![b'x'; MAX_NOM_OCTETS + 1];
+        assert_eq!(
+            Requete::from_bytes(&trame_renommer(&trop)),
+            Err(ErreurRequete::NomTropLong {
+                octets: MAX_NOM_OCTETS + 1
+            })
+        );
+        // Exactement la borne du format : c'est la règle du nom qui tranche alors, et
+        // 256 « x » font 256 caractères, donc trop.
+        let borne = vec![b'x'; MAX_NOM_OCTETS];
+        assert_eq!(
+            Requete::from_bytes(&trame_renommer(&borne)),
+            Err(ErreurRequete::NomRefuse)
+        );
+
+        // UTF-8 invalide : refusé, jamais remplacé par U+FFFD.
+        assert_eq!(
+            Requete::from_bytes(&trame_renommer(&[0xFF, 0xFE])),
+            Err(ErreurRequete::NomNonUtf8)
+        );
+
+        // La règle du dépôt, appliquée et non recopiée : les caractères interdits, les
+        // caractères de contrôle, et le nom qui n'est que des espaces.
+        for refuse in [
+            "a/b", "a\\b", "a:b", "a*b", "a?b", "a\"b", "a<b", "a>b", "a|b", "a\nb", " ", "   ",
+        ] {
+            assert_eq!(
+                Requete::from_bytes(&trame_renommer(refuse.as_bytes())),
+                Err(ErreurRequete::NomRefuse),
+                "« {refuse} »"
+            );
+            // Et le juge est bien celui du dépôt.
+            assert!(
+                conduit_backend::cable::validate_cable_name(refuse).is_err(),
+                "« {refuse} »"
+            );
+        }
+
+        // Les quatre causes mènent au même statut : « donnez-en un autre ».
+        for cause in [
+            ErreurRequete::NomVide,
+            ErreurRequete::NomTropLong { octets: 999 },
+            ErreurRequete::NomNonUtf8,
+            ErreurRequete::NomRefuse,
+        ] {
+            assert_eq!(cause.statut(), Statut::NomInvalide, "{cause:?}");
+            assert!(!cause.to_string().is_empty(), "{cause:?}");
+        }
+    }
+
+    /// Les octets en trop restent refusés — pour les six ordres qui n'ont pas de nom.
+    ///
+    /// C'est la règle que M1b-21 aurait pu relâcher par accident : ouvrir la requête à
+    /// une charge variable ne doit l'ouvrir que pour `renommer`.
+    #[test]
+    fn seul_renommer_accepte_des_octets_apres_l_en_tete() {
+        let sans_nom = [
+            (ORDRE_VERSION, 0u16),
+            (ORDRE_LISTER, 0),
+            (ORDRE_ACTIVER, 1),
+            (ORDRE_DESACTIVER, 1),
+            (ORDRE_NOM_DEFAUT, 1),
+        ];
+        for (ordre, cable) in sans_nom {
+            let mut trop = brut(PROTOCOLE_VERSION, ordre, cable, 0, 0).to_vec();
+            trop.push(b'x');
+            assert_eq!(
+                Requete::from_bytes(&trop),
+                Err(ErreurRequete::Longueur { recus: 9 }),
+                "ordre {ordre}"
+            );
+        }
+        // `canaux` aussi, avec un nombre de canaux valide.
+        let mut trop = brut(PROTOCOLE_VERSION, ORDRE_CANAUX, 1, 2, 0).to_vec();
+        trop.push(b'x');
+        assert_eq!(
+            Requete::from_bytes(&trop),
+            Err(ErreurRequete::Longueur { recus: 9 })
+        );
     }
 
     /// Table des longueurs : exacte, tronquée, allongée, vide.
@@ -912,18 +1386,24 @@ mod tests {
             Err(ErreurRequete::Longueur { recus: 9 })
         );
 
-        // Toutes les longueurs de 0 à 24 sauf la bonne sont refusées.
+        // Toutes les longueurs de 0 à 24 sont refusées, mais **pas pour la même
+        // raison** depuis M1b-21 : en dessous de l'en-tête c'est la longueur, au-dessus
+        // c'est le premier champ lisible — ici la version, qui vaut 0 dans un tampon nul.
+        // Le format n'étant plus de taille fixe, la longueur ne peut plus être jugée
+        // avant de savoir de quel ordre il s'agit.
         for taille in 0..=24usize {
             let tampon = vec![0u8; taille];
             let resultat = Requete::from_bytes(&tampon);
-            if taille == TAILLE_REQUETE {
-                // Huit octets nuls : la version 0 n'est pas la nôtre, c'est elle qui
-                // refuse — pas la longueur. C'est ce qui distingue les deux contrôles.
-                assert_eq!(resultat, Err(ErreurRequete::Version { trouvee: 0 }));
-            } else {
+            if taille < TAILLE_REQUETE {
                 assert_eq!(
                     resultat,
                     Err(ErreurRequete::Longueur { recus: taille }),
+                    "taille {taille}"
+                );
+            } else {
+                assert_eq!(
+                    resultat,
+                    Err(ErreurRequete::Version { trouvee: 0 }),
                     "taille {taille}"
                 );
             }
@@ -952,7 +1432,7 @@ mod tests {
         );
     }
 
-    /// Table des codes d'ordre : les cinq connus, tous les autres refusés.
+    /// Table des codes d'ordre : les sept connus, tous les autres refusés.
     #[test]
     fn ordre_table() {
         for code in 0..=u8::MAX {
@@ -962,7 +1442,8 @@ mod tests {
                 ORDRE_VERSION => assert_eq!(resultat, Ok(Requete::Version)),
                 ORDRE_LISTER => assert_eq!(resultat, Ok(Requete::Lister)),
                 // Les ordres qui visent un câble refusent le câble 0, pas l'ordre.
-                ORDRE_ACTIVER | ORDRE_DESACTIVER | ORDRE_CANAUX => {
+                ORDRE_ACTIVER | ORDRE_DESACTIVER | ORDRE_CANAUX | ORDRE_RENOMMER
+                | ORDRE_NOM_DEFAUT => {
                     assert_eq!(
                         resultat,
                         Err(ErreurRequete::Cable { brut: 0 }),
@@ -972,6 +1453,14 @@ mod tests {
                 _ => assert_eq!(resultat, Err(ErreurRequete::Ordre { code }), "code {code}"),
             }
         }
+        // Un ordre inconnu est signalé comme tel **même** avec des octets en trop : le
+        // code décide de la longueur à exiger, donc il est reconnu d'abord.
+        let mut trop = brut(PROTOCOLE_VERSION, 200, 0, 0, 0).to_vec();
+        trop.extend_from_slice(b"Musique");
+        assert_eq!(
+            Requete::from_bytes(&trop),
+            Err(ErreurRequete::Ordre { code: 200 })
+        );
     }
 
     /// Table du numéro de câble : 1 à `CABLE_MAX`, et rien d'autre. Le domaine vient du
@@ -1073,6 +1562,21 @@ mod tests {
                 "ordre {ordre}"
             );
         }
+        // `renommer` et `nom par défaut` n'utilisent pas les canaux non plus.
+        for ordre in [ORDRE_RENOMMER, ORDRE_NOM_DEFAUT] {
+            let mut trame = brut(PROTOCOLE_VERSION, ordre, 1, 2, 0).to_vec();
+            if ordre == ORDRE_RENOMMER {
+                trame.extend_from_slice(b"Musique");
+            }
+            assert_eq!(
+                Requete::from_bytes(&trame),
+                Err(ErreurRequete::ChampParasite {
+                    champ: "canaux",
+                    brut: 2
+                }),
+                "ordre {ordre}"
+            );
+        }
         // Le champ réservé est refusé pour tous les ordres, y compris valides.
         for ordre in [
             ORDRE_VERSION,
@@ -1080,6 +1584,8 @@ mod tests {
             ORDRE_ACTIVER,
             ORDRE_DESACTIVER,
             ORDRE_CANAUX,
+            ORDRE_RENOMMER,
+            ORDRE_NOM_DEFAUT,
         ] {
             assert_eq!(
                 Requete::from_bytes(&brut(PROTOCOLE_VERSION, ordre, 1, 2, 0xBEEF)),
@@ -1182,7 +1688,7 @@ mod tests {
     /// fidèle.
     #[test]
     fn statut_table() {
-        let attendus: [(Statut, u8); 10] = [
+        let attendus: [(Statut, u8); 12] = [
             (Statut::Succes, 0),
             (Statut::VersionInconnue, 1),
             (Statut::TrameInvalide, 2),
@@ -1193,6 +1699,8 @@ mod tests {
             (Statut::PiloteAbsent, 7),
             (Statut::PrivilegeAbsent, 8),
             (Statut::ErreurSysteme, 9),
+            (Statut::NomInvalide, 10),
+            (Statut::EndpointAbsent, 11),
         ];
         for (statut, code) in attendus {
             assert_eq!(statut.code(), code, "{statut:?}");
@@ -1200,7 +1708,7 @@ mod tests {
         }
         assert_eq!(Statut::ALL.len(), attendus.len());
         // Un code inconnu n'est pas replié sur une erreur générique.
-        for code in 10..=u8::MAX {
+        for code in 12..=u8::MAX {
             assert_eq!(Statut::from_code(code), None, "code {code}");
         }
         assert!(Statut::Succes.succes());
@@ -1251,11 +1759,14 @@ mod tests {
             Err(ErreurReponse::Longueur { recus: 29 })
         );
 
+        // Une version qui n'est pas la nôtre — dite en fonction de la nôtre, pour que ce
+        // test ne tombe pas au prochain incrément de `PROTOCOLE_VERSION`.
+        let etrangere = PROTOCOLE_VERSION.wrapping_add(1);
         let mut mauvaise_version = valide;
-        mauvaise_version[0] = 2;
+        mauvaise_version[0] = etrangere;
         assert_eq!(
             Reponse::from_bytes(&mauvaise_version),
-            Err(ErreurReponse::Version { trouvee: 2 })
+            Err(ErreurReponse::Version { trouvee: etrangere })
         );
 
         let mut reserve = valide;
@@ -1373,9 +1884,14 @@ mod tests {
         ) {
             match Requete::from_bytes(&octets) {
                 Ok(requete) => {
-                    prop_assert_eq!(octets.len(), TAILLE_REQUETE);
+                    // La longueur acceptée est celle que l'ordre exige, et rien d'autre.
+                    let attendue = TAILLE_REQUETE + requete.nom().map_or(0, str::len);
+                    prop_assert_eq!(octets.len(), attendue);
                     prop_assert_eq!(&requete.to_bytes()[..], &octets[..]);
-                    prop_assert_eq!(Requete::from_bytes(&requete.to_bytes()), Ok(requete));
+                    prop_assert_eq!(
+                        Requete::from_bytes(&requete.to_bytes()),
+                        Ok(requete.clone())
+                    );
                     // Toute sortie acceptée est dans les domaines annoncés.
                     if let Some(cable) = requete.cable() {
                         prop_assert!(cable.0 >= 1 && cable.0 <= CABLE_MAX);
@@ -1383,11 +1899,22 @@ mod tests {
                     if let Requete::Canaux { canaux, .. } = requete {
                         prop_assert!((MIN_CHANNELS..=MAX_CHANNELS).contains(&canaux));
                     }
+                    // Un nom accepté est **toujours** un nom que la règle du dépôt
+                    // accepte : c'est la propriété qui garantit qu'aucune chaîne
+                    // impossible n'atteindra le registre.
+                    if let Some(nom) = requete.nom() {
+                        prop_assert!(!nom.is_empty());
+                        prop_assert!(nom.len() <= MAX_NOM_OCTETS);
+                        prop_assert!(conduit_backend::cable::validate_cable_name(nom).is_ok());
+                    }
                 }
                 Err(err) => {
-                    // Une erreur de longueur exactement quand la longueur est fausse.
+                    // Une longueur inférieure à l'en-tête est **toujours** signalée
+                    // comme telle ; au-delà, la cause dépend de l'ordre.
                     let longueur = matches!(err, ErreurRequete::Longueur { .. });
-                    prop_assert_eq!(longueur, octets.len() != TAILLE_REQUETE);
+                    if octets.len() < TAILLE_REQUETE {
+                        prop_assert!(longueur);
+                    }
                 }
             }
         }
@@ -1431,21 +1958,32 @@ mod tests {
             }
         }
 
-        /// Une requête quelconque des cinq ordres survit au cadrage et au découpage.
+        /// Une requête quelconque des sept ordres survit au cadrage et au découpage.
+        ///
+        /// Le nom est engendré dans les caractères que la règle du dépôt accepte, et
+        /// jusqu'à la borne du format : c'est la trame la plus longue que le protocole
+        /// laisse passer, et donc celle qui éprouve `MAX_TRAME_OCTETS`.
         #[test]
         fn le_cadrage_est_reversible(
-            ordre in 0_u8..5,
+            ordre in 0_u8..7,
             cable in 1_u32..=CABLE_MAX,
             canaux in MIN_CHANNELS..=MAX_CHANNELS,
+            nom in "[a-zA-Zé0-9 _.-]{1,64}",
         ) {
             let requete = match ordre {
                 0 => Requete::Version,
                 1 => Requete::Lister,
                 2 => Requete::Activer(CableId(cable)),
                 3 => Requete::Desactiver(CableId(cable)),
-                _ => Requete::Canaux { cable: CableId(cable), canaux },
+                4 => Requete::Canaux { cable: CableId(cable), canaux },
+                5 => Requete::Renommer { cable: CableId(cable), nom: nom.trim().to_owned() },
+                _ => Requete::NomDefaut(CableId(cable)),
             };
+            // Un nom qui n'est que des espaces est refusé par la règle du dépôt : la
+            // propriété ne porte que sur les requêtes que le protocole peut porter.
+            prop_assume!(requete.nom().is_none_or(|n| !n.is_empty()));
             let trame = requete.encadrer();
+            prop_assert!(trame.len() <= EN_TETE_OCTETS + MAX_TRAME_OCTETS);
             let (charge, consommes) = decouper(&trame)
                 .map_err(|e| TestCaseError::fail(e.to_string()))?
                 .ok_or_else(|| TestCaseError::fail("trame incomplète"))?;

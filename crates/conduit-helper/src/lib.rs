@@ -25,6 +25,7 @@
 //! | [`controle`] | le `CableControl` du démon (M1b-34) | oui, sauf l'aller-retour |
 //! | [`rapport`] | la mise en forme des réponses à l'écran | **oui**, entièrement |
 //! | [`cli`] | les sous-commandes du binaire | **oui**, entièrement |
+//! | [`registre`] | le nom d'endpoint dans `HKLM` (M1b-21) | oui, sauf l'écriture |
 //! | [`journal`] | l'horodatage, les niveaux, l'identité de l'appelant | oui, sauf l'heure du système |
 //! | [`securite`] | le SDDL du canal et sa vérification | le SDDL oui, sa conversion non |
 //! | `tube` | le serveur et le client du canal nommé | non (Windows) |
@@ -80,6 +81,7 @@ pub mod controle;
 pub mod journal;
 pub mod protocole;
 pub mod rapport;
+pub mod registre;
 pub mod securite;
 
 #[cfg(windows)]

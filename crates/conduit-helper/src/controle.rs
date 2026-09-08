@@ -40,7 +40,8 @@
 //! | `remove` | **désactive** le câble | `Requete::Desactiver` |
 //! | `list` | l'état des seize | `Requete::Lister` |
 //! | `set_channels` | règle les canaux | `Requete::Canaux` |
-//! | `rename` | refusé : **M1b-21** | aucun |
+//! | `rename` | écrit le nom d'endpoint dans le registre | `Requete::Renommer` |
+//! | `rename` vers `Conduit N` | **efface** le nom personnalisé | `Requete::NomDefaut` |
 //!
 //! # `create` sur un câble déjà actif rend son état, sans erreur
 //!
@@ -52,27 +53,37 @@
 //! lancement, pour un état pourtant conforme. L'opération est donc idempotente, et la
 //! réponse décrit la machine — pas l'intention.
 //!
+//! # Renommer ne descend pas jusqu'au pilote (M1b-21)
+//!
+//! `rename` n'écrit rien dans le pilote : le nom d'un endpoint audio vit dans
+//! `HKLM\...\MMDevices\Audio`, et c'est le service qui l'y met. Le pilote continue de
+//! publier `Conduit N`, et c'est très bien — c'est la description d'origine, celle qui
+//! sert de pont entre un numéro de câble et ses clés de registre. Tout ce qui établit
+//! *quelle* valeur, *comment* on retrouve un câble déjà renommé et *comment* on revient
+//! en arrière est dans l'en-tête de [`crate::registre`].
+//!
 //! # Ce que ce module ne fait pas
 //!
-//! Il ne renomme pas (`CableControl::rename` rend une erreur qui **nomme M1b-21**) et
-//! ne change pas le nombre de canaux par lui-même : le pilote scelle `CHANNELS` dans ses
-//! tables KS et refuse toute autre valeur tant que **M1b-05** n'est pas faite. Le refus
-//! du service ([`Statut::CanauxNonApplicables`]) est propagé tel quel, avec le nom de la
-//! tâche dans le message.
+//! Il ne change pas le nombre de canaux par lui-même : le pilote scelle `CHANNELS` dans
+//! ses tables KS et refuse toute autre valeur tant que **M1b-05** n'est pas faite. Le
+//! refus du service ([`Statut::CanauxNonApplicables`]) est propagé tel quel, avec le nom
+//! de la tâche dans le message.
 //!
 //! # Aucun test de ce module ne touche la machine
 //!
 //! Tout ce qui **décide** — traduction d'une réponse en [`CableInfo`], d'un statut en
-//! [`CableError`], choix du câble libre, lecture d'un nom `Conduit N` — est pur, hors
-//! `cfg(windows)`, et vérifié en table de cas. Seul l'aller-retour sur le canal nommé
-//! est propre à Windows, et il n'est exercé que par `tests/tube.rs`, `#[ignore]`.
+//! [`CableError`], choix du câble libre, lecture d'un nom `Conduit N`, choix de l'ordre
+//! d'un renommage ([`ordre_de_renommage`]) — est pur, hors `cfg(windows)`, et vérifié en
+//! table de cas. Seul l'aller-retour sur le canal nommé est propre à Windows, et il n'est
+//! exercé que par `tests/tube.rs`, `#[ignore]`.
 
+use conduit_backend::cable::validate_cable_name;
 use conduit_backend::{CableError, CableId, CableInfo, DeviceId};
 use conduit_core::types::ChannelCount;
 use conduit_kmd_core::config::CABLE_MAX;
 use conduit_kmd_core::params::{MAX_CHANNELS, MIN_CHANNELS};
 
-use crate::protocole::{Reponse, Statut, CANAUX_APPLICABLES, PROTOCOLE_VERSION};
+use crate::protocole::{Reponse, Requete, Statut, CANAUX_APPLICABLES, PROTOCOLE_VERSION};
 
 // ---------------------------------------------------------------------------------
 // Les identifiants d'endpoint de repli.
@@ -137,10 +148,12 @@ pub fn numeros() -> impl Iterator<Item = CableId> {
     (1..=CABLE_MAX).map(CableId)
 }
 
-/// Le nom OS d'un câble : `Conduit N`, celui que le pilote publie.
+/// Le nom **d'origine** d'un câble : `Conduit N`, celui que le pilote publie.
 ///
-/// C'est le seul nom qu'un câble puisse porter aujourd'hui — le renommage est **M1b-21**
-/// et passe par le registre. Rendu par [`CableId`]'s `Display`, non recopié.
+/// Ce n'est plus forcément le nom que l'utilisateur voit — M1b-21 permet d'en écrire un
+/// autre dans le registre —, mais c'est celui auquel on revient, et le pont entre un
+/// numéro de câble et ses clés MMDevices. Rendu par le `Display` de [`CableId`], non
+/// recopié.
 #[must_use]
 pub fn nom(cable: CableId) -> String {
     cable.to_string()
@@ -166,6 +179,58 @@ pub fn cable_nomme(nom: &str) -> Option<CableId> {
     }
     let numero: u32 = chiffres.parse().ok()?;
     (1..=CABLE_MAX).contains(&numero).then_some(CableId(numero))
+}
+
+// ---------------------------------------------------------------------------------
+// La politique du renommage (M1b-21).
+// ---------------------------------------------------------------------------------
+
+/// L'ordre qu'un `rename` doit envoyer au service, ou la raison de le refuser.
+///
+/// **Pure**, donc vérifiable sans machine : c'est ici qu'est toute la politique de
+/// M1b-21 côté démon, et `CableControl::rename` ne fait qu'appliquer ce qu'elle rend.
+///
+/// Trois cas, et un seul est un refus :
+///
+/// | `voulu` | ordre | pourquoi |
+/// |---|---|---|
+/// | un nom libre (`Musique`) | [`Requete::Renommer`] | le cas ordinaire |
+/// | son propre nom d'origine (`Conduit 3` pour le câble 3) | [`Requete::NomDefaut`] | c'est **la** façon d'effacer un nom personnalisé (F-52) |
+/// | le nom d'origine d'un **autre** câble (`Conduit 5` pour le câble 3) | refus | un numéro de câble n'est pas un nom libre |
+///
+/// Le troisième cas mérite d'être refusé plutôt qu'accepté : `Conduit 5` est le nom que
+/// le câble 5 porte à la sortie d'usine et celui par lequel le service le retrouve dans
+/// le registre. L'écrire sur le câble 3 ferait deux endpoints portant le même nom, et le
+/// pont câble ↔ clés — une **égalité exacte** avec `Conduit N` — désignerait alors deux
+/// câbles à la fois.
+///
+/// Le nom est débarrassé de ses espaces de bord, comme
+/// [`conduit_backend::cable::validate_cable_name`] le fait pour juger du vide : sans
+/// cela, « `Musique ` » et « `Musique` » seraient deux noms différents dans le registre
+/// pour le même nom à l'écran.
+///
+/// # Erreurs
+///
+/// [`CableError::InvalidName`] : le nom est refusé par la règle du dépôt, ou c'est le
+/// nom d'origine d'un autre câble.
+pub fn ordre_de_renommage(cable: CableId, voulu: &str) -> Result<Requete, CableError> {
+    validate_cable_name(voulu)?;
+    let voulu = voulu.trim();
+    match cable_nomme(voulu) {
+        Some(autre) if autre != cable => Err(CableError::InvalidName(format!(
+            "« {voulu} » est le nom d'origine du câble {}, pas un nom libre : \
+             choisissez-en un autre, ou renommez le câble {} en « {} » pour lui rendre le \
+             sien",
+            autre.0,
+            cable.0,
+            nom(cable)
+        ))),
+        Some(_) => Ok(Requete::NomDefaut(cable)),
+        None => Ok(Requete::Renommer {
+            cable,
+            nom: voulu.to_owned(),
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------------
@@ -297,6 +362,21 @@ pub fn verifier(reponse: &Reponse, cable: Option<CableId>) -> Result<(), CableEr
         Statut::ErreurSysteme => CableError::Driver(format!(
             "le pilote a refusé l'ordre : erreur Win32 {detail}"
         )),
+        // M1b-21. Le nom a déjà été validé par le démon avant d'être envoyé : si le
+        // service le refuse quand même, c'est que les deux ne jugent pas avec la même
+        // règle, et cela se rapporte.
+        Statut::NomInvalide => CableError::InvalidName(format!(
+            "{} — le service d'assistance a refusé ce nom alors que le démon l'avait \
+             accepté : joignez « conduitctl dump » à un rapport de bogue",
+            Statut::NomInvalide
+        )),
+        // Le cas bénin et courant : le câble est déconnecté, donc Windows n'a publié
+        // aucun endpoint et il n'y a rien à renommer. Un `Driver` et non un `NotFound` :
+        // le câble existe, ce sont ses endpoints qui n'existent pas encore.
+        Statut::EndpointAbsent => CableError::Driver(format!(
+            "{} ({detail} côté(s) sur 2 trouvé(s))",
+            Statut::EndpointAbsent
+        )),
     })
 }
 
@@ -307,12 +387,12 @@ pub fn verifier(reponse: &Reponse, cable: Option<CableId>) -> Result<(), CableEr
 #[cfg(windows)]
 mod windows {
     use super::{
-        cable_nomme, info, liste, nom, premier_libre, verifier, CableError, CableId, CableInfo,
-        ChannelCount, CABLE_MAX, CANAUX_APPLICABLES,
+        cable_nomme, info, liste, nom, ordre_de_renommage, premier_libre, verifier, CableError,
+        CableId, CableInfo, ChannelCount, CABLE_MAX, CANAUX_APPLICABLES,
     };
     use crate::protocole::{Reponse, Requete, NOM_TUBE};
     use crate::tube::{demander, ErreurClient};
-    use conduit_backend::cable::{validate_cable_name, MAX_CABLE_NAME_LEN};
+    use conduit_backend::cable::validate_cable_name;
     use conduit_backend::{CableControl, CableSpec};
 
     /// Le [`CableControl`] du dorsal Windows : chaque appel est un ordre au service.
@@ -344,7 +424,7 @@ mod windows {
         /// Envoie un ordre et vérifie son statut.
         fn ordre(&self, requete: Requete) -> Result<Reponse, CableError> {
             let cible = requete.cable();
-            let reponse = demander(requete).map_err(|erreur| erreur_client(&erreur))?;
+            let reponse = demander(&requete).map_err(|erreur| erreur_client(&erreur))?;
             verifier(&reponse, cible)?;
             Ok(reponse)
         }
@@ -353,7 +433,71 @@ mod windows {
         fn etat(&self) -> Result<Reponse, CableError> {
             self.ordre(Requete::Lister)
         }
+
+        /// Renomme un câble **qu'on vient d'activer**, en laissant à Windows le temps de
+        /// publier ses endpoints.
+        ///
+        /// Seul le refus « endpoint absent » fait attendre : c'est le seul qui puisse
+        /// disparaître tout seul. Un nom refusé, un service absent ou un refus du
+        /// registre sortent au premier essai — réessayer n'y changerait rien et ne ferait
+        /// que retarder le message.
+        ///
+        /// # Erreurs
+        ///
+        /// La [`CableError`] du dernier essai, enrichie du fait que **le câble, lui, est
+        /// bien actif** et de la commande qui termine le travail : sans cela, l'appelant
+        /// croirait que rien n'a eu lieu et laisserait un câble activé derrière lui.
+        fn renommer_apres_activation(
+            &mut self,
+            cable: CableId,
+            nouveau: &str,
+        ) -> Result<CableInfo, CableError> {
+            let mut dernier = None;
+            for essai in 0..RENOMMAGE_ESSAIS {
+                if essai > 0 {
+                    std::thread::sleep(RENOMMAGE_PAS);
+                }
+                match self.rename(cable, nouveau) {
+                    Ok(info) => return Ok(info),
+                    Err(erreur) => {
+                        let a_reessayer = matches!(&erreur, CableError::Driver(message)
+                            if message.contains(ENDPOINT_PAS_ENCORE));
+                        dernier = Some(erreur);
+                        if !a_reessayer {
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(match dernier {
+                Some(erreur) => CableError::Driver(format!(
+                    "le câble {} est activé mais n'a pas pu être renommé en « {nouveau} » : \
+                     {erreur} — le câble reste disponible sous « {} », et « conduitctl \
+                     cable rename {} {nouveau} » terminera le travail",
+                    cable.0,
+                    nom(cable),
+                    cable.0
+                )),
+                // Injoignable : `RENOMMAGE_ESSAIS` est non nul, donc la boucle rend un
+                // `Ok` ou remplit `dernier`. Un repli plutôt qu'un `unwrap`.
+                None => CableError::Driver(format!(
+                    "le câble {} est activé mais n'a pas pu être renommé",
+                    cable.0
+                )),
+            })
+        }
     }
+
+    /// Le fragment du message de [`Statut::EndpointAbsent`] auquel
+    /// `renommer_apres_activation` reconnaît un refus qui peut disparaître tout seul.
+    ///
+    /// Reconnu sur le **texte** parce que `CableControl::rename` rend une `CableError`,
+    /// qui ne transporte pas le statut du protocole : c'est le prix de l'interface
+    /// portable du trait. Le fragment est court, en français, et le test
+    /// `le_refus_d_endpoint_absent_se_reconnait` le tient d'accord avec le message que
+    /// `verifier` construit — s'ils divergent, l'attente disparaît en silence, et c'est
+    /// ce test qui l'attrape.
+    pub(super) const ENDPOINT_PAS_ENCORE: &str = "aucun endpoint audio pour ce câble";
 
     /// Traduit un échec du **canal** — pas du pilote — en [`CableError`].
     ///
@@ -372,14 +516,23 @@ mod windows {
         }
     }
 
-    /// Le refus de renommer, qui **nomme la tâche** plutôt que de paniquer.
-    fn renommage_absent(cable: CableId) -> CableError {
-        CableError::Unsupported(format!(
-            "renommer « {} » demande d'écrire le nom d'endpoint dans le registre, ce que \
-             M1b-21 n'a pas encore fait : le câble garde le nom que le pilote publie",
-            nom(cable)
-        ))
-    }
+    /// Combien de fois `create` réessaie de renommer un câble qu'il vient d'activer, et
+    /// à quel rythme.
+    ///
+    /// **Une course réelle, mesurée.** Activer un câble écrit dans le pilote ; Windows
+    /// publie ensuite ses endpoints, et la clé `MMDevices` du registre n'existe qu'à ce
+    /// moment-là — **77 ms** après l'écriture dans la machine virtuelle. Un `create` qui
+    /// renommerait immédiatement trouverait donc souvent un
+    /// [`Statut::EndpointAbsent`](crate::protocole::Statut::EndpointAbsent) sur un câble
+    /// pourtant bien actif.
+    ///
+    /// Une seconde au total, par pas de 50 ms : plus de dix fois la latence mesurée, et
+    /// assez court pour qu'un `conduitctl cable add` reste instantané à l'usage. L'attente
+    /// n'a lieu **que** tant que le service dit « endpoint absent » ; toute autre issue
+    /// sort immédiatement.
+    const RENOMMAGE_ESSAIS: u32 = 20;
+    /// Le pas d'attente entre deux essais. Voir [`RENOMMAGE_ESSAIS`].
+    const RENOMMAGE_PAS: std::time::Duration = std::time::Duration::from_millis(50);
 
     impl CableControl for ControleCables {
         /// La réserve du pilote : seize câbles, fixée à la compilation
@@ -400,9 +553,20 @@ mod windows {
         ///
         /// Sans nom, le premier câble libre est pris. Avec un nom `Conduit N`, c'est ce
         /// câble-là — et s'il est **déjà actif**, son état est rendu tel quel, sans
-        /// erreur (voir l'en-tête de module). Tout autre nom est refusé en nommant
-        /// M1b-21 : le pilote publie `Conduit N` et rien d'autre ne peut être appliqué
-        /// aujourd'hui.
+        /// erreur (voir l'en-tête de module).
+        ///
+        /// # Tout autre nom : on active, puis on renomme (M1b-21)
+        ///
+        /// `conduitctl cable add --name Musique` prend donc le premier câble libre et lui
+        /// donne ce nom dans le registre. Les deux étapes sont distinctes parce que la
+        /// machine les distingue : le pilote ne connaît que la connexion, et le nom vit
+        /// dans `MMDevices`. Le câble n'existe pour Windows — et sa clé de registre avec
+        /// lui — qu'une fois activé, d'où l'ordre, et d'où l'attente bornée de
+        /// [`RENOMMAGE_ESSAIS`].
+        ///
+        /// Si le renommage échoue malgré l'attente, **le câble reste actif** et l'erreur
+        /// le dit, avec la commande qui termine le travail : le défaire serait détruire
+        /// ce que l'appelant a obtenu pour n'avoir pas obtenu le reste.
         ///
         /// Un nombre de canaux différent de celui que le pilote sert est refusé **avant**
         /// d'activer quoi que ce soit : activer puis échouer sur les canaux laisserait
@@ -414,23 +578,17 @@ mod windows {
                      canaux est scellé dans ses tables KS tant que M1b-05 n'est pas faite"
                 )));
             }
-            let vise = match spec.name.as_deref() {
+            // Le nom voulu, et le câble qu'il désigne s'il en désigne un. Un nom libre
+            // ne vise aucun câble en particulier : on prendra le premier libre, puis on
+            // le renommera.
+            let voulu = match spec.name.as_deref() {
                 None => None,
                 Some(voulu) => {
                     validate_cable_name(voulu)?;
-                    match cable_nomme(voulu) {
-                        Some(cable) => Some(cable),
-                        None => {
-                            return Err(CableError::Unsupported(format!(
-                                "« {} » : sous Windows un câble s'appelle « Conduit N » \
-                                 (1 à {CABLE_MAX}) tant que M1b-21 n'a pas rendu le \
-                                 renommage possible",
-                                voulu.chars().take(MAX_CABLE_NAME_LEN).collect::<String>()
-                            )))
-                        }
-                    }
+                    Some(voulu.trim().to_owned())
                 }
             };
+            let vise = voulu.as_deref().and_then(cable_nomme);
             let etat = self.etat()?;
             let cible = match vise {
                 Some(cable) if etat.est_present(cable) => cable,
@@ -451,12 +609,23 @@ mod windows {
                     }
                 },
             };
+            // Le nom libre à appliquer, s'il y en a un : `Conduit N` ne se renomme pas,
+            // c'est déjà le nom d'origine.
+            let a_renommer = voulu.filter(|_| vise.is_none());
+
             // Déjà connecté : la demande est satisfaite, on rend l'état constaté.
             if etat.est_actif(cible) {
-                return Ok(info(&etat, cible));
+                return match a_renommer {
+                    // Les endpoints sont publiés depuis longtemps : un seul essai suffit.
+                    Some(nouveau) => self.rename(cible, &nouveau),
+                    None => Ok(info(&etat, cible)),
+                };
             }
             let reponse = self.ordre(Requete::Activer(cible))?;
-            Ok(info(&reponse, cible))
+            match a_renommer {
+                Some(nouveau) => self.renommer_apres_activation(cible, &nouveau),
+                None => Ok(info(&reponse, cible)),
+            }
         }
 
         /// **Désactive** le câble : ses deux endpoints se rangent sous « Périphériques
@@ -500,16 +669,39 @@ mod windows {
             Ok(info(&reponse, id))
         }
 
-        /// **Non fait** : le renommage d'un endpoint Windows passe par le registre et
-        /// c'est **M1b-21**.
+        /// **Renomme le câble côté OS** (M1b-21), par le registre et sans toucher au
+        /// pilote.
         ///
-        /// Une erreur qui nomme la tâche, jamais un `unimplemented!()` : c'est un chemin
-        /// que l'utilisateur emprunte (`conduitctl cable rename`) et le dépôt interdit
-        /// les paniques atteignables. Le nom est tout de même validé d'abord, pour qu'un
-        /// nom impossible soit refusé pour la bonne raison.
+        /// Le nom d'un endpoint audio vit dans
+        /// `HKLM\...\MMDevices\Audio\{Render|Capture}\{id}\Properties`, sous
+        /// `PKEY_Device_DeviceDesc` ; c'est le service qui l'y écrit parce que la clé est
+        /// sous `HKLM`. Tout ce qui établit *quelle* valeur et *pourquoi* est dans
+        /// l'en-tête de [`crate::registre`].
+        ///
+        /// # Renommer un câble en `Conduit N` **efface** son nom personnalisé
+        ///
+        /// C'est la façon d'exposer le retour en arrière sans ajouter une méthode au
+        /// trait : `rename(CableId(3), "Conduit 3")` envoie
+        /// [`Requete::NomDefaut`](crate::protocole::Requete::NomDefaut), qui remet la
+        /// description d'origine et supprime la marque de Conduit — ce que F-52 exige, et
+        /// ce qu'un utilisateur cherchera naturellement à taper. Renommer le câble 3 en
+        /// « Conduit 5 » n'a en revanche aucun sens et est refusé : le numéro est celui
+        /// du pilote, pas un nom libre.
+        ///
+        /// # Le `CableInfo` rendu porte le nom **demandé**
+        ///
+        /// Le service ne relit pas le registre après avoir écrit — la valeur qu'il vient
+        /// d'y mettre est celle-là. Ce que le dorsal WASAPI publiera ensuite dans
+        /// `DeviceInfo::name` dépend, lui, du moment où le moteur audio relira la clé :
+        /// voir la section « rafraîchissement » de [`crate::registre`].
         fn rename(&mut self, id: CableId, name: &str) -> Result<CableInfo, CableError> {
-            validate_cable_name(name)?;
-            Err(renommage_absent(id))
+            let requete = ordre_de_renommage(id, name)?;
+            let voulu = requete.nom().unwrap_or(name).trim().to_owned();
+            let reponse = self.ordre(requete)?;
+            Ok(CableInfo {
+                name: voulu,
+                ..info(&reponse, id)
+            })
         }
     }
 }
@@ -696,8 +888,120 @@ mod tests {
                     // Le code du système est rendu tel quel, jamais traduit.
                     assert!(texte.contains("1314"), "{texte}");
                 }
+                Statut::EndpointAbsent => {
+                    // Le message dit **quoi faire** : connecter le câble d'abord.
+                    assert!(texte.contains("connecté"), "{texte}");
+                }
+                Statut::NomInvalide => {
+                    assert!(matches!(erreur, CableError::InvalidName(_)));
+                }
                 _ => {}
             }
+        }
+    }
+
+    /// **La politique du renommage**, en table de cas : ce qui renomme, ce qui efface,
+    /// ce qui est refusé.
+    #[test]
+    fn ordre_de_renommage_table() {
+        // Un nom libre : on renomme.
+        assert_eq!(
+            ordre_de_renommage(CableId(3), "Musique"),
+            Ok(Requete::Renommer {
+                cable: CableId(3),
+                nom: "Musique".to_owned()
+            })
+        );
+        // Les espaces de bord sont retirés : « Musique » et « Musique  » sont le même
+        // nom à l'écran, ils doivent l'être aussi dans le registre.
+        assert_eq!(
+            ordre_de_renommage(CableId(3), "  Musique  "),
+            Ok(Requete::Renommer {
+                cable: CableId(3),
+                nom: "Musique".to_owned()
+            })
+        );
+
+        // Son propre nom d'origine : c'est **la** façon d'effacer le nom personnalisé.
+        for numero in 1..=CABLE_MAX {
+            let cable = CableId(numero);
+            assert_eq!(
+                ordre_de_renommage(cable, &nom(cable)),
+                Ok(Requete::NomDefaut(cable)),
+                "câble {numero}"
+            );
+        }
+
+        // Le nom d'origine d'un **autre** câble : refusé, et le message dit les deux
+        // sorties possibles.
+        let erreur = ordre_de_renommage(CableId(3), "Conduit 5")
+            .expect_err("le nom d'origine d'un autre câble est refusé");
+        assert!(matches!(erreur, CableError::InvalidName(_)));
+        let texte = erreur.to_string();
+        assert!(texte.contains("Conduit 5"), "{texte}");
+        assert!(texte.contains("Conduit 3"), "{texte}");
+
+        // Le piège du préfixe, dans les deux sens : « Conduit 1 » ne vise pas le câble
+        // 16, et renommer le câble 1 en « Conduit 16 » est refusé, pas accepté.
+        assert!(ordre_de_renommage(CableId(1), "Conduit 16").is_err());
+        assert!(ordre_de_renommage(CableId(16), "Conduit 1").is_err());
+        // Un « nom » qui ressemble à un numéro sans en être un reste un nom libre.
+        for libre in ["Conduit 01", "Conduit 17", "conduit 3", "Conduit"] {
+            assert!(
+                matches!(
+                    ordre_de_renommage(CableId(3), libre),
+                    Ok(Requete::Renommer { .. })
+                ),
+                "« {libre} »"
+            );
+        }
+
+        // La règle du dépôt s'applique avant tout le reste, et c'est bien elle.
+        for refuse in ["", "   ", "a/b", "a\nb", &"x".repeat(65)] {
+            assert!(
+                matches!(
+                    ordre_de_renommage(CableId(3), refuse),
+                    Err(CableError::InvalidName(_))
+                ),
+                "« {refuse} »"
+            );
+            assert!(validate_cable_name(refuse).is_err(), "« {refuse} »");
+        }
+    }
+
+    /// Le fragment auquel `create` reconnaît un « endpoint pas encore publié » est bien
+    /// dans le message que [`verifier`] construit.
+    ///
+    /// Sans ce test, les deux dériveraient en silence et l'attente de `create`
+    /// disparaîtrait : le renommage échouerait alors une fois sur deux après un
+    /// `cable add --name`, pour une raison invisible.
+    #[cfg(windows)]
+    #[test]
+    fn le_refus_d_endpoint_absent_se_reconnait() {
+        let r = Reponse::refus_detaille(ORDRE_ACTIVER, Statut::EndpointAbsent, 0);
+        let erreur = verifier(&r, Some(CableId(3))).expect_err("endpoint absent est un refus");
+        let CableError::Driver(message) = &erreur else {
+            panic!("un endpoint absent doit rester un CableError::Driver : {erreur:?}");
+        };
+        assert!(
+            message.contains(super::windows::ENDPOINT_PAS_ENCORE),
+            "« {} » ne contient pas « {} »",
+            message,
+            super::windows::ENDPOINT_PAS_ENCORE
+        );
+        // Et aucun autre statut ne se fait prendre pour celui-là.
+        for statut in Statut::ALL {
+            if statut == Statut::EndpointAbsent || statut.succes() {
+                continue;
+            }
+            let autre = Reponse::refus_detaille(ORDRE_ACTIVER, statut, 0);
+            let texte = verifier(&autre, Some(CableId(3)))
+                .err()
+                .map_or_else(String::new, |e| e.to_string());
+            assert!(
+                !texte.contains(super::windows::ENDPOINT_PAS_ENCORE),
+                "{statut:?} : {texte}"
+            );
         }
     }
 

@@ -72,6 +72,26 @@ pub enum Commande {
         /// Le nombre de canaux voulu.
         canaux: u32,
     },
+    /// Demande au service de renommer un câble dans les réglages Son (M1b-21).
+    ///
+    /// Le nom est écrit dans le registre, pas dans le pilote. Le câble doit être
+    /// **connecté** : Windows ne publie ses endpoints — et donc leurs clés — qu'à ce
+    /// moment-là.
+    Renommer {
+        /// Le numéro affiché du câble.
+        cable: u32,
+        /// Le nom voulu : au plus 64 caractères, sans caractère de contrôle ni
+        /// « /\:*?"<>| ».
+        nom: String,
+    },
+    /// Rend à un câble son nom d'origine « Conduit N » en effaçant le nom personnalisé.
+    ///
+    /// C'est le retour en arrière qu'exige F-52 : les clés MMDevices survivent au retrait
+    /// du pilote, donc Conduit doit savoir défaire ce qu'il y a écrit.
+    NomDefaut {
+        /// Le numéro affiché du câble.
+        cable: u32,
+    },
 }
 
 impl Commande {
@@ -88,6 +108,8 @@ impl Commande {
                 | Self::Activer { .. }
                 | Self::Desactiver { .. }
                 | Self::Canaux { .. }
+                | Self::Renommer { .. }
+                | Self::NomDefaut { .. }
         )
     }
 

@@ -382,16 +382,53 @@ plutôt que de laisser l'erreur surgir au premier ordre. L'injection vient du d�
 non du dorsal parce que `conduit-helper` dépend déjà de `conduit-backend-wasapi` pour
 le transport KS : l'inverse ferait un cycle entre paquets. `create` **active** le
 premier câble libre de la réserve fixe de seize (SPEC §5.4) et rend l'état existant si
-le câble visé est déjà actif ; `remove` **désactive** ; `rename` rend une erreur qui
-nomme M1b-21 ; `set_channels` propage le refus du pilote, qui n'applique que deux
-canaux tant que M1b-05 n'est pas faite. Le bout en bout se vérifie en machine
-virtuelle, service installé et pilote chargé :
+le câble visé est déjà actif ; `remove` **désactive** ; `rename` écrit le nom de
+l'endpoint dans le registre (M1b-21, voir ci-dessous) ; `set_channels` propage le refus
+du pilote, qui n'applique que deux canaux tant que M1b-05 n'est pas faite. Le bout en
+bout se vérifie en machine virtuelle, service installé et pilote chargé :
 
 ```powershell
 conduitctl cable add          # -> câble 1 « Conduit 1 » 2 : rendu …, capture …
 conduitctl cable list
 conduitctl cable remove 1
 ```
+
+### Renommer un endpoint (M1b-21)
+
+Le nom affiché d'un endpoint audio ne vient pas du pilote : il vit dans
+`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\{Render|Capture}\{id}\Properties`,
+dans la valeur `{a45c254e-df1c-4efd-8020-67d146a850e0},2` — `PKEY_Device_DeviceDesc`,
+en `REG_SZ`. Écrire sous `HKLM` demande d'être `LocalSystem`, donc c'est le service qui
+le fait ; **le pilote n'est pas touché**, ce qui est l'application directe du principe
+« tout ce qui peut être fait hors du noyau y est fait ». Le détail de ce qui l'établit,
+la façon de retrouver un câble déjà renommé et le retour au nom d'origine sont dans
+l'en-tête de module de `crates/conduit-helper/src/registre.rs`.
+
+Le câble doit être **connecté** : Windows ne publie ses endpoints — et donc leurs clés —
+qu'à ce moment-là.
+
+```powershell
+conduit-helper activer 1
+conduit-helper renommer 1 Musique
+conduit-helper nom-defaut 1     # rend « Conduit 1 » et efface le nom personnalisé
+```
+
+et par le démon, depuis une session ordinaire :
+
+```powershell
+conduitctl cable rename 1 Musique
+conduitctl cable rename 1 "Conduit 1"   # le retour en arrière (F-52)
+conduitctl cable add --name Musique     # active le premier câble libre, puis le renomme
+```
+
+Pour voir ce que le service voit dans le registre — le premier renseignement à demander
+quand un renommage n'a pas l'effet attendu :
+
+```powershell
+cargo test -p conduit-helper --test registre -- --ignored --nocapture
+```
+
+Ce test est en **lecture seule** : il n'écrit rien et ne renomme aucun endpoint.
 
 Ce qui manque encore : l'exposition du mode exclusif dans la configuration du démon
 (il ouvre tout en partagé pour l'instant).

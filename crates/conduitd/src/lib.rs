@@ -122,7 +122,15 @@ fn ensure_cables(backend: &mut dyn Backend, config: &Config) {
                 }
                 if let Some(alias) = &c.alias {
                     if &e.name != alias {
-                        let _ = cc.rename(e.id, alias);
+                        // Le renommage écrit dans le registre depuis M1b-21 : son échec
+                        // se journalise, comme celui d'une activation. Il est rejoué à
+                        // chaque démarrage — `CableInfo::name` rend le nom d'origine du
+                        // câble, pas le nom personnalisé, que seul le dorsal WASAPI
+                        // connaît — mais réécrire la même valeur ne coûte rien.
+                        match cc.rename(e.id, alias) {
+                            Ok(info) => tracing::info!("câble renommé : {}", info.name),
+                            Err(err) => tracing::warn!("câble {} non renommé : {err}", c.id),
+                        }
                     }
                 }
             }

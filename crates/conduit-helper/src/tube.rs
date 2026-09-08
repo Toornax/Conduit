@@ -925,7 +925,7 @@ fn ouvrir_client() -> Result<Poignee, ErreurClient> {
 /// # Erreurs
 ///
 /// [`ErreurClient`] : canal absent, accès refusé, échange interrompu, réponse malformée.
-pub fn demander(requete: Requete) -> Result<Reponse, ErreurClient> {
+pub fn demander(requete: &Requete) -> Result<Reponse, ErreurClient> {
     let charge = demander_octets(&requete.encadrer())?;
     Reponse::from_bytes(&charge).map_err(ErreurClient::Reponse)
 }
@@ -984,7 +984,7 @@ pub fn demander_octets(trame: &[u8]) -> Result<Vec<u8>, ErreurClient> {
 /// distinguer.
 #[must_use]
 pub fn repond() -> bool {
-    demander(Requete::Version).is_ok()
+    demander(&Requete::Version).is_ok()
 }
 
 #[cfg(test)]
