@@ -384,7 +384,9 @@ le transport KS : l'inverse ferait un cycle entre paquets. `create` **active** l
 premier câble libre de la réserve fixe de seize (SPEC §5.4) et rend l'état existant si
 le câble visé est déjà actif ; `remove` **désactive** ; `rename` écrit le nom de
 l'endpoint dans le registre (M1b-21, voir ci-dessous) ; `set_channels` propage le refus
-du pilote, qui n'applique que deux canaux tant que M1b-05 n'est pas faite. Le bout en
+du pilote, qui sert 1 à 8 canaux par câble depuis M1b-05 mais ne peut pas en changer à
+chaud — le changement demande d'écrire `CableFormat<n>` dans la clé matérielle du
+périphérique puis de redémarrer le devnode, chemin que le service n'expose pas encore. Le bout en
 bout se vérifie en machine virtuelle, service installé et pilote chargé :
 
 ```powershell

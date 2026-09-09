@@ -45,16 +45,19 @@
 //!
 //! # État de câblage
 //!
-//! - **Réserve** et **tampon** : bornes et défauts complets, effectifs côté pilote dès
-//!   M1b-01 / M1b-02.
-//! - **Canaux** : la borne est écrite et testée ici, et **rien de plus**. Le câblage
-//!   dans les descripteurs appartient à M1b-05 : `descriptors::CHANNELS` est
-//!   aujourd'hui une `const` scellée dans les tables KS (`KSDATARANGE_AUDIO`,
-//!   `MaximumChannels`) et dans des assertions à la compilation (`topo.rs` :
-//!   `CHANNELS as usize <= MAX_CHANNELS`). Rendre les canaux dynamiques maintenant,
-//!   ce serait faire M1b-05 par la bande. Jusque-là, l'appelant compare
-//!   [`Params::channels`] à cette constante et journalise l'écart ; il n'en tire
-//!   aucun descripteur.
+//! - **Réserve** : bornes et défaut complets, effectifs côté pilote dès M1b-01 / M1b-02.
+//! - **Tampon** : effectif depuis M1b-05, comme **plancher** du tampon cyclique
+//!   ([`crate::format::buffer_bytes_with_floor`]). Il était lu, validé et journalisé
+//!   depuis M1b-01 sans agir sur rien.
+//! - **Canaux** : **supplanté** par M1b-05, et c'est le seul paramètre dont le statut ait
+//!   régressé. Il décrivait un nombre de canaux global ; le pilote en sert désormais un
+//!   **par câble**, celui que `CableFormat<n>` fixe
+//!   ([`crate::config::CABLE_FORMAT_VALUE_NAMES`]). Deux réglages pour une même chose
+//!   seraient un réglage de trop : `Channels` est encore lu, validé et journalisé — l'INF
+//!   l'écrit, `regedit` le montre —, mais **plus appliqué**. Le retirer est une question
+//!   d'installateur (une valeur d'INF qui disparaît laisse une clé sur les postes déjà
+//!   installés), pas de ce module ; jusque-là, mieux vaut le dire ici que le laisser
+//!   croire.
 //!
 //! Tout ici est sans allocation ni panique ; l'appel a lieu à `PASSIVE_LEVEL`
 //! (`StartDevice`), mais rien n'interdit un appel à `DISPATCH_LEVEL`.
@@ -102,10 +105,11 @@ pub const MAX_CHANNELS: u32 = FrameLayout::MAX_CHANNELS as u32;
 
 /// Nombre de canaux par défaut : 2.
 ///
-/// C'est la valeur de `descriptors::CHANNELS` du pilote et celle des formats
-/// [`crate::format::M1A_FORMATS`] (48 kHz stéréo, SPEC §5.4). Tant que M1b-05 n'a pas
-/// rendu les canaux dynamiques, c'est aussi la **seule** valeur que le pilote sait
-/// servir : voir la note de câblage en tête de module.
+/// C'est le nombre de canaux d'un câble neuf, celui de
+/// [`crate::config::CABLE_FORMAT_DEFAULT`] (48 kHz stéréo, SPEC §5.4). Ce n'est plus la
+/// seule valeur que le pilote sache servir — il les sert toutes de 1 à 8 depuis M1b-05,
+/// une par câble — mais c'est celle sur laquelle tout se replie : l'INF l'écrit, le pilote
+/// s'y rabat, et le service la propose.
 pub const DEFAULT_CHANNELS: u32 = 2;
 
 /// Durée minimale du tampon, en millisecondes.
@@ -366,7 +370,8 @@ pub struct Params {
     pub reserve: u8,
     /// Nombre de canaux par câble, dans `MIN_CHANNELS..=MAX_CHANNELS`.
     ///
-    /// **Pas encore câblé** : M1b-05. Voir la note en tête de module.
+    /// **Supplanté par `CableFormat<n>`** depuis M1b-05 : lu et validé, plus appliqué.
+    /// Voir la note d'état de câblage en tête de module.
     pub channels: u8,
     /// Durée du tampon en millisecondes, dans `MIN_BUFFER_MS..=MAX_BUFFER_MS`.
     pub buffer_ms: u32,

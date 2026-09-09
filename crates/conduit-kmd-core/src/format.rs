@@ -11,6 +11,21 @@
 //!
 //! Ce crate ne dépend pas de `conduit-core` : fréquences et comptes de canaux sont
 //! des entiers simples.
+//!
+//! # La matrice de M1b-05, et pourquoi elle est asymétrique
+//!
+//! Un câble déclare **une** fréquence et **un** nombre de canaux — ceux que le registre
+//! lui fixe ([`crate::config::CableFormat`]) — mais **trois** profondeurs, toujours les
+//! mêmes ([`SAMPLE_DEPTHS`]). L'asymétrie n'est pas un compromis : elle est dictée par ce
+//! que [`crate::ring::copy_frames`] sait faire. La copie **convertit** les profondeurs (les
+//! neuf couples) et ne **rééchantillonne rien**, ni ne remappe les canaux
+//! (`RingError::ChannelMismatch`). Fréquence et canaux doivent donc s'accorder entre les
+//! deux bouts d'un câble ; la profondeur, non.
+//!
+//! D'où la règle du pilote : les deux endpoints d'un câble ne déclarent que la fréquence
+//! et le nombre de canaux configurés. Windows ne peut pas les désaccorder, parce qu'on ne
+//! lui propose rien d'autre — c'est plus sûr qu'une négociation qu'il faudrait surveiller,
+//! et c'est ce qui garde le pilote léger (`docs/driver-design.md` §1).
 
 use core::fmt;
 
@@ -61,34 +76,150 @@ impl SupportedFormat {
     }
 
     /// Vrai si `requested` décrit exactement ce format : même fréquence, même
-    /// nombre de canaux, et F32 ⇔ `Float` 32/32 bits, I16 ⇔ `Pcm` 16/16 bits.
+    /// nombre de canaux, et F32 ⇔ `Float` 32/32 bits, PCM24 ⇔ `Pcm` 24/24 bits,
+    /// I16 ⇔ `Pcm` 16/16 bits.
+    ///
+    /// # Le conteneur, pas seulement les bits significatifs
+    ///
+    /// `bits_per_sample` **et** `valid_bits` doivent valoir la taille du conteneur. Un
+    /// PCM « 24 bits dans un conteneur de 32 » (`wBitsPerSample = 32`,
+    /// `wValidBitsPerSample = 24`) est donc refusé, et c'est délibéré : notre PCM24 fait
+    /// trois octets en mémoire ([`SampleFormat::Pcm24`]), et l'accepter reviendrait à lire
+    /// le tampon avec un pas de 3 là où le moteur audio écrit avec un pas de 4 — un
+    /// décalage qui grandit d'un octet par échantillon, c'est-à-dire du bruit. Le moteur
+    /// se rabat alors sur un format que nous déclarons vraiment.
     pub fn accepts(self, requested: &RequestedFormat) -> bool {
         if requested.sample_rate != self.sample_rate
             || requested.channels != u16::from(self.channels)
         {
             return false;
         }
-        let (kind, bits) = match self.format {
-            SampleFormat::F32 => (SampleKind::Float, 32),
-            SampleFormat::I16 => (SampleKind::Pcm, 16),
+        let kind = match self.format {
+            SampleFormat::F32 => SampleKind::Float,
+            SampleFormat::Pcm24 | SampleFormat::I16 => SampleKind::Pcm,
         };
+        let bits = self.format.bits_per_sample() as u16;
         requested.kind == kind && requested.bits_per_sample == bits && requested.valid_bits == bits
     }
 }
 
-/// Formats du spike M1a : 48 kHz stéréo, F32 et I16 (§5.4).
-pub const M1A_FORMATS: [SupportedFormat; 2] = [
-    SupportedFormat {
-        sample_rate: 48_000,
-        channels: 2,
-        format: SampleFormat::F32,
-    },
-    SupportedFormat {
-        sample_rate: 48_000,
-        channels: 2,
-        format: SampleFormat::I16,
-    },
-];
+/// Les trois fréquences d'échantillonnage qu'un câble peut porter (SPEC F-02, §5.4).
+///
+/// **Une seule est active à la fois**, celle que le registre fixe pour le câble : les deux
+/// bouts d'un câble ne déclarent que celle-là. La raison est dans
+/// [`crate::ring::copy_frames`] — il n'y a **aucun rééchantillonnage** dans le pilote, et
+/// il n'y en aura pas (« tout ce qui peut être fait en espace utilisateur y sera fait ») :
+/// deux bouts à deux fréquences différentes ne pourraient rien se transmettre. En
+/// déclarer une seule est donc ce qui rend l'incohérence *impossible* plutôt que
+/// détectable — Windows ne peut pas désaccorder ce qu'on ne lui propose pas.
+pub const SAMPLE_RATES: [u32; 3] = [RATE_44100, RATE_48000, RATE_96000];
+
+/// 44 100 Hz : la fréquence du disque compact, celle de la plupart des fichiers.
+pub const RATE_44100: u32 = 44_100;
+/// 48 000 Hz : la fréquence par défaut de Windows, et celle du câble par défaut.
+pub const RATE_48000: u32 = 48_000;
+/// 96 000 Hz : la fréquence des stations de travail audio.
+pub const RATE_96000: u32 = 96_000;
+
+/// Les trois profondeurs déclarées, **toutes les trois, toujours** (§5.4).
+///
+/// C'est l'exacte contrepartie de [`SAMPLE_RATES`] : la profondeur, elle, se convertit à
+/// la volée ([`crate::ring::copy_frames`] traite les neuf couples), donc rien n'oblige les
+/// deux bouts d'un câble à s'accorder dessus, donc rien n'oblige à en choisir une. C'est ce
+/// qui fait qu'un câble a **3 fréquences × 8 canaux = 24** variantes de descripteurs, et
+/// non 72.
+///
+/// L'ordre est celui de la préférence usuelle du moteur audio de Windows — le flottant
+/// d'abord, l'entier 16 bits en dernier ressort — sans qu'on lui prête d'effet : PortCls
+/// intersecte lui-même et rien dans la documentation ne promet que l'ordre des
+/// `KSDATARANGE` compte.
+pub const SAMPLE_DEPTHS: [SampleFormat; 3] =
+    [SampleFormat::F32, SampleFormat::Pcm24, SampleFormat::I16];
+
+/// Nombre de formats qu'un câble déclare : une profondeur par entrée de [`SAMPLE_DEPTHS`].
+pub const FORMATS_PER_CABLE: usize = SAMPLE_DEPTHS.len();
+
+/// Les formats que déclare un câble réglé sur `sample_rate` et `channels` : les trois
+/// profondeurs de [`SAMPLE_DEPTHS`], à cette fréquence et sur ce nombre de canaux.
+///
+/// Aucune validation ici — `sample_rate` et `channels` viennent d'une
+/// `crate::config::CableFormat`, déjà écrêtée. Une valeur aberrante ne produirait qu'un
+/// format que personne ne demande (et [`SupportedFormat::layout`] rendrait `None` pour
+/// `channels == 0`), jamais une panique.
+#[must_use]
+pub const fn cable_formats(sample_rate: u32, channels: u8) -> [SupportedFormat; FORMATS_PER_CABLE] {
+    [
+        SupportedFormat {
+            sample_rate,
+            channels,
+            format: SampleFormat::F32,
+        },
+        SupportedFormat {
+            sample_rate,
+            channels,
+            format: SampleFormat::Pcm24,
+        },
+        SupportedFormat {
+            sample_rate,
+            channels,
+            format: SampleFormat::I16,
+        },
+    ]
+}
+
+/// Rang de `sample_rate` dans [`SAMPLE_RATES`], ou `None` si ce n'est pas une des trois.
+///
+/// C'est l'index que les tables de descripteurs du pilote emploient : une fréquence hors
+/// liste n'a pas de variante, et l'appelant se replie sur celle du défaut. Écrit en
+/// `match` sur les trois valeurs plutôt qu'en boucle sur [`SAMPLE_RATES`] : le crate
+/// refuse l'indexation, et une assertion `const` plus bas relie les deux.
+#[must_use]
+pub const fn sample_rate_index(sample_rate: u32) -> Option<usize> {
+    match sample_rate {
+        RATE_44100 => Some(0),
+        RATE_48000 => Some(1),
+        RATE_96000 => Some(2),
+        _ => None,
+    }
+}
+
+/// La fréquence de rang `index` dans [`SAMPLE_RATES`], réciproque de
+/// [`sample_rate_index`] ; `None` au-delà de la troisième.
+#[must_use]
+pub const fn sample_rate_at(index: usize) -> Option<u32> {
+    match index {
+        0 => Some(RATE_44100),
+        1 => Some(RATE_48000),
+        2 => Some(RATE_96000),
+        _ => None,
+    }
+}
+
+// Les deux écritures de la liste des fréquences disent la même chose. Sans cette
+// assertion, ajouter une fréquence à `SAMPLE_RATES` sans toucher aux deux `match`
+// donnerait une variante de descripteur que personne ne sait indexer — un câble réglé
+// dessus se replierait en silence sur le défaut.
+const _: () = {
+    let [a, b, c] = SAMPLE_RATES;
+    assert!(a == RATE_44100 && b == RATE_48000 && c == RATE_96000);
+    assert!(matches!(sample_rate_index(RATE_44100), Some(0)));
+    assert!(matches!(sample_rate_index(RATE_48000), Some(1)));
+    assert!(matches!(sample_rate_index(RATE_96000), Some(2)));
+    assert!(sample_rate_index(0).is_none());
+    assert!(matches!(sample_rate_at(0), Some(RATE_44100)));
+    assert!(matches!(sample_rate_at(1), Some(RATE_48000)));
+    assert!(matches!(sample_rate_at(2), Some(RATE_96000)));
+    assert!(sample_rate_at(SAMPLE_RATES.len()).is_none());
+    // Les trois profondeurs, dans l'ordre annoncé, et leurs tailles de conteneur.
+    let [f32_, pcm24, i16_] = SAMPLE_DEPTHS;
+    assert!(matches!(f32_, SampleFormat::F32));
+    assert!(matches!(pcm24, SampleFormat::Pcm24));
+    assert!(matches!(i16_, SampleFormat::I16));
+    assert!(f32_.bits_per_sample() == 32);
+    assert!(pcm24.bits_per_sample() == 24);
+    assert!(i16_.bits_per_sample() == 16);
+    assert!(FORMATS_PER_CABLE == 3);
+};
 
 /// Erreur de [`validate`].
 #[non_exhaustive]
@@ -113,10 +244,11 @@ impl std::error::Error for FormatError {}
 
 /// Cherche dans `supported` le format qui correspond exactement à `requested`.
 ///
-/// Correspondance : F32 ⇔ [`SampleKind::Float`] 32 bits sur 32 ; I16 ⇔
-/// [`SampleKind::Pcm`] 16 bits sur 16 ; fréquence et canaux égaux. Tout le reste
-/// (24 bits, `Other`, bits valides partiels) est [`FormatError::Unsupported`] : le
-/// pilote répond `STATUS_INVALID_PARAMETER` et le moteur choisit un autre format.
+/// Correspondance : F32 ⇔ [`SampleKind::Float`] 32 bits sur 32 ; PCM24 ⇔
+/// [`SampleKind::Pcm`] 24 bits sur 24 ; I16 ⇔ [`SampleKind::Pcm`] 16 bits sur 16 ;
+/// fréquence et canaux égaux. Tout le reste (`Other`, bits valides partiels — dont le
+/// PCM 24-dans-32, voir [`SupportedFormat::accepts`]) est [`FormatError::Unsupported`] :
+/// le pilote répond `STATUS_INVALID_PARAMETER` et le moteur choisit un autre format.
 ///
 /// IRQL : `PASSIVE_LEVEL` en pratique, mais aucune allocation ni panique.
 pub fn validate(
@@ -174,23 +306,56 @@ pub const MAX_BUFFER_MS: u32 = 500;
 /// au-dessus du plafond), si la demande arrondie dépasse [`MAX_BUFFER_MS`] ou si la
 /// taille retenue ne tient pas dans un `u32`.
 pub fn buffer_bytes(requested_bytes: u32, frame_bytes: u32, sample_rate: u32) -> Option<u32> {
+    buffer_bytes_with_floor(requested_bytes, frame_bytes, sample_rate, MIN_BUFFER_MS)
+}
+
+/// Comme [`buffer_bytes`], mais avec un **plancher réglable** : `floor_ms` millisecondes
+/// de son au lieu de [`MIN_BUFFER_MS`].
+///
+/// C'est par là que le paramètre de registre `BufferMs` agit (M1b-01 le lisait, M1b-05
+/// l'applique). Le plancher est la seule chose qu'il commande, et c'est bien ce que SPEC
+/// §11.2 décrit — « tampon interne du pilote : 10 ms par défaut, réglable ». Un moteur
+/// audio qui demande **plus** obtient ce qu'il demande, inchangé ; un moteur qui demande
+/// **moins** obtient le plancher.
+///
+/// # Ce que régler ce plancher change vraiment
+///
+/// Le contrat de [`buffer_bytes`] tient — jamais moins que demandé, ou rien —, mais le
+/// défaut de 10 ms est **dix fois** le plancher de 1 ms qui valait jusqu'ici. Une
+/// application en mode exclusif qui demanderait 3 ms de tampon recevra donc 10 ms, et sa
+/// latence s'en ressentira. C'est le comportement voulu (le plancher existe pour que le DPC
+/// de copie ait de la marge), et c'est aussi ce qui rend le paramètre utile : un poste qui
+/// veut 5 ms écrit `BufferMs = 5`.
+///
+/// `floor_ms` est écrêté à [`MAX_BUFFER_MS`] : un plancher au-dessus du plafond refuserait
+/// toute allocation, ce qui n'est jamais ce qu'un administrateur voulait dire.
+/// [`crate::params::sanitize`] l'a déjà ramené dans les bornes de toute façon ; l'écrêtage
+/// ici est la ceinture qui rend la fonction sûre pour un appelant qui l'aurait oublié.
+pub fn buffer_bytes_with_floor(
+    requested_bytes: u32,
+    frame_bytes: u32,
+    sample_rate: u32,
+    floor_ms: u32,
+) -> Option<u32> {
     if frame_bytes == 0 || sample_rate == 0 {
         return None;
     }
+    let floor_ms = floor_ms.clamp(MIN_BUFFER_MS, MAX_BUFFER_MS);
     let frame_bytes = u64::from(frame_bytes);
     let rate = u64::from(sample_rate);
-    // ceil(rate × MIN_MS / 1000) et floor(rate × MAX_MS / 1000), en u64 : pas de
+    // ceil(rate × floor_ms / 1000) et floor(rate × MAX_MS / 1000), en u64 : pas de
     // débordement (u32 × 500 < 2^32 × 2^9 = 2^41, et le + 999 du ceil reste loin de 2^64).
     let min_frames = rate
-        .checked_mul(u64::from(MIN_BUFFER_MS))?
+        .checked_mul(u64::from(floor_ms))?
         .checked_add(999)?
         .checked_div(1_000)?;
     let max_frames = rate
         .checked_mul(u64::from(MAX_BUFFER_MS))?
         .checked_div(1_000)?;
-    // Encore atteignable, mais pour la seule fréquence de 1 Hz : min_frames = 1 et
-    // max_frames = 0. Dès 2 Hz max_frames ≥ 1 = min_frames (min_frames vaut 1 jusqu'à
-    // 1 000 Hz), et au-delà rate/2 domine largement rate/1000.
+    // Atteignable aux basses fréquences, et d'autant plus depuis que le plancher est
+    // réglable : à 1 Hz min_frames = 1 et max_frames = 0 quel que soit `floor_ms`, et à
+    // `floor_ms == MAX_BUFFER_MS` le ceil du plancher peut dépasser d'une trame le floor du
+    // plafond. Dans les deux cas il n'existe aucune taille valide : refuser.
     if min_frames > max_frames {
         return None;
     }
@@ -224,7 +389,25 @@ pub fn buffer_bytes_for_notifications(
     sample_rate: u32,
     notification_count: u32,
 ) -> Option<u32> {
-    let bytes = buffer_bytes(requested_bytes, frame_bytes, sample_rate)?;
+    buffer_bytes_for_notifications_with_floor(
+        requested_bytes,
+        frame_bytes,
+        sample_rate,
+        notification_count,
+        MIN_BUFFER_MS,
+    )
+}
+
+/// Comme [`buffer_bytes_for_notifications`], avec le plancher réglable de
+/// [`buffer_bytes_with_floor`] (paramètre de registre `BufferMs`).
+pub fn buffer_bytes_for_notifications_with_floor(
+    requested_bytes: u32,
+    frame_bytes: u32,
+    sample_rate: u32,
+    notification_count: u32,
+    floor_ms: u32,
+) -> Option<u32> {
+    let bytes = buffer_bytes_with_floor(requested_bytes, frame_bytes, sample_rate, floor_ms)?;
     // `frame_bytes ≠ 0` (vérifié par `buffer_bytes`) et `bytes` en est un multiple.
     let frames = bytes.checked_div(frame_bytes)?;
     let aligned = crate::notify::align_frames(frames, notification_count)?;
@@ -260,15 +443,18 @@ mod tests {
         }
     }
 
+    /// Les formats du câble par défaut : 48 kHz stéréo, les trois profondeurs.
+    const DEFAUT: [SupportedFormat; FORMATS_PER_CABLE] = cable_formats(48_000, 2);
+
     #[test]
     fn validate_table() {
-        let cases: [(RequestedFormat, Result<SupportedFormat, FormatError>); 12] = [
-            (
-                req(48_000, 2, 32, 32, SampleKind::Float),
-                Ok(M1A_FORMATS[0]),
-            ),
-            (req(48_000, 2, 16, 16, SampleKind::Pcm), Ok(M1A_FORMATS[1])),
-            // Mauvaise fréquence.
+        let [f32_, pcm24, i16_] = DEFAUT;
+        let cases: [(RequestedFormat, Result<SupportedFormat, FormatError>); 14] = [
+            (req(48_000, 2, 32, 32, SampleKind::Float), Ok(f32_)),
+            (req(48_000, 2, 24, 24, SampleKind::Pcm), Ok(pcm24)),
+            (req(48_000, 2, 16, 16, SampleKind::Pcm), Ok(i16_)),
+            // Mauvaise fréquence : les deux autres du domaine, qu'un **autre** câble
+            // pourrait servir mais pas celui-ci.
             (
                 req(44_100, 2, 32, 32, SampleKind::Float),
                 Err(FormatError::Unsupported),
@@ -296,10 +482,12 @@ mod tests {
                 Err(FormatError::Unsupported),
             ),
             (
-                req(48_000, 2, 24, 24, SampleKind::Pcm),
+                req(48_000, 2, 24, 24, SampleKind::Float),
                 Err(FormatError::Unsupported),
             ),
-            // Bits valides partiels (PCM 24 dans 32, float « 24 bits »).
+            // **PCM 24 dans un conteneur de 32** : refusé, et c'est le cas qui compte
+            // depuis M1b-05. L'accepter ferait lire le tampon avec un pas de 3 là où le
+            // moteur écrit avec un pas de 4 (voir `SupportedFormat::accepts`).
             (
                 req(48_000, 2, 32, 24, SampleKind::Pcm),
                 Err(FormatError::Unsupported),
@@ -308,17 +496,18 @@ mod tests {
                 req(48_000, 2, 32, 24, SampleKind::Float),
                 Err(FormatError::Unsupported),
             ),
+            // Bits valides partiels dans un conteneur de 24.
+            (
+                req(48_000, 2, 24, 20, SampleKind::Pcm),
+                Err(FormatError::Unsupported),
+            ),
             (
                 req(48_000, 2, 16, 16, SampleKind::Other),
                 Err(FormatError::Unsupported),
             ),
         ];
         for (requested, expected) in cases {
-            assert_eq!(
-                validate(&requested, &M1A_FORMATS),
-                expected,
-                "{requested:?}"
-            );
+            assert_eq!(validate(&requested, &DEFAUT), expected, "{requested:?}");
         }
         assert_eq!(
             validate(&req(48_000, 2, 32, 32, SampleKind::Float), &[]),
@@ -326,16 +515,115 @@ mod tests {
         );
     }
 
+    /// Un câble réglé sur autre chose que le défaut n'accepte que **sa** fréquence et
+    /// **son** nombre de canaux — c'est ce qui rend l'accord des deux bouts impossible à
+    /// rater.
+    #[test]
+    fn un_cable_ne_declare_que_son_reglage() {
+        let cable = cable_formats(96_000, 6);
+        assert_eq!(cable.len(), FORMATS_PER_CABLE);
+        for depth in SAMPLE_DEPTHS {
+            let bits = depth.bits_per_sample() as u16;
+            let kind = if matches!(depth, SampleFormat::F32) {
+                SampleKind::Float
+            } else {
+                SampleKind::Pcm
+            };
+            // Les trois profondeurs passent, à sa fréquence et sur ses canaux.
+            assert!(
+                validate(&req(96_000, 6, bits, bits, kind), &cable).is_ok(),
+                "{depth:?}"
+            );
+            // Les deux autres fréquences, non — même profondeur, mêmes canaux.
+            for rate in [44_100, 48_000] {
+                assert_eq!(
+                    validate(&req(rate, 6, bits, bits, kind), &cable),
+                    Err(FormatError::Unsupported),
+                    "{depth:?} à {rate} Hz"
+                );
+            }
+            // Les autres comptes de canaux, non plus.
+            for channels in [1, 2, 5, 7, 8] {
+                assert_eq!(
+                    validate(&req(96_000, channels, bits, bits, kind), &cable),
+                    Err(FormatError::Unsupported),
+                    "{depth:?} sur {channels} canaux"
+                );
+            }
+        }
+    }
+
+    /// Les 24 variantes de la matrice : trois fréquences, huit comptes de canaux, et
+    /// **trois profondeurs chacune** — 72 formats déclarés, mais 24 jeux de descripteurs.
+    #[test]
+    fn la_matrice_fait_bien_vingt_quatre_variantes() {
+        assert_eq!(SAMPLE_RATES.len(), 3);
+        assert_eq!(SAMPLE_DEPTHS.len(), FORMATS_PER_CABLE);
+        let mut variantes = 0usize;
+        let mut formats = 0usize;
+        for rate in SAMPLE_RATES {
+            for channels in 1u8..=FrameLayout::MAX_CHANNELS {
+                let jeu = cable_formats(rate, channels);
+                variantes += 1;
+                formats += jeu.len();
+                let layout = jeu[0].layout().unwrap();
+                assert_eq!(layout.channels(), channels);
+                // Les trois profondeurs, et rien d'autre.
+                let depths: [SampleFormat; 3] = [jeu[0].format, jeu[1].format, jeu[2].format];
+                assert_eq!(depths, SAMPLE_DEPTHS, "{rate} Hz, {channels} canaux");
+                for f in jeu {
+                    assert_eq!(f.sample_rate, rate);
+                    assert_eq!(f.channels, channels);
+                }
+            }
+        }
+        assert_eq!(variantes, 24);
+        assert_eq!(formats, 72);
+    }
+
+    /// Rang et fréquence sont réciproques sur tout le domaine, et rien d'autre n'a de
+    /// rang.
+    #[test]
+    fn rang_et_frequence_sont_reciproques() {
+        for (i, rate) in SAMPLE_RATES.iter().enumerate() {
+            assert_eq!(sample_rate_index(*rate), Some(i), "{rate} Hz");
+            assert_eq!(sample_rate_at(i), Some(*rate), "rang {i}");
+        }
+        for rate in [
+            0,
+            1,
+            8_000,
+            44_099,
+            44_101,
+            48_001,
+            96_001,
+            192_000,
+            u32::MAX,
+        ] {
+            assert_eq!(sample_rate_index(rate), None, "{rate} Hz");
+        }
+        assert_eq!(sample_rate_at(3), None);
+        assert_eq!(sample_rate_at(usize::MAX), None);
+    }
+
     #[test]
     fn supported_layout() {
-        assert_eq!(M1A_FORMATS[0].layout().unwrap().frame_bytes(), 8);
-        assert_eq!(M1A_FORMATS[1].layout().unwrap().frame_bytes(), 4);
+        // 48 kHz stéréo : 8 octets par trame en F32, 6 en PCM24, 4 en I16.
+        let [f32_, pcm24, i16_] = DEFAUT;
+        assert_eq!(f32_.layout().unwrap().frame_bytes(), 8);
+        assert_eq!(pcm24.layout().unwrap().frame_bytes(), 6);
+        assert_eq!(i16_.layout().unwrap().frame_bytes(), 4);
+        // Huit canaux en PCM24 : 24 octets, la seule trame de la matrice qui ne soit ni
+        // une puissance de deux ni un multiple de 4.
+        let huit = cable_formats(96_000, 8);
+        assert_eq!(huit[1].layout().unwrap().frame_bytes(), 24);
         let bad = SupportedFormat {
             sample_rate: 48_000,
             channels: 0,
             format: SampleFormat::F32,
         };
         assert!(bad.layout().is_none());
+        assert!(cable_formats(48_000, 9)[0].layout().is_none());
     }
 
     #[test]
@@ -383,6 +671,68 @@ mod tests {
         // (1 ms = 4 294 968 trames) tient encore.
         assert_eq!(buffer_bytes(u32::MAX, 32, u32::MAX), None);
         assert_eq!(buffer_bytes(1_000, 32, u32::MAX), Some(4_294_968 * 32));
+    }
+
+    /// Le plancher réglable (`BufferMs`, M1b-05) : il **remonte** les petites demandes et
+    /// ne touche pas aux grandes.
+    #[test]
+    fn buffer_bytes_with_floor_table() {
+        // 48 kHz stéréo F32, 8 octets/trame. Plancher par défaut du pilote : 10 ms, soit
+        // 480 trames = 3 840 octets.
+        assert_eq!(buffer_bytes_with_floor(0, 8, 48_000, 10), Some(3_840));
+        assert_eq!(buffer_bytes_with_floor(1, 8, 48_000, 10), Some(3_840));
+        // Une demande de 3 ms est remontée à 10 : c'est la conséquence assumée du
+        // paramètre (voir la documentation de la fonction).
+        assert_eq!(buffer_bytes_with_floor(1_152, 8, 48_000, 10), Some(3_840));
+        // Une demande plus grande passe telle quelle, arrondie à la trame.
+        assert_eq!(buffer_bytes_with_floor(7_680, 8, 48_000, 10), Some(7_680));
+        assert_eq!(buffer_bytes_with_floor(7_681, 8, 48_000, 10), Some(7_688));
+        // Plancher 1 ms : le comportement d'avant M1b-05, celui de `buffer_bytes`.
+        assert_eq!(buffer_bytes_with_floor(0, 8, 48_000, 1), Some(384));
+        assert_eq!(buffer_bytes(0, 8, 48_000), Some(384));
+        assert_eq!(
+            buffer_bytes_with_floor(1_152, 8, 48_000, 1),
+            buffer_bytes(1_152, 8, 48_000)
+        );
+        // Plancher 5 ms (« réglable à 10 ms » sur le chemin complet, SPEC §5.6).
+        assert_eq!(buffer_bytes_with_floor(0, 8, 48_000, 5), Some(1_920));
+        // Plancher au plafond : 500 ms, exactement le maximum acceptable.
+        assert_eq!(buffer_bytes_with_floor(0, 8, 48_000, 500), Some(192_000));
+        // Plancher **au-dessus** du plafond : écrêté à 500 ms, jamais un refus général.
+        assert_eq!(buffer_bytes_with_floor(0, 8, 48_000, 501), Some(192_000));
+        assert_eq!(
+            buffer_bytes_with_floor(0, 8, 48_000, u32::MAX),
+            Some(192_000)
+        );
+        // Plancher nul : remonté à 1 ms, jamais un tampon vide.
+        assert_eq!(buffer_bytes_with_floor(0, 8, 48_000, 0), Some(384));
+        // Le refus de la borne haute est indépendant du plancher.
+        assert_eq!(buffer_bytes_with_floor(192_001, 8, 48_000, 10), None);
+        assert_eq!(buffer_bytes_with_floor(u32::MAX, 8, 48_000, 1), None);
+        // 44,1 kHz I16 : 10 ms = 441 trames = 1 764 octets.
+        assert_eq!(buffer_bytes_with_floor(0, 4, 44_100, 10), Some(1_764));
+        // Les cas invalides restent invalides quel que soit le plancher.
+        assert_eq!(buffer_bytes_with_floor(1_000, 0, 48_000, 10), None);
+        assert_eq!(buffer_bytes_with_floor(1_000, 8, 0, 10), None);
+        // Le plancher aligné sur les notifications hérite de tout cela.
+        assert_eq!(
+            buffer_bytes_for_notifications_with_floor(0, 8, 48_000, 2, 10),
+            Some(3_840)
+        );
+        // 441 trames est **impair** : deux périodes de notification l'arrondissent à 442.
+        // L'alignement ne peut que remonter la taille, jamais l'abaisser sous le plancher.
+        assert_eq!(
+            buffer_bytes_for_notifications_with_floor(0, 4, 44_100, 2, 10),
+            Some(1_768)
+        );
+        assert_eq!(
+            buffer_bytes_for_notifications_with_floor(0, 4, 44_100, 1, 10),
+            Some(1_764)
+        );
+        assert_eq!(
+            buffer_bytes_for_notifications(0, 4, 44_100, 2),
+            buffer_bytes_for_notifications_with_floor(0, 4, 44_100, 2, MIN_BUFFER_MS)
+        );
     }
 
     #[test]
@@ -487,23 +837,64 @@ mod tests {
             }
         }
 
-        /// Un format supporté s'accepte lui-même ; changer un champ le refuse.
+        /// Le plancher réglable ne casse aucune propriété de [`buffer_bytes`] : le
+        /// résultat est un multiple de la trame, au moins la demande, au moins `floor_ms`
+        /// de son, et le refus reste celui du plafond.
+        #[test]
+        fn buffer_bytes_with_floor_never_shrinks(
+            requested in any::<u32>(),
+            frame_bytes in 1u32..=32,
+            sample_rate in 8_000u32..=384_000,
+            floor_ms in any::<u32>(),
+        ) {
+            let rate = u64::from(sample_rate);
+            let borne = floor_ms.clamp(MIN_BUFFER_MS, MAX_BUFFER_MS);
+            let requested_frames = u64::from(requested).div_ceil(u64::from(frame_bytes));
+            let max = rate * u64::from(MAX_BUFFER_MS) / 1_000;
+            match buffer_bytes_with_floor(requested, frame_bytes, sample_rate, floor_ms) {
+                Some(bytes) => {
+                    prop_assert_eq!(bytes % frame_bytes, 0);
+                    prop_assert!(bytes >= requested, "moins que demandé : {bytes} < {requested}");
+                    let frames = u64::from(bytes / frame_bytes);
+                    prop_assert!(
+                        frames * 1_000 >= rate * u64::from(borne),
+                        "sous le plancher de {borne} ms : {frames} trames"
+                    );
+                    prop_assert!(requested_frames <= max, "accepté au-delà de 500 ms");
+                }
+                None => {
+                    // Dans ces plages, le seul refus est le dépassement du plafond : le
+                    // plancher écrêté ne peut jamais passer au-dessus (à 8 kHz, 500 ms font
+                    // 4 000 trames et le ceil du plancher au plus 4 000 aussi).
+                    prop_assert!(requested_frames > max, "refus d'une demande sous les 500 ms");
+                }
+            }
+        }
+
+        /// Un format supporté s'accepte lui-même ; changer un champ le refuse — sur les
+        /// **trois** profondeurs, y compris le conteneur élargi (`bits + 8`), qui est la
+        /// forme du PCM 24-dans-32.
         #[test]
         fn supported_accepts_itself(
             sample_rate in 1u32..=384_000,
             channels in 1u8..=8,
-            is_float in any::<bool>(),
+            depth in 0usize..3,
         ) {
-            let format = if is_float { SampleFormat::F32 } else { SampleFormat::I16 };
+            let format = SAMPLE_DEPTHS[depth];
             let s = SupportedFormat { sample_rate, channels, format };
-            let bits = format.bytes_per_sample() as u16 * 8;
+            let bits = format.bits_per_sample() as u16;
+            let is_float = matches!(format, SampleFormat::F32);
             let kind = if is_float { SampleKind::Float } else { SampleKind::Pcm };
             let r = req(sample_rate, u16::from(channels), bits, bits, kind);
             prop_assert_eq!(validate(&r, &[s]), Ok(s));
             let other_kind = if is_float { SampleKind::Pcm } else { SampleKind::Float };
             let variants = [
                 RequestedFormat { kind: other_kind, ..r },
+                RequestedFormat { kind: SampleKind::Other, ..r },
                 RequestedFormat { valid_bits: bits - 1, ..r },
+                // Conteneur plus large, bits valides inchangés : la forme du PCM
+                // 24-dans-32 que le moteur audio propose volontiers.
+                RequestedFormat { bits_per_sample: bits + 8, ..r },
                 RequestedFormat { sample_rate: sample_rate + 1, ..r },
                 RequestedFormat { channels: u16::from(channels) + 1, ..r },
             ];
@@ -511,6 +902,33 @@ mod tests {
                 let refused = validate(&variant, &[s]).is_err();
                 prop_assert!(refused, "{:?} accepté par {:?}", variant, s);
             }
+        }
+
+        /// Un câble ne reconnaît **que** son propre réglage : quelle que soit la demande,
+        /// elle passe si et seulement si sa fréquence et ses canaux sont ceux du câble et
+        /// que sa profondeur est une des trois, conteneur exact.
+        #[test]
+        fn un_cable_accepte_exactement_sa_ligne_de_la_matrice(
+            rate_index in 0usize..3,
+            channels in 1u8..=8,
+            demande_rate in prop_oneof![
+                Just(RATE_44100), Just(RATE_48000), Just(RATE_96000), 1u32..=384_000,
+            ],
+            demande_channels in 1u16..=16,
+            bits in prop_oneof![Just(16u16), Just(24), Just(32), 1u16..=64],
+            valid in prop_oneof![Just(16u16), Just(24), Just(32), 1u16..=64],
+            float in any::<bool>(),
+        ) {
+            let rate = sample_rate_at(rate_index).unwrap();
+            let jeu = cable_formats(rate, channels);
+            let kind = if float { SampleKind::Float } else { SampleKind::Pcm };
+            let r = req(demande_rate, demande_channels, bits, valid, kind);
+            let profondeur_connue = bits == valid
+                && ((float && bits == 32) || (!float && (bits == 24 || bits == 16)));
+            let attendu = demande_rate == rate
+                && demande_channels == u16::from(channels)
+                && profondeur_connue;
+            prop_assert_eq!(validate(&r, &jeu).is_ok(), attendu, "{:?}", r);
         }
     }
 }

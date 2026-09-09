@@ -113,12 +113,14 @@
 //!   (voir [`crate::jack`]). La propriété rendra la bonne valeur et le panneau de son ne
 //!   bougera pas. La brique d'événements est construite à part ; le point d'insertion est
 //!   marqué dans `conduit_kmd::cable::Cable::set_connected`.
-//! - **Appliquer les canaux** : [`CableState::channels`] est validé par le contrat
-//!   portable, puis le gestionnaire refuse toute valeur autre que celle que le pilote sait
-//!   servir ([`CableState::channels_applicables`]). `descriptors::CHANNELS` est scellée
-//!   dans les tables KS et dans des assertions à la compilation ; rendre le champ effectif
-//!   est M1b-05. Répondre `STATUS_SUCCESS` à un réglage qui n'agit sur rien serait pire
-//!   qu'un refus.
+//! - **Changer les canaux à chaud** : [`CableState::channels`] est validé par le contrat
+//!   portable, puis le gestionnaire refuse toute valeur autre que celle que **ce câble**
+//!   sert déjà ([`CableState::channels_appliquables`], contre [`CableConfig::channels`]).
+//!   Depuis M1b-05 le pilote sait servir 1 à 8 canaux, mais pas en changer sans redémarrer
+//!   le périphérique : les tables KS sont immuables et PortCls en retient les pointeurs
+//!   pour toute la vie du filtre. Le réglage passe par le registre et un redémarrage du
+//!   devnode, tous deux en espace utilisateur. Répondre `STATUS_SUCCESS` à un changement
+//!   qui n.agirait sur rien avant le prochain démarrage serait pire qu.un refus.
 
 use conduit_com::{NtStatus, STATUS_INVALID_PARAMETER};
 use conduit_kmd_core::config::{
@@ -268,9 +270,10 @@ pub trait CableConfig: Send + Sync + 'static {
 
     /// Nombre de canaux du câble, tel que ses descripteurs KS le déclarent.
     ///
-    /// Sert à remplir [`CableState::channels`] au `GET`. Le `SET` ne s'en sert pas pour
-    /// valider — c'est [`CableState::channels_applicables`] qui tranche, contre la valeur
-    /// que le pilote sait servir jusqu'à M1b-05.
+    /// Sert à remplir [`CableState::channels`] au `GET`, et à **valider** le `SET` depuis
+    /// M1b-05 : [`CableState::channels_appliquables`] compare la valeur demandée à
+    /// celle-ci. Doit être constant pour la vie du miniport — un format ne change qu.au
+    /// redémarrage du périphérique.
     fn channels(&self) -> u32;
 
     /// L'état actif du câble, celui que `KSJACK_DESCRIPTION::IsConnected` porte aussi.
@@ -414,8 +417,9 @@ struct Applique {
 /// 1. le tampon n'est pas une [`CableState`] valide (longueur, domaines, champ réservé) —
 ///    c'est [`CableState::from_bytes`] qui tranche, dans le crate portable ;
 /// 2. [`CableState::cable`] ne désigne pas le câble de ce filtre (écho vérifié) ;
-/// 3. [`CableState::channels`] est dans le domaine du contrat mais pas dans ce que le
-///    pilote sait servir (M1b-05).
+/// 3. [`CableState::channels`] est dans le domaine du contrat mais n.est pas le nombre de
+///    canaux que **ce câble** sert (M1b-05 : le format se change par le registre plus un
+///    redémarrage du devnode, pas par cette propriété).
 fn appliquer<T: CableConfig>(
     cible: &T,
     value: &[u8],
@@ -427,7 +431,7 @@ fn appliquer<T: CableConfig>(
     if etat.cable != cible.cable_index() {
         return Err(Ok(etat));
     }
-    if !etat.channels_applicables() {
+    if !etat.channels_appliquables(cible.channels()) {
         return Err(Ok(etat));
     }
     let persiste = cible.set_connected(etat.is_connected());
@@ -693,6 +697,7 @@ mod tests {
         let etat = etat_courant(&Faux {
             cable: 0,
             connected: true,
+            channels: 2,
         });
         assert_eq!(etat.reserved, 0);
         let mut tampon = [0xFFu8; CABLE_STATE_BYTES];
@@ -756,6 +761,10 @@ mod tests {
     struct Faux {
         cable: u32,
         connected: bool,
+        /// Le nombre de canaux que ce câble sert. Réglable depuis M1b-05 : c'est lui que
+        /// le `SET` confronte à la valeur demandée, et un test qui le fixerait à 2 en dur
+        /// ne dirait plus rien d'un câble à six canaux.
+        channels: u32,
     }
 
     impl CableConfig for Faux {
@@ -763,7 +772,7 @@ mod tests {
             self.cable
         }
         fn channels(&self) -> u32 {
-            2
+            self.channels
         }
         fn is_connected(&self) -> bool {
             self.connected
@@ -776,12 +785,14 @@ mod tests {
         }
     }
 
-    /// `appliquer` refuse l'écho de câble faux et les canaux que M1b-04 ne sert pas.
+    /// `appliquer` refuse l'écho de câble faux et tout nombre de canaux qui n'est pas
+    /// celui du câble visé.
     #[test]
     fn appliquer_refuse_l_echo_faux_et_les_canaux_non_servis() {
         let cible = Faux {
             cable: 3,
             connected: false,
+            channels: 2,
         };
 
         // Le bon câble, deux canaux : appliqué.
@@ -797,12 +808,13 @@ mod tests {
             "le refus porte l'état demandé, pas un parse"
         );
 
-        // Six canaux : dans le domaine du contrat, hors de ce que le pilote sert (M1b-05).
+        // Six canaux sur un câble stéréo : dans le domaine du contrat, hors de ce que ce
+        // câble sert. Le format se change par le registre et un redémarrage du devnode.
         let six = CableState {
             channels: 6,
             ..CableState::new(3, true)
         };
-        assert!(!six.channels_applicables());
+        assert!(!six.channels_appliquables(cible.channels()));
         assert!(appliquer(&cible, &six.to_bytes()).is_err());
 
         // Un tampon d'un octet de trop : refusé par le parseur portable, pas ici.
@@ -810,5 +822,34 @@ mod tests {
         trop_long.push(0);
         let refus = appliquer(&cible, &trop_long).err().unwrap();
         assert!(matches!(refus, Err(ConfigError::Longueur { recus: 17 })));
+    }
+
+    /// La symétrie de M1b-05 : sur un câble à six canaux, c'est « six » qui passe et
+    /// « deux » qui est refusé. Le gestionnaire ne connaît plus de valeur privilégiée.
+    #[test]
+    fn appliquer_suit_les_canaux_du_cable_et_non_une_constante() {
+        for (canaux, autre) in [(1u32, 2u32), (2, 6), (6, 2), (8, 7)] {
+            let cible = Faux {
+                cable: 3,
+                connected: false,
+                channels: canaux,
+            };
+            let bon = CableState {
+                channels: canaux,
+                ..CableState::new(3, true)
+            };
+            assert!(
+                appliquer(&cible, &bon.to_bytes()).is_ok(),
+                "{canaux} canaux refusés sur un câble à {canaux} canaux"
+            );
+            let mauvais = CableState {
+                channels: autre,
+                ..CableState::new(3, true)
+            };
+            assert!(
+                appliquer(&cible, &mauvais.to_bytes()).is_err(),
+                "{autre} canaux acceptés sur un câble à {canaux} canaux"
+            );
+        }
     }
 }

@@ -61,7 +61,8 @@
 //! assertions `const` ci-dessous.
 //!
 //! **La cartographie.** `KSJACK_DESCRIPTION::ChannelMapping` doit être non nul « *only for
-//! analog rendering pins* » : `KSAUDIO_SPEAKER_STEREO` au rendu, **0** à la capture.
+//! analog rendering pins* » : le masque `KSAUDIO_SPEAKER_*` du nombre de canaux **du
+//! câble** au rendu ([`mapping_rendu`]), **0** à la capture.
 //!
 //! L'état de connexion, lui, est **par câble** et commun aux deux sens
 //! ([`Cable::is_connected`]) : un câble débranché l'est de ses deux bouts.
@@ -76,11 +77,16 @@
 //!
 //! # Le nombre de canaux
 //!
-//! [`AudioNodes::channels`] doit s'accorder avec le format des broches : c'est
-//! [`descriptors::CHANNELS`], la valeur unique de M1a (2). Une divergence rendrait
-//! `STATUS_INVALID_PARAMETER` sur un canal pourtant déclaré par le format, ou
-//! l'inverse — d'où l'assertion `const` ci-dessous contre le plafond de
-//! [`cable::MAX_CHANNELS`].
+//! [`AudioNodes::channels`] doit s'accorder avec le format des broches : depuis M1b-05,
+//! c'est celui du **câble** (`descriptors::cable_format(n).channels`), entre 1 et 8, et non
+//! plus une constante. Une divergence rendrait `STATUS_INVALID_PARAMETER` sur un canal
+//! pourtant déclaré par le format, ou l'inverse.
+//!
+//! Les assertions `const` qui scellaient la valeur 2 sont devenues des **invariants sur le
+//! domaine** : le plafond des canaux d'un câble ([`FrameLayout::MAX_CHANNELS`], 8) tient
+//! dans ce que [`NodeState`] mémorise ([`cable::MAX_CHANNELS`]), et chaque masque de
+//! haut-parleurs de [`MAPPINGS_RENDU`] porte exactement autant de bits que de canaux. Ce
+//! qu'on vérifiait sur une valeur, on le vérifie sur les huit — c'est plus fort, pas moins.
 //!
 //! # La trace
 //!
@@ -91,24 +97,24 @@
 //! puis le canal `1`, et écrit avec le canal `-1`. Si la trace ne montre que des
 //! « canal 0 », c'est le `Reserved` qu'on lit. Vide en release (`kmd_log!`).
 
+use conduit_kmd_core::FrameLayout;
 use portcls::conduit_com::{ComRef, NtStatus, STATUS_SUCCESS};
 use portcls::{
     AudioNodes, CableConfig, ConfigTrace, EventSource, EventTrace, JackInfo, JackTarget, JackTrace,
     MiniportTopology, PortEvents, PortTopology, ResourceList, Trace,
 };
-use portcls_sys::{IUnknown, KSAUDIO_SPEAKER_STEREO, PCFILTER_DESCRIPTOR, ULONG};
+use portcls_sys::{
+    IUnknown, KSAUDIO_SPEAKER_2POINT1, KSAUDIO_SPEAKER_5POINT0, KSAUDIO_SPEAKER_5POINT1,
+    KSAUDIO_SPEAKER_7POINT0, KSAUDIO_SPEAKER_7POINT1_SURROUND, KSAUDIO_SPEAKER_MONO,
+    KSAUDIO_SPEAKER_QUAD, KSAUDIO_SPEAKER_STEREO, PCFILTER_DESCRIPTOR, ULONG,
+};
 
 use crate::cable::{Cable, Direction, MAX_CHANNELS, NodeState};
 use crate::descriptors::{
-    CHANNELS, PIN_COUNT, TOPO_CAPTURE_PIN_ENDPOINT, TOPO_RENDER_PIN_ENDPOINT, topo_capture_filter,
-    topo_capture_filter_0, topo_render_filter, topo_render_filter_0,
+    PIN_COUNT, TOPO_CAPTURE_PIN_ENDPOINT, TOPO_RENDER_PIN_ENDPOINT, cable_format,
+    topo_capture_filter, topo_capture_filter_0, topo_render_filter, topo_render_filter_0,
 };
 use crate::privilege;
-
-const _: () = assert!(
-    CHANNELS as usize <= MAX_CHANNELS,
-    "le nœud de volume déclare plus de canaux que `NodeState` n'en mémorise"
-);
 
 /// Nombre de broches d'un filtre de topologie, du type que `JackInfo::pin_count` rend.
 ///
@@ -117,17 +123,50 @@ const _: () = assert!(
 /// (`STATUS_INVALID_PARAMETER`).
 const BROCHES: u32 = PIN_COUNT as u32;
 
-/// `KSJACK_DESCRIPTION::ChannelMapping` du sens **rendu** : les deux canaux avant.
+/// `KSJACK_DESCRIPTION::ChannelMapping` du sens **rendu**, par nombre de canaux : le
+/// masque `KSAUDIO_SPEAKER_*` de la disposition la plus courante à ce compte-là.
 ///
-/// `KSAUDIO_SPEAKER_STEREO` vaut `SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT` (3) : autant de
-/// bits que [`CHANNELS`], ce que l'assertion ci-dessous vérifie. Une divergence — un câble
-/// à six canaux qui annoncerait encore une cartographie stéréo — se verrait dans le nom des
-/// canaux affiché par Windows, et nulle part ailleurs.
-const MAPPING_RENDU: ULONG = KSAUDIO_SPEAKER_STEREO;
+/// # Un masque faux ne casse rien de visible, et c'est le problème
+///
+/// Ce champ dit à Windows *quels haut-parleurs* les canaux alimentent. Un câble à six
+/// canaux qui annoncerait encore une cartographie stéréo se verrait dans le nom des canaux
+/// affiché par le panneau de son, dans le rangement de l'endpoint parmi les périphériques
+/// surround, et nulle part ailleurs — pas dans le journal, pas dans `infverif`, pas à
+/// l'écoute. D'où l'assertion `const` plus bas : **autant de bits à 1 que de canaux**,
+/// pour les huit entrées.
+///
+/// Les choix, du plus courant au plus discutable : mono (centre), stéréo (avant
+/// gauche/droit), 2.1 (avant + caisson), quadriphonie, 5.0 *surround* (avant + latéraux),
+/// 5.1, 7.0 et 7.1 *surround*. Les comptes impairs sans disposition standard — 3, 5, 7 —
+/// prennent celle que Windows nomme sans « point » manquant ; aucun n'est faux, tous sont
+/// conventionnels.
+const MAPPINGS_RENDU: [ULONG; MAX_CANAUX] = [
+    KSAUDIO_SPEAKER_MONO,
+    KSAUDIO_SPEAKER_STEREO,
+    KSAUDIO_SPEAKER_2POINT1,
+    KSAUDIO_SPEAKER_QUAD,
+    KSAUDIO_SPEAKER_5POINT0,
+    KSAUDIO_SPEAKER_5POINT1,
+    KSAUDIO_SPEAKER_7POINT0,
+    KSAUDIO_SPEAKER_7POINT1_SURROUND,
+];
+
+/// Nombre maximal de canaux d'un câble (SPEC F-03), la longueur de [`MAPPINGS_RENDU`].
+const MAX_CANAUX: usize = FrameLayout::MAX_CHANNELS as usize;
 
 /// `KSJACK_DESCRIPTION::ChannelMapping` du sens **capture** : nul, comme la documentation
 /// l'exige pour toute broche qui n'est pas une broche de rendu analogique.
 const MAPPING_CAPTURE: ULONG = 0;
+
+/// Le masque de haut-parleurs de `channels` canaux ; stéréo hors domaine (repli du
+/// défaut, comme `descriptors::cable_format`).
+fn mapping_rendu(channels: u8) -> ULONG {
+    usize::from(channels)
+        .checked_sub(1)
+        .and_then(|i| MAPPINGS_RENDU.get(i))
+        .copied()
+        .unwrap_or(KSAUDIO_SPEAKER_STEREO)
+}
 
 const _: () = {
     // La broche à prise est l'endpoint, celle qui fait face à l'extérieur — jamais la
@@ -140,9 +179,30 @@ const _: () = {
     // `portcls::event`). Si un jour les deux valaient le même numéro, la confusion
     // deviendrait invisible — d'où cette assertion, qui n'a l'air de rien.
     assert!(TOPO_RENDER_PIN_ENDPOINT != TOPO_CAPTURE_PIN_ENDPOINT);
-    // Autant de bits à 1 dans la cartographie que de canaux déclarés.
-    assert!(MAPPING_RENDU.count_ones() == CHANNELS);
     assert!(MAPPING_CAPTURE == 0);
+
+    // Ce que M1a scellait sur la valeur 2, vérifié sur les huit : tout nombre de canaux
+    // qu'un câble peut porter tient dans ce que `NodeState` mémorise…
+    assert!(MAX_CANAUX <= MAX_CHANNELS);
+    assert!(MAPPINGS_RENDU.len() == MAX_CANAUX && MAX_CANAUX == 8);
+    // …et chaque masque de haut-parleurs porte exactement autant de bits que de canaux.
+    // Motif de tranche : ni indexation ni arithmétique.
+    let mut masques: &[ULONG] = &MAPPINGS_RENDU;
+    let mut attendu: u32 = 1;
+    while let [premier, reste @ ..] = masques {
+        assert!(
+            premier.count_ones() == attendu,
+            "un masque de haut-parleurs ne compte pas ses canaux"
+        );
+        masques = reste;
+        attendu = attendu.wrapping_add(1);
+    }
+    assert!(
+        attendu as usize == MAX_CANAUX.wrapping_add(1),
+        "un masque par compte"
+    );
+    // Le stéréo reste le repli, et il est bien à sa place dans la table.
+    assert!(KSAUDIO_SPEAKER_STEREO.count_ones() == 2);
 };
 
 /// Miniport topologie du filtre `TopoRender<n>`.
@@ -202,9 +262,10 @@ impl MiniportTopology for TopoRender {
 }
 
 impl AudioNodes for TopoRender {
-    // IRQL: PASSIVE_LEVEL
+    // IRQL: PASSIVE_LEVEL — le nombre de canaux du câble (M1b-05), lu une fois au
+    // démarrage : il doit s.accorder avec le format que les broches déclarent.
     fn channels(&self) -> u32 {
-        CHANNELS
+        u32::from(cable_format(self.n).channels)
     }
 
     // IRQL: PASSIVE_LEVEL
@@ -244,9 +305,10 @@ impl JackInfo for TopoRender {
         TOPO_RENDER_PIN_ENDPOINT
     }
 
-    // IRQL: PASSIVE_LEVEL — broche de rendu analogique : cartographie non nulle.
+    // IRQL: PASSIVE_LEVEL — broche de rendu analogique : cartographie non nulle, celle du
+    // nombre de canaux du câble (M1b-05).
     fn channel_mapping(&self) -> u32 {
-        MAPPING_RENDU
+        mapping_rendu(cable_format(self.n).channels)
     }
 
     // IRQL: quelconque — l'état de connexion est par câble, commun aux deux sens.
@@ -266,9 +328,10 @@ impl CableConfig for TopoRender {
         self.cable.index
     }
 
-    // IRQL: PASSIVE_LEVEL — la valeur scellée de M1a ; M1b-05 la rendra dynamique.
+    // IRQL: PASSIVE_LEVEL — le nombre de canaux réellement servi par ce câble ; un `SET`
+    // qui en demanderait un autre est refusé (`CableState::channels_appliquables`).
     fn channels(&self) -> u32 {
-        CHANNELS
+        u32::from(cable_format(self.n).channels)
     }
 
     // IRQL: quelconque — l'état de connexion est par câble, commun aux deux sens.
@@ -374,9 +437,10 @@ impl MiniportTopology for TopoCapture {
 }
 
 impl AudioNodes for TopoCapture {
-    // IRQL: PASSIVE_LEVEL
+    // IRQL: PASSIVE_LEVEL — le nombre de canaux du câble (M1b-05), lu une fois au
+    // démarrage : il doit s.accorder avec le format que les broches déclarent.
     fn channels(&self) -> u32 {
-        CHANNELS
+        u32::from(cable_format(self.n).channels)
     }
 
     // IRQL: PASSIVE_LEVEL
@@ -439,9 +503,10 @@ impl CableConfig for TopoCapture {
         self.cable.index
     }
 
-    // IRQL: PASSIVE_LEVEL — la valeur scellée de M1a ; M1b-05 la rendra dynamique.
+    // IRQL: PASSIVE_LEVEL — le nombre de canaux réellement servi par ce câble ; un `SET`
+    // qui en demanderait un autre est refusé (`CableState::channels_appliquables`).
     fn channels(&self) -> u32 {
-        CHANNELS
+        u32::from(cable_format(self.n).channels)
     }
 
     // IRQL: quelconque — le même atomique que le sens rendu, un câble ayant deux bouts.

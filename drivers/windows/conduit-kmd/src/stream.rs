@@ -23,9 +23,10 @@
 //! # Tampon
 //!
 //! Un seul tampon par flux, alloué par `IPortWaveRTStream::AllocatePagesForMdl` (taille de
-//! `conduit_kmd_core::format::buffer_bytes[_for_notifications]` : multiple de la trame et
-//! de la période de notification, jamais inférieure à la demande — au-delà de 500 ms
-//! l'allocation est refusée plutôt qu'écrêtée), mappé en mémoire noyau (`MmCached`) et mis
+//! `conduit_kmd_core::format::buffer_bytes[_for_notifications]_with_floor` : multiple de la
+//! trame et de la période de notification, jamais inférieure à la demande **ni au plancher
+//! `BufferMs` du registre** (M1b-05) — au-delà de 500 ms l'allocation est refusée plutôt
+//! qu'écrêtée), mappé en mémoire noyau (`MmCached`) et mis
 //! à zéro ; libéré par `FreeAudioBuffer` / `FreeBufferWithNotification`, **sans condition
 //! d'état** : c'est PortCls qui décide du moment, le miniport libère. `SetState` ne touche
 //! pas au tampon — `KSSTATE_STOP` le conserve, en attendant que PortCls le rende.
@@ -55,7 +56,9 @@
 
 use core::ptr::{self, NonNull};
 
-use conduit_kmd_core::{Notifier, SupportedFormat, buffer_bytes, buffer_bytes_for_notifications};
+use conduit_kmd_core::{
+    Notifier, SupportedFormat, buffer_bytes_for_notifications_with_floor, buffer_bytes_with_floor,
+};
 use portcls::conduit_com::{
     NtStatus, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
     STATUS_UNSUCCESSFUL,
@@ -167,8 +170,13 @@ impl WaveStream {
             self.n
         );
         let rate = self.format.sample_rate;
+        // Le plancher vient du registre (`BufferMs`, M1b-01 pour la lecture, M1b-05 pour
+        // l'application) : le tampon ne descend jamais sous cette durée, quelle que soit la
+        // demande du moteur audio. C'est le seul effet du paramètre, et il est ici parce
+        // que c'est le seul endroit où une taille de tampon se décide.
+        let floor_ms = crate::registry::buffer_ms();
         let bytes = match notification_count {
-            None => buffer_bytes(requested_bytes, self.frame_bytes, rate),
+            None => buffer_bytes_with_floor(requested_bytes, self.frame_bytes, rate, floor_ms),
             // La documentation d'`AllocateBufferWithNotification` annonce « Valid values
             // are 1 or 2 », et nous n'avons jamais rien observé d'autre — l'absence
             // d'observation ne se cite pas comme une mesure. Nous restons pourtant
@@ -176,9 +184,13 @@ impl WaveStream {
             // une borne arbitraire ici faisait échouer le mode événementiel sans laisser
             // la moindre trace, et refuser plus que ce que le contrat impose n'a rien
             // rapporté.
-            Some(count) => {
-                buffer_bytes_for_notifications(requested_bytes, self.frame_bytes, rate, count)
-            }
+            Some(count) => buffer_bytes_for_notifications_with_floor(
+                requested_bytes,
+                self.frame_bytes,
+                rate,
+                count,
+                floor_ms,
+            ),
         };
         let Some(bytes) = bytes else {
             kmd_log!(
