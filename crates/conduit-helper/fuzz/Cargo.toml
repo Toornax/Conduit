@@ -1,0 +1,30 @@
+[package]
+name = "conduit-helper-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+conduit-helper = { path = ".." }
+# La règle du dépôt sur les noms de câbles, pour vérifier qu'un `renommer` accepté par
+# le protocole passe bien le même juge que `conduitctl`.
+conduit-backend = { path = "../../conduit-backend" }
+# Les domaines partagés avec le pilote (bornes du câble et des canaux), lus dans le
+# contrat plutôt que recopiés dans la cible.
+conduit-kmd-core = { path = "../../conduit-kmd-core", features = ["std"] }
+
+[[bin]]
+name = "protocole"
+path = "fuzz_targets/protocole.rs"
+test = false
+doc = false
+bench = false
+
+# Ce crate est son propre workspace : logé sous un membre du workspace racine, il ne
+# serait pas affranchi par le seul `exclude` de celui-ci (cargo ne l'y honore pas), et
+# `cargo fuzz` échouerait avant de compiler quoi que ce soit.
+[workspace]

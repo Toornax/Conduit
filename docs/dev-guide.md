@@ -645,6 +645,70 @@ Niveaux : unitaires par module ; intégration `conduit-engine/tests/scenarios.rs
 (F-11 à F-22 enchaînés) ; bout en bout `conduitd/tests` et `conduitctl/tests`
 (démon en processus + client IPC, et vrais binaires).
 
+### Fuzzing (M0-74, M1b-08)
+
+Six cibles `cargo-fuzz`, réparties en trois crates `fuzz/`, chacun **à côté du crate
+qu'il éprouve** — c'est la convention de `cargo-fuzz`, qui se lance depuis le répertoire
+du crate cible, et ce que le dépôt faisait déjà pour `conduit-protocol` :
+
+| Crate cible | Cible | Ce qu'elle éprouve |
+|---|---|---|
+| `conduit-protocol` | `decoder` | le décodeur de trames du protocole utilisateur |
+| `conduit-protocol` | `config` | l'analyseur de configuration TOML de `conduitd` |
+| `conduit-kmd-core` | `etat-cable` | `CableState::from_bytes`, le parseur de la propriété KS |
+| `conduit-kmd-core` | `parametres-registre` | `decode_dword` puis `sanitize`, la lecture des paramètres |
+| `conduit-kmd-core` | `formats` | `validate`, `buffer_bytes`, `buffer_bytes_for_notifications` |
+| `conduit-helper` | `protocole` | `decouper`, `Requete::from_bytes`, `Reponse::from_bytes` |
+
+```sh
+cargo install cargo-fuzz            # ou : nix develop .#nightly
+cd crates/conduit-kmd-core && cargo +nightly fuzz run etat-cable
+cd crates/conduit-kmd-core && cargo +nightly fuzz run parametres-registre
+cd crates/conduit-kmd-core && cargo +nightly fuzz run formats
+cd crates/conduit-helper   && cargo +nightly fuzz run protocole
+cargo +nightly fuzz run <cible> -- -max_total_time=3600      # campagne bornée
+cargo +nightly fuzz run <cible> fuzz/artifacts/<cible>/<fichier>   # rejouer un plantage
+```
+
+**Sous Windows**, la bibliothèque d'exécution d'AddressSanitizer est une DLL du MSVC qui
+n'est pas dans le `PATH` par défaut : sans elle le binaire s'arrête sur
+`STATUS_DLL_NOT_FOUND` (`0xc0000135`) avant d'exécuter la moindre entrée.
+
+```powershell
+$env:PATH = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\<version>\bin\Hostx64\x64;$env:PATH"
+```
+
+**Corpus.** Chaque cible a un corpus de départ versionné sous `fuzz/corpus/<cible>/`,
+semé depuis les `to_bytes` des cas valides et des refus « à un octet près » (bornes
+franchies, mauvais type de valeur de registre, 24 bits sur 32, nom de câble maximal). Ces
+graines sont curées et nommées : pour ne pas les noyer sous ce qu'une campagne découvre,
+donner à libFuzzer un répertoire de sortie jetable **avant** le corpus versionné, qu'il
+ne lira alors qu'en entrée.
+
+```sh
+cargo +nightly fuzz run protocole /tmp/campagne-protocole fuzz/corpus/protocole -- -max_total_time=1200
+```
+
+**Ce que les cibles vérifient, au-delà de l'absence de panique** : l'aller-retour (ce qui
+est accepté se resérialise à l'octet près en l'entrée reçue — c'est ce qui interdit
+d'accepter un préfixe valide suivi d'octets en trop), les domaines annoncés, et pour
+`sanitize` l'idempotence. Aucune borne n'est écrite en dur dans les cibles : elles lisent
+les constantes du crate, et survivent donc à un déplacement de domaine.
+
+**Où l'effort compte le plus** : dans `conduit-kmd-core`, la panique est interdite *par
+construction* (`clippy::panic`, `unwrap_used`, `indexing_slicing`,
+`arithmetic_side_effects`, `#![no_std]` sans `alloc`), et le fuzz y a donc valeur de
+**preuve** plutôt que de découverte. La cible `protocole` est l'inverse : elle **alloue**,
+a une longueur variable depuis la version 2 du protocole, et son parseur tourne dans un
+processus `LocalSystem` dont le canal nommé est ouvert au groupe `INTERACTIVE`.
+
+Les crates `fuzz/` sont **hors du workspace racine** : `libfuzzer-sys` n'est
+constructible qu'en nightly. Le `exclude` du `Cargo.toml` racine ne suffit pas pour un
+crate logé **sous** un membre — cargo ne l'y honore pas, et `cargo fuzz` échoue alors sur
+« current package believes it's in a workspace when it's not » ; c'est le `[workspace]`
+vide de chaque `fuzz/Cargo.toml` qui les affranchit. Comme Miri, le fuzz n'est pas un
+check du flake : il exige le shell nightly (§7).
+
 ## 6. Conventions
 
 - Commits : Conventional Commits, scopes de ROADMAP (`core`, `engine`, `backend`,
@@ -667,9 +731,9 @@ Niveaux : unitaires par module ; intégration `conduit-engine/tests/scenarios.rs
 clippy, tests, cargo-deny, doc, vérification de `docs/protocol.md` et compilation
 croisée Windows. `nix build .#conduitd` produit le binaire Linux/macOS.
 `nix develop .#nightly` fournit Miri et cargo-fuzz : `cargo miri test -p conduit-core --lib`.
-Miri n'est pas un check du flake : la construction de son sysroot télécharge des
-crates (impossible dans le bac à sable Nix) ; il tourne dans le devshell nightly et
-en CI hors Nix.
+Ni Miri ni le fuzz ne sont des checks du flake : la construction du sysroot de Miri
+télécharge des crates (impossible dans le bac à sable Nix), et une campagne de fuzz n'a
+pas de fin. Les deux se lancent à la main depuis le devshell nightly (§5).
 
 Windows : `packaging/windows/setup-env.ps1` installe ou vérifie (`-Check`) les
 versions de `versions.json`. `-Scope User` se limite à Rust et aux Build Tools, ce qu'il
