@@ -55,6 +55,7 @@ mod cable;
 mod clock;
 mod descriptors;
 mod eventlog;
+mod intersect;
 mod power;
 mod privilege;
 mod registry;

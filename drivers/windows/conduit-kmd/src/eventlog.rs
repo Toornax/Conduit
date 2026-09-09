@@ -234,6 +234,16 @@ impl Utf16Writer {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct EventLog(PDEVICE_OBJECT);
 
+// SAFETY: `EventLog` ne fait de son pointeur qu'un seul usage — le passer à
+// `IoAllocateErrorLogEntry`, que la documentation autorise depuis n'importe quel fil
+// jusqu'à `DISPATCH_LEVEL`. Aucune référence `&mut` n'en est jamais dérivée, et l'objet de
+// périphérique visé est celui de l'adaptateur, partagé par construction et immuable pour
+// nous. Le `Send`/`Sync` est ce qui permet de le loger dans un miniport, que PortCls appelle
+// depuis n'importe quel fil (`MiniportWaveRT: Send + Sync`).
+unsafe impl Send for EventLog {}
+// SAFETY: idem ; `report` ne prend qu'un `self` par copie.
+unsafe impl Sync for EventLog {}
+
 impl EventLog {
     /// # Safety
     ///

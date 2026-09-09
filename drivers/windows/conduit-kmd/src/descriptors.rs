@@ -342,11 +342,16 @@ const fn data_format(size: ULONG, subtype: GUID, specifier: GUID) -> KSDATAFORMA
 /// exactement, `channels` canaux, `rate` Hz exactement (§4.1).
 ///
 /// **Ponctuelle des deux côtés** : minimum et maximum confondus pour la profondeur comme
-/// pour la fréquence, et `MaximumChannels` unique. C'est ce qui rend
-/// `DataRangeIntersection` inutile — PortCls intersecte lui-même, et une plage ponctuelle
-/// ne lui laisse rien à choisir. Élargir une borne ici obligerait à implémenter
-/// l'intersection, faute de quoi PortCls proposerait au moteur audio une combinaison que
-/// `NewStream` refuserait ensuite.
+/// pour la fréquence, et `MaximumChannels` unique. Une plage ponctuelle ne laisse rien à
+/// choisir à qui l'intersecte, ce qui est exactement le but : le format proposé au moteur
+/// audio est toujours un de ceux que `NewStream` acceptera.
+///
+/// Depuis M1b-21, c'est **notre** gestionnaire qui intersecte ([`crate::intersect`]) et non
+/// plus celui de PortCls, dont la documentation limite le défaut au PCM, au mono et au
+/// stéréo, et exclut tout `WAVEFORMATEXTENSIBLE`. Attention au piège de `MaximumChannels` :
+/// une `KSDATARANGE_AUDIO` n'a pas de minimum, donc cette plage dit littéralement « un à
+/// `channels` canaux » alors que le câble n'en sert qu'un nombre. C'est le gestionnaire qui
+/// referme l'écart, en n'acceptant que le compte exact.
 pub const fn audio_range(
     subtype: GUID,
     bits: ULONG,

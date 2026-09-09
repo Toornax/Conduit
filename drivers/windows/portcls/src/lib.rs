@@ -141,7 +141,7 @@ pub use received::{
 };
 pub use status::{
     STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_DEVICE_REQUEST,
-    STATUS_NOT_FOUND, STATUS_NOT_SUPPORTED, STATUS_PRIVILEGE_NOT_HELD,
+    STATUS_NO_MATCH, STATUS_NOT_FOUND, STATUS_NOT_SUPPORTED, STATUS_PRIVILEGE_NOT_HELD,
 };
 pub use stream::{
     AudioBuffer, MiniportWaveRTStream, MiniportWaveRTStreamNotification, StreamNotificationPtr,

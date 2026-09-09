@@ -197,6 +197,14 @@ pub(crate) mod code {
     /// naît de la connexion des deux filtres, et une divergence entre eux ne se voit ni dans
     /// les tables ni dans le côté wave.
     pub(crate) const TOPOLOGIE: u32 = 0x0009_0000;
+    /// Aucune intersection entre ce que Windows demande et ce que le câble déclare
+    /// (`intersect::Negotiation::resolve`, M1b-21).
+    ///
+    /// Se compose comme [`DESCRIPTEUR`]. C'est le seul code du module qui ne soit pas émis
+    /// au démarrage mais **pendant** l'énumération de l'endpoint : un refus numérique
+    /// donne « aucun format » dans le panneau de son, et sans cette entrée rien n'en
+    /// resterait. Un seul par miniport et par démarrage.
+    pub(crate) const INTERSECTION: u32 = 0x000A_0000;
 }
 
 /// Rang du paramètre dans [`Param::ALL`], pour composer un `UniqueErrorValue`.

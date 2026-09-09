@@ -33,6 +33,8 @@
 //!
 //! IRQL : `PASSIVE_LEVEL` partout (contexte de `IRP_MN_START_DEVICE`).
 
+use core::sync::atomic::AtomicBool;
+
 use portcls::conduit_com::{
     ComRef, NtStatus, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
     nt_success,
@@ -110,6 +112,11 @@ unsafe fn install_subdevice(
 /// Enregistre les quatre sous-périphériques du câble `n` et leurs deux connexions
 /// physiques.
 ///
+/// `log` est le journal d'événements de l'adaptateur, que les deux miniports WaveRT
+/// conservent : un refus d'intersection survient **après** `StartDevice`, pendant que
+/// Windows énumère l'endpoint, et il n'y aurait sans cela aucune trace de ce que Windows
+/// avait demandé (voir [`crate::intersect`]).
+///
 /// # Safety
 ///
 /// `device` et `irp` sont ceux remis à `StartDevice`, valides le temps de l'appel.
@@ -118,6 +125,7 @@ unsafe fn install_cable(
     irp: PIRP,
     resources: &ResourceList,
     n: u32,
+    log: EventLog,
 ) -> Result<(), NtStatus> {
     let Some(cable) = cable::cable(n) else {
         return fail("câble inconnu", STATUS_INVALID_PARAMETER);
@@ -146,9 +154,14 @@ unsafe fn install_cable(
     }
 
     // 1. WaveRender<n>.
-    let mini = try_new_wavert_object(WaveRender { n, cable })
-        .ok_or(STATUS_INSUFFICIENT_RESOURCES)
-        .or_else(|status| fail("allocation de WaveRender", status))?;
+    let mini = try_new_wavert_object(WaveRender {
+        n,
+        cable,
+        log,
+        refus_consigne: AtomicBool::new(false),
+    })
+    .ok_or(STATUS_INSUFFICIENT_RESOURCES)
+    .or_else(|status| fail("allocation de WaveRender", status))?;
     // SAFETY: contrat de la fonction relayé.
     let wave_render = unsafe {
         install_subdevice(
@@ -180,9 +193,14 @@ unsafe fn install_cable(
     drop(mini);
 
     // 3. WaveCapture<n> et TopoCapture<n>.
-    let mini = try_new_wavert_object(WaveCapture { n, cable })
-        .ok_or(STATUS_INSUFFICIENT_RESOURCES)
-        .or_else(|status| fail("allocation de WaveCapture", status))?;
+    let mini = try_new_wavert_object(WaveCapture {
+        n,
+        cable,
+        log,
+        refus_consigne: AtomicBool::new(false),
+    })
+    .ok_or(STATUS_INSUFFICIENT_RESOURCES)
+    .or_else(|status| fail("allocation de WaveCapture", status))?;
     // SAFETY: idem.
     let wave_capture = unsafe {
         install_subdevice(
@@ -365,7 +383,7 @@ pub unsafe fn start_device(
 
     for n in 0..reserve {
         // SAFETY: contrat de la fonction relayé.
-        if let Err(status) = unsafe { install_cable(device, irp, &resources, n) } {
+        if let Err(status) = unsafe { install_cable(device, irp, &resources, n, log) } {
             return status;
         }
     }

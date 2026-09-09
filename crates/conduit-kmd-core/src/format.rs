@@ -150,9 +150,10 @@ pub const RATE_96000: u32 = 96_000;
 /// non 72.
 ///
 /// L'ordre est celui de la préférence usuelle du moteur audio de Windows — le flottant
-/// d'abord, l'entier 16 bits en dernier ressort — sans qu'on lui prête d'effet : PortCls
-/// intersecte lui-même et rien dans la documentation ne promet que l'ordre des
-/// `KSDATARANGE` compte.
+/// d'abord, l'entier 16 bits en dernier ressort. Rien dans la documentation ne promet que
+/// l'ordre des `KSDATARANGE` compte, mais PortCls interroge le gestionnaire d'intersection
+/// ([`crate::wavefmt`], M1b-21) une plage après l'autre : si l'ordre a un effet, c'est
+/// celui-là, et il va dans le bon sens.
 pub const SAMPLE_DEPTHS: [SampleFormat; 3] =
     [SampleFormat::F32, SampleFormat::Pcm24, SampleFormat::I16];
 

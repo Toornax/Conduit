@@ -63,6 +63,15 @@ pub trait MiniportTopology: Send + Sync + 'static {
     /// Le défaut, `Err(STATUS_NOT_IMPLEMENTED)`, laisse PortCls faire l'intersection
     /// lui-même : c'est ce que fait un miniport topologie (pas de pin de données).
     ///
+    /// # Ce que les deux références couvrent
+    ///
+    /// `client` et `my` sont des `KSDATARANGE` **suivies de leur extension** :
+    /// `FormatSize` octets lisibles à partir de leur adresse, comme la `KSDATAFORMAT` de
+    /// `NewStream`. Le type de la référence n'en décrit que les 64 premiers ; un
+    /// gestionnaire qui veut les champs d'une `KSDATARANGE_AUDIO` doit donc d'abord
+    /// vérifier que `FormatSize` les couvre, puis élargir le pointeur — une plage de 64
+    /// octets avec des jokers est parfaitement licite côté client.
+    ///
     /// IRQL : `PASSIVE_LEVEL`.
     fn data_range_intersection(
         &self,

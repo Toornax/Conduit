@@ -12,6 +12,10 @@
 //! - la validation des formats ([`format`]) : format demandé par le moteur audio
 //!   contre la liste supportée — une fréquence et un nombre de canaux par câble, les
 //!   trois profondeurs toujours (M1b-05) —, taille de tampon bornée ;
+//! - la négociation de format ([`wavefmt`]) : l'intersection de deux plages audio
+//!   (`IMiniport::DataRangeIntersection`), le choix entre `WAVEFORMATEX` simple et
+//!   `WAVEFORMATEXTENSIBLE`, et le masque de haut-parleurs qui va avec le nombre de
+//!   canaux ;
 //! - les périodes de notification ([`notify`]) : quand signaler les événements
 //!   enregistrés par `IMiniportWaveRTStreamNotification`, à partir de la position
 //!   absolue, bouclage compris ;
@@ -76,6 +80,7 @@ pub mod notify;
 pub mod params;
 pub mod position;
 pub mod ring;
+pub mod wavefmt;
 
 pub use config::{
     cable_bit, is_active, sanitize_mask, with_active, CableFormat, CableFormatFix, CableState,
@@ -99,3 +104,8 @@ pub use params::{
 };
 pub use position::{byte_offset, StreamPosition, VirtualClock};
 pub use ring::{copy_frames, silence, FrameLayout, RingError, SampleFormat};
+pub use wavefmt::{
+    intersect, needs_extensible, speaker_mask, AudioRange, NoMatch, WaveFormat,
+    KSDATAFORMAT_WAVEFORMATEXTENSIBLE_BYTES, KSDATAFORMAT_WAVEFORMATEX_BYTES,
+    WAVEFORMATEXTENSIBLE_CB_SIZE, WAVE_FORMAT_EXTENSIBLE, WAVE_FORMAT_IEEE_FLOAT, WAVE_FORMAT_PCM,
+};

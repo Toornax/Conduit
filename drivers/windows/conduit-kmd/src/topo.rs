@@ -206,6 +206,27 @@ const _: () = {
     );
     // Le stéréo reste le repli, et il est bien à sa place dans la table.
     assert!(KSAUDIO_SPEAKER_STEREO.count_ones() == 2);
+
+    // **Une seule vérité sur les masques** (M1b-21). `conduit_kmd_core::wavefmt` en tient
+    // désormais sa propre table — c'est elle qui remplit le `dwChannelMask` des
+    // `WAVEFORMATEXTENSIBLE` que le gestionnaire d'intersection rend — et elle est testée
+    // en mode utilisateur, ce que celle-ci ne peut pas être. Les deux doivent dire la même
+    // chose : un jack qui annonce une disposition et un format qui en annonce une autre
+    // est exactement le genre de divergence qui ne se voit nulle part.
+    let mut notres: &[ULONG] = &MAPPINGS_RENDU;
+    let mut canal: u8 = 1;
+    while let [premier, reste @ ..] = notres {
+        let portable = match conduit_kmd_core::speaker_mask(canal) {
+            Some(m) => m,
+            None => 0,
+        };
+        assert!(
+            portable == *premier,
+            "le masque du jack et celui du WAVEFORMATEXTENSIBLE divergent"
+        );
+        notres = reste;
+        canal = canal.wrapping_add(1);
+    }
 };
 
 // ---------------------------------------------------------------------------------

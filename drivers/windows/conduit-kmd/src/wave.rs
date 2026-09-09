@@ -12,7 +12,20 @@
 //! dans l'emplacement du [`Cable`] correspondant à son sens (un seul flux par sens :
 //! `STATUS_DEVICE_BUSY` sinon) et le rend à PortCls par `StreamObject`. C'est le tick du
 //! câble qui, dès lors, copie le rendu vers la capture (M1a-08, §5.3).
-//! `DataRangeIntersection` et `GetDeviceDescription` restent aux défauts de `portcls`.
+//! `GetDeviceDescription` reste au défaut de `portcls`.
+//!
+//! # Deux portes, une seule liste de formats
+//!
+//! Windows passe par les deux, et elles doivent dire la même chose :
+//!
+//! - `DataRangeIntersection` ([`crate::intersect`], M1b-21) répond « quel format ce câble
+//!   peut-il servir ? » — c'est de là que l'endpoint tire le sien ;
+//! - `NewStream` répond « acceptes-tu celui-ci ? » au moment d'ouvrir le flux.
+//!
+//! Les deux confrontent la demande à `conduit_kmd_core::cable_formats` du **même** câble.
+//! C'est ce qui garantit que le gestionnaire d'intersection ne propose jamais un format que
+//! `NewStream` refuserait ensuite — la panne que la documentation du gestionnaire par
+//! défaut décrit, et qui laisse le moteur audio parcourir une liste jusqu'à épuisement.
 //!
 //! # Lecture du format
 //!
@@ -24,7 +37,9 @@
 //! indexation d'octets.
 
 use core::mem::size_of;
+use core::sync::atomic::AtomicBool;
 
+use conduit_kmd_core::wavefmt::WAVEFORMATEXTENSIBLE_CB_SIZE;
 use conduit_kmd_core::{
     RequestedFormat, SampleKind, SupportedFormat, cable_formats, config::CableFormat, validate,
 };
@@ -38,7 +53,7 @@ use portcls::{
 use portcls_sys::{
     GUID, IUnknown, KSDATAFORMAT, KSDATAFORMAT_SPECIFIER_WAVEFORMATEX,
     KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, KSDATAFORMAT_SUBTYPE_PCM, KSDATAFORMAT_TYPE_AUDIO,
-    KSDATAFORMAT_WAVEFORMATEX, KSDATAFORMAT_WAVEFORMATEXTENSIBLE, PCFILTER_DESCRIPTOR,
+    KSDATAFORMAT_WAVEFORMATEX, KSDATAFORMAT_WAVEFORMATEXTENSIBLE, KSDATARANGE, PCFILTER_DESCRIPTOR,
     WAVE_FORMAT_EXTENSIBLE, WAVE_FORMAT_IEEE_FLOAT, WAVE_FORMAT_PCM,
 };
 
@@ -47,16 +62,17 @@ use crate::descriptors::{
     WAVE_CAPTURE_PIN_SYSTEM, WAVE_RENDER_PIN_SYSTEM, cable_format, wave_capture_filter,
     wave_capture_filter_default, wave_render_filter, wave_render_filter_default,
 };
+use crate::eventlog::EventLog;
+use crate::intersect::{Negotiation, guid_eq};
 use crate::stream::WaveStream;
 
 /// Taille minimale de `cbSize` pour qu'un `WAVEFORMATEX` étendu contienne les champs
 /// de `WAVEFORMATEXTENSIBLE` (`Samples`, `dwChannelMask`, `SubFormat` : 22 octets).
-const WAVEFORMATEXTENSIBLE_CBSIZE: u16 = 22;
-
-/// Égalité de deux `GUID` (le type généré n'implémente pas `PartialEq`).
-fn guid_eq(a: &GUID, b: &GUID) -> bool {
-    a.Data1 == b.Data1 && a.Data2 == b.Data2 && a.Data3 == b.Data3 && a.Data4 == b.Data4
-}
+///
+/// La même valeur que [`WAVEFORMATEXTENSIBLE_CB_SIZE`], qui est ce que notre gestionnaire
+/// d'intersection **écrit** : lire et écrire d'après la même constante est ce qui empêche
+/// les deux portes de diverger.
+const WAVEFORMATEXTENSIBLE_CBSIZE: u16 = WAVEFORMATEXTENSIBLE_CB_SIZE;
 
 /// Famille d'échantillons d'après le sous-format d'un `WAVEFORMATEXTENSIBLE`.
 fn kind_of_subformat(subformat: &GUID) -> SampleKind {
@@ -211,6 +227,24 @@ pub struct WaveRender {
     pub n: u32,
     /// État partagé du câble : le flux rendu courant y est inscrit par `NewStream`.
     pub cable: &'static Cable,
+    /// Journal d'événements de l'adaptateur, pour les refus d'intersection (M1b-21).
+    pub log: EventLog,
+    /// Un refus numérique d'intersection a déjà été consigné pour ce miniport.
+    pub refus_consigne: AtomicBool,
+}
+
+impl WaveRender {
+    /// Le contexte de négociation de ce miniport (voir [`crate::intersect`]).
+    fn negotiation(&self) -> Negotiation<'_> {
+        Negotiation {
+            name: "WaveRender",
+            n: self.n,
+            system_pin: WAVE_RENDER_PIN_SYSTEM,
+            format: cable_format(self.n),
+            log: self.log,
+            reported: &self.refus_consigne,
+        }
+    }
 }
 
 impl MiniportWaveRT for WaveRender {
@@ -256,6 +290,19 @@ impl MiniportWaveRT for WaveRender {
     }
 
     // IRQL: PASSIVE_LEVEL
+    fn data_range_intersection(
+        &self,
+        pin_id: u32,
+        client: &KSDATARANGE,
+        my: &KSDATARANGE,
+        out: Option<&mut [u8]>,
+    ) -> Result<u32, NtStatus> {
+        // SAFETY: `client` et `my` viennent du thunk `DataRangeIntersection` de `portcls`,
+        // qui garantit des `KSDATARANGE` suivies de leur extension `FormatSize`.
+        unsafe { self.negotiation().resolve(pin_id, client, my, out) }
+    }
+
+    // IRQL: PASSIVE_LEVEL
     fn new_stream(
         &self,
         port_stream: PortWaveRTStream,
@@ -293,6 +340,24 @@ pub struct WaveCapture {
     pub n: u32,
     /// État partagé du câble (le flux capture courant y sera inscrit en M1a-08).
     pub cable: &'static Cable,
+    /// Journal d'événements de l'adaptateur, pour les refus d'intersection (M1b-21).
+    pub log: EventLog,
+    /// Un refus numérique d'intersection a déjà été consigné pour ce miniport.
+    pub refus_consigne: AtomicBool,
+}
+
+impl WaveCapture {
+    /// Le contexte de négociation de ce miniport (voir [`crate::intersect`]).
+    fn negotiation(&self) -> Negotiation<'_> {
+        Negotiation {
+            name: "WaveCapture",
+            n: self.n,
+            system_pin: WAVE_CAPTURE_PIN_SYSTEM,
+            format: cable_format(self.n),
+            log: self.log,
+            reported: &self.refus_consigne,
+        }
+    }
 }
 
 impl MiniportWaveRT for WaveCapture {
@@ -327,6 +392,18 @@ impl MiniportWaveRT for WaveCapture {
                 wave_capture_filter_default()
             }
         }
+    }
+
+    // IRQL: PASSIVE_LEVEL
+    fn data_range_intersection(
+        &self,
+        pin_id: u32,
+        client: &KSDATARANGE,
+        my: &KSDATARANGE,
+        out: Option<&mut [u8]>,
+    ) -> Result<u32, NtStatus> {
+        // SAFETY: voir `WaveRender::data_range_intersection`.
+        unsafe { self.negotiation().resolve(pin_id, client, my, out) }
     }
 
     // IRQL: PASSIVE_LEVEL

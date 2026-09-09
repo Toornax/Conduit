@@ -119,9 +119,14 @@ pub trait MiniportWaveRT: Send + Sync + 'static {
     fn description(&self) -> &'static PCFILTER_DESCRIPTOR;
 
     /// `DataRangeIntersection` : même contrat que
-    /// [`MiniportTopology::data_range_intersection`](crate::topology::MiniportTopology::data_range_intersection).
+    /// [`MiniportTopology::data_range_intersection`](crate::topology::MiniportTopology::data_range_intersection),
+    /// **extension des plages comprise**.
+    ///
     /// Le défaut, `Err(STATUS_NOT_IMPLEMENTED)`, laisse PortCls intersecter lui-même les
-    /// `KSDATARANGE_AUDIO` du descripteur (suffisant pour les formats de M1a, §5.4).
+    /// `KSDATARANGE_AUDIO` du descripteur. Son gestionnaire par défaut est limité — « *only
+    /// PCM data formats* », « *only mono and stereo audio streams* », aucun format contenant
+    /// un `WAVEFORMATEXTENSIBLE` : un miniport qui déclare du flottant ou plus de deux
+    /// canaux doit écrire le sien.
     ///
     /// IRQL : `PASSIVE_LEVEL`.
     fn data_range_intersection(

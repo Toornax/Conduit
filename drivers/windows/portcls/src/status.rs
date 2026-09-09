@@ -11,6 +11,14 @@ pub const STATUS_BUFFER_OVERFLOW: NtStatus = 0x8000_0005_u32 as i32;
 /// `STATUS_BUFFER_TOO_SMALL` (`0xC0000023`) : tampon de sortie fourni mais trop petit.
 pub const STATUS_BUFFER_TOO_SMALL: NtStatus = 0xC000_0023_u32 as i32;
 
+/// `STATUS_NO_MATCH` (`0xC0000272`) : réponse de `DataRangeIntersection` quand les deux
+/// plages ne se croisent pas.
+///
+/// C'est le code que la documentation de `IMiniport::DataRangeIntersection` nomme — « *there
+/// is no intersection* » — et il ne se confond pas avec `STATUS_NOT_IMPLEMENTED`, qui
+/// **délègue** au gestionnaire par défaut de PortCls au lieu de refuser.
+pub const STATUS_NO_MATCH: NtStatus = 0xC000_0272_u32 as i32;
+
 /// `STATUS_NOT_SUPPORTED` (`0xC00000BB`) : réponse par défaut de
 /// `IMiniportWaveRTStream::SetFormat` (changement de format en cours de flux refusé,
 /// comme SYSVAD).
@@ -41,12 +49,14 @@ mod tests {
     fn valeurs_du_wdk() {
         assert_eq!(STATUS_BUFFER_OVERFLOW as u32, 0x8000_0005);
         assert_eq!(STATUS_BUFFER_TOO_SMALL as u32, 0xC000_0023);
+        assert_eq!(STATUS_NO_MATCH as u32, 0xC000_0272);
         assert_eq!(STATUS_NOT_SUPPORTED as u32, 0xC000_00BB);
         assert_eq!(STATUS_INVALID_DEVICE_REQUEST as u32, 0xC000_0010);
         assert_eq!(STATUS_PRIVILEGE_NOT_HELD as u32, 0xC000_0061);
         assert_eq!(STATUS_NOT_FOUND as u32, 0xC000_0225);
         assert!(!nt_success(STATUS_BUFFER_OVERFLOW));
         assert!(!nt_success(STATUS_BUFFER_TOO_SMALL));
+        assert!(!nt_success(STATUS_NO_MATCH));
         assert!(!nt_success(STATUS_NOT_SUPPORTED));
         assert!(!nt_success(STATUS_INVALID_DEVICE_REQUEST));
         assert!(!nt_success(STATUS_PRIVILEGE_NOT_HELD));
