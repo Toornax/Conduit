@@ -541,14 +541,28 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   `BufferMs` enfin appliqué. Coût : **+20,3 Kio** de section de données.
   *La moitié espace utilisateur n'est pas faite* : ordre 8 du protocole, version 3,
   `conduitctl cable set-format`, et le format dans `CableSpec`/`CableInfo`.
-  **Régression mesurée le 2026-09-09, en cours de correction** : un câble activé au-delà
-  des deux actifs par défaut produit un endpoint dont `IAudioClient::GetMixFormat` **échoue**
-  — et ce **quel que soit son format**, y compris le format par défaut, ce qui écarte les
-  variantes. Avant M1b-05, activer le câble 3 marchait (mesuré le 2026-09-08). Le pilote lit
-  pourtant la bonne valeur : les traces montrent les seize formats lus et les seize câbles
-  enregistrés. La rupture est entre le magasin des formats et ce que Windows obtient de la
-  broche. Premier suspect : le `unwrap_or_else(wave_render_filter_default)` de `wave.rs`,
-  qui **avale une variante introuvable en silence**.
+  **Régression mesurée le 2026-09-09, en cours de correction** : **un câble configuré pour
+  autre chose que deux canaux ne peut plus être activé.** Comparaison contrôlée, une seule
+  variable — le nombre de canaux configuré :
+
+  | Câble | `CableFormat<n>` | `conduit-helper activer` |
+  |---|---|---|
+  | 4 | `0x00020302` — 48 kHz, **2** canaux | succès |
+  | 3 | `0x00060303` — 96 kHz, **6** canaux | **refus, Win32 87** |
+
+  Le `SET` de `KSPROPERTY_CONDUIT_CABLE_STATE` compare désormais les canaux de la requête à
+  ceux **configurés pour le câble visé**, alors que le service envoie toujours 2. Défaut de
+  frontière entre deux lots écrits en parallèle : le pilote a changé de contrat, le client
+  ne le sait pas.
+  *Fausse piste, consignée pour ne pas y revenir* : j'ai d'abord cru que l'endpoint d'un
+  câble activé au-delà des deux par défaut n'avait pas de format (`GetMixFormat` échouait).
+  C'était **mon** chemin d'activation : écrire le masque `ActiveCables` en registre puis
+  redémarrer le périphérique ne fait **pas** partir l'événement de jack, et Windows réutilise
+  telle quelle la clé d'endpoint créée jadis « débranché, sans format ». Activé par la
+  propriété KS — le seul chemin du produit — le câble 3 marche parfaitement. Un démontage du
+  binaire livré avait d'ailleurs établi que les 24 rangées de plages, les 48 broches système
+  et les 48 filtres wave sont exacts entrée par entrée, et qu'au format par défaut les seize
+  câbles reçoivent des descripteurs **identiques**.
   *Instruction du 2026-09-09, à la table plutôt qu'en machine — trois suspects écartés,
   preuve à l'appui* : le pilote **livré** a été démonté (en-tête PE, table des symboles du
   `.map`, contenu de `.rdata`, table de relocation). Les quatre tables de descripteurs y
