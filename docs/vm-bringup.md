@@ -206,6 +206,14 @@ mesurer, parce que l'erreur serait silencieuse et fausserait tout le reste.
 
 Si la lecture s'arrête ou bégaie : regarder les compteurs de débordement du câble.
 
+**Les compteurs se relèvent sans débogueur** depuis M1b-21 :
+`conduit-looptest --cable-compteurs` (les seize câbles, ou un seul avec `--cable N`)
+les lit par le jeu de propriétés KS et nomme le régime que chacun démontre — rendu seul,
+capture seule, les deux côtés, ou au repos. C'est la voie à préférer pour toute mesure
+de transport : attacher le débogueur noyau la fausse (17 passes sur 20 attaché contre 20
+sur 20 détaché, le 2026-09-08) et impose un redémarrage qui ferme la session console
+dont l'audio a besoin. DebugView reste utile pour tout le reste, en debug.
+
 ## 5. M1a-08 — la capture reçoit ce que le rendu joue
 
 Enregistrer sur « Conduit 1 » pendant qu'une application y joue (Enregistreur vocal, ou

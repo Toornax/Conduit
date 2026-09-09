@@ -1,8 +1,9 @@
 //! Le jeu de propriétés privé `KSPROPSETID_Conduit` vu par un faux PortCls, sur le modèle
 //! de `tests/jack.rs` : une `PCPROPERTY_REQUEST` bâtie à la main est passée au `Handler` du
-//! `PCPROPERTY_ITEM` que `config::cable_state_item` et `config::version_item` produisent.
+//! `PCPROPERTY_ITEM` que `config::cable_state_item`, `config::version_item` et
+//! `config::counters_item` produisent.
 //!
-//! Quatre points que ces tests verrouillent, et que les tests unitaires du module ne
+//! Cinq points que ces tests verrouillent, et que les tests unitaires du module ne
 //! peuvent pas atteindre parce qu'ils ne passent pas par le thunk :
 //!
 //! - **« sans effet » est vérifié, pas supposé** : chaque refus est encadré d'une lecture
@@ -14,7 +15,10 @@
 //! - **la négociation de taille de KS** : tampon vide, trop court, exact, trop grand, aux
 //!   trois verbes ;
 //! - **l'échec de persistance ne fait pas échouer la propriété** : le faux miniport sait
-//!   refuser d'écrire, et le `SET` rend quand même `STATUS_SUCCESS` avec l'état appliqué.
+//!   refuser d'écrire, et le `SET` rend quand même `STATUS_SUCCESS` avec l'état appliqué ;
+//! - **les compteurs se lisent sans droit et ne s'écrivent pas** (M1b-21) : le `GET` passe
+//!   sans privilège, le `SET` est refusé même avec, et la garde de vtable protège la seule
+//!   propriété du jeu qu'un appelant quelconque peut atteindre avec un tampon de 56 octets.
 
 #![allow(
     clippy::undocumented_unsafe_blocks,
@@ -34,8 +38,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use common::This;
 use conduit_com::{ComRef, NtStatus, STATUS_INVALID_PARAMETER, STATUS_SUCCESS};
 use conduit_kmd_core::config::{
-    CABLE_MAX, CABLE_STATE_BYTES, CONFIG_VERSION, CableState, KSPROPERTY_CONDUIT_CABLE_STATE,
-    KSPROPERTY_CONDUIT_VERSION, KSPROPSETID_CONDUIT, O_CABLE, O_CHANNELS, O_CONNECTED, O_RESERVED,
+    CABLE_COUNTERS_BYTES, CABLE_MAX, CABLE_STATE_BYTES, CONFIG_VERSION, CableCounters, CableState,
+    KSPROPERTY_CONDUIT_CABLE_STATE, KSPROPERTY_CONDUIT_COUNTERS, KSPROPERTY_CONDUIT_VERSION,
+    KSPROPSETID_CONDUIT, O_CABLE, O_CHANNELS, O_CONNECTED, O_RESERVED, OC_CABLE, OC_COPIED,
+    OC_DISCARDED_TICKS, OC_OVERRUNS, OC_RESERVED, OC_SILENCED_BEFORE_RENDER, OC_SILENCED_NO_RENDER,
+    OC_TICKS,
 };
 use portcls::portcls_sys::{
     GUID, GUID_NULL, IMiniportTopologyVtbl, IUnknown, KSPROPERTY_TYPE_BASICSUPPORT,
@@ -43,10 +50,10 @@ use portcls::portcls_sys::{
     PCFILTER_DESCRIPTOR, PCPROPERTY_ITEM, PCPROPERTY_REQUEST, ULONG, VARENUM,
 };
 use portcls::{
-    CABLE_STATE_ACCESS_FLAGS, CableConfig, ConfigTrace, MiniportTopology, PortTopology,
-    ResourceList, STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_DEVICE_REQUEST,
-    STATUS_NOT_SUPPORTED, STATUS_PRIVILEGE_NOT_HELD, VERSION_ACCESS_FLAGS, cable_state_item,
-    new_topology_object, version_item,
+    CABLE_STATE_ACCESS_FLAGS, COUNTERS_ACCESS_FLAGS, CableConfig, ConfigTrace, MiniportTopology,
+    PortTopology, ResourceList, STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL,
+    STATUS_INVALID_DEVICE_REQUEST, STATUS_NOT_SUPPORTED, STATUS_PRIVILEGE_NOT_HELD,
+    VERSION_ACCESS_FLAGS, cable_state_item, counters_item, new_topology_object, version_item,
 };
 
 // ---------------------------------------------------------------------------------
@@ -74,10 +81,31 @@ const TAILLE_ACCESSFLAGS: usize = 4;
 /// Taille de la valeur de la version.
 const TAILLE_VERSION: usize = 4;
 
+/// Taille de la valeur des compteurs.
+const TAILLE_COMPTEURS: usize = CABLE_COUNTERS_BYTES;
+
 /// Le câble que le faux miniport sert.
 const CABLE: u32 = 3;
 /// Nombre de canaux du faux miniport, celui que le pilote sait servir (M1b-05 exclue).
 const CANAUX: u32 = 2;
+
+/// Les compteurs que le faux miniport rapporte.
+///
+/// **Six valeurs toutes différentes, et aucune ronde** : c'est la seule façon d'attraper
+/// deux `ULONGLONG` écrits l'un à la place de l'autre, qu'un instantané à zéro laisserait
+/// passer sans un mot. Le régime décrit est celui du « rendu seul » de M1b-07 — des ticks
+/// jetés — mais les autres compteurs sont volontairement non nuls ici : ce test vise la
+/// sérialisation, pas la lecture du régime, qui se vérifie dans `conduit-kmd-core`.
+const COMPTEURS: CableCounters = CableCounters {
+    cable: CABLE,
+    reserved: 0,
+    ticks: 1_111,
+    copied: 22_222,
+    silenced_no_render: 333,
+    silenced_before_render: 44,
+    discarded_ticks: 5_555_555,
+    overruns: 6,
+};
 
 // ---------------------------------------------------------------------------------
 // Le faux miniport.
@@ -151,6 +179,10 @@ impl CableConfig for Faux {
         self.privilegie.load(Ordering::SeqCst)
     }
 
+    fn counters(&self) -> CableCounters {
+        COMPTEURS
+    }
+
     fn trace(&self, trace: &ConfigTrace<'_>) {
         self.traces.fetch_add(1, Ordering::SeqCst);
         self.dernier_statut
@@ -190,6 +222,7 @@ unsafe impl Sync for SyncItem {}
 
 static ITEM_ETAT: SyncItem = SyncItem(cable_state_item::<IMiniportTopologyVtbl, Faux>());
 static ITEM_VERSION: SyncItem = SyncItem(version_item::<IMiniportTopologyVtbl, Faux>());
+static ITEM_COMPTEURS: SyncItem = SyncItem(counters_item::<IMiniportTopologyVtbl, Faux>());
 
 /// `Node` d'une propriété de filtre : `ULONG(-1)`.
 const NODE: ULONG = ULONG::MAX;
@@ -269,6 +302,21 @@ fn u32_a(octets: &[u8], offset: usize) -> u32 {
     u32::from_ne_bytes(octets[offset..offset + 4].try_into().unwrap())
 }
 
+fn u64_a(octets: &[u8], offset: usize) -> u64 {
+    u64::from_ne_bytes(octets[offset..offset + 8].try_into().unwrap())
+}
+
+/// `GET` des compteurs avec `place` octets de tampon : `(statut, ValueSize, octets)`.
+fn lire_compteurs(this: This, place: usize) -> (NTSTATUS, ULONG, Vec<u8>) {
+    let mut tampon = vec![0xAAu8; place];
+    let mut req = requete(this, &ITEM_COMPTEURS, KSPROPERTY_TYPE_GET);
+    if place > 0 {
+        avec_valeur(&mut req, &mut tampon);
+    }
+    let status = appeler(&ITEM_COMPTEURS, &mut req);
+    (status, req.ValueSize, tampon)
+}
+
 /// Les 16 octets d'un GUID tels qu'ils apparaissent en mémoire.
 fn guid_octets(guid: &GUID) -> Vec<u8> {
     let mut v = Vec::with_capacity(16);
@@ -288,28 +336,37 @@ fn valeur(cable: u32, connecte: bool) -> Vec<u8> {
 // Les entrées de table.
 // ---------------------------------------------------------------------------------
 
-/// Les deux `PCPROPERTY_ITEM` portent le jeu privé, leurs identifiants et leurs drapeaux.
+/// Les trois `PCPROPERTY_ITEM` portent le jeu privé, leurs identifiants et leurs drapeaux.
 #[test]
 fn les_entrees_de_table_portent_le_jeu_prive() {
     let set_etat = unsafe { &*ITEM_ETAT.0.Set };
     let set_version = unsafe { &*ITEM_VERSION.0.Set };
-    for (nom, set) in [("état", set_etat), ("version", set_version)] {
+    let set_compteurs = unsafe { &*ITEM_COMPTEURS.0.Set };
+    for (nom, set) in [
+        ("état", set_etat),
+        ("version", set_version),
+        ("compteurs", set_compteurs),
+    ] {
         assert_eq!(set.Data1, KSPROPSETID_CONDUIT.data1, "{nom}");
         assert_eq!(set.Data2, KSPROPSETID_CONDUIT.data2, "{nom}");
         assert_eq!(set.Data3, KSPROPSETID_CONDUIT.data3, "{nom}");
         assert_eq!(set.Data4, KSPROPSETID_CONDUIT.data4, "{nom}");
     }
-    // Le même `static`, pas deux copies : `PCPROPERTY_ITEM::Set` est un pointeur que
-    // PortCls conserve, et deux GUID identiques à deux adresses seraient un gaspillage
+    // Le même `static`, pas trois copies : `PCPROPERTY_ITEM::Set` est un pointeur que
+    // PortCls conserve, et des GUID identiques à trois adresses seraient un gaspillage
     // silencieux qui masquerait une divergence future.
     assert!(ptr::eq(set_etat, set_version));
+    assert!(ptr::eq(set_etat, set_compteurs));
 
     assert_eq!(ITEM_ETAT.0.Id, KSPROPERTY_CONDUIT_CABLE_STATE);
     assert_eq!(ITEM_VERSION.0.Id, KSPROPERTY_CONDUIT_VERSION);
+    assert_eq!(ITEM_COMPTEURS.0.Id, KSPROPERTY_CONDUIT_COUNTERS);
     assert_eq!(ITEM_ETAT.0.Flags, CABLE_STATE_ACCESS_FLAGS);
     assert_eq!(ITEM_VERSION.0.Flags, VERSION_ACCESS_FLAGS);
+    assert_eq!(ITEM_COMPTEURS.0.Flags, COUNTERS_ACCESS_FLAGS);
     assert!(ITEM_ETAT.0.Handler.is_some());
     assert!(ITEM_VERSION.0.Handler.is_some());
+    assert!(ITEM_COMPTEURS.0.Handler.is_some());
 }
 
 // ---------------------------------------------------------------------------------
@@ -716,10 +773,161 @@ fn la_version_se_lit_et_ne_s_ecrit_pas() {
 }
 
 // ---------------------------------------------------------------------------------
+// Les compteurs (M1b-21).
+// ---------------------------------------------------------------------------------
+
+/// La lecture rend les huit champs, chacun à son décalage nommé du contrat.
+///
+/// Les six compteurs du faux miniport sont toutes des valeurs différentes : deux
+/// `ULONGLONG` écrits l'un à la place de l'autre passeraient un aller-retour sur des zéros
+/// sans que rien ne le signale, et c'est exactement l'erreur que ce test cherche.
+#[test]
+fn la_lecture_des_compteurs_rend_les_huit_champs_a_leurs_decalages() {
+    let this = faux(true, false);
+    let (status, taille, octets) = lire_compteurs(this, TAILLE_COMPTEURS);
+    assert_eq!(status, STATUS_SUCCESS);
+    assert_eq!(taille as usize, TAILLE_COMPTEURS);
+
+    assert_eq!(u32_a(&octets, OC_CABLE), CABLE, "l'écho de câble");
+    assert_eq!(
+        u32_a(&octets, OC_RESERVED),
+        0,
+        "rien de la mémoire du noyau ne transite par le champ réservé"
+    );
+    assert_eq!(u64_a(&octets, OC_TICKS), COMPTEURS.ticks);
+    assert_eq!(u64_a(&octets, OC_COPIED), COMPTEURS.copied);
+    assert_eq!(
+        u64_a(&octets, OC_SILENCED_NO_RENDER),
+        COMPTEURS.silenced_no_render
+    );
+    assert_eq!(
+        u64_a(&octets, OC_SILENCED_BEFORE_RENDER),
+        COMPTEURS.silenced_before_render
+    );
+    assert_eq!(
+        u64_a(&octets, OC_DISCARDED_TICKS),
+        COMPTEURS.discarded_ticks
+    );
+    assert_eq!(u64_a(&octets, OC_OVERRUNS), COMPTEURS.overruns);
+
+    // Et l'aller-retour complet par le parseur du contrat, celui-là même que le client
+    // d'espace utilisateur applique.
+    assert_eq!(CableCounters::from_bytes(&octets), Ok(COMPTEURS));
+
+    common::release(this);
+}
+
+/// Négociation de taille du `GET` des compteurs : vide, trop court, exact, trop grand.
+///
+/// Le palier « trop court » est vérifié sur **toutes** les tailles de 1 à 55 : un
+/// gestionnaire qui écrirait les premiers champs et s'arrêterait rendrait au client un
+/// instantané dont il ne saurait pas quels compteurs sont à lui.
+#[test]
+fn la_negociation_de_taille_des_compteurs() {
+    let this = faux(true, false);
+
+    // Tampon absent : interrogation de taille.
+    let (status, taille, _) = lire_compteurs(this, 0);
+    assert_eq!(status, STATUS_BUFFER_OVERFLOW);
+    assert_eq!(taille as usize, TAILLE_COMPTEURS);
+
+    // Trop court : rien n'est écrit, la taille requise est rendue. Les paliers de 1 à 55
+    // couvrent notamment 16 (la taille de l'**autre** structure du jeu), qu'un client
+    // pourrait allouer par confusion.
+    for place in 1..TAILLE_COMPTEURS {
+        let (status, taille, octets) = lire_compteurs(this, place);
+        assert_eq!(status, STATUS_BUFFER_TOO_SMALL, "place {place}");
+        assert_eq!(taille as usize, TAILLE_COMPTEURS, "place {place}");
+        assert!(
+            octets.iter().all(|o| *o == 0xAA),
+            "place {place} : un instantané à demi écrit serait pire qu'aucun"
+        );
+    }
+
+    // Exact, puis plus grand : succès, et rien n'est écrit au-delà des cinquante-six
+    // octets.
+    let (status, taille, _) = lire_compteurs(this, TAILLE_COMPTEURS);
+    assert_eq!(status, STATUS_SUCCESS);
+    assert_eq!(taille as usize, TAILLE_COMPTEURS);
+
+    let (status, taille, octets) = lire_compteurs(this, TAILLE_COMPTEURS + 8);
+    assert_eq!(status, STATUS_SUCCESS);
+    assert_eq!(taille as usize, TAILLE_COMPTEURS);
+    assert!(octets[TAILLE_COMPTEURS..].iter().all(|o| *o == 0xAA));
+
+    common::release(this);
+}
+
+/// Les compteurs se lisent **sans privilège** et ne s'écrivent pas.
+///
+/// Deux moitiés indissociables. La lecture libre est ce qui rend le diagnostic utilisable
+/// là où il sert — sur la machine où plus rien ne marche, depuis un processus quelconque.
+/// L'absence de `SET` est ce qui dit qu'un compteur n'est pas un réglage : les `Flags` le
+/// déclarent déjà et PortCls filtre, mais le gestionnaire refuse en seconde ligne, comme
+/// pour la version.
+#[test]
+fn les_compteurs_se_lisent_sans_privilege_et_ne_s_ecrivent_pas() {
+    let this = faux(true, false);
+    assert!(!interieur(this).may_configure());
+
+    let (status, _, _) = lire_compteurs(this, TAILLE_COMPTEURS);
+    assert_eq!(
+        status, STATUS_SUCCESS,
+        "un outil de diagnostic non élevé doit pouvoir relever les compteurs"
+    );
+
+    // `SET`, avec un tampon parfaitement formé et **avec** le privilège : refusé quand
+    // même, et par `STATUS_NOT_SUPPORTED` — le refus d'un verbe, pas celui d'un contenu.
+    let prive = faux(true, true);
+    let mut tampon = COMPTEURS.to_bytes();
+    let mut req = requete(prive, &ITEM_COMPTEURS, KSPROPERTY_TYPE_SET);
+    avec_valeur(&mut req, &mut tampon);
+    assert_eq!(appeler(&ITEM_COMPTEURS, &mut req), STATUS_NOT_SUPPORTED);
+    // Et l'instantané n'a pas bougé : il n'y avait rien à écrire.
+    let (_, _, octets) = lire_compteurs(prive, TAILLE_COMPTEURS);
+    assert_eq!(CableCounters::from_bytes(&octets), Ok(COMPTEURS));
+
+    common::release(prive);
+    common::release(this);
+}
+
+/// La garde de vtable de `property.rs` protège aussi le gestionnaire des compteurs : un
+/// `MajorTarget` qui n'est pas un `ComObject<IMiniportTopologyVtbl, Faux>` est refusé.
+///
+/// Le cas compte plus ici qu'ailleurs : cette propriété est la seule du jeu qu'un appelant
+/// **non privilégié** peut atteindre en écrivant 56 octets dans son propre tampon. Sans la
+/// garde, un `MajorTarget` étranger ferait lire des compteurs à une adresse quelconque.
+#[test]
+fn un_major_target_etranger_est_refuse_sur_les_compteurs() {
+    // Requête nulle.
+    let slot = ITEM_COMPTEURS.0.Handler.unwrap();
+    assert_eq!(
+        unsafe { slot(ptr::null_mut()) },
+        STATUS_INVALID_PARAMETER,
+        "requête nulle"
+    );
+
+    // Un objet quelconque dont le premier mot n'est pas notre vtable.
+    let mut faux_vtbl: *const u8 = ptr::null();
+    let mut tampon = [0u8; CABLE_COUNTERS_BYTES];
+    let mut req = requete(ptr::null_mut(), &ITEM_COMPTEURS, KSPROPERTY_TYPE_GET);
+    req.MajorTarget = ptr::from_mut(&mut faux_vtbl).cast();
+    avec_valeur(&mut req, &mut tampon);
+    assert_eq!(
+        appeler(&ITEM_COMPTEURS, &mut req),
+        STATUS_INVALID_DEVICE_REQUEST
+    );
+    assert!(
+        tampon.iter().all(|o| *o == 0),
+        "une cible refusée ne doit rien avoir écrit dans le tampon de l'appelant"
+    );
+}
+
+// ---------------------------------------------------------------------------------
 // BASICSUPPORT.
 // ---------------------------------------------------------------------------------
 
-/// Les paliers de `BASICSUPPORT`, pour les deux propriétés, et le contenu de chacun.
+/// Les paliers de `BASICSUPPORT`, pour les trois propriétés, et le contenu de chacun.
 #[test]
 fn basic_support_repond_en_paliers() {
     let this = faux(true, false);
@@ -738,6 +946,15 @@ fn basic_support_repond_en_paliers() {
             VERSION_ACCESS_FLAGS,
             KSPROPTYPESETID_General,
             VARENUM::VT_UI4 as u32,
+        ),
+        // Les compteurs : une structure de cinquante-six octets, qu'aucune `VARENUM` ne
+        // nomme — donc un `PropTypeSet` nul, comme l'état et pour la même raison.
+        (
+            "compteurs",
+            &ITEM_COMPTEURS,
+            COUNTERS_ACCESS_FLAGS,
+            GUID_NULL,
+            0_u32,
         ),
     ] {
         // Moins de quatre octets : refusé. Répondre autre chose casserait la négociation.
@@ -819,7 +1036,7 @@ fn basic_support_ne_demande_aucun_privilege() {
 fn le_thunk_refuse_les_requetes_mal_formees() {
     let this = faux(true, true);
 
-    for item in [&ITEM_ETAT, &ITEM_VERSION] {
+    for item in [&ITEM_ETAT, &ITEM_VERSION, &ITEM_COMPTEURS] {
         let slot = item.0.Handler.unwrap();
         assert_eq!(
             unsafe { slot(ptr::null_mut()) },

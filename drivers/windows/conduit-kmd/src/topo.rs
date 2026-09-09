@@ -100,6 +100,7 @@
 use core::fmt;
 
 use conduit_kmd_core::FrameLayout;
+use conduit_kmd_core::config::CableCounters;
 use portcls::conduit_com::{ComRef, NtStatus, STATUS_SUCCESS};
 use portcls::{
     AudioNodes, CableConfig, ConfigTrace, EventSource, EventTrace, JackInfo, JackTarget, JackTrace,
@@ -495,6 +496,12 @@ impl CableConfig for TopoRender {
         privilege::may_load_driver()
     }
 
+    // IRQL: quelconque — les compteurs sont par câble, comme l'état de connexion : les deux
+    // sens d'un même câble rendent le même instantané, la boucle locale étant unique.
+    fn counters(&self) -> CableCounters {
+        self.cable.counters_snapshot()
+    }
+
     // IRQL: PASSIVE_LEVEL
     fn trace(&self, trace: &ConfigTrace<'_>) {
         kmd_log!("TopoRender{} : {trace:?}", self.n);
@@ -677,6 +684,12 @@ impl CableConfig for TopoCapture {
     // IRQL: PASSIVE_LEVEL — voir la réserve sur le contexte de fil dans `crate::privilege`.
     fn may_configure(&self) -> bool {
         privilege::may_load_driver()
+    }
+
+    // IRQL: quelconque — voir `TopoRender` : la boucle locale est unique par câble, les
+    // deux sens rendent donc le même instantané.
+    fn counters(&self) -> CableCounters {
+        self.cable.counters_snapshot()
     }
 
     // IRQL: PASSIVE_LEVEL

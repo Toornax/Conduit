@@ -6,14 +6,16 @@
 //! `conduit-kmd-core`, partagé avec le pilote. Ce module ne fait que **choisir** les
 //! requêtes et mettre en forme le compte rendu.
 //!
-//! Cinq actions, combinables dans un seul appel et exécutées dans cet ordre :
+//! Six actions, combinables dans un seul appel et exécutées dans cet ordre :
 //!
 //! 1. `--cable-privilege` : l'état de `SeLoadDriverPrivilege` dans ce processus, sans
 //!    rien écrire ni armer ;
 //! 2. `--cable-etat` : l'état des seize câbles, plus la version du contrat servi ;
-//! 3. `--cable-set` : l'écriture, affichée avant et après ;
-//! 4. `--cable-chrono` : le délai entre l'écriture et l'endpoint MMDevice qui suit ;
-//! 5. `--cable-invalide` : la batterie d'entrées volontairement invalides.
+//! 3. `--cable-compteurs` : les compteurs de la boucle locale, et le régime qu'ils
+//!    démontrent — la lecture de M1b-07 que seul le débogueur savait faire (M1b-21) ;
+//! 4. `--cable-set` : l'écriture, affichée avant et après ;
+//! 5. `--cable-chrono` : le délai entre l'écriture et l'endpoint MMDevice qui suit ;
+//! 6. `--cable-invalide` : la batterie d'entrées volontairement invalides.
 //!
 //! # Le privilège est armé une fois, pour toute la durée des écritures
 //!
@@ -22,7 +24,8 @@
 //! en machine virtuelle a établi. [`run`] appelle donc [`armer_privilege`] **une seule
 //! fois**, avant les actions qui écrivent, et garde le garde jusqu'à son retour : il
 //! restaure alors le jeton dans l'état où il l'a trouvé. Une lecture
-//! (`--cable-privilege`, `--cable-etat`) n'arme rien, parce qu'elle n'en a pas besoin.
+//! (`--cable-privilege`, `--cable-etat`, `--cable-compteurs`) n'arme rien, parce qu'elle
+//! n'en a pas besoin.
 //!
 //! **Aucun flux audio n'est ouvert et aucun son n'émis** : `IOCTL_KS_PROPERTY` est une
 //! requête de contrôle, et le chronomètre ne fait qu'**énumérer** les endpoints. Les
@@ -38,7 +41,8 @@ use std::time::{Duration, Instant};
 use conduit_backend::{Backend, CableId, DeviceDirection};
 use conduit_backend_wasapi::cable::{
     armer_privilege, contract_version, etat_privilege, topology_interfaces, Armement, BadInput,
-    CableConfigError, CableState, EtatPrivilege, FilterSide, TopologyFilter, CABLE_MAX,
+    CableConfigError, CableCounters, CableState, EtatPrivilege, FilterSide, TopologyFilter,
+    CABLE_MAX,
 };
 use conduit_backend_wasapi::WasapiBackend;
 
@@ -89,7 +93,7 @@ pub fn run(args: &Args) -> Result<Rapport, String> {
     if args.cable_privilege {
         pousser(&mut texte, &bloc_privilege(&etat_privilege()));
     }
-    if !(args.cable_etat || args.writes_cable()) {
+    if !(args.cable_etat || args.cable_compteurs || args.writes_cable()) {
         return Ok(Rapport { texte, conforme });
     }
 
@@ -98,6 +102,10 @@ pub fn run(args: &Args) -> Result<Rapport, String> {
 
     if args.cable_etat {
         pousser(&mut texte, &etat_des_cables(&paths, side));
+    }
+
+    if args.cable_compteurs {
+        pousser(&mut texte, &compteurs_des_cables(&paths, side, args.cable));
     }
 
     // Une seule fois, pour toutes les écritures : le garde vit jusqu'au `return` de
@@ -299,8 +307,16 @@ fn etat_des_cables(paths: &[String], side: FilterSide) -> String {
                 if servie == attendue {
                     ""
                 } else {
-                    " — INADÉQUATION : la structure d'échange n'a pas la forme attendue, \
-                     ne vous fiez pas aux états ci-dessus"
+                    // Ce que cet outil sait, et rien de plus : les deux numéros diffèrent.
+                    // Il ne sait **pas** ce qui diffère — un changement peut être purement
+                    // additif (une propriété qui apparaît, M1b-21) et laisser l'état
+                    // parfaitement lisible, comme il peut toucher à la structure
+                    // d'échange. Affirmer la seconde hypothèse serait un diagnostic faux
+                    // une fois sur deux.
+                    " — INADÉQUATION : le pilote ne sert pas le millésime de contrat que \
+                     cet outil connaît. Ce qui diffère n'est pas dit ici : reprenez la \
+                     documentation de CONFIG_VERSION avant de vous fier aux états \
+                     ci-dessus"
                 }
             );
         }
@@ -311,6 +327,110 @@ fn etat_des_cables(paths: &[String], side: FilterSide) -> String {
             "Aucun filtre de topologie Conduit : le pilote n'est pas chargé sur cette \
              machine (voir docs/driver-dev.md).\n",
         ),
+    }
+    out
+}
+
+/// Le régime que six compteurs démontrent, en français et en une ligne.
+///
+/// Pure, et c'est ici qu'est écrit tout ce que M1b-07 voulait pouvoir **montrer**. Les
+/// deux régimes à un seul côté ouvert sont les seuls qui aient besoin d'être nommés : ce
+/// sont eux qu'un relevé sans témoin confondait avec un câble au repos.
+fn regime(compteurs: &CableCounters) -> &'static str {
+    if compteurs.rendu_seul() {
+        "RENDU SEUL : les trames sont jetées, rien ne s'accumule (M1b-07)"
+    } else if compteurs.capture_seule() {
+        "CAPTURE SEULE : l'entrée sans producteur lit du silence (M1b-07)"
+    } else if compteurs.copied > 0 {
+        "les deux côtés tournent : le câble transporte"
+    } else if compteurs.ticks > 0 {
+        "au repos : le timer tourne, aucun flux n'est ouvert"
+    } else {
+        "aucun tick depuis le dernier démarrage du périphérique"
+    }
+}
+
+/// Les compteurs d'un câble, en trois lignes.
+fn lignes_compteurs(cable: CableId, index: u32, compteurs: &CableCounters) -> String {
+    let mut out = format!("  Conduit {:>2} (index pilote {index})\n", cable.0);
+    let _ = writeln!(
+        out,
+        "      {} ticks, {} trames copiées, {} débordements",
+        compteurs.ticks, compteurs.copied, compteurs.overruns
+    );
+    let _ = writeln!(
+        out,
+        "      silences : {} sans rendu, {} avant le départ du rendu ; {} ticks jetés",
+        compteurs.silenced_no_render, compteurs.silenced_before_render, compteurs.discarded_ticks
+    );
+    let _ = writeln!(out, "      → {}", regime(compteurs));
+    out
+}
+
+/// `--cable-compteurs` : le relevé de la boucle locale, sans débogueur.
+///
+/// `vise` restreint le relevé à un seul câble quand `--cable N` est donné ; sinon les
+/// seize sont lus, comme pour `--cable-etat`.
+///
+/// # Pourquoi cette option existe
+///
+/// Les compteurs sont dans le pilote depuis M1b-07 mais ne se lisaient qu'au **débogueur
+/// noyau** (`kmd_log!` est vide en release). Or l'attacher fausse précisément ce qu'on
+/// mesure — 17 passes sur 20 attaché contre 20 sur 20 détaché — et coûte un redémarrage
+/// de la machine virtuelle, qui ferme la session console dont l'audio a besoin. Ce relevé
+/// passe par `IOCTL_KS_PROPERTY`, sans rien attacher et sans ouvrir de flux.
+fn compteurs_des_cables(paths: &[String], side: FilterSide, vise: Option<u32>) -> String {
+    let mut out = format!(
+        "compteurs de la boucle locale, côté {} (filtres {}<n>) :\n",
+        side.label(),
+        side.prefix()
+    );
+    out.push_str(
+        "  (remis à zéro à chaque démarrage du périphérique ; instantané non atomique, \
+         deux ticks peuvent s'y mélanger)\n",
+    );
+    let numeros: Vec<u32> = match vise {
+        Some(n) => vec![n],
+        None => (1..=CABLE_MAX).collect(),
+    };
+    let mut vus = 0u32;
+    for numero in numeros {
+        let cable = CableId(numero);
+        // Décalage de un : « Conduit 1 » est l'index 0 du pilote.
+        let index = numero.saturating_sub(1);
+        match ouvrir(paths, cable, side) {
+            Ok(filtre) => {
+                vus = vus.saturating_add(1);
+                match filtre.read_counters() {
+                    Ok(compteurs) => out.push_str(&lignes_compteurs(cable, index, &compteurs)),
+                    Err(e) => {
+                        let _ = writeln!(
+                            out,
+                            "  Conduit {:>2} (index pilote {index}) : lecture refusée — {e}\n      \
+                             Un pilote antérieur à M1b-21 n'a pas cette propriété : vérifiez la \
+                             version avec --cable-etat.",
+                            cable.0
+                        );
+                    }
+                }
+            }
+            Err(CableConfigError::FiltreAbsent { .. }) => {
+                let _ = writeln!(
+                    out,
+                    "  Conduit {:>2} (index pilote {index}) : filtre absent",
+                    cable.0
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(out, "  Conduit {:>2} : {e}", cable.0);
+            }
+        }
+    }
+    if vus == 0 {
+        out.push_str(
+            "Aucun filtre de topologie Conduit : le pilote n'est pas chargé sur cette \
+             machine (voir docs/driver-dev.md).\n",
+        );
     }
     out
 }
@@ -679,6 +799,80 @@ mod tests {
         assert_eq!(texte, "un\n");
         pousser(&mut texte, "deux\n");
         assert_eq!(texte, "un\n\ndeux\n");
+    }
+
+    /// Le régime que le relevé nomme, pour chacune des cinq situations — et surtout la
+    /// différence entre « rendu seul » et « au repos », que rien ne distinguait avant
+    /// M1b-07 et que rien ne montrait sans débogueur avant M1b-21.
+    #[test]
+    fn le_releve_nomme_le_regime_que_les_compteurs_demontrent() {
+        let rendu_seul = CableCounters {
+            ticks: 100,
+            discarded_ticks: 100,
+            ..CableCounters::new(0)
+        };
+        assert!(regime(&rendu_seul).contains("RENDU SEUL"));
+
+        let capture_seule = CableCounters {
+            ticks: 100,
+            silenced_no_render: 4_800,
+            ..CableCounters::new(0)
+        };
+        assert!(regime(&capture_seule).contains("CAPTURE SEULE"));
+
+        let boucle = CableCounters {
+            ticks: 100,
+            copied: 480_000,
+            silenced_before_render: 96,
+            ..CableCounters::new(0)
+        };
+        assert!(regime(&boucle).contains("transporte"));
+
+        let repos = CableCounters {
+            ticks: 100,
+            ..CableCounters::new(0)
+        };
+        assert!(regime(&repos).contains("repos"));
+        assert_ne!(
+            regime(&repos),
+            regime(&rendu_seul),
+            "un câble au repos et un rendu seul doivent se lire différemment : c'est \
+             exactement la confusion que M1b-07 a levée"
+        );
+
+        let neuf = CableCounters::new(0);
+        assert!(regime(&neuf).contains("aucun tick"));
+    }
+
+    /// Le relevé imprime les six compteurs, le câble, son index, et le régime.
+    #[test]
+    fn les_lignes_de_compteurs_portent_les_six_valeurs() {
+        let compteurs = CableCounters {
+            cable: 2,
+            reserved: 0,
+            ticks: 1_111,
+            copied: 22_222,
+            silenced_no_render: 333,
+            silenced_before_render: 44,
+            discarded_ticks: 5_555_555,
+            overruns: 6,
+        };
+        let texte = lignes_compteurs(CableId(3), 2, &compteurs);
+        for attendu in [
+            "Conduit  3",
+            "index pilote 2",
+            "1111",
+            "22222",
+            "333",
+            "44",
+            "5555555",
+            "6",
+        ] {
+            assert!(
+                texte.contains(attendu),
+                "« {attendu} » absent de :\n{texte}"
+            );
+        }
     }
 
     #[test]

@@ -680,7 +680,9 @@ n'est pas un cas particulier puisque le tampon est un multiple de la période). 
 compteurs atomiques par câble (ticks, trames copiées, silences faute de rendu, silences pour
 des trames antérieures au départ du rendu, ticks de rendu sans capture, débordements) sont
 journalisés toutes les 1000 ticks — **en debug seulement** (`kmd_log!` est vide en
-release) — et **remis à zéro par `Cable::start`**, à chaque `StartDevice` : le pilote ne
+release), d'où `KSPROPERTY_CONDUIT_COUNTERS` (§6, M1b-21) qui les rend lisibles en
+release et sans débogueur — et **remis à zéro par `Cable::start`**, à chaque
+`StartDevice` : le pilote ne
 se décharge pas entre deux cycles de périphérique, et des compteurs cumulés font lire une
 trace de cycle neuf comme une trace de cycle ancien (c'est ce qui a fait conclure à tort à
 une image obsolète du pilote le 2026-09-06). Le flux (`stream::WaveStream`, un seul type pour les deux sens, distingués par
@@ -769,9 +771,27 @@ la configuration passe par un **jeu de propriétés KS privé** (`KSPROPSETID_Co
 GUID généré une fois et figé dans `conduit-kmd-core::config`) exposé par le filtre de
 topologie de chaque câble. Le helper ouvre l'interface `KSCATEGORY_TOPOLOGY` du câble
 et envoie `IOCTL_KS_PROPERTY` (`KSPROPERTY_CONDUIT_CABLE_STATE` get/set,
-`KSPROPERTY_CONDUIT_VERSION` get). Avantages : PortCls fait tout le routage, l'accès
-se fait par les handles standard, la validation est un simple parseur sur un tampon
-borné (fuzzable en mode utilisateur, M1b-08).
+`KSPROPERTY_CONDUIT_VERSION` get, `KSPROPERTY_CONDUIT_COUNTERS` get). Avantages :
+PortCls fait tout le routage, l'accès se fait par les handles standard, la validation
+est un simple parseur sur un tampon borné (fuzzable en mode utilisateur, M1b-08).
+
+`KSPROPERTY_CONDUIT_COUNTERS` (M1b-21) rend une `CableCounters` de 56 octets : les six
+compteurs de la boucle locale que M1b-07 avait séparés par cause. Ils existaient déjà
+mais ne se lisaient qu'au **débogueur noyau** (`kmd_log!` est vide en release), or
+l'attacher fausse la mesure de transport qu'on cherche justement à qualifier — 17 passes
+sur 20 attaché contre 20 sur 20 détaché, mesuré le 2026-09-08 — et coûte un redémarrage
+de la VM, qui ferme la session console dont l'audio a besoin. La propriété les rend
+lisibles sans rien attacher : `conduit-looptest --cable-compteurs`. Pas de `SET` (un
+compteur n'est pas un réglage) ni de contrôle de privilège (rien n'est écrit), et
+l'instantané est volontairement **non atomique** entre les six valeurs — prendre le
+verrou du câble à `PASSIVE_LEVEL` sérialiserait la boucle locale avec un diagnostic,
+alors qu'on ne lit que **quels** compteurs bougent.
+
+Toute apparition de propriété incrémente `CONFIG_VERSION` (2 → 3 en M1b-21) : le GUID du
+jeu est gravé et la longueur des tampons est refusée dès qu'elle change, ce numéro est
+donc la seule voie de versionnement du jeu. Un changement additif y est indiscernable
+d'un changement de forme, d'où la règle sur les messages : un outil qui constate une
+inadéquation dit que les millésimes diffèrent, jamais **ce qui** diffère.
 
 Contrôle d'accès : le gestionnaire de propriété s'exécute dans le contexte du thread
 appelant ; toute écriture exige `SeSinglePrivilegeCheck(SE_LOAD_DRIVER_PRIVILEGE)`

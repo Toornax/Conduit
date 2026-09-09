@@ -1,5 +1,5 @@
 //! Le jeu de propriétés KS **privé** de configuration (M1b-04, driver-design.md §6) :
-//! trait [`CableConfig`] que le miniport topologie implémente, et les deux
+//! trait [`CableConfig`] que le miniport topologie implémente, et les trois
 //! [`PropertyHandler`] posés sur la brique de [`crate::property`].
 //!
 //! **Ce module ne stocke aucun état et ne valide rien lui-même**, comme [`crate::audio`]
@@ -13,14 +13,20 @@
 //! mode utilisateur, et il ne peut l'être que s'il ne dépend d'aucun type du WDK. Toute
 //! validation écrite **ici** échapperait au fuzzer.
 //!
-//! # Deux propriétés, un jeu
+//! # Trois propriétés, un jeu
 //!
 //! | Propriété | Verbes | Valeur |
 //! |---|---|---|
 //! | [`KSPROPERTY_CONDUIT_CABLE_STATE`] | GET, SET, BASICSUPPORT | [`CableState`], 16 octets |
 //! | [`KSPROPERTY_CONDUIT_VERSION`] | GET, BASICSUPPORT | un `ULONG` |
+//! | [`KSPROPERTY_CONDUIT_COUNTERS`] | GET, BASICSUPPORT | [`CableCounters`], 56 octets |
 //!
-//! Les deux se posent dans la `PCAUTOMATION_TABLE` du **filtre** de topologie
+//! Une seule est modifiable, et c'est la première : la version est celle du binaire chargé,
+//! les compteurs sont ce que la boucle locale a fait. **Un compteur n'est pas un réglage**,
+//! d'où l'absence de `SET` — et, faute d'écriture, aucun contrôle de privilège à faire :
+//! seule l'écriture en demandait un.
+//!
+//! Les trois se posent dans la `PCAUTOMATION_TABLE` du **filtre** de topologie
 //! (`PCFILTER_DESCRIPTOR::AutomationTable`), à côté de `KSPROPERTY_JACK_DESCRIPTION`, et
 //! non sur une broche ni sur un nœud : elles décrivent le câble entier, pas un point de
 //! son graphe. Le service d'assistance (M1b-20) ouvre l'interface `KSCATEGORY_TOPOLOGY` du
@@ -133,9 +139,11 @@
 
 use conduit_com::{NtStatus, STATUS_INVALID_PARAMETER};
 use conduit_kmd_core::config::{
-    CABLE_STATE_BYTES, CONFIG_VERSION, CableState, ConfigError, ConfigGuid,
-    KSPROPERTY_CONDUIT_CABLE_STATE, KSPROPERTY_CONDUIT_VERSION, KSPROPSETID_CONDUIT, O_CABLE,
-    O_CHANNELS, O_CONNECTED, O_RESERVED,
+    CABLE_COUNTERS_BYTES, CABLE_STATE_BYTES, CONFIG_VERSION, CableCounters, CableState,
+    ConfigError, ConfigGuid, KSPROPERTY_CONDUIT_CABLE_STATE, KSPROPERTY_CONDUIT_COUNTERS,
+    KSPROPERTY_CONDUIT_VERSION, KSPROPSETID_CONDUIT, O_CABLE, O_CHANNELS, O_CONNECTED, O_RESERVED,
+    OC_CABLE, OC_COPIED, OC_DISCARDED_TICKS, OC_OVERRUNS, OC_RESERVED, OC_SILENCED_BEFORE_RENDER,
+    OC_SILENCED_NO_RENDER, OC_TICKS,
 };
 use portcls_sys::{
     GUID, GUID_NULL, KSPROPERTY_TYPE_BASICSUPPORT, KSPROPERTY_TYPE_GET, KSPROPERTY_TYPE_SET,
@@ -202,17 +210,34 @@ pub const CABLE_STATE_ACCESS_FLAGS: u32 =
 /// La version est celle du binaire chargé : elle se lit, elle ne se règle pas.
 pub const VERSION_ACCESS_FLAGS: u32 = KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_BASICSUPPORT;
 
+/// `Flags` du `PCPROPERTY_ITEM` des compteurs : `GET | BASICSUPPORT` (513), **sans `SET`**.
+///
+/// Même valeur que [`VERSION_ACCESS_FLAGS`], et pour une raison de même nature : un
+/// compteur n'est pas un réglage. Deux constantes plutôt qu'une, parce qu'elles décrivent
+/// deux propriétés dont rien ne garantit qu'elles resteront d'accord — et parce qu'un
+/// `assert_eq!` entre les deux dirait quelque chose de faux, à savoir qu'elles dépendent
+/// l'une de l'autre.
+pub const COUNTERS_ACCESS_FLAGS: u32 = KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_BASICSUPPORT;
+
 /// Taille de la valeur de [`KSPROPERTY_CONDUIT_VERSION`] : un `ULONG`.
 const TAILLE_VERSION: usize = 4;
 
 const _: () = assert!(CABLE_STATE_ACCESS_FLAGS == 515);
 const _: () = assert!(VERSION_ACCESS_FLAGS == 513);
 const _: () = assert!(VERSION_ACCESS_FLAGS & KSPROPERTY_TYPE_SET == 0);
+const _: () = assert!(COUNTERS_ACCESS_FLAGS == 513);
+const _: () = assert!(COUNTERS_ACCESS_FLAGS & KSPROPERTY_TYPE_SET == 0);
 const _: () = assert!(CABLE_STATE_BYTES == 16 && TAILLE_VERSION == 4);
 // Les décalages de la structure d'échange sont ceux du contrat portable et pavent bien ses
 // seize octets : la sérialisation ci-dessous n'en recopie pas une seconde définition.
 const _: () = assert!(O_CABLE == 0 && O_CONNECTED == 4 && O_CHANNELS == 8 && O_RESERVED == 12);
 const _: () = assert!(O_RESERVED + 4 == CABLE_STATE_BYTES);
+// Idem pour les compteurs : deux `ULONG` puis six `ULONGLONG`, chacun aligné sur huit.
+const _: () = assert!(CABLE_COUNTERS_BYTES == 56);
+const _: () = assert!(OC_CABLE == 0 && OC_RESERVED == 4 && OC_TICKS == 8);
+const _: () = assert!(OC_COPIED == 16 && OC_SILENCED_NO_RENDER == 24);
+const _: () = assert!(OC_SILENCED_BEFORE_RENDER == 32 && OC_DISCARDED_TICKS == 40);
+const _: () = assert!(OC_OVERRUNS == 48 && OC_OVERRUNS + 8 == CABLE_COUNTERS_BYTES);
 
 // ---------------------------------------------------------------------------------
 // Trace.
@@ -251,6 +276,8 @@ pub struct ConfigTrace<'a> {
 const PROP_ETAT: &str = "état";
 /// Nom de propriété des traces de la version.
 const PROP_VERSION: &str = "version";
+/// Nom de propriété des traces des compteurs.
+const PROP_COMPTEURS: &str = "compteurs";
 /// Nom de verbe des traces de lecture.
 const VERBE_GET: &str = "GET";
 /// Nom de verbe des traces d'écriture.
@@ -317,6 +344,23 @@ pub trait CableConfig: Send + Sync + 'static {
     /// IRQL : `PASSIVE_LEVEL`.
     fn may_configure(&self) -> bool;
 
+    /// Les compteurs de la boucle locale du câble, pour
+    /// [`KSPROPERTY_CONDUIT_COUNTERS`] (M1b-21).
+    ///
+    /// **Un instantané, pas une transaction** : l'implémentation lit ses compteurs
+    /// atomiques indépendamment les uns des autres, sans verrou, et le résultat peut donc
+    /// mélanger deux ticks. La raison tient en une phrase — prendre le verrou du câble à
+    /// `PASSIVE_LEVEL` sérialiserait la boucle locale, celle qui doit tenir un budget de
+    /// dix millisecondes, avec un simple diagnostic. Voir
+    /// `conduit_kmd::cable::Cable::counters_snapshot`, où le détail est écrit.
+    ///
+    /// Le champ [`CableCounters::cable`] doit valoir [`Self::cable_index`] : c'est un écho,
+    /// et il n'y a rien à comparer puisque cette propriété n'a pas de `SET`.
+    ///
+    /// IRQL : `PASSIVE_LEVEL` (les propriétés KS sont traitées en ligne par PortCls) ;
+    /// l'implémentation, elle, doit se contenter de chargements atomiques.
+    fn counters(&self) -> CableCounters;
+
     /// Point de trace, appelé une fois par requête, après coup.
     ///
     /// Défaut : ne fait rien. Ne doit ni allouer ni bloquer.
@@ -351,6 +395,30 @@ fn ecrire_etat(value: &mut [u8], etat: &CableState) {
     champs.u32(O_CHANNELS, etat.channels);
     // Toujours zéro : rien de la mémoire du noyau ne transite par le champ réservé.
     champs.u32(O_RESERVED, etat.reserved);
+}
+
+/// Écrit une [`CableCounters`] dans `value`, champ par champ, aux décalages du contrat
+/// portable.
+///
+/// **Tout ou rien**, comme [`ecrire_etat`] et pour la même raison : un instantané à demi
+/// écrit ferait lire au client des compteurs dont il ne saurait pas lesquels sont à lui.
+/// Aucun transtypage vers un `*mut CableCounters` — `value` n'est aligné sur rien, et les
+/// six `ULONGLONG` d'un `repr(C)` aligné sur huit sont exactement ce qu'une écriture par
+/// pointeur casserait le plus sûrement.
+fn ecrire_compteurs(value: &mut [u8], compteurs: &CableCounters) {
+    if value.len() < CABLE_COUNTERS_BYTES {
+        return;
+    }
+    let mut champs = Champs { dest: value };
+    champs.u32(OC_CABLE, compteurs.cable);
+    // Toujours zéro : rien de la mémoire du noyau ne transite par le champ réservé.
+    champs.u32(OC_RESERVED, compteurs.reserved);
+    champs.u64(OC_TICKS, compteurs.ticks);
+    champs.u64(OC_COPIED, compteurs.copied);
+    champs.u64(OC_SILENCED_NO_RENDER, compteurs.silenced_no_render);
+    champs.u64(OC_SILENCED_BEFORE_RENDER, compteurs.silenced_before_render);
+    champs.u64(OC_DISCARDED_TICKS, compteurs.discarded_ticks);
+    champs.u64(OC_OVERRUNS, compteurs.overruns);
 }
 
 /// Écrit un `ULONG` en tête de `value` s'il y tient (sinon rien : le thunk rendra la taille
@@ -582,6 +650,63 @@ impl<T: CableConfig> PropertyHandler<T> for ConduitVersion {
 }
 
 // ---------------------------------------------------------------------------------
+// Le gestionnaire des compteurs.
+// ---------------------------------------------------------------------------------
+
+/// [`KSPROPERTY_CONDUIT_COUNTERS`] : les compteurs de la boucle locale du câble (M1b-21).
+///
+/// Une [`CableCounters`] de 56 octets, en **lecture seule** et **sans contrôle de
+/// privilège**, comme la version. C'est le seul chemin par lequel les compteurs de M1b-07
+/// se lisent en release : `kmd_log!` y est vide, et attacher le débogueur noyau fausse la
+/// mesure de transport qu'on cherche justement à qualifier (17 passes sur 20 attaché contre
+/// 20 sur 20 détaché, le 2026-09-08).
+///
+/// L'écho de câble n'est pas comparé — il n'y a rien à comparer sans `SET` — mais il est
+/// **rempli par le miniport**, donc par le câble du filtre visé : un relevé des seize
+/// câbles se relit sans se souvenir de l'ordre des descripteurs ouverts.
+#[derive(Debug)]
+pub struct ConduitCounters;
+
+impl<T: CableConfig> PropertyHandler<T> for ConduitCounters {
+    fn get(req: &Request<'_, T>, value: &mut [u8]) -> Result<u32, NtStatus> {
+        // Lecture libre : voir `ConduitCableState::get`. Un diagnostic qui exigerait
+        // l'élévation ne servirait pas là où il sert.
+        let compteurs = req.target.counters();
+        ecrire_compteurs(value, &compteurs);
+        req.target.trace(&ConfigTrace {
+            property: PROP_COMPTEURS,
+            verb: VERBE_GET,
+            instance: req.instance,
+            cable: compteurs.cable,
+            // `ConfigTrace::state` porte une `CableState` ; les compteurs n'en sont pas
+            // une, et les recopier dans la trace n'apprendrait rien que le tampon rendu ne
+            // dise déjà.
+            state: None,
+            status: conduit_com::STATUS_SUCCESS,
+            persisted: None,
+        });
+        // Taille **requise**, écrite ou non : contrat de `get`.
+        Ok(CABLE_COUNTERS_BYTES as u32)
+    }
+
+    fn basic_support(req: &Request<'_, T>, value: &mut [u8]) -> Result<u32, NtStatus> {
+        // Structure de cinquante-six octets : aucune `VARENUM` ne la nomme, d'où un
+        // `PropTypeSet` nul, exactement comme pour l'état.
+        let ecrits = basic_support_ks(value, COUNTERS_ACCESS_FLAGS, &GUID_NULL, 0);
+        req.target.trace(&ConfigTrace {
+            property: PROP_COMPTEURS,
+            verb: VERBE_BASICSUPPORT,
+            instance: req.instance,
+            cable: req.target.cable_index(),
+            state: None,
+            status: ecrits.map_or_else(|status| status, |_| conduit_com::STATUS_SUCCESS),
+            persisted: None,
+        });
+        ecrits
+    }
+}
+
+// ---------------------------------------------------------------------------------
 // Entrées de table prêtes à poser.
 // ---------------------------------------------------------------------------------
 
@@ -619,6 +744,20 @@ where
     )
 }
 
+/// Entrée de `PCAUTOMATION_TABLE` du **filtre** de topologie :
+/// `KSPROPSETID_Conduit`, [`KSPROPERTY_CONDUIT_COUNTERS`], `GET | BASICSUPPORT` (M1b-21).
+pub const fn counters_item<V, T>() -> PCPROPERTY_ITEM
+where
+    V: TargetVtbl<T>,
+    T: CableConfig,
+{
+    property::item::<V, T, ConduitCounters>(
+        &SET_CONDUIT,
+        KSPROPERTY_CONDUIT_COUNTERS,
+        COUNTERS_ACCESS_FLAGS,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     // Tests en mode utilisateur : les lints anti-panique du noyau y sont sans objet, une
@@ -644,29 +783,105 @@ mod tests {
         assert_ne!(SET_CONDUIT.Data1, GUID_NULL.Data1);
     }
 
-    /// Les drapeaux d'accès : l'état s'écrit, la version non.
+    /// Les drapeaux d'accès : l'état s'écrit, la version et les compteurs non.
     #[test]
     fn les_drapeaux_disent_qui_s_ecrit() {
         assert_eq!(CABLE_STATE_ACCESS_FLAGS, 515);
         assert_eq!(VERSION_ACCESS_FLAGS, 513);
+        assert_eq!(COUNTERS_ACCESS_FLAGS, 513);
         assert_ne!(CABLE_STATE_ACCESS_FLAGS & KSPROPERTY_TYPE_SET, 0);
         assert_eq!(VERSION_ACCESS_FLAGS & KSPROPERTY_TYPE_SET, 0);
-        // Les deux répondent à BASICSUPPORT : dès ce bit posé, PortCls ne répond plus à
+        assert_eq!(
+            COUNTERS_ACCESS_FLAGS & KSPROPERTY_TYPE_SET,
+            0,
+            "un compteur n'est pas un réglage : le bit SET ne doit pas être déclaré"
+        );
+        // Les trois répondent à BASICSUPPORT : dès ce bit posé, PortCls ne répond plus à
         // notre place.
         assert_ne!(CABLE_STATE_ACCESS_FLAGS & KSPROPERTY_TYPE_BASICSUPPORT, 0);
         assert_ne!(VERSION_ACCESS_FLAGS & KSPROPERTY_TYPE_BASICSUPPORT, 0);
+        assert_ne!(COUNTERS_ACCESS_FLAGS & KSPROPERTY_TYPE_BASICSUPPORT, 0);
     }
 
-    /// Les deux entrées de table portent le même jeu et deux identifiants distincts.
+    /// Les trois entrées de table portent le même jeu et trois identifiants distincts.
     #[test]
-    fn les_deux_entrees_partagent_le_jeu_et_pas_l_identifiant() {
-        assert_ne!(
-            KSPROPERTY_CONDUIT_CABLE_STATE, KSPROPERTY_CONDUIT_VERSION,
-            "PortCls sert la première entrée de même Set/Id : deux identifiants égaux \
-             rendraient une des deux propriétés inatteignable"
-        );
+    fn les_trois_entrees_partagent_le_jeu_et_pas_l_identifiant() {
+        let ids = [
+            KSPROPERTY_CONDUIT_CABLE_STATE,
+            KSPROPERTY_CONDUIT_VERSION,
+            KSPROPERTY_CONDUIT_COUNTERS,
+        ];
+        for (i, gauche) in ids.iter().enumerate() {
+            for droite in ids.iter().skip(i + 1) {
+                assert_ne!(
+                    gauche, droite,
+                    "PortCls sert la première entrée de même Set/Id : deux identifiants \
+                     égaux rendraient une des propriétés inatteignable"
+                );
+            }
+        }
         assert_eq!(CABLE_STATE_BYTES, 16);
         assert_eq!(TAILLE_VERSION, 4);
+        assert_eq!(CABLE_COUNTERS_BYTES, 56);
+    }
+
+    /// La sérialisation des compteurs écrit chaque champ à son décalage, ou rien du tout.
+    ///
+    /// Les six valeurs sont toutes différentes : deux compteurs intervertis passeraient un
+    /// aller-retour sur des zéros sans que rien ne le signale.
+    #[test]
+    fn la_serialisation_des_compteurs_est_tout_ou_rien() {
+        let compteurs = CableCounters {
+            cable: 3,
+            reserved: 0,
+            ticks: 11,
+            copied: 22,
+            silenced_no_render: 33,
+            silenced_before_render: 44,
+            discarded_ticks: 55,
+            overruns: 66,
+        };
+
+        // Place suffisante : les huit champs, à leurs décalages.
+        let mut tampon = [0xAAu8; CABLE_COUNTERS_BYTES];
+        ecrire_compteurs(&mut tampon, &compteurs);
+        assert_eq!(tampon, compteurs.to_bytes());
+        assert_eq!(CableCounters::from_bytes(&tampon), Ok(compteurs));
+
+        // Un octet de trop peu : rien n'est écrit, le tampon reste tel quel.
+        let mut court = [0xAAu8; CABLE_COUNTERS_BYTES - 1];
+        ecrire_compteurs(&mut court, &compteurs);
+        assert_eq!(court, [0xAAu8; CABLE_COUNTERS_BYTES - 1]);
+
+        // Tampon vide (interrogation de taille) : rien non plus, et aucune panique.
+        ecrire_compteurs(&mut [], &compteurs);
+
+        // Plus grand que nécessaire : les cinquante-six premiers octets, et rien au-delà.
+        let mut grand = [0xAAu8; CABLE_COUNTERS_BYTES + 8];
+        ecrire_compteurs(&mut grand, &compteurs);
+        assert_eq!(&grand[..CABLE_COUNTERS_BYTES], &compteurs.to_bytes()[..]);
+        assert_eq!(&grand[CABLE_COUNTERS_BYTES..], &[0xAAu8; 8]);
+    }
+
+    /// Le champ réservé des compteurs part toujours à zéro, comme celui de l'état : rien de
+    /// la mémoire du noyau ne transite par lui.
+    #[test]
+    fn le_reserve_des_compteurs_part_a_zero() {
+        let cible = Faux {
+            cable: 3,
+            connected: true,
+            channels: 2,
+        };
+        let compteurs = cible.counters();
+        assert_eq!(compteurs.reserved, 0);
+        assert_eq!(
+            compteurs.cable,
+            cible.cable_index(),
+            "l'écho de câble doit être celui du miniport"
+        );
+        let mut tampon = [0xFFu8; CABLE_COUNTERS_BYTES];
+        ecrire_compteurs(&mut tampon, &compteurs);
+        assert_eq!(&tampon[OC_RESERVED..OC_RESERVED + 4], &[0, 0, 0, 0]);
     }
 
     /// La sérialisation de l'état écrit chaque champ à son décalage, ou rien du tout.
@@ -791,6 +1006,14 @@ mod tests {
         }
         fn may_configure(&self) -> bool {
             true
+        }
+        fn counters(&self) -> CableCounters {
+            // Le régime « rendu seul » de M1b-07 : des ticks jetés, rien d'écrit.
+            CableCounters {
+                ticks: 100,
+                discarded_ticks: 100,
+                ..CableCounters::new(self.cable)
+            }
         }
     }
 

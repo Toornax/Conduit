@@ -118,6 +118,14 @@ pub struct Args {
     /// pilote, plus la version du contrat qu'il sert. Ne change rien.
     #[arg(long = "cable-etat")]
     pub cable_etat: bool,
+    /// Lit et affiche les compteurs de la boucle locale (propriété
+    /// `KSPROPERTY_CONDUIT_COUNTERS`) : ticks, trames copiées, silences par cause,
+    /// ticks jetés, débordements. Les seize câbles par défaut, ou le seul câble de
+    /// `--cable N`. C'est le seul moyen de relever ces compteurs **sans débogueur
+    /// noyau**, dont l'attachement fausse la mesure de transport. Ne change rien et
+    /// n'ouvre aucun flux.
+    #[arg(long = "cable-compteurs")]
+    pub cable_compteurs: bool,
     /// Affiche l'état de SeLoadDriverPrivilege dans le jeton de ce processus (absent /
     /// présent mais désactivé / actif) et sort. N'écrit rien, n'arme rien, et ne
     /// demande ni le pilote ni un câble : c'est le diagnostic qui sépare « mauvais
@@ -225,18 +233,23 @@ impl Args {
     }
 
     /// Vrai si l'outil doit parler au **jeu de propriétés KS privé** du pilote au
-    /// lieu de mesurer une boucle (`--cable-etat`, `--cable-set`, `--cable-invalide`),
-    /// ou simplement relever l'état du privilège d'écriture (`--cable-privilege`).
+    /// lieu de mesurer une boucle (`--cable-etat`, `--cable-compteurs`, `--cable-set`,
+    /// `--cable-invalide`), ou simplement relever l'état du privilège d'écriture
+    /// (`--cable-privilege`).
     ///
     /// C'est une action à part entière, comme `--list` et `--set-volume` : elle
     /// s'exécute, affiche son compte rendu et sort. Aucun flux n'est ouvert, aucun
     /// son n'est émis — configurer un câble ne doit pas avoir cet effet de bord.
     ///
-    /// Les quatre se combinent dans un seul appel, et s'exécutent dans cet ordre :
-    /// état du privilège, lecture de l'état des câbles, écriture, batterie d'entrées
-    /// invalides.
+    /// Les cinq se combinent dans un seul appel, et s'exécutent dans cet ordre :
+    /// état du privilège, lecture de l'état des câbles, relevé des compteurs,
+    /// écriture, batterie d'entrées invalides.
     pub fn controls_cable(&self) -> bool {
-        self.cable_privilege || self.cable_etat || self.cable_set.is_some() || self.cable_invalide
+        self.cable_privilege
+            || self.cable_etat
+            || self.cable_compteurs
+            || self.cable_set.is_some()
+            || self.cable_invalide
     }
 
     /// Vrai si l'action demandée va **écrire** sur le pilote (`--cable-set`,
@@ -535,10 +548,12 @@ mod tests {
         assert!(parse(&["--cable-privilege"]).controls_cable());
         assert!(parse(&["--cable", "3", "--cable-set", "connecte"]).controls_cable());
         assert!(parse(&["--cable", "3", "--cable-invalide"]).controls_cable());
-        // Les quatre se combinent dans un seul appel.
+        assert!(parse(&["--cable-compteurs"]).controls_cable());
+        // Les cinq se combinent dans un seul appel.
         let tout = parse(&[
             "--cable-privilege",
             "--cable-etat",
+            "--cable-compteurs",
             "--cable",
             "2",
             "--cable-set",
@@ -548,6 +563,35 @@ mod tests {
         assert!(tout.validate().is_ok());
         assert_eq!(tout.cable_vise(), Some(2));
         assert_eq!(tout.cable_set, Some(EtatCable::Deconnecte));
+        assert!(tout.cable_compteurs);
+    }
+
+    /// `--cable-compteurs` est une **lecture** : il se suffit à lui-même, n'exige pas
+    /// `--cable N`, n'arme aucun privilège, et exclut les actions qui font autre chose.
+    ///
+    /// La première moitié compte : exiger un câble ferait du relevé des seize une
+    /// commande à écrire seize fois, et c'est le relevé complet qu'on veut après une
+    /// passe.
+    #[test]
+    fn le_releve_des_compteurs_se_demande_seul_et_ne_prend_pas_le_privilege() {
+        let seul = parse(&["--cable-compteurs"]);
+        assert!(seul.validate().is_ok());
+        assert_eq!(seul.cable_vise(), None);
+        assert!(!seul.writes_cable());
+
+        // Restreint à un câble quand on le demande, sans que la validation l'exige.
+        let un = parse(&["--cable", "3", "--cable-compteurs"]);
+        assert!(un.validate().is_ok());
+        assert_eq!(un.cable, Some(3));
+
+        for (args, attendu) in [
+            (vec!["--cable-compteurs", "--list"], "--list"),
+            (vec!["--cable-compteurs", "--self-test"], "--self-test"),
+            (vec!["--cable-compteurs", "--loopback"], "--loopback"),
+        ] {
+            let err = parse(&args).validate().expect_err(&format!("{args:?}"));
+            assert!(err.contains(attendu), "{err}");
+        }
     }
 
     /// Seules les actions qui **écrivent** demandent d'armer le privilège : une
@@ -557,6 +601,7 @@ mod tests {
         assert!(!parse(&[]).writes_cable());
         assert!(!parse(&["--cable-etat"]).writes_cable());
         assert!(!parse(&["--cable-privilege"]).writes_cable());
+        assert!(!parse(&["--cable-compteurs"]).writes_cable());
         assert!(parse(&["--cable", "3", "--cable-set", "connecte"]).writes_cable());
         assert!(parse(&["--cable", "3", "--cable-invalide"]).writes_cable());
     }

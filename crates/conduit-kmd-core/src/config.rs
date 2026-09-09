@@ -1,6 +1,7 @@
 //! Contrat du jeu de propriétés KS **privé** de configuration (M1b-04,
-//! `docs/driver-design.md` §6) : le GUID du jeu, les identifiants de propriété, la
-//! structure d'échange, son parseur, et le masque de bits qui persiste l'état des câbles.
+//! `docs/driver-design.md` §6) : le GUID du jeu, les identifiants de propriété, les deux
+//! structures d'échange ([`CableState`] et, depuis M1b-21, [`CableCounters`]), leurs
+//! parseurs, et le masque de bits qui persiste l'état des câbles.
 //!
 //! Tout est ici et **rien n'appelle le noyau** : ce module est le contrat que le service
 //! d'assistance (M1b-20) et le pilote se partagent, celui que M1b-08 fuzzera en mode
@@ -14,7 +15,8 @@
 //! descripteur de sécurité que l'INF pose sur l'objet de périphérique
 //! (`…(A;;GRGWGX;;;WD)`, « Tout le monde ») le laisse ouvrir nos filtres KS, comme tout
 //! adaptateur audio. Le contenu et la **longueur** du tampon sont donc hostiles. D'où la
-//! règle qui gouverne [`CableState::from_bytes`] :
+//! règle qui gouverne [`CableState::from_bytes`] — et, à l'identique,
+//! [`CableCounters::from_bytes`] :
 //!
 //! **toute longueur inattendue est refusée, y compris un préfixe valide suivi d'octets en
 //! trop.** Accepter un préfixe est le défaut classique de ce genre de parseur : il rend le
@@ -140,6 +142,33 @@ pub const KSPROPERTY_CONDUIT_CABLE_STATE: u32 = 0;
 /// qu'elle change), ni un second GUID de jeu.
 pub const KSPROPERTY_CONDUIT_VERSION: u32 = 1;
 
+/// `KSPROPERTY_CONDUIT_COUNTERS` : les compteurs de la boucle locale du câble
+/// (`GET` seulement).
+///
+/// La valeur échangée est une [`CableCounters`]. Comme pour
+/// [`KSPROPERTY_CONDUIT_CABLE_STATE`], le câble n'est pas désigné par un paramètre de la
+/// requête mais par le filtre auquel elle s'adresse ; [`CableCounters::cable`] n'est qu'un
+/// **écho**, et il n'y a rien à comparer puisqu'il n'y a pas de `SET`.
+///
+/// # Pourquoi une propriété, et pas une ligne de journal
+///
+/// Les compteurs existaient déjà (M1b-07) mais ne se lisaient qu'au **débogueur noyau** :
+/// `kmd_log!` est vide en release. Or attacher le débogueur fausse précisément ce qu'on
+/// cherche à mesurer — 17 passes sur 20 attaché contre 20 sur 20 détaché, mesuré le
+/// 2026-09-08 — et coûte un redémarrage de la machine virtuelle, qui ferme la session
+/// console dont l'audio a besoin. La moitié « rendu seul » de M1b-07 restait donc
+/// invisible. Une propriété `GET` la rend lisible **sans débogueur**, session console
+/// ouverte, par le chemin `IOCTL_KS_PROPERTY` déjà en place.
+///
+/// # Pas de `SET`, et pas de contrôle de privilège
+///
+/// Un compteur n'est pas un réglage : il n'y a rien à écrire, donc le bit `SET` n'est pas
+/// déclaré (comme [`KSPROPERTY_CONDUIT_VERSION`]). Et la lecture est libre, comme celle de
+/// l'état : savoir combien de ticks un câble a jetés n'apprend rien qu'un compte
+/// privilégié devrait seul connaître, et un diagnostic qui exigerait l'élévation ne
+/// servirait pas là où il sert — sur la machine où plus rien ne marche.
+pub const KSPROPERTY_CONDUIT_COUNTERS: u32 = 2;
+
 /// Le `pid` de la **marque de câble** dans le magasin de propriétés d'un endpoint
 /// MMDevices : la valeur `{3f1b27a4-8c6e-4d02-9b75-e4a0d61c8f3b},1`.
 ///
@@ -170,12 +199,13 @@ pub const PID_MARQUE_CABLE: u32 = 1;
 
 /// Version du contrat rendue par [`KSPROPERTY_CONDUIT_VERSION`].
 ///
-/// À incrémenter **à chaque** changement observable de [`CableState`] — un champ ajouté,
-/// un domaine élargi, une sémantique modifiée. Le service d'assistance compare, refuse de
-/// piloter un pilote qu'il ne connaît pas, et le dit ; sans ce numéro, la panne serait un
+/// À incrémenter **à chaque** changement observable du jeu de propriétés — un champ
+/// ajouté à une structure d'échange, un domaine élargi, une sémantique modifiée, une
+/// propriété qui apparaît. Le service d'assistance compare, refuse de piloter un pilote
+/// qu'il ne connaît pas, et le dit ; sans ce numéro, la panne serait un
 /// `STATUS_INVALID_PARAMETER` inexplicable sur une longueur d'un octet de trop.
 ///
-/// # Pourquoi 2
+/// # Pourquoi 2 : une sémantique qui bouge sans que la forme bouge
 ///
 /// La forme de [`CableState`] n'a pas bougé d'un octet en M1b-05 ; sa **sémantique**, si,
 /// et c'est exactement le cas que ce numéro doit couvrir. En version 1, `channels` valait
@@ -184,7 +214,30 @@ pub const PID_MARQUE_CABLE: u32 = 1;
 /// câble-là, entre 1 et 8, et le `SET` exige cette valeur-là et non plus 2
 /// ([`CableState::channels_appliquables`]). Un service v1 devant un pilote v2 lirait « 6 »
 /// et conclurait à un pilote cassé ; il reçoit un refus de version, qui dit quoi faire.
-pub const CONFIG_VERSION: u32 = 2;
+///
+/// # Pourquoi 3 : une propriété qui apparaît est un changement du contrat
+///
+/// M1b-21 ajoute [`KSPROPERTY_CONDUIT_COUNTERS`] au jeu, sans toucher à un seul octet de
+/// [`CableState`] ni à sa sémantique. Le numéro monte quand même, et la raison est écrite
+/// deux lignes plus haut, sur [`KSPROPSETID_CONDUIT`] : **le GUID du jeu est gravé et la
+/// longueur des tampons est refusée dès qu'elle change, donc ce numéro est la seule voie
+/// de versionnement qui reste**. Ne pas le monter ferait désigner par « version 2 » deux
+/// jeux de propriétés différents — celui à deux propriétés et celui à trois — sans qu'aucun
+/// canal du contrat ne puisse les distinguer. Un client aurait alors pour seul recours
+/// d'envoyer la requête et d'interpréter le refus, c'est-à-dire de deviner la version au
+/// lieu de la lire, ce que cette constante existe précisément pour éviter.
+///
+/// # Ce que le passage de 2 à 3 **ne** dit **pas**, et ce que les messages doivent en tenir
+///
+/// Un changement **additif** : un client v2 devant un pilote v3 lit exactement la même
+/// [`CableState`], avec la même sémantique, et tout ce qu'il sait faire continue de
+/// marcher. C'est la différence avec 1 → 2, où l'ancien client se **trompait** sur ce qu'il
+/// lisait. Un message d'inadéquation ne doit donc pas affirmer que « la structure
+/// d'échange n'a pas la forme attendue » : il ne sait pas ce qui diffère, il sait
+/// seulement que le pilote et l'outil ne sont pas du même millésime. C'est ainsi que
+/// `conduit-looptest` le formule depuis M1b-21 ; le service d'assistance, lui, se contente
+/// de rapporter les deux numéros et ne refuse rien sur ce seul critère.
+pub const CONFIG_VERSION: u32 = 3;
 
 /// Nombre de câbles que le contrat sait adresser : le plafond de la réserve
 /// ([`crate::params::MAX_RESERVE`], SPEC F-06).
@@ -524,6 +577,356 @@ impl CableState {
             connected,
             channels,
             reserved,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------------
+// Les compteurs de la boucle locale (M1b-21).
+// ---------------------------------------------------------------------------------
+
+/// Taille d'un `ULONGLONG`, l'unité des compteurs.
+const TAILLE_MOT_LONG: usize = 8;
+
+/// `CableCounters::cable` (`ULONG`) : décalage 0.
+pub const OC_CABLE: usize = 0;
+/// `CableCounters::reserved` (`ULONG`) : décalage 4.
+pub const OC_RESERVED: usize = 4;
+/// `CableCounters::ticks` (`ULONGLONG`) : décalage 8.
+pub const OC_TICKS: usize = 8;
+/// `CableCounters::copied` (`ULONGLONG`) : décalage 16.
+pub const OC_COPIED: usize = 16;
+/// `CableCounters::silenced_no_render` (`ULONGLONG`) : décalage 24.
+pub const OC_SILENCED_NO_RENDER: usize = 24;
+/// `CableCounters::silenced_before_render` (`ULONGLONG`) : décalage 32.
+pub const OC_SILENCED_BEFORE_RENDER: usize = 32;
+/// `CableCounters::discarded_ticks` (`ULONGLONG`) : décalage 40.
+pub const OC_DISCARDED_TICKS: usize = 40;
+/// `CableCounters::overruns` (`ULONGLONG`) : décalage 48.
+pub const OC_OVERRUNS: usize = 48;
+
+/// Taille de la valeur de [`KSPROPERTY_CONDUIT_COUNTERS`], en octets : **56**.
+///
+/// Fixe et vérifiée par assertion `const` contre `size_of::<CableCounters>()`, comme
+/// [`CABLE_STATE_BYTES`] : une structure qui grandirait sans que cette constante bouge
+/// donnerait un `GET` qui écrit hors de ce que le client a réservé.
+pub const CABLE_COUNTERS_BYTES: usize = 56;
+
+/// Les compteurs de la boucle locale d'un câble, tels qu'ils traversent
+/// `IOCTL_KS_PROPERTY`.
+///
+/// # Ce que chaque compteur démontre
+///
+/// Ce ne sont pas six nombres interchangeables : chacun est le **témoin** d'un régime, et
+/// c'est leur combinaison qui distingue des situations qu'un compteur unique confondrait
+/// (M1b-07). Les trois lectures qui comptent :
+///
+/// - `copied` monte, silences à zéro : les deux côtés tournent, le câble transporte ;
+/// - `silenced_no_render` monte seul : **capture seule**, l'entrée sans producteur lit du
+///   silence, en régime permanent ;
+/// - `discarded_ticks` monte seul, `copied` et les deux silences à zéro : **rendu seul**,
+///   les trames sont jetées et rien ne s'accumule. C'est le cas qui ne laissait aucune
+///   trace avant M1b-07 et qui ne se distinguait pas d'un câble au repos.
+///
+/// `silenced_before_render` est borné par le décalage du lien — quelques trames à chaque
+/// ouverture, pas un régime ; le voir monter sans fin dirait que le lien se refait sans
+/// cesse. `overruns` compte les ticks trop en retard pour rattraper, donc les trous.
+///
+/// # Huit octets pavés en tête, et pourquoi
+///
+/// `#[repr(C)]`, alignement 8, **rembourrage explicite** : [`Self::cable`] et
+/// [`Self::reserved`] sont deux `ULONG` qui pavent ensemble les huit premiers octets, de
+/// sorte que le premier `ULONGLONG` tombe sur un multiple de 8 **sans** que le compilateur
+/// ait à insérer un trou. Un rembourrage implicite serait de la mémoire noyau non
+/// initialisée recopiée vers l'espace utilisateur au `GET` — c'est la même règle que sur
+/// [`CableState`], et elle est plus contraignante ici parce que les champs n'ont pas tous
+/// la même taille.
+///
+/// # Un instantané, pas une transaction
+///
+/// Les six valeurs sont lues **indépendamment** dans le pilote
+/// (`conduit_kmd::cable::Cable::counters_snapshot`) : elles peuvent donc mélanger deux
+/// ticks. C'est voulu, et la raison est écrite sur cette méthode-là. Rien de ce qu'on
+/// cherche à lire n'en souffre : on regarde quels compteurs **bougent**, pas si leur somme
+/// est exacte à une trame près.
+///
+/// # Remis à zéro à chaque `StartDevice`
+///
+/// Comme les compteurs qu'ils recopient. Une valeur qui additionnerait les cycles de
+/// périphérique précédents ferait croire à une image obsolète du pilote — plusieurs heures
+/// perdues ainsi le 2026-09-06.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(C)]
+pub struct CableCounters {
+    /// Numéro du câble, de 0 à [`CABLE_MAX`] − 1.
+    ///
+    /// **Un écho, comme [`CableState::cable`]**, et ici rien de plus : il n'y a pas de
+    /// `SET`, donc rien à comparer. Il dit au lecteur quel câble il vient d'interroger,
+    /// sans qu'il ait à se souvenir du descripteur qu'il a ouvert — ce qui compte quand on
+    /// relève les seize câbles d'affilée.
+    pub cable: u32,
+    /// Rembourrage **explicite**, toujours nul.
+    ///
+    /// Deux rôles à la fois : garder libre la place d'un futur champ 32 bits, et amener le
+    /// premier `ULONGLONG` sur un multiple de 8 sans trou implicite (voir la note de
+    /// structure). Le `GET` l'écrit toujours à zéro, et [`CableCounters::from_bytes`] le
+    /// refuse non nul — c'est ce refus qui garde la place réellement libre.
+    pub reserved: u32,
+    /// Ticks du timer du câble depuis le dernier `StartDevice`.
+    pub ticks: u64,
+    /// Trames copiées du rendu vers la capture.
+    pub copied: u64,
+    /// Trames de silence écrites faute de rendu en `RUN` (`SilenceCause::NoRender`) :
+    /// « l'entrée sans producteur lit du silence ». Le témoin de la **capture seule**.
+    pub silenced_no_render: u64,
+    /// Trames de silence écrites alors qu'un rendu tourne, pour des trames antérieures à
+    /// son départ (`SilenceCause::BeforeRenderStart`). Borné par le décalage du lien.
+    pub silenced_before_render: u64,
+    /// Ticks où le rendu tournait **sans capture** : ses trames sont jetées, rien n'est
+    /// accumulé. Le témoin du **rendu seul**, et le seul compteur qui ne compte pas des
+    /// trames écrites.
+    pub discarded_ticks: u64,
+    /// Ticks trop en retard pour rattraper : un trou dans la capture.
+    pub overruns: u64,
+}
+
+// La taille annoncée est celle de la structure, et chaque décalage nommé est celui que
+// `repr(C)` produit — même couple d'assertions que pour `CableState`, en remplacement d'un
+// golden.
+const _: () = assert!(size_of::<CableCounters>() == CABLE_COUNTERS_BYTES);
+const _: () = assert!(align_of::<CableCounters>() == 8);
+const _: () = assert!(core::mem::offset_of!(CableCounters, cable) == OC_CABLE);
+const _: () = assert!(core::mem::offset_of!(CableCounters, reserved) == OC_RESERVED);
+const _: () = assert!(core::mem::offset_of!(CableCounters, ticks) == OC_TICKS);
+const _: () = assert!(core::mem::offset_of!(CableCounters, copied) == OC_COPIED);
+const _: () =
+    assert!(core::mem::offset_of!(CableCounters, silenced_no_render) == OC_SILENCED_NO_RENDER);
+const _: () = assert!(
+    core::mem::offset_of!(CableCounters, silenced_before_render) == OC_SILENCED_BEFORE_RENDER
+);
+const _: () = assert!(core::mem::offset_of!(CableCounters, discarded_ticks) == OC_DISCARDED_TICKS);
+const _: () = assert!(core::mem::offset_of!(CableCounters, overruns) == OC_OVERRUNS);
+// Les deux `ULONG` de tête pavent les huit premiers octets, et les six `ULONGLONG` le
+// reste : aucun trou, aucun recouvrement, donc aucun octet de rembourrage implicite à
+// recopier vers l'espace utilisateur.
+const _: () = assert!(OC_RESERVED.saturating_add(TAILLE_MOT) == OC_TICKS);
+const _: () = assert!(OC_OVERRUNS.saturating_add(TAILLE_MOT_LONG) == CABLE_COUNTERS_BYTES);
+
+/// Ce qui a fait refuser une [`CableCounters`] : un cas, une cause, une ligne de journal.
+///
+/// Distinct de [`ConfigError`] parce que les longueurs attendues ne sont pas les mêmes et
+/// qu'un message qui annoncerait « 16 attendus » pour une structure de 56 octets serait un
+/// diagnostic faux — le genre d'erreur qui coûte une heure à 3 h du matin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CountersError {
+    /// Longueur du tampon différente de [`CABLE_COUNTERS_BYTES`] — plus courte **ou** plus
+    /// longue, préfixe valide compris (voir la règle en tête de module).
+    Longueur {
+        /// Octets reçus.
+        recus: usize,
+    },
+    /// [`CableCounters::cable`] au-delà du dernier câble.
+    Cable(u32),
+    /// [`CableCounters::reserved`] non nul.
+    Reserved(u32),
+}
+
+impl fmt::Display for CountersError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Longueur { recus } => write!(
+                f,
+                "valeur de {recus} octets, {CABLE_COUNTERS_BYTES} attendus exactement"
+            ),
+            Self::Cable(cable) => write!(f, "câble {cable} inconnu (0 à {} )", {
+                CABLE_MAX.saturating_sub(1)
+            }),
+            Self::Reserved(brut) => write!(f, "champ réservé non nul ({brut:#010x})"),
+        }
+    }
+}
+
+/// Lit un `ULONGLONG` au décalage `offset` d'un tampon d'alignement quelconque.
+///
+/// Même règle que [`mot`] : les huit octets sont **recopiés** puis interprétés, jamais
+/// transtypés — et l'alignement compte davantage ici, un `u64` désaligné n'étant pas
+/// seulement mal vu mais un comportement indéfini en Rust.
+fn mot_long(data: &[u8], offset: usize) -> Option<u64> {
+    let fin = offset.checked_add(TAILLE_MOT_LONG)?;
+    let huit = data.get(offset..fin)?;
+    let mut octets = [0u8; TAILLE_MOT_LONG];
+    octets.copy_from_slice(huit);
+    Some(u64::from_ne_bytes(octets))
+}
+
+impl CableCounters {
+    /// Les compteurs d'un câble qui n'a pas encore tourné : tout à zéro, sauf le numéro.
+    #[must_use]
+    pub const fn new(cable: u32) -> Self {
+        Self {
+            cable,
+            reserved: 0,
+            ticks: 0,
+            copied: 0,
+            silenced_no_render: 0,
+            silenced_before_render: 0,
+            discarded_ticks: 0,
+            overruns: 0,
+        }
+    }
+
+    /// Le câble a-t-il tourné en **rendu seul** depuis le dernier `StartDevice` ?
+    ///
+    /// C'est la lecture que M1b-07 demandait et que le débogueur seul savait faire : des
+    /// ticks jetés, et **aucune** trame écrite d'aucune sorte. La conjonction compte — des
+    /// ticks jetés à côté de trames copiées ne diraient qu'un rendu qui a commencé avant la
+    /// capture, pas un régime.
+    #[must_use]
+    pub const fn rendu_seul(&self) -> bool {
+        self.discarded_ticks > 0
+            && self.copied == 0
+            && self.silenced_no_render == 0
+            && self.silenced_before_render == 0
+    }
+
+    /// Le câble a-t-il tourné en **capture seule** depuis le dernier `StartDevice` ?
+    ///
+    /// Le symétrique : du silence écrit faute de rendu, et rien de copié.
+    #[must_use]
+    pub const fn capture_seule(&self) -> bool {
+        self.silenced_no_render > 0 && self.copied == 0
+    }
+
+    /// Sérialise les compteurs en [`CABLE_COUNTERS_BYTES`] octets, champ par champ, aux
+    /// décalages [`OC_CABLE`] à [`OC_OVERRUNS`].
+    ///
+    /// Le pilote n'utilise pas cette fonction pour répondre à un `GET` — il écrit
+    /// directement dans le tampon `Value`, d'alignement quelconque, par
+    /// `portcls::property::Champs` — mais elle en est le miroir exact, et c'est elle que
+    /// l'aller-retour du proptest vérifie.
+    #[must_use]
+    pub const fn to_bytes(&self) -> [u8; CABLE_COUNTERS_BYTES] {
+        let cable = self.cable.to_ne_bytes();
+        let reserved = self.reserved.to_ne_bytes();
+        let ticks = self.ticks.to_ne_bytes();
+        let copied = self.copied.to_ne_bytes();
+        let sans_rendu = self.silenced_no_render.to_ne_bytes();
+        let avant_rendu = self.silenced_before_render.to_ne_bytes();
+        let jetes = self.discarded_ticks.to_ne_bytes();
+        let debordements = self.overruns.to_ne_bytes();
+        [
+            cable[0],
+            cable[1],
+            cable[2],
+            cable[3],
+            reserved[0],
+            reserved[1],
+            reserved[2],
+            reserved[3],
+            ticks[0],
+            ticks[1],
+            ticks[2],
+            ticks[3],
+            ticks[4],
+            ticks[5],
+            ticks[6],
+            ticks[7],
+            copied[0],
+            copied[1],
+            copied[2],
+            copied[3],
+            copied[4],
+            copied[5],
+            copied[6],
+            copied[7],
+            sans_rendu[0],
+            sans_rendu[1],
+            sans_rendu[2],
+            sans_rendu[3],
+            sans_rendu[4],
+            sans_rendu[5],
+            sans_rendu[6],
+            sans_rendu[7],
+            avant_rendu[0],
+            avant_rendu[1],
+            avant_rendu[2],
+            avant_rendu[3],
+            avant_rendu[4],
+            avant_rendu[5],
+            avant_rendu[6],
+            avant_rendu[7],
+            jetes[0],
+            jetes[1],
+            jetes[2],
+            jetes[3],
+            jetes[4],
+            jetes[5],
+            jetes[6],
+            jetes[7],
+            debordements[0],
+            debordements[1],
+            debordements[2],
+            debordements[3],
+            debordements[4],
+            debordements[5],
+            debordements[6],
+            debordements[7],
+        ]
+    }
+
+    /// **Le** parseur des compteurs : des octets hostiles vers un instantané valide, ou une
+    /// cause de refus.
+    ///
+    /// Pure, sans allocation, sans panique, sans appel noyau — appelable à n'importe quel
+    /// IRQL et fuzzable en mode utilisateur, comme [`CableState::from_bytes`].
+    ///
+    /// La longueur est vérifiée **avant** tout le reste et exigée **exacte** : ni plus
+    /// courte, ni plus longue, ni un préfixe valide suivi d'octets en trop.
+    ///
+    /// # Ce qui n'est pas validé, et pourquoi
+    ///
+    /// Les six compteurs eux-mêmes : **tout `u64` est une valeur légitime**. Inventer une
+    /// borne (« pas plus de N ticks ») ferait refuser un pilote qui tourne depuis longtemps,
+    /// et une relation entre compteurs (« `copied` ≤ `ticks` × avance ») serait fausse par
+    /// construction, l'instantané n'étant pas pris d'un seul coup (voir la note de
+    /// structure). Seuls l'écho de câble et le champ réservé ont un domaine.
+    ///
+    /// # Erreurs
+    ///
+    /// [`CountersError`], qui nomme le **premier** champ fautif dans l'ordre de la
+    /// structure.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, CountersError> {
+        if data.len() != CABLE_COUNTERS_BYTES {
+            return Err(CountersError::Longueur { recus: data.len() });
+        }
+        // Les huit lectures ne peuvent plus échouer (la longueur est exacte) ; le `ok_or`
+        // remplace un `unwrap` interdit par les lints du crate.
+        let longueur = || CountersError::Longueur { recus: data.len() };
+        let cable = mot(data, OC_CABLE).ok_or_else(longueur)?;
+        let reserved = mot(data, OC_RESERVED).ok_or_else(longueur)?;
+        let ticks = mot_long(data, OC_TICKS).ok_or_else(longueur)?;
+        let copied = mot_long(data, OC_COPIED).ok_or_else(longueur)?;
+        let silenced_no_render = mot_long(data, OC_SILENCED_NO_RENDER).ok_or_else(longueur)?;
+        let silenced_before_render =
+            mot_long(data, OC_SILENCED_BEFORE_RENDER).ok_or_else(longueur)?;
+        let discarded_ticks = mot_long(data, OC_DISCARDED_TICKS).ok_or_else(longueur)?;
+        let overruns = mot_long(data, OC_OVERRUNS).ok_or_else(longueur)?;
+
+        if cable >= CABLE_MAX {
+            return Err(CountersError::Cable(cable));
+        }
+        if reserved != 0 {
+            return Err(CountersError::Reserved(reserved));
+        }
+        Ok(Self {
+            cable,
+            reserved,
+            ticks,
+            copied,
+            silenced_no_render,
+            silenced_before_render,
+            discarded_ticks,
+            overruns,
         })
     }
 }
@@ -1045,19 +1448,29 @@ mod tests {
         assert_ne!(KSPROPSETID_CONDUIT.data1, 0xCAA7_4E3D);
     }
 
-    /// Les deux identifiants de propriété sont distincts et stables.
+    /// Les trois identifiants de propriété sont distincts et stables.
     #[test]
     fn les_identifiants_de_propriete_sont_distincts() {
         assert_eq!(KSPROPERTY_CONDUIT_CABLE_STATE, 0);
         assert_eq!(KSPROPERTY_CONDUIT_VERSION, 1);
-        assert_ne!(
-            KSPROPERTY_CONDUIT_CABLE_STATE, KSPROPERTY_CONDUIT_VERSION,
-            "deux propriétés du même jeu ne peuvent pas partager un identifiant : \
-             PortCls cherche la première entrée de même Set/Id et servirait la mauvaise"
-        );
-        // M1b-05 : `channels` a changé de sémantique sans changer de forme, ce qui est
-        // exactement le cas que ce numéro doit couvrir (voir sa documentation).
-        assert_eq!(CONFIG_VERSION, 2);
+        assert_eq!(KSPROPERTY_CONDUIT_COUNTERS, 2);
+        let ids = [
+            KSPROPERTY_CONDUIT_CABLE_STATE,
+            KSPROPERTY_CONDUIT_VERSION,
+            KSPROPERTY_CONDUIT_COUNTERS,
+        ];
+        for (i, gauche) in ids.iter().enumerate() {
+            for droite in ids.iter().skip(i + 1) {
+                assert_ne!(
+                    gauche, droite,
+                    "deux propriétés du même jeu ne peuvent pas partager un identifiant : \
+                     PortCls cherche la première entrée de même Set/Id et servirait la mauvaise"
+                );
+            }
+        }
+        // M1b-21 : une propriété qui apparaît est un changement observable du jeu, et ce
+        // numéro en est la seule voie (voir sa documentation).
+        assert_eq!(CONFIG_VERSION, 3);
     }
 
     /// Le `pid` de la marque : celui qu'écrit le service et celui que lit le dorsal.
@@ -1095,6 +1508,173 @@ mod tests {
         assert_eq!(mot(&brut, O_CONNECTED), Some(1));
         assert_eq!(mot(&brut, O_CHANNELS), Some(2));
         assert_eq!(mot(&brut, O_RESERVED), Some(0));
+    }
+
+    /// La disposition des compteurs : 56 octets, deux `ULONG` puis six `ULONGLONG`, aucun
+    /// trou — et chaque compteur se relit **à son décalage nommé**.
+    ///
+    /// Les six valeurs sont volontairement toutes différentes : c'est la seule façon
+    /// d'attraper deux champs intervertis, qu'un aller-retour sur des zéros laisserait
+    /// passer.
+    #[test]
+    fn la_disposition_des_compteurs_est_celle_des_decalages_nommes() {
+        assert_eq!(CABLE_COUNTERS_BYTES, 56);
+        assert_eq!(size_of::<CableCounters>(), CABLE_COUNTERS_BYTES);
+        assert_eq!(align_of::<CableCounters>(), 8);
+
+        // Les deux `ULONG` de tête pavent les huit premiers octets…
+        assert_eq!(OC_CABLE, 0);
+        assert_eq!(OC_RESERVED, TAILLE_MOT);
+        assert_eq!(OC_TICKS, TAILLE_MOT * 2);
+        // …puis six `ULONGLONG` contigus, sans trou ni recouvrement.
+        let longs = [
+            OC_TICKS,
+            OC_COPIED,
+            OC_SILENCED_NO_RENDER,
+            OC_SILENCED_BEFORE_RENDER,
+            OC_DISCARDED_TICKS,
+            OC_OVERRUNS,
+        ];
+        for (i, decalage) in longs.iter().enumerate() {
+            assert_eq!(*decalage, OC_TICKS + i * TAILLE_MOT_LONG, "compteur n° {i}");
+            assert_eq!(*decalage % TAILLE_MOT_LONG, 0, "compteur n° {i} désaligné");
+        }
+        assert_eq!(
+            OC_OVERRUNS + TAILLE_MOT_LONG,
+            CABLE_COUNTERS_BYTES,
+            "la structure est exactement deux mots puis six mots longs"
+        );
+
+        let compteurs = CableCounters {
+            cable: 3,
+            reserved: 0,
+            ticks: 11,
+            copied: 22,
+            silenced_no_render: 33,
+            silenced_before_render: 44,
+            discarded_ticks: 55,
+            overruns: 66,
+        };
+        let brut = compteurs.to_bytes();
+        assert_eq!(mot(&brut, OC_CABLE), Some(3));
+        assert_eq!(mot(&brut, OC_RESERVED), Some(0));
+        assert_eq!(mot_long(&brut, OC_TICKS), Some(11));
+        assert_eq!(mot_long(&brut, OC_COPIED), Some(22));
+        assert_eq!(mot_long(&brut, OC_SILENCED_NO_RENDER), Some(33));
+        assert_eq!(mot_long(&brut, OC_SILENCED_BEFORE_RENDER), Some(44));
+        assert_eq!(mot_long(&brut, OC_DISCARDED_TICKS), Some(55));
+        assert_eq!(mot_long(&brut, OC_OVERRUNS), Some(66));
+        assert_eq!(CableCounters::from_bytes(&brut), Ok(compteurs));
+    }
+
+    /// Les longueurs refusées, y compris le préfixe valide suivi d'un octet.
+    #[test]
+    fn seule_la_longueur_exacte_des_compteurs_est_acceptee() {
+        let complet = CableCounters::new(0).to_bytes();
+        assert!(CableCounters::from_bytes(&complet).is_ok());
+
+        for taille in 0..CABLE_COUNTERS_BYTES {
+            let court = complet.get(..taille).unwrap().to_vec();
+            assert_eq!(
+                CableCounters::from_bytes(&court),
+                Err(CountersError::Longueur { recus: taille }),
+                "taille {taille}"
+            );
+        }
+
+        // Un préfixe **parfaitement valide** suivi d'un octet : le cas qu'un fuzzer trouve
+        // en premier, et le seul que la longueur exacte attrape.
+        let mut allonge = Vec::from(complet);
+        allonge.push(0);
+        assert_eq!(
+            CableCounters::from_bytes(&allonge),
+            Err(CountersError::Longueur { recus: 57 })
+        );
+    }
+
+    /// Les deux échos ont un domaine, les six compteurs n'en ont pas — et le message de
+    /// refus nomme la bonne longueur, pas celle de `CableState`.
+    #[test]
+    fn les_compteurs_refusent_l_echo_faux_et_le_reserve_non_nul() {
+        let hors = CableCounters {
+            cable: CABLE_MAX,
+            ..CableCounters::new(0)
+        };
+        assert_eq!(
+            CableCounters::from_bytes(&hors.to_bytes()),
+            Err(CountersError::Cable(CABLE_MAX))
+        );
+
+        let sale = CableCounters {
+            reserved: 1,
+            ..CableCounters::new(0)
+        };
+        assert_eq!(
+            CableCounters::from_bytes(&sale.to_bytes()),
+            Err(CountersError::Reserved(1))
+        );
+
+        // `u64::MAX` partout : accepté, un compteur n'a pas de borne inventée.
+        let plein = CableCounters {
+            cable: CABLE_MAX - 1,
+            reserved: 0,
+            ticks: u64::MAX,
+            copied: u64::MAX,
+            silenced_no_render: u64::MAX,
+            silenced_before_render: u64::MAX,
+            discarded_ticks: u64::MAX,
+            overruns: u64::MAX,
+        };
+        assert_eq!(CableCounters::from_bytes(&plein.to_bytes()), Ok(plein));
+
+        // Le message dit **cinquante-six**, pas seize : un diagnostic qui annoncerait la
+        // longueur de l'autre structure coûterait une heure.
+        let message = CountersError::Longueur { recus: 16 }.to_string();
+        assert!(message.contains("56"), "{message}");
+        assert!(!message.contains("16 attendus"), "{message}");
+    }
+
+    /// Les deux lectures que M1b-07 demandait : « rendu seul » et « capture seule », et ce
+    /// qui les distingue d'un câble qui transporte.
+    #[test]
+    fn les_deux_regimes_a_un_seul_cote_se_lisent_dans_les_compteurs() {
+        // Rendu seul : des ticks jetés, et rien d'écrit d'aucune sorte.
+        let rendu_seul = CableCounters {
+            ticks: 100,
+            discarded_ticks: 100,
+            ..CableCounters::new(0)
+        };
+        assert!(rendu_seul.rendu_seul());
+        assert!(!rendu_seul.capture_seule());
+
+        // Capture seule : du silence sans rendu, et rien de copié.
+        let capture_seule = CableCounters {
+            ticks: 100,
+            silenced_no_render: 4_800,
+            ..CableCounters::new(0)
+        };
+        assert!(capture_seule.capture_seule());
+        assert!(!capture_seule.rendu_seul());
+
+        // Les deux côtés ouverts : ni l'un ni l'autre, quelques trames de silence au
+        // départ du lien ne changent rien.
+        let boucle = CableCounters {
+            ticks: 100,
+            copied: 480_000,
+            silenced_before_render: 96,
+            ..CableCounters::new(0)
+        };
+        assert!(!boucle.rendu_seul());
+        assert!(!boucle.capture_seule());
+
+        // Un câble au repos : aucun régime, et c'est bien ce qui le distinguait mal du
+        // rendu seul avant que `discarded_ticks` existe.
+        let repos = CableCounters {
+            ticks: 100,
+            ..CableCounters::new(0)
+        };
+        assert!(!repos.rendu_seul());
+        assert!(!repos.capture_seule());
     }
 
     /// Table des longueurs : exacte, tronquée d'un octet, allongée d'un octet, vide.
@@ -1657,6 +2237,66 @@ mod tests {
                 && (MIN_CHANNELS..=MAX_CHANNELS).contains(&channels)
                 && reserved == 0;
             prop_assert_eq!(CableState::from_bytes(&brut).is_ok(), valide);
+        }
+
+        /// Le même critère sur les compteurs : **quelle que soit l'entrée**, le parseur ne
+        /// panique pas, et toute sortie acceptée se resérialise à l'identique.
+        ///
+        /// L'aller-retour est ce qui attrape un `ULONGLONG` lu au mauvais décalage — deux
+        /// compteurs intervertis passeraient toutes les tables de cas, où ils valent
+        /// souvent zéro.
+        #[test]
+        fn les_compteurs_ne_paniquent_pas_et_l_aller_retour_est_fidele(
+            octets in proptest::collection::vec(any::<u8>(), 0..128),
+        ) {
+            match CableCounters::from_bytes(&octets) {
+                Ok(compteurs) => {
+                    prop_assert_eq!(octets.len(), CABLE_COUNTERS_BYTES);
+                    prop_assert_eq!(&compteurs.to_bytes()[..], &octets[..]);
+                    prop_assert_eq!(
+                        CableCounters::from_bytes(&compteurs.to_bytes()),
+                        Ok(compteurs)
+                    );
+                    prop_assert!(compteurs.cable < CABLE_MAX);
+                    prop_assert_eq!(compteurs.reserved, 0);
+                }
+                Err(err) => {
+                    // Une erreur de longueur exactement quand la longueur est fausse : les
+                    // deux autres causes ne peuvent tomber que sur cinquante-six octets.
+                    let longueur = matches!(err, CountersError::Longueur { .. });
+                    prop_assert_eq!(longueur, octets.len() != CABLE_COUNTERS_BYTES);
+                }
+            }
+        }
+
+        /// Sur tout le domaine : les compteurs eux-mêmes n'ont **aucune** borne, seuls
+        /// l'écho de câble et le champ réservé en ont une.
+        #[test]
+        fn les_compteurs_acceptent_toute_valeur_et_refusent_les_deux_echos(
+            cable in any::<u32>(),
+            reserved in any::<u32>(),
+            ticks in any::<u64>(),
+            copied in any::<u64>(),
+            sans_rendu in any::<u64>(),
+            avant_rendu in any::<u64>(),
+            jetes in any::<u64>(),
+            debordements in any::<u64>(),
+        ) {
+            let compteurs = CableCounters {
+                cable,
+                reserved,
+                ticks,
+                copied,
+                silenced_no_render: sans_rendu,
+                silenced_before_render: avant_rendu,
+                discarded_ticks: jetes,
+                overruns: debordements,
+            };
+            let valide = cable < CABLE_MAX && reserved == 0;
+            prop_assert_eq!(
+                CableCounters::from_bytes(&compteurs.to_bytes()).is_ok(),
+                valide
+            );
         }
 
         /// Le masque : poser puis retirer un bit est l'identité, et l'écrêtage ne touche

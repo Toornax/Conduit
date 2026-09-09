@@ -2,8 +2,9 @@
 //! (M1b-04, `docs/driver-design.md` §6) : ouvrir le filtre de topologie d'un câble et
 //! lui parler.
 //!
-//! Le pilote expose `KSPROPERTY_CONDUIT_CABLE_STATE` (lecture/écriture) et
-//! `KSPROPERTY_CONDUIT_VERSION` (lecture) sur la table d'automation du **filtre** de
+//! Le pilote expose `KSPROPERTY_CONDUIT_CABLE_STATE` (lecture/écriture),
+//! `KSPROPERTY_CONDUIT_VERSION` (lecture) et, depuis M1b-21,
+//! `KSPROPERTY_CONDUIT_COUNTERS` (lecture) sur la table d'automation du **filtre** de
 //! topologie de chaque côté de câble. Ce module est le seul endroit du dépôt qui sache
 //! les atteindre depuis l'espace utilisateur ; il servira à la mesure de M1b-04
 //! aujourd'hui et au `CableControl` de M1b-34 demain, d'où le découpage :
@@ -62,9 +63,10 @@ use conduit_backend::CableId;
 /// Le contrat lui-même, ré-exporté : les clients de ce module (l'outil de diagnostic
 /// aujourd'hui, `CableControl` demain) lisent la structure d'échange et le nombre de
 /// câbles **ici**, sans dépendre du crate du pilote ni en recopier quoi que ce soit.
-pub use conduit_kmd_core::config::{CableState, CABLE_MAX};
+pub use conduit_kmd_core::config::{CableCounters, CableState, CABLE_MAX};
 use conduit_kmd_core::config::{
-    ConfigError, ConfigGuid, CABLE_STATE_BYTES, CONFIG_VERSION, KSPROPERTY_CONDUIT_CABLE_STATE,
+    ConfigError, ConfigGuid, CountersError, CABLE_COUNTERS_BYTES, CABLE_STATE_BYTES,
+    CONFIG_VERSION, KSPROPERTY_CONDUIT_CABLE_STATE, KSPROPERTY_CONDUIT_COUNTERS,
     KSPROPERTY_CONDUIT_VERSION, KSPROPSETID_CONDUIT,
 };
 use windows::core::PCWSTR;
@@ -546,6 +548,39 @@ pub fn parse_version(buffer: &[u8], returned: usize) -> Result<u32, CableConfigE
         cause: format!("{} octets rendus, 4 attendus pour un ULONG", utiles.len()),
     })?;
     Ok(u32::from_ne_bytes(mot))
+}
+
+/// Analyse la réponse d'un `GET` de [`KSPROPERTY_CONDUIT_COUNTERS`] :
+/// `returned` octets utiles dans `buffer`.
+///
+/// Même forme que [`parse_cable_state`], et pour la même raison : la longueur **rendue**
+/// est vérifiée avant le contenu, puis le jugement sur les octets est délégué au parseur du
+/// contrat, celui-là même que le pilote partage. Rien n'est validé deux fois.
+///
+/// # Erreurs
+///
+/// [`CableConfigError::Reponse`] si le pilote a écrit un nombre d'octets inattendu ou une
+/// valeur que le contrat refuse.
+pub fn parse_counters(buffer: &[u8], returned: usize) -> Result<CableCounters, CableConfigError> {
+    let utiles = buffer
+        .get(..returned)
+        .ok_or_else(|| CableConfigError::Reponse {
+            cause: format!(
+                "{returned} octets annoncés pour un tampon de {} : le pilote a débordé",
+                buffer.len()
+            ),
+        })?;
+    if utiles.len() != CABLE_COUNTERS_BYTES {
+        return Err(CableConfigError::Reponse {
+            cause: format!(
+                "{} octets rendus, {CABLE_COUNTERS_BYTES} attendus pour des CableCounters",
+                utiles.len()
+            ),
+        });
+    }
+    CableCounters::from_bytes(utiles).map_err(|e: CountersError| CableConfigError::Reponse {
+        cause: e.to_string(),
+    })
 }
 
 /// La version du contrat que ce client connaît, à comparer à celle du pilote.
@@ -1314,6 +1349,37 @@ impl TopologyFilter {
         parse_version(&valeur, rendus)
     }
 
+    /// Lit [`KSPROPERTY_CONDUIT_COUNTERS`], l'instantané de la boucle locale du câble
+    /// (M1b-21).
+    ///
+    /// # Ce que l'instantané vaut, et ce qu'il ne vaut pas
+    ///
+    /// Les six compteurs sont lus **indépendamment** dans le pilote et peuvent donc
+    /// mélanger deux ticks : c'est un choix, écrit sur
+    /// `conduit_kmd::cable::Cable::counters_snapshot`, et il n'affecte pas ce à quoi cette
+    /// lecture sert — savoir **quels** compteurs bougent, pas si leur somme est exacte à
+    /// une trame près.
+    ///
+    /// Aucun privilège n'est exigé : c'est une lecture, comme [`Self::read_state`], et un
+    /// diagnostic qui demanderait l'élévation ne servirait pas là où il sert.
+    ///
+    /// # Erreurs
+    ///
+    /// Voir [`Self::read_state`]. Sur un pilote antérieur à M1b-21, la propriété n'existe
+    /// pas : le refus arrive en [`CableConfigError::Requete`], et c'est
+    /// [`Self::read_version`] qui dit pourquoi.
+    pub fn read_counters(&self) -> Result<CableCounters, CableConfigError> {
+        let mut valeur = [0u8; CABLE_COUNTERS_BYTES];
+        let rendus = self.property(
+            KSPROPERTY_CONDUIT_COUNTERS,
+            KSPROPERTY_TYPE_GET,
+            &mut valeur,
+            "KSPROPERTY_CONDUIT_COUNTERS",
+            "GET",
+        )?;
+        parse_counters(&valeur, rendus)
+    }
+
     /// Écrit [`KSPROPERTY_CONDUIT_CABLE_STATE`] : connecte ou déconnecte le câble.
     ///
     /// # Une lecture, puis l'écriture — et c'est le contrat, pas une précaution
@@ -1613,6 +1679,48 @@ mod tests {
         }
         .to_bytes();
         let erreur = parse_cable_state(&reserve, CABLE_STATE_BYTES).expect_err("réservé non nul");
+        assert!(erreur.to_string().contains("réservé"), "{erreur}");
+    }
+
+    /// La réponse des compteurs doit faire exactement cinquante-six octets, et le message
+    /// d'erreur doit dire **cette** longueur-là.
+    ///
+    /// Le cas des seize octets est celui qui compte : c'est la taille de l'autre structure
+    /// du même jeu, donc l'erreur qu'un client fait en confondant les deux propriétés.
+    #[test]
+    fn la_reponse_des_compteurs_doit_faire_exactement_cinquante_six_octets() {
+        let valide = CableCounters {
+            ticks: 100,
+            discarded_ticks: 100,
+            ..CableCounters::new(2)
+        }
+        .to_bytes();
+        let compteurs = parse_counters(&valide, CABLE_COUNTERS_BYTES).expect("compteurs valides");
+        assert_eq!(compteurs.cable, 2);
+        assert!(
+            compteurs.rendu_seul(),
+            "des ticks jetés et rien d'écrit : c'est le rendu seul de M1b-07"
+        );
+
+        for rendus in [0, 4, 16, 55] {
+            let erreur = parse_counters(&valide, rendus).expect_err("longueur");
+            assert!(
+                matches!(erreur, CableConfigError::Reponse { .. }),
+                "{rendus} octets rendus"
+            );
+        }
+        // Plus d'octets que le tampon n'en contient : le pilote a débordé.
+        assert!(matches!(
+            parse_counters(&valide, CABLE_COUNTERS_BYTES + 1),
+            Err(CableConfigError::Reponse { .. })
+        ));
+        // Contenu refusé par le contrat : le message vient de `CountersError`.
+        let reserve = CableCounters {
+            reserved: 1,
+            ..CableCounters::new(0)
+        }
+        .to_bytes();
+        let erreur = parse_counters(&reserve, CABLE_COUNTERS_BYTES).expect_err("réservé non nul");
         assert!(erreur.to_string().contains("réservé"), "{erreur}");
     }
 

@@ -423,6 +423,15 @@ impl Champs<'_> {
         self.octets(offset, &valeur.to_ne_bytes());
     }
 
+    /// Un `ULONGLONG` au décalage `offset`.
+    ///
+    /// Passe par [`Self::octets`] comme les autres, donc par une copie : le tampon `Value`
+    /// n'est aligné sur rien, et un `u64` désaligné écrit par un pointeur serait un
+    /// comportement indéfini là où un `u32` l'est déjà.
+    pub(crate) fn u64(&mut self, offset: usize, valeur: u64) {
+        self.octets(offset, &valeur.to_ne_bytes());
+    }
+
     /// Un `GUID` au décalage `offset`, champ par champ dans l'ordre de `guiddef.h`
     /// (`Data1: ULONG`, `Data2: USHORT`, `Data3: USHORT`, `Data4: [UCHAR; 8]`).
     pub(crate) fn guid(&mut self, offset: usize, valeur: &GUID) {

@@ -111,7 +111,7 @@ use core::mem::ManuallyDrop;
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
-use conduit_kmd_core::config::{self, ACTIVE_CABLES_DEFAULT};
+use conduit_kmd_core::config::{self, ACTIVE_CABLES_DEFAULT, CableCounters};
 use conduit_kmd_core::{
     FrameLayout, Loopback, Notifier, SilenceCause, StreamPosition, StreamView, VirtualClock,
     byte_offset, copy_frames, silence,
@@ -1241,6 +1241,49 @@ impl Cable {
     /// Sans journalisation en release.
     #[cfg(not(debug_assertions))]
     fn log_counters(&self, _ticks: u64) {}
+
+    /// Un **instantané** des six compteurs de la boucle locale, pour
+    /// `KSPROPERTY_CONDUIT_COUNTERS` (M1b-21).
+    ///
+    /// # Six chargements `Relaxed`, non atomiques entre eux — et c'est voulu
+    ///
+    /// Les six valeurs sont lues l'une après l'autre, sans verrou et sans barrière : un
+    /// tick peut donc s'intercaler entre deux lectures, et l'instantané rendu **mélanger
+    /// deux ticks** — `ticks` d'avant, `copied` d'après, par exemple. Rien ici ne le
+    /// corrige, et la raison n'est pas la commodité.
+    ///
+    /// La seule façon de rendre les six cohérentes serait de prendre le verrou du câble, ce
+    /// que cette méthode fait à `PASSIVE_LEVEL` (les propriétés KS sont traitées en ligne
+    /// par PortCls) : on **sérialiserait la boucle locale avec un simple diagnostic**. La
+    /// boucle tourne sur un timer haute résolution et tient un budget par tick ; la faire
+    /// attendre parce qu'un outil relève des compteurs échangerait la mesure contre ce
+    /// qu'elle mesure — c'est exactement le défaut du débogueur noyau qui a motivé cette
+    /// propriété (17 passes sur 20 attaché contre 20 sur 20 détaché, le 2026-09-08).
+    ///
+    /// Le prix payé est nul pour l'usage visé. On ne cherche pas une somme exacte à une
+    /// trame près mais **quels compteurs bougent** : `discarded_ticks` seul à monter
+    /// démontre le rendu seul, `silenced_no_render` seul démontre la capture seule, et
+    /// aucune de ces deux lectures ne change si une valeur a un tick de retard sur une
+    /// autre. Un compteur qui vaut 100 ou 101 dit la même chose ; un compteur qui vaut zéro
+    /// pendant que la boucle attend le verrou, non.
+    ///
+    /// `Relaxed` suffit pour la même raison qu'à l'écriture : chaque compteur est un
+    /// `fetch_add` indépendant, aucune relation d'ordre entre eux n'est publiée, et il n'y a
+    /// donc rien à acquérir.
+    ///
+    /// IRQL : quelconque — six chargements atomiques, aucun verrou pris.
+    pub fn counters_snapshot(&self) -> CableCounters {
+        CableCounters {
+            cable: self.index,
+            reserved: 0,
+            ticks: self.counters.ticks.load(Ordering::Relaxed),
+            copied: self.counters.copied.load(Ordering::Relaxed),
+            silenced_no_render: self.counters.silenced_no_render.load(Ordering::Relaxed),
+            silenced_before_render: self.counters.silenced_before_render.load(Ordering::Relaxed),
+            discarded_ticks: self.counters.discarded_ticks.load(Ordering::Relaxed),
+            overruns: self.counters.overruns.load(Ordering::Relaxed),
+        }
+    }
 
     /// Arrête le câble ([`Cable::stop`] : timer supprimé, objet de périphérique oublié)
     /// puis relâche ce qui pourrait survivre au déchargement du pilote. Les broches sont

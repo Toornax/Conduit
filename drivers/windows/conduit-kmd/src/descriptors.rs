@@ -139,10 +139,10 @@ use conduit_kmd_core::{
     FORMATS_PER_CABLE, FrameLayout, SAMPLE_DEPTHS, SAMPLE_RATES, SampleFormat, VARIANT_COUNT,
 };
 use portcls::{
-    CABLE_COUNT, CABLE_STATE_ACCESS_FLAGS, JACK_ACCESS_FLAGS, JACK_EVENT_FLAGS,
-    JACK_INFO_CHANGE_ID, PIN_NAME_GUIDS, VERSION_ACCESS_FLAGS, cable_state_item,
-    jack_description_item, jack_info_change_item, mute_item, version_item, volume_item,
-    with_events,
+    CABLE_COUNT, CABLE_STATE_ACCESS_FLAGS, COUNTERS_ACCESS_FLAGS, JACK_ACCESS_FLAGS,
+    JACK_EVENT_FLAGS, JACK_INFO_CHANGE_ID, PIN_NAME_GUIDS, VERSION_ACCESS_FLAGS, cable_state_item,
+    counters_item, jack_description_item, jack_info_change_item, mute_item, version_item,
+    volume_item, with_events,
 };
 use portcls_sys::{
     GUID, IMiniportTopologyVtbl, KSCATEGORY_AUDIO, KSDATAFORMAT, KSDATAFORMAT__bindgen_ty_1,
@@ -815,8 +815,9 @@ static RENDER_MUTE_PROPERTIES: Shared<[PCPROPERTY_ITEM; 1]> = Shared(RENDER_MUTE
 static CAPTURE_VOLUME_PROPERTIES: Shared<[PCPROPERTY_ITEM; 1]> = Shared(CAPTURE_VOLUME_ITEMS);
 static CAPTURE_MUTE_PROPERTIES: Shared<[PCPROPERTY_ITEM; 1]> = Shared(CAPTURE_MUTE_ITEMS);
 
-/// Les trois propriétés du **filtre** `TopoRender` : le jack (M1b-03), puis l'état et la
-/// version du jeu privé `KSPROPSETID_Conduit` (M1b-04).
+/// Les quatre propriétés du **filtre** `TopoRender` : le jack (M1b-03), puis l'état et la
+/// version du jeu privé `KSPROPSETID_Conduit` (M1b-04), puis les compteurs de la boucle
+/// locale (M1b-21).
 ///
 /// L'ordre n'a pas d'importance pour PortCls, qui cherche par `Set`/`Id`, mais celui-ci se
 /// lit dans l'ordre d'apparition des tâches.
@@ -824,19 +825,23 @@ const RENDER_FILTER_ITEMS: [PCPROPERTY_ITEM; FILTER_PROPERTY_COUNT] = [
     jack_description_item::<IMiniportTopologyVtbl, TopoRender>(),
     cable_state_item::<IMiniportTopologyVtbl, TopoRender>(),
     version_item::<IMiniportTopologyVtbl, TopoRender>(),
+    counters_item::<IMiniportTopologyVtbl, TopoRender>(),
 ];
-/// Les trois mêmes propriétés du **filtre** `TopoCapture`, monomorphisées sur son type.
+/// Les quatre mêmes propriétés du **filtre** `TopoCapture`, monomorphisées sur son type.
 const CAPTURE_FILTER_ITEMS: [PCPROPERTY_ITEM; FILTER_PROPERTY_COUNT] = [
     jack_description_item::<IMiniportTopologyVtbl, TopoCapture>(),
     cable_state_item::<IMiniportTopologyVtbl, TopoCapture>(),
     version_item::<IMiniportTopologyVtbl, TopoCapture>(),
+    counters_item::<IMiniportTopologyVtbl, TopoCapture>(),
 ];
 
-/// Nombre de propriétés portées par un filtre de topologie : jack, état, version.
+/// Nombre de propriétés portées par un filtre de topologie : jack, état, version,
+/// compteurs.
 ///
-/// Nommée plutôt qu'écrite trois fois : c'est elle que `PCAUTOMATION_TABLE::PropertyCount`
-/// reçoit, par déduction du tableau dans [`property_automation`].
-const FILTER_PROPERTY_COUNT: usize = 3;
+/// Nommée plutôt qu'écrite quatre fois : c'est elle que
+/// `PCAUTOMATION_TABLE::PropertyCount` reçoit, par déduction du tableau dans
+/// [`property_automation`].
+const FILTER_PROPERTY_COUNT: usize = 4;
 
 static RENDER_FILTER_PROPERTIES: Shared<[PCPROPERTY_ITEM; FILTER_PROPERTY_COUNT]> =
     Shared(RENDER_FILTER_ITEMS);
@@ -2004,8 +2009,8 @@ const _: () = {
     assert!(automation_is_well_formed(&EMPTY_AUTOMATION_TABLE, 0, 0));
 
     // Les deux tables de filtre **topologie**, celles-là mêmes que les `static` livrent
-    // (doublet `const` puis `static`) : le jack, l'état et la version, **plus**
-    // l'événement `JACKINFOCHANGE`. C'est ce dernier triplet qui sépare un endpoint qui
+    // (doublet `const` puis `static`) : le jack, l'état, la version et les compteurs,
+    // **plus** l'événement `JACKINFOCHANGE`. C'est ce dernier qui sépare un endpoint qui
     // suit l'état du câble d'un endpoint figé au démarrage.
     assert!(automation_is_well_formed(
         &TOPO_RENDER_AUTOMATION_TABLE,
@@ -2035,20 +2040,29 @@ const _: () = {
     assert!(CAPTURE_FILTER_ITEMS[0].Flags == JACK_ACCESS_FLAGS);
     assert!(JACK_ACCESS_FLAGS & portcls_sys::KSPROPERTY_TYPE_SET == 0);
 
-    // Le jeu privé `KSPROPSETID_Conduit` (M1b-04) : l'état s'écrit, la version non. Une
-    // version déclarée en écriture laisserait croire au service d'assistance qu'il peut
-    // faire changer d'avis le pilote sur sa propre version.
+    // Le jeu privé `KSPROPSETID_Conduit` : l'état s'écrit (M1b-04), la version et les
+    // compteurs non. Une version déclarée en écriture laisserait croire au service
+    // d'assistance qu'il peut faire changer d'avis le pilote sur sa propre version ; un
+    // compteur déclaré en écriture laisserait croire qu'on peut le remettre à zéro, alors
+    // que seul un nouveau `StartDevice` le fait.
     assert!(RENDER_FILTER_ITEMS[1].Flags == CABLE_STATE_ACCESS_FLAGS);
     assert!(CAPTURE_FILTER_ITEMS[1].Flags == CABLE_STATE_ACCESS_FLAGS);
     assert!(CABLE_STATE_ACCESS_FLAGS & portcls_sys::KSPROPERTY_TYPE_SET != 0);
     assert!(RENDER_FILTER_ITEMS[2].Flags == VERSION_ACCESS_FLAGS);
     assert!(CAPTURE_FILTER_ITEMS[2].Flags == VERSION_ACCESS_FLAGS);
     assert!(VERSION_ACCESS_FLAGS & portcls_sys::KSPROPERTY_TYPE_SET == 0);
-    // Les trois entrées d'un filtre portent bien trois `Id` distincts : PortCls sert la
+    assert!(RENDER_FILTER_ITEMS[3].Flags == COUNTERS_ACCESS_FLAGS);
+    assert!(CAPTURE_FILTER_ITEMS[3].Flags == COUNTERS_ACCESS_FLAGS);
+    assert!(COUNTERS_ACCESS_FLAGS & portcls_sys::KSPROPERTY_TYPE_SET == 0);
+    // Les trois entrées du jeu privé portent bien trois `Id` distincts : PortCls sert la
     // **première** entrée de même `Set`/`Id`, et deux entrées confondues rendraient une
     // propriété inatteignable sans le moindre message.
     assert!(RENDER_FILTER_ITEMS[1].Id != RENDER_FILTER_ITEMS[2].Id);
+    assert!(RENDER_FILTER_ITEMS[1].Id != RENDER_FILTER_ITEMS[3].Id);
+    assert!(RENDER_FILTER_ITEMS[2].Id != RENDER_FILTER_ITEMS[3].Id);
     assert!(CAPTURE_FILTER_ITEMS[1].Id != CAPTURE_FILTER_ITEMS[2].Id);
+    assert!(CAPTURE_FILTER_ITEMS[1].Id != CAPTURE_FILTER_ITEMS[3].Id);
+    assert!(CAPTURE_FILTER_ITEMS[2].Id != CAPTURE_FILTER_ITEMS[3].Id);
 
     // Les quatre tables de nœud : une propriété chacune, réellement pointée, et **aucun**
     // événement — les nœuds de volume et de sourdine n'en déclarent pas.
