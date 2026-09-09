@@ -533,6 +533,22 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   `TRUE` même quand elle n'a rien armé — seul `ERROR_NOT_ALL_ASSIGNED` le dit.
 - [ ] **M1b-05** `feat(driver): formats 44,1/48/96 kHz, float32, PCM16 et PCM24`
   *Fait quand* : test de boucle pour chaque format (F-04).
+  *Code livré le 2026-09-09, côté pilote et côté crate portable* : `SampleFormat::Pcm24`,
+  matrice de formats, **24 variantes** de descripteurs par sens (3 fréquences × 8 canaux —
+  pas 72, parce que `copy_frames` convertit déjà les profondeurs et que seuls la fréquence
+  et les canaux doivent s'accorder entre les deux bouts), une valeur `CableFormat<n>` par
+  câble, `CHANNELS` libérée (ses six assertions devenues des invariants de domaine),
+  `BufferMs` enfin appliqué. Coût : **+20,3 Kio** de section de données.
+  *La moitié espace utilisateur n'est pas faite* : ordre 8 du protocole, version 3,
+  `conduitctl cable set-format`, et le format dans `CableSpec`/`CableInfo`.
+  **Régression mesurée le 2026-09-09, en cours de correction** : un câble activé au-delà
+  des deux actifs par défaut produit un endpoint dont `IAudioClient::GetMixFormat` **échoue**
+  — et ce **quel que soit son format**, y compris le format par défaut, ce qui écarte les
+  variantes. Avant M1b-05, activer le câble 3 marchait (mesuré le 2026-09-08). Le pilote lit
+  pourtant la bonne valeur : les traces montrent les seize formats lus et les seize câbles
+  enregistrés. La rupture est entre le magasin des formats et ce que Windows obtient de la
+  broche. Premier suspect : le `unwrap_or_else(wave_render_filter_default)` de `wave.rs`,
+  qui **avale une variante introuvable en silence**.
 - [ ] **M1b-06** `feat(driver): gestion d'alimentation et arrêt propre`
   *Fait quand* : veille/reprise 50 fois avec flux ouvert, sans erreur ni fuite.
   *Code livré le 2026-09-09* : enveloppe de `PcRegisterAdapterPowerManagement`,
@@ -573,9 +589,34 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   l'arrêt du rendu) fait ~100 ms, sous la cadence de journalisation de 1000 ticks. Elle
   deviendra mesurable **sans débogueur** quand les compteurs seront exposés par le jeu de
   propriétés privé — forme proposée, à fusionner avec M1b-05 qui touche les mêmes fichiers.
-- [ ] **M1b-08** `test(driver): harnais utilisateur et fuzzing du parseur de la propriété KS`
+- [x] **M1b-08** `test(driver): harnais utilisateur et fuzzing du parseur de la propriété KS`
   Le code de validation compile aussi en mode utilisateur pour être fuzzé.
   *Fait quand* : 1 h de fuzzing sans panique.
+  *Campagne du 2026-09-09*, nightly + AddressSanitizer, quatre cibles en parallèle,
+  20 min chacune — **1 h 20 de fuzz cumulé, 506 556 115 exécutions, zéro panique, zéro
+  artefact** :
+
+  | Cible | Exécutions | exec/s | Corpus final |
+  |---|---|---|---|
+  | `etat-cable` (`CableState::from_bytes`) | 162 871 439 | 135 613 | 9 |
+  | `parametres-registre` (`decode_dword` + `sanitize`) | 182 341 689 | 151 824 | 18 |
+  | `formats` (`validate`, `buffer_bytes`) | 143 602 343 | 119 568 | 56 |
+  | `protocole` (`Requete::from_bytes`, `decouper`) | 17 740 644 | 14 771 | **417** |
+
+  Le protocole du service est dix fois plus lent — il alloue et boucle — et c'est lui qui a
+  produit le corpus le plus riche : **c'est là qu'est le gisement**, comme prévu.
+  `conduit-kmd-core` interdit déjà la panique par lint (`panic`, `unwrap`,
+  `indexing_slicing`, `arithmetic_side_effects`) : le fuzz y a valeur de **preuve**, pas de
+  découverte.
+  *Défaut trouvé et corrigé* : `crates/conduit-protocol/fuzz` **ne construisait plus**, donc
+  la commande documentée dans le guide était morte. `workspace.exclude` n'affranchit pas un
+  crate logé **sous** un membre du workspace — il faut un `[workspace]` vide dans son propre
+  manifeste. Un harnais de fuzzing cassé qu'on croit fonctionnel est pire que pas de harnais.
+  *Défaut trouvé et délibérément non corrigé par le fuzzer* : `SupportedFormat::accepts`
+  compare le nombre de canaux demandé **sans vérifier que celui de l'entrée soit
+  représentable** — un format accepté dont `layout()` vaut `None`. Inatteignable tant que la
+  liste supportée était une `const` à deux canaux ; **M1b-05 la construit à l'exécution**.
+  Passé à la correction de M1b-05.
 - [ ] **M1b-09** `test(driver): 1000 cycles activation/désactivation et 48 h de stress`
   *Fait quand* : aucune fuite (pool tags stables), aucun BSOD, Driver Verifier actif.
   **Reporté (2026-09-08)** : la priorité va au fonctionnel. La campagne d'une heure sous
