@@ -660,7 +660,9 @@ pub enum Statut {
     /// Nombre de canaux valide, mais qui n'est pas celui que **ce câble** sert.
     ///
     /// [`Reponse::detail`] porte le nombre de canaux réellement servi, pour que le client
-    /// n'ait pas à le deviner.
+    /// n'ait pas à le deviner : c'est ce qui distingue ce refus d'un
+    /// [`Self::ErreurSysteme`] portant le 87 du pilote, lequel ne dit pas quelle valeur
+    /// était attendue.
     ///
     /// # Ce que ce statut veut dire depuis M1b-05
     ///
@@ -669,11 +671,19 @@ pub enum Statut {
     /// tables KS. Depuis, il sert 1 à 8 — mais **pas en changer à chaud** : les tables KS
     /// sont immuables et PortCls en retient les pointeurs pour toute la vie du filtre.
     ///
-    /// Changer le format d'un câble demande donc deux gestes que cet ordre ne fait pas :
-    /// écrire `CableFormat<n>` dans la clé matérielle du périphérique
+    /// Changer le format d'un câble demande donc deux gestes qu'aucun ordre de ce
+    /// protocole ne fait : écrire `CableFormat<n>` dans la clé matérielle du périphérique
     /// ([`conduit_kmd_core::config::CABLE_FORMAT_VALUE_NAMES`]) **et** redémarrer le
     /// devnode. Répondre `Succes` à un `canaux` qui n'agirait sur rien avant le prochain
     /// démarrage serait pire qu'un refus, et c'est pourquoi ce statut reste.
+    ///
+    /// # Il ne répond plus au seul ordre `canaux`
+    ///
+    /// [`conduit_kmd_core::config::CableState::channels`] est un **écho vérifié** : tout
+    /// `SET` en porte un, y compris un `activer`. Le service le juge donc sur les trois
+    /// ordres qui parlent au pilote, et ce statut peut désormais répondre à n'importe
+    /// lequel — c'est ce qui a manqué au défaut de frontière de M1b-05, où un `activer` sur
+    /// un câble en six canaux ne rendait qu'« erreur Win32 87 ».
     CanauxNonApplicables,
     /// Aucune interface `KSCATEGORY_TOPOLOGY` de ce câble : le pilote Conduit n'est pas
     /// chargé, ou ce câble n'est pas enregistré.
@@ -776,8 +786,8 @@ impl fmt::Display for Statut {
             Self::CableInconnu => "câble inconnu",
             Self::CanauxInvalides => "nombre de canaux hors bornes",
             Self::CanauxNonApplicables => {
-                "nombre de canaux valide mais que le pilote ne sait pas encore appliquer \
-                 (M1b-05) : il n'accepte aujourd'hui que la valeur par défaut"
+                "nombre de canaux valide, mais ce n'est pas celui que ce câble sert : le \
+                 format d'un câble ne change qu'au redémarrage du périphérique"
             }
             Self::PiloteAbsent => "pilote Conduit absent ou câble non enregistré",
             Self::PrivilegeAbsent => {
@@ -1690,10 +1700,13 @@ mod tests {
         assert!(ligne.contains("canaux"), "{ligne}");
         assert!(ligne.contains('4'), "{ligne}");
 
-        // Le statut des canaux non applicables **nomme M1b-05** : c'est ce qui évite
-        // qu'on cherche un bogue là où il n'y a qu'une tâche pas encore faite.
+        // Le statut des canaux non applicables dit **ce que le câble sert** et ce qu'il
+        // faudrait faire pour en changer ; le compte, lui, voyage dans `detail`. Un
+        // message qui ne dirait que « refusé » laisserait chercher un bogue là où il n'y a
+        // qu'un format.
         let ligne = Statut::CanauxNonApplicables.to_string();
-        assert!(ligne.contains("M1b-05"), "{ligne}");
+        assert!(ligne.contains("ce câble sert"), "{ligne}");
+        assert!(ligne.contains("redémarrage"), "{ligne}");
     }
 
     /// Les codes de statut sont stables, deux à deux distincts, et l'aller-retour est

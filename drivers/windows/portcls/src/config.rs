@@ -121,6 +121,15 @@
 //!   pour toute la vie du filtre. Le réglage passe par le registre et un redémarrage du
 //!   devnode, tous deux en espace utilisateur. Répondre `STATUS_SUCCESS` à un changement
 //!   qui n.agirait sur rien avant le prochain démarrage serait pire qu.un refus.
+//!
+//! # Les deux champs comparés sont deux échos, et le client les reprend d'un `GET`
+//!
+//! `cable` et `channels` sont de même nature : le gestionnaire les **compare** à ce que le
+//! miniport rapporte, il ne les applique pas. Un `SET` est donc toujours une
+//! lecture-modification-écriture — [`CableState::avec_connexion`] est ce geste côté client
+//! —, et un client qui fabriquerait sa requête de toutes pièces se ferait refuser dès que
+//! le câble n'est pas au format d'usine. La décision et ce qu'elle écarte sont écrites sur
+//! [`CableState::channels`] ; le refus, lui, est ci-dessous.
 
 use conduit_com::{NtStatus, STATUS_INVALID_PARAMETER};
 use conduit_kmd_core::config::{
@@ -822,6 +831,41 @@ mod tests {
         trop_long.push(0);
         let refus = appliquer(&cible, &trop_long).err().unwrap();
         assert!(matches!(refus, Err(ConfigError::Longueur { recus: 17 })));
+    }
+
+    /// **La régression de frontière, vue du gestionnaire** : l'état qu'un client relit puis
+    /// modifie est accepté sur n'importe quel format, celui qu'il fabrique ne l'est que sur
+    /// un câble stéréo.
+    ///
+    /// C'est le refus mesuré en machine virtuelle — `conduit-helper activer 3` sur un câble
+    /// en 96 kHz / 6 canaux, `ERROR_INVALID_PARAMETER` (87) — reproduit sans machine, du
+    /// côté qui refuse.
+    #[test]
+    fn brancher_le_jack_passe_sur_tous_les_formats() {
+        use conduit_kmd_core::params::{MAX_CHANNELS, MIN_CHANNELS};
+
+        for canaux in MIN_CHANNELS..=MAX_CHANNELS {
+            let cible = Faux {
+                cable: 3,
+                connected: false,
+                channels: canaux,
+            };
+            // Ce que le client relit, puis modifie : accepté quel que soit le format.
+            let lu = etat_courant(&cible);
+            let voulu = lu.avec_connexion(true);
+            assert!(
+                appliquer(&cible, &voulu.to_bytes()).is_ok(),
+                "brancher le jack d'un câble à {canaux} canaux doit passer"
+            );
+            // Ce que le client fabriquait : refusé dès que le câble n'est pas au format
+            // d'usine, sans que rien ne dise pourquoi côté appelant.
+            let fabrique = CableState::new(3, true);
+            assert_eq!(
+                appliquer(&cible, &fabrique.to_bytes()).is_ok(),
+                canaux == fabrique.channels,
+                "un état fabriqué sur un câble à {canaux} canaux"
+            );
+        }
     }
 
     /// La symétrie de M1b-05 : sur un câble à six canaux, c'est « six » qui passe et

@@ -42,14 +42,20 @@
 //! le nombre de canaux est celui que le registre fixe pour le câble, par la valeur
 //! `CableFormat<n>` dont [`CableFormat`] est le codec.
 //!
-//! **Le nombre de canaux se lit ici et ne s'écrit pas.** La structure d'échange est
-//! `GET`/`SET`, mais son champ `channels` n'est pas un réglage : un format ne peut pas
-//! changer sans redémarrer le périphérique (les tables KS sont immuables et PortCls en
-//! retient les pointeurs à vie), et le seul chemin qui redémarre le devnode est en espace
-//! utilisateur — `cfgmgr32`, dans le service d'assistance. Un `SET` qui prétendrait
-//! changer les canaux rendrait `STATUS_SUCCESS` pour un réglage sans effet jusqu'au
-//! prochain démarrage, ce qui est pire qu'un refus : le gestionnaire exige donc que le
-//! champ **égale la valeur courante du câble** ([`CableState::channels_appliquables`]).
+//! **[`CableState::channels`] est un écho vérifié, comme [`CableState::cable`]** — pas un
+//! ordre. La structure d'échange est `GET`/`SET`, mais ce champ n'est pas un réglage : un
+//! format ne peut pas changer sans redémarrer le périphérique (les tables KS sont
+//! immuables et PortCls en retient les pointeurs à vie), et le seul chemin qui redémarre
+//! le devnode est en espace utilisateur — `cfgmgr32`, dans le service d'assistance. Un
+//! `SET` qui prétendrait changer les canaux rendrait `STATUS_SUCCESS` pour un réglage sans
+//! effet jusqu'au prochain démarrage, ce qui est pire qu'un refus : le gestionnaire exige
+//! donc que le champ **égale la valeur courante du câble**
+//! ([`CableState::channels_appliquables`]).
+//!
+//! Un client qui veut seulement **brancher le jack** ne fabrique donc pas sa requête : il
+//! relit l'état par un `GET` et n'en change que la connexion
+//! ([`CableState::avec_connexion`]). La décision et ce qu'elle écarte sont écrites sur le
+//! champ lui-même.
 //!
 //! # Le format d'un câble est une configuration, pas un état
 //!
@@ -254,11 +260,45 @@ pub struct CableState {
     pub connected: u32,
     /// Nombre de canaux du câble, dans `MIN_CHANNELS..=MAX_CHANNELS`.
     ///
-    /// **Lu, pas réglé** (M1b-05) : au `GET`, c'est le nombre de canaux que le câble sert
-    /// réellement, celui de [`CableFormat::channels`] lu au démarrage ; au `SET`, il doit
-    /// l'égaler ([`CableState::channels_appliquables`]). Le domaine est celui de
-    /// [`crate::params::Param::Channels`] — une seule définition des bornes, comme pour
-    /// le registre.
+    /// **Un écho vérifié, pas un ordre** — la même nature que [`Self::cable`], et la
+    /// décision est écrite ici parce que le champ en admettait deux lectures depuis
+    /// M1b-05.
+    ///
+    /// Au `GET`, c'est le nombre de canaux que le câble sert réellement, celui de
+    /// [`CableFormat::channels`] lu au démarrage. Au `SET`, le gestionnaire le
+    /// **compare** à cette valeur et refuse `STATUS_INVALID_PARAMETER` s'il diffère
+    /// ([`Self::channels_appliquables`]) : un client qui croirait le câble stéréo alors
+    /// qu'il est en 5.1 se verrait sinon accepter un branchement fondé sur une idée fausse
+    /// du format, et découvrirait l'écart au premier flux audio.
+    ///
+    /// # Ce que la lecture « ordre » aurait voulu dire, et pourquoi elle est écartée
+    ///
+    /// « Mets ce câble à *N* canaux » demanderait au pilote de reconstruire ses
+    /// descripteurs à chaud, ce que PortCls interdit : ses tables sont immuables et il en
+    /// retient les pointeurs pour toute la vie du filtre. Le seul `SET` que le pilote
+    /// pourrait honorer serait celui qui ne change rien — c'est-à-dire un ordre dont la
+    /// seule valeur acceptable est la valeur courante, donc un écho déguisé. Le changement
+    /// de format passe par [`CABLE_FORMAT_VALUE_NAMES`] et un redémarrage du devnode, tous
+    /// deux en espace utilisateur.
+    ///
+    /// # Ce qu'envoie un client qui ne veut rien dire des canaux
+    ///
+    /// **Ce que le `GET` vient de lui rendre.** C'est la différence pratique avec
+    /// [`Self::cable`] : le câble visé, un client le connaît par le descripteur qu'il a
+    /// ouvert, tandis que le format, il ne peut que le lire. Un `SET` est donc toujours
+    /// une lecture-modification-écriture, et [`Self::avec_connexion`] est ce geste en une
+    /// méthode. Le coût est nul là où il compte : le seul écrivain du dépôt — le service
+    /// d'assistance — relit déjà l'état avant d'écrire, pour dire dans son journal ce qui
+    /// a changé.
+    ///
+    /// Une valeur sentinelle (0 = « peu importe ») aurait évité cette relecture. Elle est
+    /// écartée : elle élargit le domaine du contrat que M1b-08 fuzze, elle change la
+    /// sémantique observable de la structure — donc [`CONFIG_VERSION`] —, et elle rend
+    /// muet le seul cas que la comparaison attrape, celui d'un client qui se trompe sur le
+    /// format. Un champ qu'on a le droit de ne pas remplir ne vérifie plus rien.
+    ///
+    /// Le domaine est celui de [`crate::params::Param::Channels`] — une seule définition
+    /// des bornes, comme pour le registre.
     pub channels: u32,
     /// Rembourrage **explicite**, exigé nul dans les deux sens.
     ///
@@ -337,16 +377,49 @@ fn mot(data: &[u8], offset: usize) -> Option<u32> {
 }
 
 impl CableState {
-    /// L'état d'un câble au repos : connecté, canaux par défaut, réservé nul.
+    /// L'état d'un câble **neuf** : connecté ou non, canaux par défaut, réservé nul.
     ///
-    /// Sert de point de départ aux tests et au service d'assistance ; le pilote, lui,
-    /// construit toujours la sienne depuis l'état vivant du câble.
+    /// # À ne pas envoyer en `SET` d'un câble dont on n'a pas lu le format
+    ///
+    /// Le [`Self::channels`] que cette fonction pose est [`DEFAULT_CHANNELS`], c'est-à-dire
+    /// ce que sert un câble **fraîchement installé** — pas ce que sert le câble qu'on a
+    /// sous la main. L'envoyer tel quel à un câble configuré autrement le fait refuser par
+    /// le gestionnaire, et le client n'en voit qu'un `STATUS_INVALID_PARAMETER`
+    /// (`ERROR_INVALID_PARAMETER`, 87 côté Win32) qu'il ne saura pas relier au format.
+    /// C'est exactement le défaut mesuré entre M1b-05 et M1b-20 : le pilote avait changé de
+    /// contrat, le client fabriquait encore un « 2 » universel.
+    ///
+    /// Pour modifier l'état d'un câble existant, c'est [`Self::avec_connexion`] sur ce
+    /// qu'un `GET` vient de rendre. Cette fonction reste le point de départ des tests, et
+    /// le repli du service quand la relecture échoue et qu'il ne reste rien de mieux.
     #[must_use]
     pub const fn new(cable: u32, connected: bool) -> Self {
         Self {
             cable,
             connected: if connected { 1 } else { 0 },
             channels: DEFAULT_CHANNELS,
+            reserved: 0,
+        }
+    }
+
+    /// L'état **relu**, la seule connexion changée : la lecture-modification-écriture en
+    /// une méthode.
+    ///
+    /// C'est le geste que tout client de `SET` doit faire, et la conséquence directe de la
+    /// nature d'écho de [`Self::cable`] et [`Self::channels`] : les deux champs sont
+    /// **comparés** par le gestionnaire, donc les deux se reprennent de l'état lu au lieu
+    /// d'être fabriqués. Le champ réservé repart à zéro, seule valeur que le contrat
+    /// accepte dans les deux sens.
+    ///
+    /// Sur un état sorti de [`Self::from_bytes`], le résultat est valide par construction :
+    /// `cable` et `channels` sont ceux que le pilote vient d'annoncer, et `connected` est
+    /// dans `{0, 1}`.
+    #[must_use]
+    pub const fn avec_connexion(&self, connected: bool) -> Self {
+        Self {
+            cable: self.cable,
+            connected: if connected { 1 } else { 0 },
+            channels: self.channels,
             reserved: 0,
         }
     }
@@ -1169,6 +1242,42 @@ mod tests {
         let deux = CableState::from_bytes(&octets(0, 1, DEFAULT_CHANNELS, 0)).unwrap();
         assert!(deux.channels_appliquables(DEFAULT_CHANNELS));
         assert!(!deux.channels_appliquables(MAX_CHANNELS));
+    }
+
+    /// **L'écho se reprend, il ne se fabrique pas.**
+    ///
+    /// Sur chaque format possible, l'état relu dont on ne change que la connexion reste
+    /// applicable au câble ; l'état fabriqué par [`CableState::new`], lui, ne l'est que sur
+    /// un câble stéréo. C'est le défaut de frontière de M1b-05 en une table de cas, et la
+    /// raison d'être de [`CableState::avec_connexion`].
+    #[test]
+    fn brancher_le_jack_reprend_les_canaux_du_cable() {
+        for servis in MIN_CHANNELS..=MAX_CHANNELS {
+            // Ce qu'un `GET` rend sur un câble configuré pour `servis` canaux.
+            let lu = CableState::from_bytes(&octets(3, 0, servis, 0)).unwrap();
+            for connecte in [true, false] {
+                let voulu = lu.avec_connexion(connecte);
+                assert_eq!(voulu.channels, servis, "{servis} canaux");
+                assert_eq!(voulu.cable, lu.cable, "{servis} canaux");
+                assert_eq!(voulu.is_connected(), connecte, "{servis} canaux");
+                assert_eq!(voulu.reserved, 0, "{servis} canaux");
+                assert!(
+                    voulu.channels_appliquables(servis),
+                    "brancher le jack d'un câble à {servis} canaux doit être applicable"
+                );
+                // Et l'aller-retour du contrat l'accepte : c'est bien une requête émettable.
+                assert_eq!(CableState::from_bytes(&voulu.to_bytes()), Ok(voulu));
+            }
+
+            // L'état **fabriqué** — celui que le service envoyait — n'est applicable que
+            // sur un câble stéréo, et c'est le refus mesuré (erreur Win32 87).
+            let fabrique = CableState::new(3, true);
+            assert_eq!(
+                fabrique.channels_appliquables(servis),
+                servis == DEFAULT_CHANNELS,
+                "un état fabriqué de toutes pièces sur un câble à {servis} canaux"
+            );
+        }
     }
 
     /// Table du champ réservé : nul, ou refusé.

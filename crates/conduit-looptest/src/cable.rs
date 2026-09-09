@@ -546,7 +546,10 @@ fn entrees_invalides(
     let mut refusees = 0u32;
     let mut privileges = 0u32;
     for mauvaise in BadInput::ALL {
-        let charge = mauvaise.payload(index);
+        // La base est l'état **relu**, pas un état fabriqué : sur un câble qui n'est pas
+        // au format d'usine, chaque entrée se ferait sinon refuser sur ses canaux plutôt
+        // que sur le contrôle qu'elle vise.
+        let charge = mauvaise.payload(avant);
         let resultat = filtre.write_raw(&charge);
         match resultat {
             Ok(traites) => {

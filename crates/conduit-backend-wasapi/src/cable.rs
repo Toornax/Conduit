@@ -1039,13 +1039,16 @@ impl BadInput {
         }
     }
 
-    /// La charge utile à envoyer en `SET` sur le filtre du câble d'index `index`.
+    /// La charge utile à envoyer en `SET`, obtenue en violant **une** règle de `base`.
     ///
     /// Le reste de la structure est toujours **valide** : une entrée qui violerait deux
-    /// règles à la fois ne dirait pas laquelle a fait refuser.
+    /// règles à la fois ne dirait pas laquelle a fait refuser. D'où `base`, qui doit être
+    /// l'état que le filtre visé vient de rendre en `GET` — et non un état fabriqué : ses
+    /// canaux seraient ceux d'un câble neuf, et sur un câble configuré autrement les six
+    /// entrées se feraient refuser sur leur format plutôt que sur ce qu'elles visent.
     #[must_use]
-    pub fn payload(self, index: u32) -> Vec<u8> {
-        let valide = CableState::new(index, true).to_bytes();
+    pub fn payload(self, base: CableState) -> Vec<u8> {
+        let valide = base.to_bytes();
         match self {
             Self::TropCourt => valide[..CABLE_STATE_BYTES - 1].to_vec(),
             Self::TropLong => {
@@ -1055,22 +1058,30 @@ impl BadInput {
             }
             Self::ReserveNonNulle => CableState {
                 reserved: 0xDEAD_BEEF,
-                ..CableState::new(index, true)
+                ..base
             }
             .to_bytes()
             .to_vec(),
             Self::ConnecteDeux => CableState {
                 connected: 2,
-                ..CableState::new(index, true)
+                ..base
             }
             .to_bytes()
             .to_vec(),
             // Un autre câble **existant** : on éprouve la comparaison de l'écho, pas le
             // domaine. Le modulo garde l'index dans les câbles adressables.
-            Self::CableAutre => CableState::new(index.wrapping_add(1) % CABLE_MAX, true)
-                .to_bytes()
-                .to_vec(),
-            Self::CableHorsDomaine => CableState::new(CABLE_MAX, true).to_bytes().to_vec(),
+            Self::CableAutre => CableState {
+                cable: base.cable.wrapping_add(1) % CABLE_MAX,
+                ..base
+            }
+            .to_bytes()
+            .to_vec(),
+            Self::CableHorsDomaine => CableState {
+                cable: CABLE_MAX,
+                ..base
+            }
+            .to_bytes()
+            .to_vec(),
         }
     }
 }
@@ -1305,6 +1316,23 @@ impl TopologyFilter {
 
     /// Écrit [`KSPROPERTY_CONDUIT_CABLE_STATE`] : connecte ou déconnecte le câble.
     ///
+    /// # Une lecture, puis l'écriture — et c'est le contrat, pas une précaution
+    ///
+    /// Deux champs de [`CableState`] sont des **échos vérifiés** par le pilote : `cable` et,
+    /// depuis M1b-05, `channels`. Le premier, ce type le connaît (`self.index`) ; le second,
+    /// non — il vaut ce que `CableFormat<n>` fixe pour ce câble-là, entre 1 et 8. La
+    /// requête part donc de ce qu'un `GET` vient de rendre, dont on ne change que la
+    /// connexion ([`CableState::avec_connexion`]).
+    ///
+    /// Ce qu'il ne faut **pas** faire est ce qui a été mesuré : fabriquer l'état par
+    /// `CableState::new`, dont les canaux sont ceux d'un câble neuf. Sur un câble configuré
+    /// en six canaux, le pilote refuse alors `STATUS_INVALID_PARAMETER`, que l'appelant lit
+    /// en `ERROR_INVALID_PARAMETER` (87) sans pouvoir le relier au format.
+    ///
+    /// Un `GET` n'exige aucun privilège et se fait sur le descripteur déjà ouvert : le prix
+    /// est un `IOCTL` de plus. Son échec est propagé tel quel plutôt que remplacé par une
+    /// supposition — un état qu'on n'a pas pu lire est un état qu'on ne sait pas réécrire.
+    ///
     /// **L'appelant doit avoir armé [`armer_privilege`] avant** et en tenir le garde
     /// pendant l'appel. Le pilote contrôle l'écriture par
     /// `SeSinglePrivilegeCheck(SE_LOAD_DRIVER_PRIVILEGE)`, qui exige le privilège
@@ -1317,9 +1345,10 @@ impl TopologyFilter {
     ///
     /// # Erreurs
     ///
-    /// [`CableConfigError::Requete`], dont le code Win32 est rendu tel quel.
+    /// [`CableConfigError::Requete`], dont le code Win32 est rendu tel quel — pour le `GET`
+    /// préalable comme pour le `SET`, le champ `verbe` disant lequel des deux a échoué.
     pub fn write_state(&self, connected: bool) -> Result<(), CableConfigError> {
-        let etat = CableState::new(self.index, connected);
+        let etat = self.read_state()?.avec_connexion(connected);
         self.write_raw(&etat.to_bytes()).map(|_| ())
     }
 
@@ -1597,9 +1626,15 @@ mod tests {
 
     #[test]
     fn les_entrees_invalides_ne_violent_qu_une_regle_chacune() {
-        // Sur le filtre du câble d'index 3.
-        assert_eq!(BadInput::TropCourt.payload(3).len(), 15);
-        assert_eq!(BadInput::TropLong.payload(3).len(), 17);
+        // Sur le filtre du câble d'index 3, tel qu'un `GET` vient de le rendre : six
+        // canaux, pour que le test dise quelque chose d'un câble qui n'est pas au format
+        // d'usine.
+        let base = CableState {
+            channels: 6,
+            ..CableState::new(3, true)
+        };
+        assert_eq!(BadInput::TropCourt.payload(base).len(), 15);
+        assert_eq!(BadInput::TropLong.payload(base).len(), 17);
 
         // Toutes les autres font la bonne taille : c'est bien le *contenu* qu'on éprouve.
         for mauvaise in [
@@ -1609,8 +1644,20 @@ mod tests {
             BadInput::CableHorsDomaine,
         ] {
             assert_eq!(
-                mauvaise.payload(3).len(),
+                mauvaise.payload(base).len(),
                 CABLE_STATE_BYTES,
+                "{}",
+                mauvaise.label()
+            );
+        }
+
+        // Le format de `base` est reconduit tel quel : une entrée qui vise l'écho de câble
+        // ne doit pas se faire refuser sur ses canaux.
+        for mauvaise in [BadInput::ReserveNonNulle, BadInput::ConnecteDeux] {
+            let brut = mauvaise.payload(base);
+            assert_eq!(
+                u32::from_ne_bytes(brut[8..12].try_into().expect("quatre octets")),
+                base.channels,
                 "{}",
                 mauvaise.label()
             );
@@ -1618,7 +1665,7 @@ mod tests {
 
         // Chacune est refusée par le contrat, sauf `CableAutre` que seul le pilote peut
         // rejeter (l'index est valide, mais ce n'est pas celui du filtre ouvert).
-        let refus = |mauvaise: BadInput| CableState::from_bytes(&mauvaise.payload(3));
+        let refus = |mauvaise: BadInput| CableState::from_bytes(&mauvaise.payload(base));
         assert!(matches!(
             refus(BadInput::TropCourt),
             Err(ConfigError::Longueur { recus: 15 })
@@ -1646,9 +1693,14 @@ mod tests {
         // Le modulo garde l'index dans les câbles adressables, même sur le dernier.
         let dernier = refus(BadInput::CableAutre).expect("contrat satisfait");
         assert!(dernier.cable < CABLE_MAX);
-        let boucle = CableState::from_bytes(&BadInput::CableAutre.payload(CABLE_MAX - 1))
+        let sur_le_dernier = CableState {
+            cable: CABLE_MAX - 1,
+            ..base
+        };
+        let boucle = CableState::from_bytes(&BadInput::CableAutre.payload(sur_le_dernier))
             .expect("contrat satisfait");
         assert_eq!(boucle.cable, 0);
+        assert_eq!(boucle.channels, base.channels);
 
         assert_eq!(BadInput::ALL.len(), 6);
     }

@@ -82,9 +82,13 @@ pub fn precision(reponse: &Reponse) -> Option<String> {
             "le service sert la version {} de ce protocole",
             reponse.detail
         )),
+        // Le renseignement qui manquait au défaut de frontière de M1b-05 : **quelle
+        // valeur** le pilote attendait. Sans lui, l'utilisateur ne lisait que « refus du
+        // système, code 87 ».
         Statut::CanauxNonApplicables => Some(format!(
-            "le pilote n'accepte aujourd'hui que {} canaux ; les rendre réglables est \
-             l'objet de M1b-05",
+            "ce câble sert {} canaux : c'est la valeur que la requête doit porter, et en \
+             changer demande d'écrire le format du câble dans la clé matérielle du \
+             périphérique puis de redémarrer celui-ci",
             reponse.detail
         )),
         Statut::PrivilegeAbsent => Some(
@@ -188,7 +192,8 @@ mod tests {
             (Statut::CableInconnu, 0, None),
             (Statut::ErreurSysteme, 1314, Some("1314")),
             (Statut::VersionInconnue, 1, Some("version 1")),
-            (Statut::CanauxNonApplicables, 2, Some("M1b-05")),
+            // Le détail est le compte **servi par le câble**, et il doit se lire tel quel.
+            (Statut::CanauxNonApplicables, 6, Some("6 canaux")),
             (Statut::PrivilegeAbsent, 0, Some("LocalSystem")),
         ];
         for (statut, detail, attendu) in cas {

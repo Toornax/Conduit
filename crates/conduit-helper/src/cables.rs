@@ -43,6 +43,23 @@
 //! la conception : ce qui peut être fait hors du noyau y est fait, et le pilote ne connaît
 //! toujours que la connexion et les canaux.
 //!
+//! # Tout ordre qui écrit est une lecture-modification-écriture, et un refus le précède
+//!
+//! Deux champs de [`CableState`] sont des **échos vérifiés** par le pilote : `cable` et,
+//! depuis M1b-05, `channels`. Un état fabriqué de toutes pièces porte donc les canaux d'un
+//! câble neuf, et se fait refuser dès que le câble visé est configuré autrement — c'est le
+//! défaut mesuré entre M1b-05 et M1b-20, un `activer` sur un câble en six canaux soldé par
+//! un `ERROR_INVALID_PARAMETER` (87) que rien ne reliait au format.
+//!
+//! [`ecrire`] relit donc l'état **avant** toute écriture — il le faisait déjà pour le
+//! journal — et les trois ordres qui parlent au pilote ne font que le modifier
+//! ([`CableState::avec_connexion`] pour la connexion, le champ `channels` pour `canaux`).
+//! Le même endroit porte le seul refus que le service prononce lui-même : si l'état à
+//! écrire n'est pas applicable au format relu, il rend [`Statut::CanauxNonApplicables`]
+//! avec le compte servi dans `detail`, **sans** armer le privilège ni écrire. Laisser
+//! partir la requête donnerait le code 87 du pilote, qui ne dit pas quelle valeur était
+//! attendue.
+//!
 //! # Aucun flux audio, aucun son
 //!
 //! `IOCTL_KS_PROPERTY` est une requête de contrôle sur un filtre de topologie. Ce module
@@ -244,6 +261,10 @@ fn refus_de_transport(code: u8, erreur: &CableConfigError) -> Reponse {
 }
 
 /// Connecte ou déconnecte un câble, puis relit l'état de tous les câbles.
+///
+/// **Ne fabrique pas l'état qu'il écrit** : il reprend celui que [`ecrire`] vient de relire
+/// et n'en change que la connexion. Les canaux partent donc tels que le câble les sert, et
+/// non tels qu'un câble neuf les servirait — voir l'en-tête de module.
 fn ecrire_connexion(
     code: u8,
     cable: CableId,
@@ -252,8 +273,8 @@ fn ecrire_connexion(
     journal: &Journal,
 ) -> Reponse {
     let verbe = if connecte { "activer" } else { "désactiver" };
-    ecrire(code, cable, appelant, journal, verbe, |filtre, _actuel| {
-        filtre.write_state(connecte)
+    ecrire(code, cable, appelant, journal, verbe, |actuel| {
+        actuel.avec_connexion(connecte)
     })
 }
 
@@ -265,12 +286,13 @@ fn ecrire_connexion(
 /// câble-là. Ce qu'il ne sait toujours pas faire, c'est **en changer à chaud** : ses tables
 /// KS sont immuables et PortCls en retient les pointeurs pour toute la vie du filtre. Le
 /// gestionnaire de propriété refuse donc toute valeur différente de celle que le câble sert
-/// ([`CableState::channels_appliquables`]), et cet ordre le refuse **avant** l'écriture, à
-/// la valeur près : ce n'est plus un `2` universel, c'est le compte relu sur le câble visé.
+/// ([`CableState::channels_appliquables`]).
 ///
-/// L'envoyer quand même donnerait un `ERROR_INVALID_PARAMETER` du pilote, qui ressemblerait
-/// à un défaut du service. Le refus, lui, porte dans `detail` le nombre réellement servi —
-/// de quoi afficher « ce câble est en 6 canaux » plutôt que « paramètre invalide ».
+/// Cet ordre n'a plus rien de particulier pour autant : c'est [`ecrire`] qui prononce le
+/// refus, avant l'écriture et contre le compte **relu sur le câble visé**, et il le fait
+/// pour les trois ordres qui parlent au pilote. Ce module ne fait ici que dire quel champ
+/// changer. La relecture qui servait à ce contrôle est celle de [`ecrire`] : le câble n'est
+/// plus ouvert deux fois.
 ///
 /// Une valeur **égale** à celle servie part quand même dans le pilote : la requête est
 /// alors sans effet, mais elle vaut confirmation, et le chemin d'écriture reste celui des
@@ -292,63 +314,43 @@ fn regler_canaux(
     appelant: &Appelant,
     journal: &Journal,
 ) -> Reponse {
-    // Le compte réellement servi, relu sur le câble visé. `None` : le filtre n'a pas pu
-    // être lu — on laisse alors partir l'écriture, et c'est le pilote qui tranchera, ce qui
-    // vaut mieux qu'un refus fondé sur une supposition.
-    if let Some(servis) = canaux_du_cable(cable) {
-        let etat = CableState {
+    ecrire(code, cable, appelant, journal, "canaux", |actuel| {
+        CableState {
             channels: canaux,
-            ..CableState::new(0, false)
-        };
-        if !etat.channels_appliquables(servis) {
-            journal.info(&format!(
-                "refus : canaux {canaux} sur le câble {} demandés par {appelant} — ce câble \
-                 sert {servis} canaux, et en changer demande d'écrire son format au registre \
-                 puis de redémarrer le périphérique",
-                cable.0
-            ));
-            return Reponse::refus_detaille(code, Statut::CanauxNonApplicables, servis);
+            ..actuel
         }
-    }
-    ecrire(
-        code,
-        cable,
-        appelant,
-        journal,
-        "canaux",
-        |filtre, actuel| {
-            let voulu = CableState {
-                channels: canaux,
-                ..actuel
-            };
-            filtre.write_raw(&voulu.to_bytes()).map(|_| ())
-        },
-    )
+    })
 }
 
-/// Le nombre de canaux que sert le câble `cable`, ou `None` si son filtre est illisible.
+/// Le compte de canaux à annoncer quand l'état qu'on s'apprête à écrire n'est **pas**
+/// applicable au câble, `None` quand il l'est.
 ///
-/// Une ouverture de plus sur le chemin d'un ordre d'administration rare : le prix d'un
-/// refus qui dit la vérité plutôt qu'une constante.
-fn canaux_du_cable(cable: CableId) -> Option<u32> {
-    TopologyFilter::open(cable, COTE)
-        .and_then(|filtre| filtre.read_state())
-        .ok()
-        .map(|etat| etat.channels)
+/// Pure, et c'est tout le jugement que le service porte lui-même sur une écriture : le
+/// reste est du transport. `lu` est l'état que le câble vient de rendre, `None` si la
+/// relecture a échoué — on laisse alors partir l'écriture, et c'est le pilote qui
+/// tranchera, ce qui vaut mieux qu'un refus fondé sur une supposition.
+fn refus_de_canaux(lu: Option<CableState>, voulu: &CableState) -> Option<u32> {
+    let servis = lu?.channels;
+    (!voulu.channels_appliquables(servis)).then_some(servis)
 }
 
-/// Le corps commun des trois ordres qui écrivent : énumérer, ouvrir, armer, écrire,
-/// relire, journaliser.
+/// Le corps commun des trois ordres qui écrivent : énumérer, ouvrir, **relire**, décider,
+/// armer, écrire, relire, journaliser.
+///
+/// `voulu` ne fait que **modifier l'état relu** : il ne fabrique rien, parce que `cable` et
+/// `channels` sont des échos que le pilote compare (voir l'en-tête de module). Entre les
+/// deux, ce module prononce son unique jugement, [`refus_de_canaux`] — le seul refus qui
+/// n'a pas besoin du privilège, et le seul qui sache dire **quelle valeur était attendue**.
 fn ecrire<F>(
     code: u8,
     cable: CableId,
     appelant: &Appelant,
     journal: &Journal,
     verbe: &str,
-    action: F,
+    voulu: F,
 ) -> Reponse
 where
-    F: FnOnce(&TopologyFilter, CableState) -> Result<(), CableConfigError>,
+    F: FnOnce(CableState) -> CableState,
 {
     let Some(index) = driver_index(cable) else {
         // Ne peut pas arriver : le parseur du protocole a déjà borné le numéro. Le
@@ -375,12 +377,26 @@ where
             return refus_de_transport(code, &erreur);
         }
     };
-    // L'état **avant**, pour que le journal dise ce qui a changé plutôt que ce qu'on a
-    // demandé. Une lecture qui échoue n'empêche pas d'écrire : on repart de l'état au
-    // repos du contrat.
-    let avant = filtre
-        .read_state()
-        .unwrap_or_else(|_| CableState::new(index, false));
+    // L'état **avant** : la base de ce qu'on va écrire, et ce qui permet au journal de dire
+    // ce qui a changé plutôt que ce qu'on a demandé. Une lecture qui échoue n'empêche pas
+    // d'écrire : on repart de l'état au repos du contrat, faute de mieux — et le jugement
+    // ci-dessous s'abstient alors, `lu` valant `None`.
+    let lu = filtre.read_state().ok();
+    let avant = lu.unwrap_or_else(|| CableState::new(index, false));
+    let etat = voulu(avant);
+
+    // Le seul refus que ce service prononce lui-même, **avant** d'armer quoi que ce soit :
+    // le pilote rendrait `ERROR_INVALID_PARAMETER` (87), qui ne dit pas quelle valeur il
+    // attendait ; `detail` porte le compte servi, et le client l'affiche.
+    if let Some(servis) = refus_de_canaux(lu, &etat) {
+        journal.info(&format!(
+            "{verbe} câble {} par {appelant} : refus — {} canaux dans la requête, ce câble en \
+             sert {servis} ; en changer demande d'écrire son format au registre puis de \
+             redémarrer le périphérique",
+            cable.0, etat.channels
+        ));
+        return Reponse::refus_detaille(code, Statut::CanauxNonApplicables, servis);
+    }
 
     // Le privilège est armé **ici**, pour cette écriture, et le garde meurt à la sortie
     // de la fonction : le jeton du service retrouve alors l'état où il était.
@@ -410,7 +426,7 @@ where
         return Reponse::refus_detaille(code, statut, detail);
     }
 
-    if let Err(erreur) = action(&filtre, avant) {
+    if let Err(erreur) = filtre.write_raw(&etat.to_bytes()) {
         journal.erreur(&format!(
             "{verbe} câble {} par {appelant} : refusé par le pilote — {erreur}",
             cable.0
@@ -538,28 +554,105 @@ mod tests {
     /// Le prédicat de refus est celui du contrat, contre le compte **du câble** — plus
     /// contre une constante.
     ///
-    /// Test hors machine : `canaux_du_cable` rendrait `None` ici (aucun pilote chargé), et
-    /// `regler_canaux` laisserait alors passer l'écriture. Ce qui se vérifie sans machine,
-    /// c'est la règle elle-même, sur les 64 couples possibles — et c'est elle qui a changé
-    /// avec M1b-05.
+    /// Test hors machine : c'est la règle elle-même qui se vérifie, sur les 64 couples
+    /// possibles, et c'est elle qui a changé avec M1b-05.
     #[test]
     fn le_refus_des_canaux_se_decide_contre_le_compte_du_cable() {
         use conduit_kmd_core::params::{MAX_CHANNELS, MIN_CHANNELS};
         for servis in MIN_CHANNELS..=MAX_CHANNELS {
+            let lu = CableState {
+                channels: servis,
+                ..CableState::new(0, false)
+            };
             for demandes in MIN_CHANNELS..=MAX_CHANNELS {
                 let etat = CableState {
                     channels: demandes,
-                    ..CableState::new(0, false)
+                    ..lu
                 };
                 assert_eq!(
                     etat.channels_appliquables(servis),
                     demandes == servis,
                     "{demandes} demandés sur un câble à {servis}"
                 );
+                // Et le jugement du service dit la même chose, en portant le compte servi.
+                assert_eq!(
+                    refus_de_canaux(Some(lu), &etat),
+                    (demandes != servis).then_some(servis),
+                    "{demandes} demandés sur un câble à {servis}"
+                );
             }
         }
+        // Sans relecture, aucun jugement : on laisse le pilote trancher.
+        let fabrique = CableState::new(0, true);
+        assert_eq!(refus_de_canaux(None, &fabrique), None);
         // Le défaut du protocole reste ce qu'un poste neuf sert, et rien de plus.
         assert_eq!(crate::protocole::CANAUX_PAR_DEFAUT, 2);
+    }
+
+    /// **Le défaut de frontière de M1b-05, du côté du service.**
+    ///
+    /// Mesuré en machine virtuelle : `conduit-helper activer 3` sur un câble en
+    /// `0x00060303` (96 kHz, six canaux) rendait « refus du système, code 87 », là où le
+    /// câble 4 en `0x00020302` réussissait — seule la configuration du câble changeait.
+    ///
+    /// Ce que ce test fixe, sans machine : l'état que l'ordre `activer` s'apprête à écrire
+    /// est celui que le câble vient de rendre, la connexion changée, et il est donc
+    /// applicable **quel que soit** le format. Avant la correction, `ecrire_connexion`
+    /// passait par `write_state`, qui fabriquait `CableState::new` — deux canaux, toujours.
+    #[test]
+    fn activer_ecrit_les_canaux_du_cable_et_non_deux() {
+        use conduit_kmd_core::params::{MAX_CHANNELS, MIN_CHANNELS};
+
+        for servis in MIN_CHANNELS..=MAX_CHANNELS {
+            // Ce qu'un `GET` rend sur le câble « Conduit 3 » configuré pour `servis` canaux.
+            let lu = CableState {
+                channels: servis,
+                ..CableState::new(2, false)
+            };
+            for connecte in [true, false] {
+                let etat = lu.avec_connexion(connecte);
+                assert_eq!(etat.channels, servis, "{servis} canaux");
+                assert_eq!(etat.cable, lu.cable, "{servis} canaux");
+                assert_eq!(etat.is_connected(), connecte, "{servis} canaux");
+                assert_eq!(
+                    refus_de_canaux(Some(lu), &etat),
+                    None,
+                    "brancher le jack d'un câble à {servis} canaux doit passer"
+                );
+            }
+
+            // L'état fabriqué de toutes pièces, celui d'avant : refusé partout sauf en
+            // stéréo, et c'est le 87 mesuré.
+            let fabrique = CableState::new(2, true);
+            assert_eq!(
+                refus_de_canaux(Some(lu), &fabrique),
+                (servis != crate::protocole::CANAUX_PAR_DEFAUT).then_some(servis),
+                "état fabriqué sur un câble à {servis} canaux"
+            );
+        }
+    }
+
+    /// Le refus des canaux **dit quelle valeur était attendue**, et il la dit par le
+    /// statut prévu pour cela — pas par un code Win32 brut.
+    #[test]
+    fn le_refus_des_canaux_porte_le_compte_servi() {
+        let lu = CableState {
+            channels: 6,
+            ..CableState::new(2, false)
+        };
+        let fabrique = CableState::new(2, true);
+        let servis = refus_de_canaux(Some(lu), &fabrique).expect("six canaux, requête à deux");
+        let reponse = Reponse::refus_detaille(
+            crate::protocole::ORDRE_ACTIVER,
+            Statut::CanauxNonApplicables,
+            servis,
+        );
+        assert_eq!(reponse.detail, 6);
+        // Ce que l'utilisateur lit : le compte servi, pas « refus du système, code 87 ».
+        let texte =
+            crate::rapport::rendre(&crate::protocole::Requete::Activer(CableId(3)), &reponse);
+        assert!(texte.contains("6 canaux"), "{texte}");
+        assert!(!texte.contains("87"), "{texte}");
     }
 
     /// Le côté ouvert est le rendu, et l'étiquette du journal suit l'état.
