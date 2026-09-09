@@ -552,12 +552,26 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   *Le second, ouvert* : **seule la variante par défaut produit un endpoint utilisable.**
   Quatre câbles neufs, quatre formats, activés par la propriété KS, une dimension à la fois :
 
-  | Format du câble | Endpoint obtenu |
-  |---|---|
-  | 48 kHz, 2 canaux — **témoin** | 2 canaux, 48000 Hz, 16 bits |
-  | 48 kHz, **6 canaux** | **aucun format** |
-  | **96 kHz**, 2 canaux | **aucun format** |
-  | 48 kHz, 2 canaux, PCM24 préférée | 2 canaux, 48000 Hz, 16 bits |
+  | Format du câble | Variante | Endpoint obtenu |
+  |---|---|---|
+  | 48 kHz, 2 canaux — **témoin** | 9 (défaut) | 2 canaux, 48000 Hz, 16 bits |
+  | 48 kHz, 2 canaux, PCM24 préférée | 9 | 2 canaux, 48000 Hz, 16 bits |
+  | **44,1 kHz**, 2 canaux | 1 | **2 canaux, 44100 Hz, 16 bits** |
+  | **96 kHz**, 2 canaux | 17 | aucun format |
+  | 48 kHz, **1 canal** | 8 | aucun format |
+  | 48 kHz, **3 canaux** | 10 | aucun format |
+  | 48 kHz, **6 canaux** | 13 | aucun format |
+
+  `GetMixFormat` rend **`0x88890008`, `AUDCLNT_E_UNSUPPORTED_FORMAT`**.
+  Un confondant a été levé en chemin : les deux premiers cas sont la **même** variante, celle
+  du défaut de compilation, et ne prouvaient donc rien sur les autres. Le 44,1 kHz le règle —
+  **le pilote sert bien ses variantes**. Ce qui reste : **96 kHz échoue** alors que 44,1 et 48
+  passent, et **tout compte de canaux autre que 2 échoue, mono compris**.
+  Piste documentaire établie pour la moitié « canaux » : le pilote laisse
+  `DataRangeIntersection` au défaut, donc PortCls applique ses *default data-intersection
+  handlers*, qui ne traitent **que PCM, mono et stéréo, sans `WAVEFORMATEXTENSIBLE`**. Le
+  correctif est d'écrire notre propre gestionnaire. Cela n'explique **ni** l'échec du mono
+  **ni** celui du 96 kHz — SYSVAD déclare 88,2 et 96 kHz sans rien de particulier.
 
   « Aucun format » : l'endpoint existe et devient actif, mais `IAudioClient::GetMixFormat`
   échoue. Ce qui est **écarté** : les tables du binaire livré sont exactes entrée par entrée
