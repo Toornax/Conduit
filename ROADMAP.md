@@ -535,8 +535,44 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   *Fait quand* : test de boucle pour chaque format (F-04).
 - [ ] **M1b-06** `feat(driver): gestion d'alimentation et arrêt propre`
   *Fait quand* : veille/reprise 50 fois avec flux ouvert, sans erreur ni fuite.
+  *Code livré le 2026-09-09* : enveloppe de `PcRegisterAdapterPowerManagement`,
+  implémenteur d'`AdapterPowerManagement`, `Cable::suspend` (D3) et `Cable::stop`.
+  **Le critère n'est pas mesurable dans la VM** : `powercfg /a` dans l'invité rend
+  « aucun état de veille disponible » — Hyper-V n'expose ni S1-S3, ni veille prolongée,
+  ni S0 basse consommation. À reprendre sur une machine physique, ou à requalifier.
+  *Ce qui a été mesuré à la place*, et c'est le vrai risque : la règle Driver Verifier du
+  domaine audio dit que **deux `PcRegisterAdapterPowerManagement` sans désenregistrement
+  intercalaire donnent un bugcheck `0xC4 / 0x00071006`**. Or le pilote ne désenregistre
+  jamais et chaque cycle désactiver/réactiver rejoue `StartDevice`. **Cinq cycles** :
+  périphérique OK, quatre endpoints à chaque fois, **zéro vidage, zéro bugcheck**,
+  amorçage inchangé — le verrou d'unicité tient.
+  *Deux points documentés comme incertains dans le code*, faute de source : l'IRQL des
+  rappels d'alimentation (PortCls ne le documente pas ; l'affirmation `PASSIVE_LEVEL` qui
+  traînait dans le trait a été corrigée), et la survie de l'enregistrement à un cycle PnP.
+  D'où le choix d'`ExCancelTimer` (`<= DISPATCH_LEVEL`, n'attend rien) plutôt que
+  d'`ExDeleteTimer(Wait = TRUE)` (`<= APC_LEVEL`, bloquant) en D3.
+  *Suite décrite et non faite* : `IAdapterPnpManagement` est le vrai rappel d'arrêt, et
+  c'est là que `Cable::stop` et `PcUnregisterAdapterPowerManagement` trouveraient leur
+  appelant.
 - [ ] **M1b-07** `feat(driver): comportement à un seul côté ouvert`
   *Fait quand* : capture seule → silence ; rendu seul → pas d'accumulation.
+  Le comportement était **déjà correct et testé** depuis M1a ; le travail a consisté à le
+  rendre **mesurable**. Le plan dit désormais *pourquoi* il demande un silence
+  (`SilenceCause::NoRender` — permanent — contre `BeforeRenderStart` — transitoire), et
+  `Plan::discarded` marque le seul cas qui ne demande rien à écrire. Sans lui, « le rendu
+  tournait seul » et « rien ne tournait » rendaient exactement le même plan vide.
+  *Mesuré le 2026-09-09*, dans la VM, session 0 (on éprouve des **chemins de code**, pas du
+  contenu sonore) — **la moitié « rendu seul » est démontrée** :
+  ```
+  câble 0 : 13000 ticks, 0 trames copiées, 0 silences sans rendu, 13000 ticks jetés
+  câble 0 : 14000 ticks, 48775 trames copiées, …, 13319 ticks jetés
+  ```
+  Vingt secondes de rendu sans capture : le compteur de rejets suit les ticks, tout le
+  reste reste à zéro. Puis la passe normale démarre et il se fige net.
+  *Reste à mesurer* : la moitié « capture seule ». Sa fenêtre naturelle (la queue après
+  l'arrêt du rendu) fait ~100 ms, sous la cadence de journalisation de 1000 ticks. Elle
+  deviendra mesurable **sans débogueur** quand les compteurs seront exposés par le jeu de
+  propriétés privé — forme proposée, à fusionner avec M1b-05 qui touche les mêmes fichiers.
 - [ ] **M1b-08** `test(driver): harnais utilisateur et fuzzing du parseur de la propriété KS`
   Le code de validation compile aussi en mode utilisateur pour être fuzzé.
   *Fait quand* : 1 h de fuzzing sans panique.
