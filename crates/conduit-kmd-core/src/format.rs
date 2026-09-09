@@ -966,6 +966,14 @@ mod tests {
         );
         // Plancher nul : remonté à 1 ms, jamais un tampon vide.
         assert_eq!(buffer_bytes_with_floor(0, 8, 48_000, 0), Some(384));
+        // Plancher au plafond **et** fréquence impaire : le ceil du plancher dépasse d'une
+        // trame le floor du plafond (124 565 contre 124 564), aucune taille n'est valide,
+        // et refuser est correct. Sans effet sur le pilote — les trois fréquences servies
+        // sont paires —, mais c'est la frontière qui rendait la propriété instable.
+        assert_eq!(buffer_bytes_with_floor(0, 1, 249_129, 500), None);
+        // La même fréquence, un cran de plancher plus bas : le plancher redevient
+        // atteignable.
+        assert_eq!(buffer_bytes_with_floor(0, 1, 249_129, 499), Some(124_316));
         // Le refus de la borne haute est indépendant du plancher.
         assert_eq!(buffer_bytes_with_floor(192_001, 8, 48_000, 10), None);
         assert_eq!(buffer_bytes_with_floor(u32::MAX, 8, 48_000, 1), None);
@@ -1099,7 +1107,12 @@ mod tests {
 
         /// Le plancher réglable ne casse aucune propriété de [`buffer_bytes`] : le
         /// résultat est un multiple de la trame, au moins la demande, au moins `floor_ms`
-        /// de son, et le refus reste celui du plafond.
+        /// de son. Le refus, lui, a **deux** causes une fois le plancher réglable — le
+        /// plafond dépassé, ou le plancher écrêté qui passe au-dessus de lui —, et la
+        /// propriété les nomme toutes les deux plutôt que de restreindre son domaine aux
+        /// fréquences paires : la seconde est une frontière réelle de la fonction, et
+        /// l'énoncer ici c'est la documenter, alors que l'éviter en tirant des fréquences
+        /// paires la laisserait non testée.
         #[test]
         fn buffer_bytes_with_floor_never_shrinks(
             requested in any::<u32>(),
@@ -1111,6 +1124,7 @@ mod tests {
             let borne = floor_ms.clamp(MIN_BUFFER_MS, MAX_BUFFER_MS);
             let requested_frames = u64::from(requested).div_ceil(u64::from(frame_bytes));
             let max = rate * u64::from(MAX_BUFFER_MS) / 1_000;
+            let min = (rate * u64::from(borne)).div_ceil(1_000);
             match buffer_bytes_with_floor(requested, frame_bytes, sample_rate, floor_ms) {
                 Some(bytes) => {
                     prop_assert_eq!(bytes % frame_bytes, 0);
@@ -1123,10 +1137,20 @@ mod tests {
                     prop_assert!(requested_frames <= max, "accepté au-delà de 500 ms");
                 }
                 None => {
-                    // Dans ces plages, le seul refus est le dépassement du plafond : le
-                    // plancher écrêté ne peut jamais passer au-dessus (à 8 kHz, 500 ms font
-                    // 4 000 trames et le ceil du plancher au plus 4 000 aussi).
-                    prop_assert!(requested_frames > max, "refus d'une demande sous les 500 ms");
+                    // Dans ces plages, les tailles tiennent toujours dans un u32 : il ne
+                    // reste que deux refus possibles, et l'un des deux ne se voit qu'au
+                    // plancher maximal. `min > max` demande `borne == 500` — en dessous,
+                    // le plancher est plus bas que le plafond d'au moins `rate / 1 000`
+                    // trames, soit 8 dès 8 kHz — et une fréquence **impaire**, où
+                    // ceil(rate × 500 / 1 000) vaut floor(rate × 500 / 1 000) + 1 : aucune
+                    // taille n'est alors à la fois au-dessus du plancher et sous le
+                    // plafond, et refuser est la seule réponse juste.
+                    prop_assert!(
+                        requested_frames > max || min > max,
+                        "refus alors que le plafond et le plancher de {borne} ms laissaient \
+                         de la place : {requested_frames} trames demandées, {min} au plancher, \
+                         {max} au plafond"
+                    );
                 }
             }
         }
