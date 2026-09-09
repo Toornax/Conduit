@@ -1,11 +1,13 @@
 //! Miniports WaveRT d'un câble (driver-design.md §4, §5) : [`WaveRender`] et
 //! [`WaveCapture`], un par sens, implémentent `portcls::MiniportWaveRT`.
 //!
-//! Ils exposent leur descripteur de filtre (`descriptors::WAVE_RENDER_FILTER`,
-//! `WAVE_CAPTURE_FILTER`, M1a-06), ce qui publie les endpoints, et `NewStream` vérifie
-//! la broche et le sens, traduit le `KSDATAFORMAT_WAVEFORMATEX[TENSIBLE]` reçu en
-//! `conduit_kmd_core::RequestedFormat` ([`requested_format`]) et le valide contre
-//! `M1A_FORMATS`. Les deux créent ensuite le même flux ([`crate::stream::WaveStream`] :
+//! Ils exposent le descripteur de filtre **du format de leur câble**
+//! (`descriptors::wave_render_filter`, `wave_capture_filter`, M1a-06 puis M1b-05), ce qui
+//! publie les endpoints, et `NewStream` vérifie la broche et le sens, traduit le
+//! `KSDATAFORMAT_WAVEFORMATEX[TENSIBLE]` reçu en `conduit_kmd_core::RequestedFormat`
+//! ([`requested_format`]) et le valide contre les formats de **ce** câble
+//! (`conduit_kmd_core::cable_formats`). Les deux créent ensuite le même flux
+//! ([`crate::stream::WaveStream`] :
 //! tampon cyclique, horloge, position, notifications) par [`open_stream`], qui l'inscrit
 //! dans l'emplacement du [`Cable`] correspondant à son sens (un seul flux par sens :
 //! `STATUS_DEVICE_BUSY` sinon) et le rend à PortCls par `StreamObject`. C'est le tick du
@@ -23,7 +25,9 @@
 
 use core::mem::size_of;
 
-use conduit_kmd_core::{M1A_FORMATS, RequestedFormat, SampleKind, SupportedFormat, validate};
+use conduit_kmd_core::{
+    RequestedFormat, SampleKind, SupportedFormat, cable_formats, config::CableFormat, validate,
+};
 use portcls::conduit_com::{
     ComRef, NtStatus, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
 };
@@ -40,7 +44,8 @@ use portcls_sys::{
 
 use crate::cable::{Cable, Direction};
 use crate::descriptors::{
-    WAVE_CAPTURE_FILTER, WAVE_CAPTURE_PIN_SYSTEM, WAVE_RENDER_FILTER, WAVE_RENDER_PIN_SYSTEM,
+    WAVE_CAPTURE_PIN_SYSTEM, WAVE_RENDER_PIN_SYSTEM, cable_format, wave_capture_filter,
+    wave_capture_filter_default, wave_render_filter, wave_render_filter_default,
 };
 use crate::stream::WaveStream;
 
@@ -135,7 +140,13 @@ unsafe fn requested_format(format: &KSDATAFORMAT) -> Option<RequestedFormat> {
 }
 
 /// Vérifications communes de `NewStream` : broche système attendue, sens attendu, format
-/// lisible et supporté (§5.4). Renvoie le format retenu.
+/// lisible et supporté par **ce câble** (§5.4). Renvoie le format retenu.
+///
+/// `cable_format` est le format configuré du câble ; la liste confrontée est celle de ses
+/// trois profondeurs, à sa fréquence et sur ses canaux. Le moteur audio ne devrait rien
+/// proposer d'autre — c'est tout ce que le descripteur déclare —, mais `NewStream` reste
+/// le seul endroit où le format est vérifié **avant** qu'un tampon ne soit dimensionné
+/// dessus : le refus vaut mieux qu'une trame lue de travers.
 ///
 /// # Safety
 ///
@@ -145,6 +156,7 @@ unsafe fn check_stream_request(
     expected_capture: bool,
     pin: u32,
     capture: bool,
+    cable_format: CableFormat,
     format: &KSDATAFORMAT,
 ) -> Result<SupportedFormat, NtStatus> {
     if pin != expected_pin || capture != expected_capture {
@@ -152,7 +164,8 @@ unsafe fn check_stream_request(
     }
     // SAFETY: contrat relayé tel quel.
     let requested = unsafe { requested_format(format) }.ok_or(STATUS_INVALID_PARAMETER)?;
-    validate(&requested, &M1A_FORMATS).map_err(|_| STATUS_INVALID_PARAMETER)
+    let supportes = cable_formats(cable_format.sample_rate, cable_format.channels);
+    validate(&requested, &supportes).map_err(|_| STATUS_INVALID_PARAMETER)
 }
 
 /// Crée le flux du sens `direction` sur le câble `cable` (numéro `n`), l'inscrit dans
@@ -214,7 +227,12 @@ impl MiniportWaveRT for WaveRender {
 
     // IRQL: PASSIVE_LEVEL
     fn description(&self) -> &'static PCFILTER_DESCRIPTOR {
-        WAVE_RENDER_FILTER.get()
+        // Le descripteur de la **variante de format** du câble (M1b-05), et non plus une
+        // table unique. Le trait rend une référence, pas une `Option` : le repli sur la
+        // variante par défaut n'est là que pour qu'aucun chemin ne panique (même idiome
+        // que `topo::TopoRender::description`). Il est inatteignable pour un format sorti
+        // de `CableFormat::sanitize`, seul chemin d'écriture du magasin.
+        wave_render_filter(cable_format(self.n)).unwrap_or_else(wave_render_filter_default)
     }
 
     // IRQL: PASSIVE_LEVEL
@@ -227,8 +245,16 @@ impl MiniportWaveRT for WaveRender {
     ) -> Result<StreamObject, NtStatus> {
         // SAFETY: `format` vient du thunk `NewStream` de `portcls`, qui garantit une
         // `KSDATAFORMAT` suivie de son extension `FormatSize`.
-        let supported =
-            unsafe { check_stream_request(WAVE_RENDER_PIN_SYSTEM, false, pin, capture, format) }?;
+        let supported = unsafe {
+            check_stream_request(
+                WAVE_RENDER_PIN_SYSTEM,
+                false,
+                pin,
+                capture,
+                cable_format(self.n),
+                format,
+            )
+        }?;
         open_stream(
             self.n,
             Direction::Render,
@@ -263,7 +289,10 @@ impl MiniportWaveRT for WaveCapture {
 
     // IRQL: PASSIVE_LEVEL
     fn description(&self) -> &'static PCFILTER_DESCRIPTOR {
-        WAVE_CAPTURE_FILTER.get()
+        // Voir `WaveRender::description` : même variante, l'autre sens. Les deux bouts du
+        // câble lisent le **même** `cable_format(n)`, ce qui est exactement ce qui les
+        // empêche de se désaccorder.
+        wave_capture_filter(cable_format(self.n)).unwrap_or_else(wave_capture_filter_default)
     }
 
     // IRQL: PASSIVE_LEVEL
@@ -275,8 +304,16 @@ impl MiniportWaveRT for WaveCapture {
         format: &KSDATAFORMAT,
     ) -> Result<StreamObject, NtStatus> {
         // SAFETY: voir `WaveRender::new_stream`.
-        let supported =
-            unsafe { check_stream_request(WAVE_CAPTURE_PIN_SYSTEM, true, pin, capture, format) }?;
+        let supported = unsafe {
+            check_stream_request(
+                WAVE_CAPTURE_PIN_SYSTEM,
+                true,
+                pin,
+                capture,
+                cable_format(self.n),
+                format,
+            )
+        }?;
         open_stream(
             self.n,
             Direction::Capture,

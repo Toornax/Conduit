@@ -657,16 +657,23 @@ pub enum Statut {
     CableInconnu,
     /// Nombre de canaux hors des bornes du pilote.
     CanauxInvalides,
-    /// Nombre de canaux valide, mais que le pilote ne sait pas encore appliquer.
+    /// Nombre de canaux valide, mais qui n'est pas celui que **ce câble** sert.
     ///
-    /// **C'est l'état réel de M1b-20, pas un contournement.** Le nombre de canaux est
-    /// scellé dans les tables KS du pilote (`descriptors::CHANNELS`) et le gestionnaire
-    /// de propriété refuse toute valeur différente de
-    /// [`conduit_kmd_core::params::DEFAULT_CHANNELS`] tant que **M1b-05** n'a pas rendu
-    /// la valeur dynamique. Le service le dit ici, avec le mot « M1b-05 » dans le
-    /// message, plutôt que de rendre un succès pour un réglage qui n'agirait sur rien —
-    /// ce qui serait pire qu'un refus. Ce statut **disparaîtra avec M1b-05** : c'est
-    /// alors le pilote qui tranchera.
+    /// [`Reponse::detail`] porte le nombre de canaux réellement servi, pour que le client
+    /// n'ait pas à le deviner.
+    ///
+    /// # Ce que ce statut veut dire depuis M1b-05
+    ///
+    /// Il a changé de raison sans changer de conclusion. Avant M1b-05, le pilote ne
+    /// *savait* pas servir autre chose que deux canaux : la valeur était scellée dans ses
+    /// tables KS. Depuis, il sert 1 à 8 — mais **pas en changer à chaud** : les tables KS
+    /// sont immuables et PortCls en retient les pointeurs pour toute la vie du filtre.
+    ///
+    /// Changer le format d'un câble demande donc deux gestes que cet ordre ne fait pas :
+    /// écrire `CableFormat<n>` dans la clé matérielle du périphérique
+    /// ([`conduit_kmd_core::config::CABLE_FORMAT_VALUE_NAMES`]) **et** redémarrer le
+    /// devnode. Répondre `Succes` à un `canaux` qui n'agirait sur rien avant le prochain
+    /// démarrage serait pire qu'un refus, et c'est pourquoi ce statut reste.
     CanauxNonApplicables,
     /// Aucune interface `KSCATEGORY_TOPOLOGY` de ce câble : le pilote Conduit n'est pas
     /// chargé, ou ce câble n'est pas enregistré.
@@ -1114,12 +1121,17 @@ pub fn decouper(tampon: &[u8]) -> Result<Option<(&[u8], usize)>, ErreurTrame> {
     }
 }
 
-/// Le nombre de canaux que le pilote sait **servir** aujourd'hui.
+/// Le nombre de canaux d'un câble **neuf**, celui que l'INF écrit et sur lequel le pilote
+/// se replie.
 ///
-/// Ré-exporté depuis le contrat partagé plutôt que recopié : c'est la valeur contre
-/// laquelle [`Statut::CanauxNonApplicables`] se décide, et elle doit bouger avec M1b-05
-/// sans que ce fichier soit rouvert.
-pub const CANAUX_APPLICABLES: u32 = DEFAULT_CHANNELS;
+/// Ce n'est **plus** la seule valeur applicable, contrairement à `CANAUX_APPLICABLES` de
+/// M1b-20 : depuis M1b-05, chaque câble sert le nombre de canaux que son `CableFormat<n>`
+/// fixe, entre 1 et 8, et [`Statut::CanauxNonApplicables`] se décide contre **cette**
+/// valeur-là, relue sur le câble visé. La constante ne sert plus qu'à dire ce qu'un poste
+/// fraîchement installé sert.
+///
+/// Ré-exportée depuis le contrat partagé plutôt que recopiée : une seule source.
+pub const CANAUX_PAR_DEFAUT: u32 = DEFAULT_CHANNELS;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
@@ -1851,27 +1863,33 @@ mod tests {
         assert!(!NOM_TUBE.starts_with(r"\\serveur"));
     }
 
-    /// Les canaux applicables aujourd'hui sont ceux du contrat, pas un 2 recopié.
+    /// Les canaux applicables sont ceux **du câble visé**, et non plus une constante.
+    ///
+    /// C'est le rappel que M1b-05 avait mis en place et qu'elle vient de consommer :
+    /// `channels_applicables()` a laissé la place à `channels_appliquables(courants)`, et
+    /// le prédicat suit désormais le format de chaque câble.
     #[test]
-    fn les_canaux_applicables_viennent_du_contrat() {
-        assert_eq!(CANAUX_APPLICABLES, DEFAULT_CHANNELS);
+    fn les_canaux_applicables_sont_ceux_du_cable() {
+        assert_eq!(CANAUX_PAR_DEFAUT, DEFAULT_CHANNELS);
         const _: () =
-            assert!(MIN_CHANNELS <= CANAUX_APPLICABLES && CANAUX_APPLICABLES <= MAX_CHANNELS);
-        // Le prédicat du contrat et le nôtre disent la même chose : quand M1b-05 rendra
-        // les canaux dynamiques, `channels_applicables` disparaîtra et ce test tombera,
-        // ce qui est exactement le rappel qu'on veut.
-        for canaux in MIN_CHANNELS..=MAX_CHANNELS {
-            let etat = conduit_kmd_core::config::CableState {
-                cable: 0,
-                connected: 1,
-                channels: canaux,
-                reserved: 0,
-            };
-            assert_eq!(
-                etat.channels_applicables(),
-                canaux == CANAUX_APPLICABLES,
-                "canaux {canaux}"
-            );
+            assert!(MIN_CHANNELS <= CANAUX_PAR_DEFAUT && CANAUX_PAR_DEFAUT <= MAX_CHANNELS);
+        // Sur chaque câble possible, le prédicat du contrat accepte exactement le nombre
+        // de canaux que ce câble sert — ni plus (un réglage sans effet), ni moins (un
+        // refus d'une valeur légitime).
+        for servis in MIN_CHANNELS..=MAX_CHANNELS {
+            for demandes in MIN_CHANNELS..=MAX_CHANNELS {
+                let etat = conduit_kmd_core::config::CableState {
+                    cable: 0,
+                    connected: 1,
+                    channels: demandes,
+                    reserved: 0,
+                };
+                assert_eq!(
+                    etat.channels_appliquables(servis),
+                    demandes == servis,
+                    "{demandes} canaux demandés sur un câble à {servis}"
+                );
+            }
         }
     }
 

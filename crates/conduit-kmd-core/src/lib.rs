@@ -7,9 +7,11 @@
 //! - l'horloge virtuelle et les positions de flux ([`position`]) : trames écoulées
 //!   depuis un instant du compteur de performance, position cyclique en octets ;
 //! - la copie cyclique rendu → capture ([`ring`]) : tampons de tailles différentes,
-//!   wrap-around des deux côtés, conversion F32 ↔ I16, silence ;
+//!   wrap-around des deux côtés, conversion entre F32, PCM24 et I16 (les neuf couples),
+//!   silence ;
 //! - la validation des formats ([`format`]) : format demandé par le moteur audio
-//!   contre la liste supportée, taille de tampon bornée ;
+//!   contre la liste supportée — une fréquence et un nombre de canaux par câble, les
+//!   trois profondeurs toujours (M1b-05) —, taille de tampon bornée ;
 //! - les périodes de notification ([`notify`]) : quand signaler les événements
 //!   enregistrés par `IMiniportWaveRTStreamNotification`, à partir de la position
 //!   absolue, bouclage compris ;
@@ -76,14 +78,17 @@ pub mod position;
 pub mod ring;
 
 pub use config::{
-    cable_bit, is_active, sanitize_mask, with_active, CableState, ConfigError, ConfigGuid, MaskFix,
-    ACTIVE_CABLES_DEFAULT, ACTIVE_CABLES_LABEL, ACTIVE_CABLES_MASK, ACTIVE_CABLES_VALUE_NAME,
-    CABLE_MAX, CABLE_STATE_BYTES, CONFIG_VERSION, KSPROPERTY_CONDUIT_CABLE_STATE,
-    KSPROPERTY_CONDUIT_VERSION, KSPROPSETID_CONDUIT,
+    cable_bit, is_active, sanitize_mask, with_active, CableFormat, CableFormatFix, CableState,
+    ConfigError, ConfigGuid, FormatCodeError, MaskFix, ACTIVE_CABLES_DEFAULT, ACTIVE_CABLES_LABEL,
+    ACTIVE_CABLES_MASK, ACTIVE_CABLES_VALUE_NAME, CABLE_FORMAT_DEFAULT, CABLE_FORMAT_LABEL,
+    CABLE_FORMAT_VALUE_NAMES, CABLE_MAX, CABLE_STATE_BYTES, CONFIG_VERSION,
+    KSPROPERTY_CONDUIT_CABLE_STATE, KSPROPERTY_CONDUIT_VERSION, KSPROPSETID_CONDUIT,
 };
 pub use format::{
-    buffer_bytes, buffer_bytes_for_notifications, validate, FormatError, RequestedFormat,
-    SampleKind, SupportedFormat, M1A_FORMATS,
+    buffer_bytes, buffer_bytes_for_notifications, buffer_bytes_for_notifications_with_floor,
+    buffer_bytes_with_floor, cable_formats, sample_rate_at, sample_rate_index, validate,
+    FormatError, RequestedFormat, SampleKind, SupportedFormat, FORMATS_PER_CABLE, SAMPLE_DEPTHS,
+    SAMPLE_RATES,
 };
 pub use loopback::{CopyOp, Loopback, Plan, SilenceCause, SilenceOp, StreamView, LEAD_MS};
 pub use notify::{align_frames, boundaries_crossed, Notifier};

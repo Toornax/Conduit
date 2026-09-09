@@ -58,12 +58,25 @@
 //!
 //! # Ce qui est *par câble*, et ce qui ne l'est pas
 //!
-//! Le seul contenu réellement par câble d'un descripteur est le GUID
-//! `KsPinDescriptor.Name` des broches endpoint ([`PIN_NAMES`], un par câble depuis
-//! M1b-02) : les seize filtres de topologie d'un même sens ne diffèrent que par lui, d'où
-//! les tables [`TOPO_RENDER_PINS`] et [`TOPO_CAPTURE_PINS`], une rangée par câble, et les
-//! deux tableaux de [`PCFILTER_DESCRIPTOR`] qui les pointent. Les **filtres wave**, eux,
-//! restent uniques : rien n'y est par câble.
+//! Deux contenus varient, et pas selon le même axe.
+//!
+//! - Le GUID `KsPinDescriptor.Name` des broches endpoint ([`PIN_NAMES`], un par câble
+//!   depuis M1b-02) varie **par câble** : les seize filtres de topologie d'un même sens ne
+//!   diffèrent que par lui, d'où les tables [`TOPO_RENDER_PINS`] et [`TOPO_CAPTURE_PINS`],
+//!   une rangée par câble, et les deux tableaux de [`PCFILTER_DESCRIPTOR`] qui les
+//!   pointent.
+//! - Les **plages système** des filtres wave varient, depuis M1b-05, par **variante de
+//!   format** : la fréquence et le nombre de canaux du câble, soit
+//!   `3 × 8 = `[`VARIANT_COUNT`] combinaisons ([`variant_of`]). Les filtres wave sont donc
+//!   eux aussi des tables — [`WAVE_RENDER_FILTERS`], [`WAVE_CAPTURE_FILTERS`] — mais
+//!   indexées par variante et non par câble : deux câbles réglés pareil partagent la même
+//!   rangée, et c'est ce qui garde la table à 24 entrées au lieu de 16.
+//!
+//! Un câble ne change **jamais** de variante en cours de route : `Shared<T>` est `Sync`
+//! *parce que* son contenu ne change jamais, et PortCls conserve le pointeur rendu par
+//! `GetDescription` pour toute la vie du filtre. Le format se lit une fois, au démarrage
+//! ([`apply_cable_format`], depuis `registry::read_params`), et en changer demande de
+//! redémarrer le devnode — ce que fait le service d'assistance, en espace utilisateur.
 //!
 //! Les nœuds, leurs tables d'automatisation et leurs `PCPROPERTY_ITEM` sont des `static`
 //! **partagées par tous les câbles** : le gestionnaire retrouve le
@@ -105,8 +118,10 @@
 use core::fmt;
 use core::mem::size_of;
 use core::ptr;
+use core::sync::atomic::{AtomicU32, Ordering};
 
-use conduit_kmd_core::{M1A_FORMATS, SampleFormat};
+use conduit_kmd_core::config::{CABLE_FORMAT_DEFAULT, CableFormat};
+use conduit_kmd_core::{FORMATS_PER_CABLE, FrameLayout, SAMPLE_DEPTHS, SAMPLE_RATES, SampleFormat};
 use portcls::{
     CABLE_COUNT, CABLE_STATE_ACCESS_FLAGS, JACK_ACCESS_FLAGS, JACK_EVENT_FLAGS,
     JACK_INFO_CHANGE_ID, PIN_NAME_GUIDS, VERSION_ACCESS_FLAGS, cable_state_item,
@@ -180,34 +195,116 @@ pub const TOPO_CONNECTION_COUNT: usize = 3;
 /// Nombre de connexions d'un filtre WaveRT : la connexion directe broche 0 → broche 1.
 pub const WAVE_CONNECTION_COUNT: usize = 1;
 
-/// Nombre de canaux d'un câble, et donc du nœud de volume (`AudioNodes::channels`).
+// ---------------------------------------------------------------------------------
+// La matrice des formats (M1b-05, §5.4) : 3 fréquences × 8 canaux = 24 variantes, chacune
+// déclarant les 3 profondeurs de `conduit_kmd_core::SAMPLE_DEPTHS`.
+// ---------------------------------------------------------------------------------
+
+/// Nombre maximal de canaux par câble (SPEC F-03), du type des tables d'ici.
+pub const MAX_CHANNELS: usize = FrameLayout::MAX_CHANNELS as usize;
+
+/// Nombre de fréquences d'échantillonnage servables (`conduit_kmd_core::SAMPLE_RATES`).
+pub const RATE_COUNT: usize = SAMPLE_RATES.len();
+
+/// Nombre de **variantes de descripteurs wave** : une par couple (fréquence, canaux).
 ///
-/// C'est la valeur unique de M1a, celle des plages de formats ci-dessous ; `topo` vérifie
-/// en `const` qu'elle tient dans `cable::MAX_CHANNELS`.
-pub const CHANNELS: ULONG = 2;
+/// **24, et non 72.** La profondeur ne multiplie rien : les trois sont déclarées dans
+/// toutes les variantes, parce que `copy_frames` les convertit à la volée et que les deux
+/// bouts d'un câble n'ont donc pas à s'accorder dessus. Seuls la fréquence et le nombre de
+/// canaux figent quelque chose (voir l'en-tête de `conduit_kmd_core::format`).
+pub const VARIANT_COUNT: usize = RATE_COUNT.saturating_mul(MAX_CHANNELS);
 
-// ---------------------------------------------------------------------------------
-// Formats du spike (§5.4), tirés de `conduit_kmd_core::M1A_FORMATS`.
-// ---------------------------------------------------------------------------------
+/// Nombre de plages système par broche : une par profondeur.
+pub const RANGES_PER_SYSTEM_PIN: usize = FORMATS_PER_CABLE;
 
-/// Fréquence d'échantillonnage unique de M1a (Hz).
-const SAMPLE_RATE: ULONG = 48_000;
-/// Taille du conteneur des échantillons flottants (bits).
-const BITS_F32: ULONG = 32;
-/// Taille du conteneur des échantillons PCM entiers (bits).
-const BITS_I16: ULONG = 16;
+/// L'index de variante du couple (`rate_index`, `channels`), ou `None` hors domaine.
+///
+/// Rangement : les huit comptes de canaux d'une fréquence sont contigus, ce qui rend la
+/// table lisible dans un vidage mémoire — les entrées 0 à 7 sont le 44,1 kHz, 8 à 15 le
+/// 48 kHz, 16 à 23 le 96 kHz.
+#[must_use]
+pub const fn variant_index(rate_index: usize, channels: u8) -> Option<usize> {
+    if rate_index >= RATE_COUNT || channels == 0 || channels as usize > MAX_CHANNELS {
+        return None;
+    }
+    // `rate_index < 3` et `channels ≤ 8` : le produit vaut au plus 23, sans débordement
+    // possible. Les `checked_*` remplacent des opérateurs que les lints du crate refusent.
+    match rate_index.checked_mul(MAX_CHANNELS) {
+        Some(base) => base.checked_add((channels as usize).wrapping_sub(1)),
+        None => None,
+    }
+}
+
+/// L'index de variante d'un [`CableFormat`], ou `None` si sa fréquence n'est pas une des
+/// trois (impossible pour un format sorti de `CableFormat::sanitize`).
+#[must_use]
+pub const fn variant_of(format: CableFormat) -> Option<usize> {
+    match format.rate_index() {
+        Some(rate_index) => variant_index(rate_index, format.channels),
+        None => None,
+    }
+}
+
+/// L'index de variante du format par défaut (48 kHz, 2 canaux) : le repli de toutes les
+/// fonctions de sélection, et le seul index dont on puisse prouver l'existence en `const`.
+pub const DEFAULT_VARIANT: usize = match variant_of(CABLE_FORMAT_DEFAULT) {
+    Some(index) => index,
+    // Inatteignable : le défaut est dans le domaine, ce que l'assertion ci-dessous
+    // reformule. Un `0` plutôt qu'un `panic!`, interdit en noyau comme en `const` ici.
+    None => 0,
+};
+
+/// Fréquence de la variante `variant`, en Hz ; 48 000 hors domaine (repli du défaut).
+const fn variant_rate(variant: usize) -> ULONG {
+    match conduit_kmd_core::sample_rate_at(variant.wrapping_div(MAX_CHANNELS)) {
+        Some(hz) => hz,
+        None => CABLE_FORMAT_DEFAULT.sample_rate,
+    }
+}
+
+/// Nombre de canaux de la variante `variant` ; 1 hors domaine (le seul repli qui donne
+/// toujours une trame valide).
+const fn variant_channels(variant: usize) -> ULONG {
+    // `% 8` puis `+ 1` : l'inverse exact de `variant_index`, et le résultat est dans 1..=8
+    // quel que soit `variant`, y compris hors domaine.
+    variant.wrapping_rem(MAX_CHANNELS).wrapping_add(1) as ULONG
+}
 
 const _: () = {
-    assert!(M1A_FORMATS.len() == 2, "deux plages système : F32 et I16");
-    let fmt_f32 = M1A_FORMATS[0];
-    let fmt_i16 = M1A_FORMATS[1];
-    assert!(fmt_f32.sample_rate == SAMPLE_RATE && fmt_i16.sample_rate == SAMPLE_RATE);
-    assert!(fmt_f32.channels as ULONG == CHANNELS && fmt_i16.channels as ULONG == CHANNELS);
-    assert!(matches!(fmt_f32.format, SampleFormat::F32));
-    assert!(matches!(fmt_i16.format, SampleFormat::I16));
-    // 4 octets = 32 bits, 2 octets = 16 bits.
-    assert!(SampleFormat::F32.bytes_per_sample() == 4 && BITS_F32 == 32);
-    assert!(SampleFormat::I16.bytes_per_sample() == 2 && BITS_I16 == 16);
+    assert!(RATE_COUNT == 3 && MAX_CHANNELS == 8);
+    assert!(VARIANT_COUNT == 24, "3 fréquences × 8 canaux, pas 72");
+    assert!(SAMPLE_DEPTHS.len() == RANGES_PER_SYSTEM_PIN && RANGES_PER_SYSTEM_PIN == 3);
+    // Le défaut a bien une variante, et c'est celle qu'on croit : 48 kHz (rang 1) sur
+    // 2 canaux, donc 1 × 8 + 1 = 9.
+    assert!(matches!(variant_of(CABLE_FORMAT_DEFAULT), Some(9)));
+    assert!(DEFAULT_VARIANT == 9 && DEFAULT_VARIANT < VARIANT_COUNT);
+    // `variant_index` et les deux accesseurs sont bien réciproques sur tout le domaine.
+    // Écrit en boucle `while` plutôt qu'en `for` (interdit en `const`) : c'est la seule
+    // vérification qui attrape un rangement inversé — 24 variantes toutes valides mais
+    // décalées d'un cran donneraient un câble à six canaux servi en quatre, sans un mot.
+    let mut rate_index = 0;
+    while rate_index < RATE_COUNT {
+        let mut channels = 1u8;
+        while channels as usize <= MAX_CHANNELS {
+            let variant = match variant_index(rate_index, channels) {
+                Some(v) => v,
+                None => 0,
+            };
+            assert!(variant < VARIANT_COUNT);
+            assert!(variant_channels(variant) == channels as ULONG);
+            let attendue = match conduit_kmd_core::sample_rate_at(rate_index) {
+                Some(hz) => hz,
+                None => 0,
+            };
+            assert!(variant_rate(variant) == attendue);
+            channels = channels.wrapping_add(1);
+        }
+        rate_index = rate_index.wrapping_add(1);
+    }
+    // Hors domaine : aucune variante, jamais un index qu'on indexerait quand même.
+    assert!(variant_index(RATE_COUNT, 2).is_none());
+    assert!(variant_index(0, 0).is_none());
+    assert!(variant_index(0, 9).is_none());
 };
 
 // ---------------------------------------------------------------------------------
@@ -282,20 +379,77 @@ const fn data_format(size: ULONG, subtype: GUID, specifier: GUID) -> KSDATAFORMA
 
 /// Plage système (`KSDATARANGE_AUDIO`) : spécificateur `WAVEFORMATEX`, sous-type
 /// `subtype` (`KSDATAFORMAT_SUBTYPE_PCM` ou `IEEE_FLOAT`), `bits` par échantillon
-/// exactement, 2 canaux, 48 000 Hz exactement (§4.1).
-pub const fn audio_range(subtype: GUID, bits: ULONG) -> KSDATARANGE_AUDIO {
+/// exactement, `channels` canaux, `rate` Hz exactement (§4.1).
+///
+/// **Ponctuelle des deux côtés** : minimum et maximum confondus pour la profondeur comme
+/// pour la fréquence, et `MaximumChannels` unique. C'est ce qui rend
+/// `DataRangeIntersection` inutile — PortCls intersecte lui-même, et une plage ponctuelle
+/// ne lui laisse rien à choisir. Élargir une borne ici obligerait à implémenter
+/// l'intersection, faute de quoi PortCls proposerait au moteur audio une combinaison que
+/// `NewStream` refuserait ensuite.
+pub const fn audio_range(
+    subtype: GUID,
+    bits: ULONG,
+    channels: ULONG,
+    rate: ULONG,
+) -> KSDATARANGE_AUDIO {
     KSDATARANGE_AUDIO {
         DataRange: data_format(
             KSDATARANGE_AUDIO_SIZE,
             subtype,
             KSDATAFORMAT_SPECIFIER_WAVEFORMATEX,
         ),
-        MaximumChannels: CHANNELS,
+        MaximumChannels: channels,
         MinimumBitsPerSample: bits,
         MaximumBitsPerSample: bits,
-        MinimumSampleFrequency: SAMPLE_RATE,
-        MaximumSampleFrequency: SAMPLE_RATE,
+        MinimumSampleFrequency: rate,
+        MaximumSampleFrequency: rate,
     }
+}
+
+/// Le sous-type KS d'une profondeur : `IEEE_FLOAT` pour le flottant, `PCM` pour les deux
+/// entiers.
+///
+/// Le bras `_` existe parce que `SampleFormat` est `#[non_exhaustive]` et vient d'un autre
+/// crate : il est **inatteignable** pour les trois profondeurs de `SAMPLE_DEPTHS`, ce que
+/// [`variant_ranges_are_well_formed`] vérifie en comparant le sous-type de chaque plage
+/// bâtie. Sans cette vérification, une quatrième profondeur ajoutée un jour se déclarerait
+/// en silence comme du PCM — une plage flottante annoncée en entier est exactement le genre
+/// de faute qui ne se voit qu'à l'écoute.
+const fn subtype_of(depth: SampleFormat) -> GUID {
+    match depth {
+        SampleFormat::F32 => KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
+        SampleFormat::Pcm24 | SampleFormat::I16 => KSDATAFORMAT_SUBTYPE_PCM,
+        _ => KSDATAFORMAT_SUBTYPE_PCM,
+    }
+}
+
+/// Les trois plages système de la variante `variant` : une par profondeur de
+/// `SAMPLE_DEPTHS`, à la fréquence et sur le nombre de canaux de la variante.
+const fn variant_ranges(variant: usize) -> [KSDATARANGE_AUDIO; RANGES_PER_SYSTEM_PIN] {
+    let channels = variant_channels(variant);
+    let rate = variant_rate(variant);
+    // Motif de tranche plutôt qu'indexation : `SAMPLE_DEPTHS` a exactement trois entrées,
+    // et les déstructurer ici fait échouer la compilation si elle en gagnait une — plutôt
+    // que de déclarer en silence une profondeur de moins que la matrice n'en annonce.
+    let [d0, d1, d2] = SAMPLE_DEPTHS;
+    [
+        audio_range(subtype_of(d0), d0.bits_per_sample(), channels, rate),
+        audio_range(subtype_of(d1), d1.bits_per_sample(), channels, rate),
+        audio_range(subtype_of(d2), d2.bits_per_sample(), channels, rate),
+    ]
+}
+
+/// Les [`VARIANT_COUNT`] jeux de plages système, dans l'ordre des variantes.
+#[allow(clippy::indexing_slicing)] // évalué à la compilation, `i < VARIANT_COUNT`
+const fn all_variant_ranges() -> [[KSDATARANGE_AUDIO; RANGES_PER_SYSTEM_PIN]; VARIANT_COUNT] {
+    let mut out = [const { variant_ranges(0) }; VARIANT_COUNT];
+    let mut i = 0;
+    while i < VARIANT_COUNT {
+        out[i] = variant_ranges(i);
+        i = i.wrapping_add(1);
+    }
+    out
 }
 
 /// Plage « analogique » des broches bridge : `KSDATARANGE` simple, sous-type
@@ -309,25 +463,27 @@ pub const fn analog_range() -> KSDATARANGE {
 }
 
 /// Pointeur `PKSDATARANGE` sur une plage logée dans une `static` (`KSDATARANGE_AUDIO`
-/// commence par sa `KSDATARANGE`). Le `cast_mut` satisfait le prototype ; PortCls ne
-/// modifie pas les plages.
-const fn range_ptr<T>(range: &'static Shared<T>) -> PKSDATARANGE {
+/// commence par sa `KSDATARANGE`, et [`Shared`] est `repr(transparent)` : les trois
+/// adresses sont la même). Le `cast_mut` satisfait le prototype ; PortCls ne modifie pas
+/// les plages.
+const fn range_ptr<T>(range: &'static T) -> PKSDATARANGE {
     ptr::from_ref(range).cast::<KSDATARANGE>().cast_mut()
 }
 
 /// Broche de filtre : `flow`/`comm` (§4.1), catégorie `category`, nom `name` (§4.2 :
 /// GUID que KS résout en chaîne dans `HKR\MediaCategories` pour répondre à
 /// `KSPROPERTY_PIN_NAME` — `None` laisse KS retomber sur la catégorie), plages `ranges`
-/// (tableau de pointeurs logé dans une `static`), `instances` instances possibles
-/// (globales et par filtre : 1 pour une broche système, 0 pour une broche bridge, qui ne
-/// s'instancie pas). Ni interface ni médium déclarés (défauts KS), pas de table
-/// d'automatisation propre.
+/// (**rangée** d'un tableau de pointeurs logé dans une `static` : une par variante de
+/// format pour les broches système, l'unique plage analogique pour les autres),
+/// `instances` instances possibles (globales et par filtre : 1 pour une broche système,
+/// 0 pour une broche bridge, qui ne s'instancie pas). Ni interface ni médium déclarés
+/// (défauts KS), pas de table d'automatisation propre.
 pub const fn pin<const N: usize>(
     flow: KSPIN_DATAFLOW::Type,
     comm: KSPIN_COMMUNICATION::Type,
     category: &'static GUID,
     name: Option<&'static GUID>,
-    ranges: &'static Shared<[PKSDATARANGE; N]>,
+    ranges: &'static [PKSDATARANGE; N],
     instances: ULONG,
 ) -> PCPIN_DESCRIPTOR {
     let name = match name {
@@ -363,20 +519,20 @@ pub const fn bridge_pin(flow: KSPIN_DATAFLOW::Type) -> PCPIN_DESCRIPTOR {
         KSPIN_COMMUNICATION::KSPIN_COMMUNICATION_NONE,
         &CATEGORY_AUDIO,
         None,
-        &BRIDGE_RANGES,
+        BRIDGE_RANGES.get(),
         0,
     )
 }
 
 /// Broche système d'un filtre WaveRT : `KSPIN_COMMUNICATION_SINK`, catégorie
-/// `KSCATEGORY_AUDIO`, plages système, une instance.
-const fn system_pin(flow: KSPIN_DATAFLOW::Type) -> PCPIN_DESCRIPTOR {
+/// `KSCATEGORY_AUDIO`, les trois plages système de la variante `variant`, une instance.
+const fn system_pin(flow: KSPIN_DATAFLOW::Type, variant: usize) -> PCPIN_DESCRIPTOR {
     pin(
         flow,
         KSPIN_COMMUNICATION::KSPIN_COMMUNICATION_SINK,
         &CATEGORY_AUDIO,
         None,
-        &SYSTEM_RANGES,
+        ranges_row(&SYSTEM_RANGES_TABLE, variant),
         1,
     )
 }
@@ -399,7 +555,7 @@ const fn endpoint_pin(
         KSPIN_COMMUNICATION::KSPIN_COMMUNICATION_NONE,
         category,
         Some(name),
-        &BRIDGE_RANGES,
+        BRIDGE_RANGES.get(),
         0,
     )
 }
@@ -589,20 +745,59 @@ static NODE_TYPE_VOLUME: GUID = KSNODETYPE_VOLUME;
 /// `KSNODETYPE_MUTE`, adressable.
 static NODE_TYPE_MUTE: GUID = KSNODETYPE_MUTE;
 
-/// Plage système flottante 32 bits.
-static RANGE_F32: Shared<KSDATARANGE_AUDIO> =
-    Shared(audio_range(KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, BITS_F32));
-/// Plage système PCM 16 bits.
-static RANGE_I16: Shared<KSDATARANGE_AUDIO> =
-    Shared(audio_range(KSDATAFORMAT_SUBTYPE_PCM, BITS_I16));
 /// Plage analogique des broches bridge et endpoint.
 static RANGE_ANALOG: Shared<KSDATARANGE> = Shared(analog_range());
 
-/// Plages des broches système (`DataRanges` : tableau de pointeurs).
-static SYSTEM_RANGES: Shared<[PKSDATARANGE; 2]> =
-    Shared([range_ptr(&RANGE_F32), range_ptr(&RANGE_I16)]);
-/// Plage des broches bridge et endpoint.
+/// Plage des broches bridge et endpoint : la même pour tous les câbles et toutes les
+/// variantes — une broche analogique n'a pas de format.
 static BRIDGE_RANGES: Shared<[PKSDATARANGE; 1]> = Shared([range_ptr(&RANGE_ANALOG)]);
+
+/// Les [`VARIANT_COUNT`] × 3 plages système, **les valeurs** : c'est ici qu'elles vivent,
+/// et c'est leur adresse que les tableaux de pointeurs ci-dessous conservent.
+///
+/// 24 × 3 × 88 octets = 6 336 octets dans la section de données du pilote. Les avoir
+/// toutes à la compilation plutôt que d'en bâtir une au démarrage est ce qui permet aux
+/// assertions `const` de les vérifier — et le coût est celui d'une page et demie.
+static SYSTEM_RANGE_VALUES: Shared<[[KSDATARANGE_AUDIO; RANGES_PER_SYSTEM_PIN]; VARIANT_COUNT]> =
+    Shared(all_variant_ranges());
+
+/// Les trois pointeurs de plage de la variante `variant`, visant la rangée correspondante
+/// de `table`.
+#[allow(clippy::indexing_slicing)] // évalué à la compilation, `variant < VARIANT_COUNT`
+const fn system_range_ptrs(
+    table: &'static Shared<[[KSDATARANGE_AUDIO; RANGES_PER_SYSTEM_PIN]; VARIANT_COUNT]>,
+    variant: usize,
+) -> [PKSDATARANGE; RANGES_PER_SYSTEM_PIN] {
+    let [f32_, pcm24, i16_] = &table.get()[variant];
+    [range_ptr(f32_), range_ptr(pcm24), range_ptr(i16_)]
+}
+
+/// Les [`VARIANT_COUNT`] tableaux de pointeurs `DataRanges`, un par variante.
+#[allow(clippy::indexing_slicing)] // évalué à la compilation
+const fn all_system_range_ptrs() -> [[PKSDATARANGE; RANGES_PER_SYSTEM_PIN]; VARIANT_COUNT] {
+    let mut out = [const { system_range_ptrs(&SYSTEM_RANGE_VALUES, 0) }; VARIANT_COUNT];
+    let mut i = 0;
+    while i < VARIANT_COUNT {
+        out[i] = system_range_ptrs(&SYSTEM_RANGE_VALUES, i);
+        i = i.wrapping_add(1);
+    }
+    out
+}
+
+/// Plages des broches système (`DataRanges` : tableau de pointeurs), **une rangée par
+/// variante de format**.
+static SYSTEM_RANGES_TABLE: Shared<[[PKSDATARANGE; RANGES_PER_SYSTEM_PIN]; VARIANT_COUNT]> =
+    Shared(all_system_range_ptrs());
+
+/// La rangée de plages de la variante `variant` : c'est son adresse que
+/// `KSPIN_DESCRIPTOR::DataRanges` conserve.
+#[allow(clippy::indexing_slicing)] // évalué à la compilation, `variant < VARIANT_COUNT`
+const fn ranges_row(
+    table: &'static Shared<[[PKSDATARANGE; RANGES_PER_SYSTEM_PIN]; VARIANT_COUNT]>,
+    variant: usize,
+) -> &'static [PKSDATARANGE; RANGES_PER_SYSTEM_PIN] {
+    &table.get()[variant]
+}
 
 /// Table d'automatisation vide : tailles d'élément renseignées, aucun élément.
 ///
@@ -804,19 +999,50 @@ const TOPO_CONNECTIONS: [PCCONNECTION_DESCRIPTOR; TOPO_CONNECTION_COUNT] = [
 static TOPO_CONNECTIONS_TABLE: Shared<[PCCONNECTION_DESCRIPTOR; TOPO_CONNECTION_COUNT]> =
     Shared(TOPO_CONNECTIONS);
 
-/// Broches de `WaveRender` : système (entrée) puis bridge (sortie).
-const WAVE_RENDER_PINS: [PCPIN_DESCRIPTOR; PIN_COUNT] = [
-    system_pin(KSPIN_DATAFLOW::KSPIN_DATAFLOW_IN),
-    bridge_pin(KSPIN_DATAFLOW::KSPIN_DATAFLOW_OUT),
-];
-/// Broches de `WaveCapture` : bridge (entrée) puis système (sortie).
-const WAVE_CAPTURE_PINS: [PCPIN_DESCRIPTOR; PIN_COUNT] = [
-    bridge_pin(KSPIN_DATAFLOW::KSPIN_DATAFLOW_IN),
-    system_pin(KSPIN_DATAFLOW::KSPIN_DATAFLOW_OUT),
-];
+/// Broches de `WaveRender` pour la variante `variant` : système (entrée, plages de la
+/// variante) puis bridge (sortie).
+const fn wave_render_pins(variant: usize) -> [PCPIN_DESCRIPTOR; PIN_COUNT] {
+    [
+        system_pin(KSPIN_DATAFLOW::KSPIN_DATAFLOW_IN, variant),
+        bridge_pin(KSPIN_DATAFLOW::KSPIN_DATAFLOW_OUT),
+    ]
+}
+/// Broches de `WaveCapture` pour la variante `variant` : bridge (entrée) puis système
+/// (sortie, plages de la variante).
+const fn wave_capture_pins(variant: usize) -> [PCPIN_DESCRIPTOR; PIN_COUNT] {
+    [
+        bridge_pin(KSPIN_DATAFLOW::KSPIN_DATAFLOW_IN),
+        system_pin(KSPIN_DATAFLOW::KSPIN_DATAFLOW_OUT, variant),
+    ]
+}
 
-static WAVE_RENDER_PINS_TABLE: Shared<[PCPIN_DESCRIPTOR; PIN_COUNT]> = Shared(WAVE_RENDER_PINS);
-static WAVE_CAPTURE_PINS_TABLE: Shared<[PCPIN_DESCRIPTOR; PIN_COUNT]> = Shared(WAVE_CAPTURE_PINS);
+/// Les [`VARIANT_COUNT`] jeux de broches d'un sens wave (`rendu` comme dans
+/// [`topo_pins_table`] : un `bool` plutôt qu'un pointeur de fonction, que l'évaluation
+/// `const` n'appelle pas).
+#[allow(clippy::indexing_slicing)] // évalué à la compilation
+const fn wave_pins_table(rendu: bool) -> [[PCPIN_DESCRIPTOR; PIN_COUNT]; VARIANT_COUNT] {
+    let mut out = [const { wave_render_pins(0) }; VARIANT_COUNT];
+    let mut i = 0;
+    while i < VARIANT_COUNT {
+        out[i] = if rendu {
+            wave_render_pins(i)
+        } else {
+            wave_capture_pins(i)
+        };
+        i = i.wrapping_add(1);
+    }
+    out
+}
+
+/// Broches des 24 filtres `WaveRender`, une rangée par variante de format.
+const WAVE_RENDER_PINS: [[PCPIN_DESCRIPTOR; PIN_COUNT]; VARIANT_COUNT] = wave_pins_table(true);
+/// Broches des 24 filtres `WaveCapture`.
+const WAVE_CAPTURE_PINS: [[PCPIN_DESCRIPTOR; PIN_COUNT]; VARIANT_COUNT] = wave_pins_table(false);
+
+static WAVE_RENDER_PINS_TABLE: Shared<[[PCPIN_DESCRIPTOR; PIN_COUNT]; VARIANT_COUNT]> =
+    Shared(WAVE_RENDER_PINS);
+static WAVE_CAPTURE_PINS_TABLE: Shared<[[PCPIN_DESCRIPTOR; PIN_COUNT]; VARIANT_COUNT]> =
+    Shared(WAVE_CAPTURE_PINS);
 
 /// Broches de `TopoRender<n>` : bridge (entrée) puis endpoint (sortie), nommé par le GUID
 /// du câble `cable`.
@@ -877,14 +1103,20 @@ static TOPO_RENDER_PINS_TABLE: Shared<[[PCPIN_DESCRIPTOR; PIN_COUNT]; CABLE_COUN
 static TOPO_CAPTURE_PINS_TABLE: Shared<[[PCPIN_DESCRIPTOR; PIN_COUNT]; CABLE_COUNT]> =
     Shared(TOPO_CAPTURE_PINS);
 
-/// La rangée du câble `cable` dans une table de broches logée dans une `static` : c'est
-/// son adresse que `PCFILTER_DESCRIPTOR::Pins` conserve.
-#[allow(clippy::indexing_slicing)] // évalué à la compilation, `cable < CABLE_COUNT`
-const fn pins_row(
-    table: &'static Shared<[[PCPIN_DESCRIPTOR; PIN_COUNT]; CABLE_COUNT]>,
-    cable: usize,
+/// La rangée `index` d'une table de broches logée dans une `static` : c'est son adresse
+/// que `PCFILTER_DESCRIPTOR::Pins` conserve.
+///
+/// Générique sur la longueur de la table depuis M1b-05 : les filtres de topologie en ont
+/// une par **câble** ([`CABLE_COUNT`] rangées, le GUID de nom variant), les filtres wave
+/// une par **variante de format** ([`VARIANT_COUNT`] rangées, les plages variant). Deux
+/// axes, une seule fonction — et le `const` générique interdit de confondre les deux
+/// tables, ce qu'un paramètre `usize` nu aurait laissé passer.
+#[allow(clippy::indexing_slicing)] // évalué à la compilation, `index < N`
+const fn pins_row<const N: usize>(
+    table: &'static Shared<[[PCPIN_DESCRIPTOR; PIN_COUNT]; N]>,
+    index: usize,
 ) -> &'static [PCPIN_DESCRIPTOR; PIN_COUNT] {
-    &table.get()[cable]
+    &table.get()[index]
 }
 
 /// Descripteur du filtre `TopoRender<n>` du câble `cable`.
@@ -924,20 +1156,48 @@ const fn topo_filters(rendu: bool) -> [PCFILTER_DESCRIPTOR; CABLE_COUNT] {
     out
 }
 
-/// Descripteur du filtre `WaveRender<n>` (rendu par `wave::WaveRender::description`).
-///
-/// **Un seul pour les seize câbles** : rien n'y est par câble (le nom de broche est sur
-/// les filtres de topologie).
-pub static WAVE_RENDER_FILTER: Shared<PCFILTER_DESCRIPTOR> = Shared(wave_filter(
-    WAVE_RENDER_PINS_TABLE.get(),
-    &DIRECT_CONNECTION_TABLE,
-));
-/// Descripteur du filtre `WaveCapture<n>` (rendu par `wave::WaveCapture::description`),
-/// unique lui aussi.
-pub static WAVE_CAPTURE_FILTER: Shared<PCFILTER_DESCRIPTOR> = Shared(wave_filter(
-    WAVE_CAPTURE_PINS_TABLE.get(),
-    &DIRECT_CONNECTION_TABLE,
-));
+/// Descripteur du filtre `WaveRender` de la variante `variant`.
+const fn wave_render_filter_of(variant: usize) -> PCFILTER_DESCRIPTOR {
+    wave_filter(
+        pins_row(&WAVE_RENDER_PINS_TABLE, variant),
+        &DIRECT_CONNECTION_TABLE,
+    )
+}
+
+/// Descripteur du filtre `WaveCapture` de la variante `variant`.
+const fn wave_capture_filter_of(variant: usize) -> PCFILTER_DESCRIPTOR {
+    wave_filter(
+        pins_row(&WAVE_CAPTURE_PINS_TABLE, variant),
+        &DIRECT_CONNECTION_TABLE,
+    )
+}
+
+/// Les [`VARIANT_COUNT`] descripteurs de filtre wave d'un sens (voir [`wave_pins_table`]
+/// pour `rendu`).
+#[allow(clippy::indexing_slicing)] // évalué à la compilation
+const fn wave_filters(rendu: bool) -> [PCFILTER_DESCRIPTOR; VARIANT_COUNT] {
+    let mut out = [const { wave_render_filter_of(0) }; VARIANT_COUNT];
+    let mut i = 0;
+    while i < VARIANT_COUNT {
+        out[i] = if rendu {
+            wave_render_filter_of(i)
+        } else {
+            wave_capture_filter_of(i)
+        };
+        i = i.wrapping_add(1);
+    }
+    out
+}
+
+/// Descripteurs des 24 filtres `WaveRender` (const : lu par les assertions).
+const WAVE_RENDER_FILTERS: [PCFILTER_DESCRIPTOR; VARIANT_COUNT] = wave_filters(true);
+/// Descripteurs des 24 filtres `WaveCapture`.
+const WAVE_CAPTURE_FILTERS: [PCFILTER_DESCRIPTOR; VARIANT_COUNT] = wave_filters(false);
+
+static WAVE_RENDER_FILTER_TABLE: Shared<[PCFILTER_DESCRIPTOR; VARIANT_COUNT]> =
+    Shared(WAVE_RENDER_FILTERS);
+static WAVE_CAPTURE_FILTER_TABLE: Shared<[PCFILTER_DESCRIPTOR; VARIANT_COUNT]> =
+    Shared(WAVE_CAPTURE_FILTERS);
 
 /// Descripteurs des seize filtres `TopoRender<n>` (const : lu par les assertions).
 const TOPO_RENDER_FILTERS: [PCFILTER_DESCRIPTOR; CABLE_COUNT] = topo_filters(true);
@@ -967,6 +1227,110 @@ pub fn topo_capture_filter(cable: u32) -> Option<&'static PCFILTER_DESCRIPTOR> {
     usize::try_from(cable)
         .ok()
         .and_then(|index| TOPO_CAPTURE_FILTER_TABLE.get().get(index))
+}
+
+// ---------------------------------------------------------------------------------
+// Le format de chaque câble, lu une fois au démarrage (M1b-05).
+// ---------------------------------------------------------------------------------
+
+/// Le format de chaque câble, **encodé** (`CableFormat::encode`), tel que le registre l'a
+/// fixé au dernier `StartDevice`.
+///
+/// # Pourquoi ici, et pourquoi encodé
+///
+/// *Ici* parce que c'est ce module qui traduit un format en variante de descripteurs, et
+/// que le seul usage de cette valeur est de choisir une rangée de table. La loger dans
+/// `cable::Cable` aurait mêlé de la **configuration** (lue au démarrage, immuable ensuite)
+/// à de l'**état** (le flux courant, l'état de connexion), et le câble n'est pas le seul
+/// lecteur : `wave` choisit son descripteur avant même qu'un flux existe.
+///
+/// *Encodé* parce qu'un `AtomicU32` se lit sans verrou depuis n'importe quel IRQL, et que
+/// l'encodage est déjà la représentation canonique — en garder une seconde, décodée,
+/// obligerait à les tenir cohérentes. `Relaxed` partout : la valeur est écrite une fois par
+/// `StartDevice`, avant l'enregistrement du moindre sous-périphérique, donc avant qu'aucun
+/// lecteur n'existe ; il n'y a aucune relation d'ordre à établir avec un autre champ. C'est
+/// le raisonnement de `cable::Cable::connected`, à l'identique.
+static CABLE_FORMATS: [AtomicU32; CABLE_COUNT] =
+    [const { AtomicU32::new(CABLE_FORMAT_DEFAULT.encode()) }; CABLE_COUNT];
+
+/// Fixe le format du câble `cable`. Sans effet au-delà du dernier câble.
+///
+/// Appelée par `registry::read_params` à chaque `StartDevice`, **avant** que le moindre
+/// sous-périphérique ne soit enregistré : les descripteurs sont demandés plus tard, par
+/// `wave::WaveRender::description` et consorts.
+///
+/// IRQL : `PASSIVE_LEVEL` (contexte de `IRP_MN_START_DEVICE`).
+pub fn apply_cable_format(cable: u32, format: CableFormat) {
+    if let Some(slot) = usize::try_from(cable)
+        .ok()
+        .and_then(|i| CABLE_FORMATS.get(i))
+    {
+        slot.store(format.encode(), Ordering::Relaxed);
+    }
+}
+
+/// Le format du câble `cable`, ou [`CABLE_FORMAT_DEFAULT`] au-delà du dernier câble.
+///
+/// Le repli couvre aussi l'impossible — une valeur stockée que `decode` refuserait — parce
+/// que la seule écriture passe par [`apply_cable_format`], qui encode un format déjà
+/// validé. Rendre le défaut vaut mieux qu'un `Option` que chaque appelant traiterait à sa
+/// façon : c'est l'idiome de `cable::NodeState::volume` et de `topo_render_filter_0`.
+///
+/// IRQL : quelconque.
+#[must_use]
+pub fn cable_format(cable: u32) -> CableFormat {
+    usize::try_from(cable)
+        .ok()
+        .and_then(|i| CABLE_FORMATS.get(i))
+        .map(|slot| slot.load(Ordering::Relaxed))
+        .and_then(|brut| CableFormat::decode(brut).ok())
+        .unwrap_or(CABLE_FORMAT_DEFAULT)
+}
+
+/// Descripteur du filtre `WaveRender` servant `format`, `None` si sa variante n'existe
+/// pas.
+#[must_use]
+pub fn wave_render_filter(format: CableFormat) -> Option<&'static PCFILTER_DESCRIPTOR> {
+    variant_of(format).and_then(|variant| WAVE_RENDER_FILTER_TABLE.get().get(variant))
+}
+
+/// Descripteur du filtre `WaveCapture` servant `format`, `None` si sa variante n'existe
+/// pas.
+#[must_use]
+pub fn wave_capture_filter(format: CableFormat) -> Option<&'static PCFILTER_DESCRIPTOR> {
+    variant_of(format).and_then(|variant| WAVE_CAPTURE_FILTER_TABLE.get().get(variant))
+}
+
+/// Le filtre `WaveRender` du format par défaut, repli de [`wave_render_filter`].
+///
+/// [`DEFAULT_VARIANT`] existe (assertion `const` plus haut), mais le trait
+/// `MiniportWaveRT::description` rend une **référence** : il faut donc un chemin sans
+/// `Option` ni panique, exactement comme [`topo_render_filter_0`]. Le motif de tranche
+/// `split_at` évite l'indexation.
+#[must_use]
+pub fn wave_render_filter_default() -> &'static PCFILTER_DESCRIPTOR {
+    variant_or_first(WAVE_RENDER_FILTER_TABLE.get())
+}
+
+/// Le filtre `WaveCapture` du format par défaut, repli de [`wave_capture_filter`].
+#[must_use]
+pub fn wave_capture_filter_default() -> &'static PCFILTER_DESCRIPTOR {
+    variant_or_first(WAVE_CAPTURE_FILTER_TABLE.get())
+}
+
+/// La variante par défaut de `table`, ou sa première entrée si l'index n'y était pas —
+/// ce qui ne peut arriver que si [`DEFAULT_VARIANT`] et [`VARIANT_COUNT`] divergeaient,
+/// cas que les assertions `const` interdisent déjà.
+fn variant_or_first(
+    table: &'static [PCFILTER_DESCRIPTOR; VARIANT_COUNT],
+) -> &'static PCFILTER_DESCRIPTOR {
+    match table.get(DEFAULT_VARIANT) {
+        Some(filtre) => filtre,
+        None => {
+            let [premier, ..] = table;
+            premier
+        }
+    }
 }
 
 /// Le filtre `TopoRender0`, repli de [`topo_render_filter`] : le câble 0 existe toujours
@@ -1044,6 +1408,148 @@ const fn topo_pins_are_well_formed(
     true
 }
 
+/// Les deux broches d'un filtre wave, pour **toutes** les rangées d'une table (une par
+/// variante de format) : orientation, communication, comptes de plages, et aucune broche
+/// nommée (le nom du câble est sur les filtres de topologie).
+///
+/// `systeme_en_entree` : vrai pour `WaveRender` (le lecteur écrit sur la broche 0), faux
+/// pour `WaveCapture` (l'enregistreur lit sur la broche 1).
+///
+/// Motif de tranche : ni indexation ni arithmétique.
+const fn wave_pins_are_well_formed(
+    mut rangees: &[[PCPIN_DESCRIPTOR; PIN_COUNT]],
+    systeme_en_entree: bool,
+) -> bool {
+    while let [rangee, reste @ ..] = rangees {
+        let [entree, sortie] = rangee;
+        let (systeme, bridge) = if systeme_en_entree {
+            (entree, sortie)
+        } else {
+            (sortie, entree)
+        };
+        if !pin_is(
+            entree,
+            KSPIN_DATAFLOW::KSPIN_DATAFLOW_IN,
+            if systeme_en_entree {
+                KSPIN_COMMUNICATION::KSPIN_COMMUNICATION_SINK
+            } else {
+                KSPIN_COMMUNICATION::KSPIN_COMMUNICATION_NONE
+            },
+            if systeme_en_entree { 1 } else { 0 },
+        ) || !pin_is(
+            sortie,
+            KSPIN_DATAFLOW::KSPIN_DATAFLOW_OUT,
+            if systeme_en_entree {
+                KSPIN_COMMUNICATION::KSPIN_COMMUNICATION_NONE
+            } else {
+                KSPIN_COMMUNICATION::KSPIN_COMMUNICATION_SINK
+            },
+            if systeme_en_entree { 0 } else { 1 },
+        ) {
+            return false;
+        }
+        // Trois plages système (une par profondeur), une plage analogique sur le bridge.
+        if systeme.KsPinDescriptor.DataRangesCount as usize != RANGES_PER_SYSTEM_PIN
+            || bridge.KsPinDescriptor.DataRangesCount != 1
+        {
+            return false;
+        }
+        // Aucune broche wave ne porte de nom : KS retombe sur la catégorie, et le nom du
+        // câble est ailleurs.
+        if !systeme.KsPinDescriptor.Name.is_null() || !bridge.KsPinDescriptor.Name.is_null() {
+            return false;
+        }
+        rangees = reste;
+    }
+    true
+}
+
+/// Chaque variante déclare bien la fréquence et le nombre de canaux qu'elle annonce, dans
+/// les trois profondeurs, et toutes ses plages sont **ponctuelles**.
+///
+/// C'est l'assertion la plus utile de M1b-05, parce que la panne qu'elle attrape est
+/// muette : vingt-quatre variantes toutes bâties sur les mêmes valeurs — un `variant` qui
+/// ne serait pas propagé, un `wrapping_rem` pris pour un `wrapping_div` — donneraient un
+/// pilote qui charge, seize endpoints qui apparaissent, et pas un câble au format demandé.
+/// Rien dans le journal, rien dans `infverif`, rien dans la VM avant l'écoute.
+#[allow(clippy::indexing_slicing)] // évalué à la compilation, `variant < VARIANT_COUNT`
+const fn variant_ranges_are_well_formed() -> bool {
+    let mut variant = 0;
+    while variant < VARIANT_COUNT {
+        let canaux = variant_channels(variant);
+        let frequence = variant_rate(variant);
+        // La variante doit se retrouver depuis ses propres valeurs : c'est le contrôle
+        // qui attrape un rangement décalé d'un cran.
+        let index = match conduit_kmd_core::sample_rate_index(frequence) {
+            Some(rate_index) => variant_index(rate_index, canaux as u8),
+            None => None,
+        };
+        if !matches!(index, Some(i) if i == variant) {
+            return false;
+        }
+        let [f32_, pcm24, i16_] = &SYSTEM_RANGE_VALUES.get()[variant];
+        if !range_is(
+            f32_,
+            &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
+            32,
+            canaux,
+            frequence,
+        ) || !range_is(pcm24, &KSDATAFORMAT_SUBTYPE_PCM, 24, canaux, frequence)
+            || !range_is(i16_, &KSDATAFORMAT_SUBTYPE_PCM, 16, canaux, frequence)
+        {
+            return false;
+        }
+        variant = variant.wrapping_add(1);
+    }
+    true
+}
+
+/// Égalité de deux `GUID` en contexte `const` (le type généré n'implémente pas
+/// `PartialEq`). Motif de tranche sur `Data4` : ni indexation ni arithmétique.
+const fn guid_eq(a: &GUID, b: &GUID) -> bool {
+    let [a0, a1, a2, a3, a4, a5, a6, a7] = a.Data4;
+    let [b0, b1, b2, b3, b4, b5, b6, b7] = b.Data4;
+    a.Data1 == b.Data1
+        && a.Data2 == b.Data2
+        && a.Data3 == b.Data3
+        && a0 == b0
+        && a1 == b1
+        && a2 == b2
+        && a3 == b3
+        && a4 == b4
+        && a5 == b5
+        && a6 == b6
+        && a7 == b7
+}
+
+/// Une plage système : sous-type, profondeur, canaux et fréquence attendus, bornes
+/// **ponctuelles** des deux côtés, spécificateur `WAVEFORMATEX` et `FormatSize` exact.
+///
+/// Le sous-type est vérifié parce que rien d'autre ne le ferait : une plage flottante
+/// annoncée en `KSDATAFORMAT_SUBTYPE_PCM` a la bonne taille, les bonnes bornes, le bon
+/// `FormatSize`, et ne se manifeste qu'à l'écoute — le moteur audio y écrirait des entiers
+/// que le câble relirait comme des flottants.
+const fn range_is(
+    range: &KSDATARANGE_AUDIO,
+    subtype: &GUID,
+    bits: ULONG,
+    channels: ULONG,
+    rate: ULONG,
+) -> bool {
+    // SAFETY: lecture du membre nommé de l'union, le seul que `data_format` écrive.
+    let header = unsafe { range.DataRange.__bindgen_anon_1 };
+    range.MaximumChannels == channels
+        && range.MinimumBitsPerSample == bits
+        && range.MaximumBitsPerSample == bits
+        && range.MinimumSampleFrequency == rate
+        && range.MaximumSampleFrequency == rate
+        && header.FormatSize == KSDATARANGE_AUDIO_SIZE
+        && header.Flags == 0
+        && guid_eq(&header.MajorFormat, &KSDATAFORMAT_TYPE_AUDIO)
+        && guid_eq(&header.SubFormat, subtype)
+        && guid_eq(&header.Specifier, &KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)
+}
+
 /// Les GUID de nom de broche portent le numéro du câble, dans l'ordre : `names[i]` a
 /// `Data4[7] == depart + i`.
 ///
@@ -1065,45 +1571,37 @@ const fn pin_names_are_numbered(mut names: &[GUID], mut attendu: u8) -> bool {
 }
 
 const _: () = {
-    use KSPIN_COMMUNICATION::{KSPIN_COMMUNICATION_NONE as NONE, KSPIN_COMMUNICATION_SINK as SINK};
-    use KSPIN_DATAFLOW::{KSPIN_DATAFLOW_IN as IN, KSPIN_DATAFLOW_OUT as OUT};
-
     // Deux broches par filtre, numérotées par la direction des données ; un jeu de
-    // broches de topologie par câble.
-    assert!(WAVE_RENDER_PINS.len() == PIN_COUNT && WAVE_CAPTURE_PINS.len() == PIN_COUNT);
+    // broches de topologie par câble, un jeu de broches wave par **variante de format**.
+    assert!(WAVE_RENDER_PINS.len() == VARIANT_COUNT && WAVE_CAPTURE_PINS.len() == VARIANT_COUNT);
     assert!(TOPO_RENDER_PINS.len() == CABLE_COUNT && TOPO_CAPTURE_PINS.len() == CABLE_COUNT);
     assert!(WAVE_RENDER_PIN_SYSTEM == 0 && WAVE_RENDER_PIN_BRIDGE == 1);
     assert!(TOPO_RENDER_PIN_BRIDGE == 0 && TOPO_RENDER_PIN_ENDPOINT == 1);
     assert!(WAVE_CAPTURE_PIN_BRIDGE == 0 && WAVE_CAPTURE_PIN_SYSTEM == 1);
     assert!(TOPO_CAPTURE_PIN_ENDPOINT == 0 && TOPO_CAPTURE_PIN_BRIDGE == 1);
 
-    // Orientation : broches système `SINK` à 1 instance, bridges et endpoints `NONE` à 0.
-    assert!(pin_is(&WAVE_RENDER_PINS[0], IN, SINK, 1));
-    assert!(pin_is(&WAVE_RENDER_PINS[1], OUT, NONE, 0));
-    assert!(pin_is(&WAVE_CAPTURE_PINS[0], IN, NONE, 0));
-    assert!(pin_is(&WAVE_CAPTURE_PINS[1], OUT, SINK, 1));
+    // Orientation, nommage et comptes de plages, sur les **24** rangées de chaque sens et
+    // pas seulement la première : une variante mal bâtie ne se manifesterait que sur les
+    // câbles réglés dessus, c'est-à-dire chez l'utilisateur et nulle part ailleurs.
+    assert!(wave_pins_are_well_formed(&WAVE_RENDER_PINS, true));
+    assert!(wave_pins_are_well_formed(&WAVE_CAPTURE_PINS, false));
     // Les seize jeux de broches de topologie, orientation et nommage compris.
     assert!(topo_pins_are_well_formed(&TOPO_RENDER_PINS, true));
     assert!(topo_pins_are_well_formed(&TOPO_CAPTURE_PINS, false));
 
-    // Plages : deux plages système, une plage analogique.
-    assert!(WAVE_RENDER_PINS[0].KsPinDescriptor.DataRangesCount == 2);
-    assert!(WAVE_RENDER_PINS[1].KsPinDescriptor.DataRangesCount == 1);
-    assert!(WAVE_CAPTURE_PINS[1].KsPinDescriptor.DataRangesCount == 2);
+    // Chaque variante déclare bien SA fréquence et SES canaux, dans les trois profondeurs.
+    // C'est l'assertion qui sépare une matrice correcte d'une matrice dont toutes les
+    // entrées seraient celle du défaut — panne parfaitement muette : le pilote chargerait,
+    // les endpoints apparaîtraient, et tous seraient stéréo à 48 kHz.
+    assert!(variant_ranges_are_well_formed());
 
-    // Plages système : 2 canaux, 48 kHz, 32 bits flottants et 16 bits PCM, `FormatSize`
-    // exact.
-    let range_f32 = audio_range(KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, BITS_F32);
-    let range_i16 = audio_range(KSDATAFORMAT_SUBTYPE_PCM, BITS_I16);
-    assert!(range_f32.MaximumChannels == 2 && range_i16.MaximumChannels == 2);
-    assert!(range_f32.MinimumSampleFrequency == 48_000);
-    assert!(range_f32.MaximumSampleFrequency == 48_000);
-    assert!(range_i16.MinimumSampleFrequency == 48_000);
-    assert!(range_i16.MaximumSampleFrequency == 48_000);
-    assert!(range_f32.MinimumBitsPerSample == 32 && range_f32.MaximumBitsPerSample == 32);
-    assert!(range_i16.MinimumBitsPerSample == 16 && range_i16.MaximumBitsPerSample == 16);
+    // `FormatSize` exact, sur une plage prise au hasard de la matrice et sur l'analogique.
     // SAFETY: lecture du membre nommé de l'union, celui que `data_format` a écrit.
-    let header = unsafe { range_f32.DataRange.__bindgen_anon_1 };
+    let header = unsafe {
+        audio_range(KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, 32, 2, 48_000)
+            .DataRange
+            .__bindgen_anon_1
+    };
     assert!(header.FormatSize == 88 && header.Flags == 0);
     // SAFETY: idem.
     let analog = unsafe { analog_range().__bindgen_anon_1 };
@@ -1115,10 +1613,6 @@ const _: () = {
     // l'est, et c'est lui qui distingue les seize câbles.
     assert!(PIN_NAME_GUIDS.len() == CABLE_COUNT);
     assert!(pin_names_are_numbered(&PIN_NAME_GUIDS, 0));
-    assert!(WAVE_RENDER_PINS[0].KsPinDescriptor.Name.is_null());
-    assert!(WAVE_RENDER_PINS[1].KsPinDescriptor.Name.is_null());
-    assert!(WAVE_CAPTURE_PINS[0].KsPinDescriptor.Name.is_null());
-    assert!(WAVE_CAPTURE_PINS[1].KsPinDescriptor.Name.is_null());
 
     // Connexion directe 0 → 1 via `PCFILTER_NODE`.
     let direct = connection(PCFILTER_NODE, 0, PCFILTER_NODE, 1);
@@ -1169,22 +1663,24 @@ const fn topo_filters_are_well_formed(mut filters: &[PCFILTER_DESCRIPTOR]) -> bo
     true
 }
 
+/// Tous les filtres d'une table wave (même motif de tranche).
+const fn wave_filters_are_well_formed(mut filters: &[PCFILTER_DESCRIPTOR]) -> bool {
+    while let [premier, reste @ ..] = filters {
+        if !wave_filter_is_well_formed(premier) {
+            return false;
+        }
+        filters = reste;
+    }
+    true
+}
+
 const _: () = {
-    assert!(wave_filter_is_well_formed(&wave_filter::<
-        PIN_COUNT,
-        WAVE_CONNECTION_COUNT,
-    >(
-        WAVE_RENDER_PINS_TABLE.get(),
-        &DIRECT_CONNECTION_TABLE
-    )));
-    assert!(wave_filter_is_well_formed(&wave_filter::<
-        PIN_COUNT,
-        WAVE_CONNECTION_COUNT,
-    >(
-        WAVE_CAPTURE_PINS_TABLE.get(),
-        &DIRECT_CONNECTION_TABLE
-    )));
-    // Les seize filtres de chaque sens, et pas seulement le premier.
+    // Les 24 filtres wave de chaque sens, et pas seulement le premier.
+    assert!(WAVE_RENDER_FILTERS.len() == VARIANT_COUNT);
+    assert!(WAVE_CAPTURE_FILTERS.len() == VARIANT_COUNT);
+    assert!(wave_filters_are_well_formed(&WAVE_RENDER_FILTERS));
+    assert!(wave_filters_are_well_formed(&WAVE_CAPTURE_FILTERS));
+    // Les seize filtres de topologie de chaque sens, idem.
     assert!(TOPO_RENDER_FILTERS.len() == CABLE_COUNT);
     assert!(TOPO_CAPTURE_FILTERS.len() == CABLE_COUNT);
     assert!(topo_filters_are_well_formed(&TOPO_RENDER_FILTERS));

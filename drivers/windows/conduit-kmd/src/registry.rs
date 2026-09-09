@@ -7,23 +7,31 @@
 //! aussi le masque `ActiveCables` ([`read_active_cables`]), que le gestionnaire de
 //! propriété privée réécrit ensuite à chaque changement ([`write_active_cables`]).
 //!
-//! # Deux natures, deux chemins
+//! # Trois natures, trois chemins
 //!
-//! Les trois paramètres et le masque partagent la même clé et les mêmes primitives, mais
-//! **pas la même nature**, et c'est pourquoi ils ne passent pas par la même fonction :
+//! Les trois paramètres, le masque et les seize formats partagent la même clé et les mêmes
+//! primitives, mais **pas la même nature**, et c'est pourquoi ils ne passent pas par la
+//! même fonction :
 //!
-//! | | `ReserveSize`, `Channels`, `BufferMs` | `ActiveCables` |
-//! |---|---|---|
-//! | Qui écrit | l'administrateur (et l'INF, une fois) | le **pilote**, à chaque `SET` |
-//! | Quand c'est lu | `StartDevice` | `StartDevice` |
-//! | Ce que c'est | de la configuration | de l'**état** |
+//! | | `ReserveSize`, `Channels`, `BufferMs` | `CableFormat<n>` | `ActiveCables` |
+//! |---|---|---|---|
+//! | Qui écrit | l'administrateur (et l'INF, une fois) | le **service**, puis redémarrage du devnode | le **pilote**, à chaque `SET` |
+//! | Quand c'est lu | `StartDevice` | `StartDevice` | `StartDevice` |
+//! | Ce que c'est | de la configuration | de la configuration | de l'**état** |
 //!
-//! Les fondre dans [`read_params`] aurait demandé un quatrième `Param` dans le crate
-//! portable, donc un quatrième défaut, un quatrième rang de code d'événement et une
+//! Fondre `ActiveCables` dans [`read_params`] aurait demandé un quatrième `Param` dans le
+//! crate portable, donc un quatrième défaut, un quatrième rang de code d'événement et une
 //! quatrième correction — pour une valeur que l'administrateur n'est pas censé régler à la
 //! main et que le pilote écrase à la première demande de l'utilisateur. Le prix de la
 //! séparation est **une ouverture de clé de plus** au démarrage, négligeable devant les
 //! seize câbles à enregistrer.
+//!
+//! Les seize `CableFormat<n>` (M1b-05), eux, sont lus **dans** [`read_params`] et sur la
+//! même ouverture de clé : ce sont des paramètres de démarrage comme les trois autres,
+//! simplement indexés par câble. La seule différence est ce qu'on en fait — ils ne
+//! ressortent pas dans les [`Params`] mais sont déposés dans le magasin de
+//! `crate::descriptors` ([`conduit_kmd::descriptors::apply_cable_format`]), le seul lecteur
+//! qui compte, avant que le moindre sous-périphérique ne soit enregistré.
 //!
 //! # La règle qui gouverne tout ce module : **on charge quand même**
 //!
@@ -84,8 +92,11 @@
 //! gestionnaire de propriété pour l'écriture), exigé par `IoOpenDeviceRegistryKey` comme
 //! par `ZwQueryValueKey` et `ZwSetValueKey`.
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use conduit_kmd_core::config::{
-    ACTIVE_CABLES_DEFAULT, ACTIVE_CABLES_LABEL, ACTIVE_CABLES_VALUE_NAME, sanitize_mask,
+    ACTIVE_CABLES_DEFAULT, ACTIVE_CABLES_LABEL, ACTIVE_CABLES_VALUE_NAME, CABLE_FORMAT_DEFAULT,
+    CABLE_FORMAT_LABEL, CABLE_FORMAT_VALUE_NAMES, CableFormat, sanitize_mask,
 };
 use conduit_kmd_core::params::{self, Param, Params, RawParams};
 use portcls::conduit_com::{NtStatus, nt_success};
@@ -100,6 +111,7 @@ use wdk_sys::{
     STATUS_SUCCESS, ULONG, UNICODE_STRING, USHORT, WCHAR,
 };
 
+use crate::descriptors::apply_cable_format;
 use crate::eventlog::{EventLog, kmd_event};
 
 /// Le `REG_DWORD` du décodeur portable est bien celui du WDK.
@@ -139,6 +151,16 @@ const _: () = assert!(Param::Reserve.value_name().len() < NAME_UNITS);
 const _: () = assert!(Param::Channels.value_name().len() < NAME_UNITS);
 const _: () = assert!(Param::BufferMs.value_name().len() < NAME_UNITS);
 const _: () = assert!(ACTIVE_CABLES_VALUE_NAME.len() < NAME_UNITS);
+// Les seize noms de format aussi : « CableFormat15 » fait treize caractères ASCII, mais la
+// vérifier plutôt que la compter est ce qui tiendra le jour où `CABLE_MAX` passera à trois
+// chiffres. Motif de tranche : ni indexation ni arithmétique.
+const _: () = {
+    let mut noms: &[&str] = &CABLE_FORMAT_VALUE_NAMES;
+    while let [premier, reste @ ..] = noms {
+        assert!(premier.len() < NAME_UNITS);
+        noms = reste;
+    }
+};
 
 /// Codes portés par `UniqueErrorValue` : la seule information qui survivrait si le texte
 /// de l'entrée n'arrivait pas jusqu'à l'Observateur (voir [`crate::eventlog`]).
@@ -176,6 +198,21 @@ const fn rang(param: Param) -> u32 {
 
 /// Rang de `ActiveCables` dans les codes d'événement, à la suite des trois paramètres.
 const RANG_MASQUE: u32 = 3;
+
+/// Rang du premier `CableFormat<n>` : les seize occupent 4 à 19, à la suite du masque.
+///
+/// L'octet de poids faible d'un `UniqueErrorValue` porte donc directement le numéro du
+/// câble, décalé de 4 — c'est ce qui rend une entrée du journal exploitable sans le texte
+/// (voir [`crate::eventlog`]).
+const RANG_FORMAT: u32 = 4;
+
+// Les rangs des seize formats tiennent dans l'octet de poids faible du code d'événement :
+// au-delà, ils déborderaient sur l'octet qui dit la nature de l'anomalie, et deux pannes
+// différentes porteraient le même code.
+const _: () = assert!(
+    RANG_FORMAT.saturating_add(CABLE_FORMAT_VALUE_NAMES.len() as u32) <= 0xFF,
+    "les rangs de code d'événement débordent sur l'octet de nature"
+);
 
 /// Nom de valeur encodé en UTF-16 sur la pile, avec l'`UNICODE_STRING` qui le décrit.
 ///
@@ -336,15 +373,28 @@ unsafe fn read_dword(key: HANDLE, nom: &str) -> Lecture {
     }
 }
 
-/// Lit les trois paramètres dans la clé matérielle du périphérique, les valide, et
-/// journalise tout ce qui a été corrigé.
+/// Lit les trois paramètres **et les seize formats de câble** dans la clé matérielle du
+/// périphérique, les valide, et journalise tout ce qui a été corrigé.
 ///
-/// **Ne peut pas échouer** : rend toujours des [`Params`] utilisables. Voir la règle en
-/// tête de module.
+/// **Ne peut pas échouer** : rend toujours des [`Params`] utilisables, et laisse toujours
+/// un format valide pour chacun des seize câbles. Voir la règle en tête de module.
 ///
-/// `log` reçoit une entrée par anomalie : clé inaccessible (une seule, les trois valeurs
+/// `log` reçoit une entrée par anomalie : clé inaccessible (une seule, toutes les valeurs
 /// partant alors sur leur défaut), valeur absente, illisible, inexploitable, ou hors
 /// bornes. Une clé complète et correcte n'écrit rien.
+///
+/// # Ce que la fonction rend, et ce qu'elle dépose
+///
+/// Les formats ne ressortent pas dans les [`Params`] : ils sont **déposés** dans le magasin
+/// de `crate::descriptors` par [`apply_cable_format`], qui est le seul endroit d'où
+/// `wave::description` et `topo::channels` sauront les lire. La signature ne change donc
+/// pas, et `adapter::start_device` n'a rien à faire de plus — c'est délibéré : le format
+/// d'un câble n'intéresse pas l'adaptateur, qui n'enregistre que des sous-périphériques.
+///
+/// L'ordre compte : les formats sont posés **avant** le retour, donc avant le premier
+/// `install_cable`, donc avant que PortCls ne demande le moindre `GetDescription`. Un câble
+/// qui prendrait son format après coup ne pourrait plus en changer — PortCls retient le
+/// pointeur du descripteur à vie.
 ///
 /// IRQL : `PASSIVE_LEVEL`.
 ///
@@ -358,6 +408,9 @@ pub(crate) unsafe fn read_params(device: PDEVICE_OBJECT, log: EventLog) -> Param
         Ok(key) => {
             // SAFETY: `key` vient d'être ouvert en `KEY_READ` et n'est fermé qu'après.
             let raw = unsafe { read_all(key, log) };
+            // Les seize formats, sur la même ouverture de clé (M1b-05).
+            // SAFETY: idem.
+            unsafe { read_all_cable_formats(key, log) };
             // SAFETY: `key` est le descripteur rendu par `IoOpenDeviceRegistryKey`, que
             // sa documentation demande de fermer par `ZwClose` ; il n'est plus utilisé.
             let status = unsafe { ZwClose(key) };
@@ -373,6 +426,11 @@ pub(crate) unsafe fn read_params(device: PDEVICE_OBJECT, log: EventLog) -> Param
                 "clé matérielle du périphérique illisible ({status:#010x}), \
                  paramètres par défaut"
             );
+            // Les seize câbles gardent le format par défaut : le magasin est initialisé
+            // dessus, mais le poser explicitement rend le cycle `StopDevice` puis
+            // `StartDevice` idempotent — sans quoi un démarrage sans clé conserverait les
+            // formats du démarrage précédent.
+            defaut_pour_tous_les_cables();
             RawParams::MISSING
         }
     };
@@ -386,13 +444,48 @@ pub(crate) unsafe fn read_params(device: PDEVICE_OBJECT, log: EventLog) -> Param
             "{correction}"
         );
     }
+    // `BufferMs` devient effectif ici (M1b-05) : il était lu, validé et journalisé depuis
+    // M1b-01, et n'agissait sur rien.
+    BUFFER_MS.store(params.buffer_ms, Ordering::Relaxed);
+    // `Channels` est journalisé « (ignoré) » plutôt que passé sous silence : il est encore
+    // dans l'INF et dans `regedit`, et un administrateur qui vient de le régler doit lire
+    // pourquoi rien n'a bougé, au lieu de le déduire (voir `conduit_kmd_core::params`).
     kmd_log!(
-        "registre : réserve {} câbles, {} canaux, tampon {} ms",
+        "registre : réserve {} câbles, tampon {} ms, Channels = {} (ignoré, supplanté par \
+         les CableFormat<n>)",
         params.reserve,
-        params.channels,
-        params.buffer_ms
+        params.buffer_ms,
+        params.channels
     );
     params
+}
+
+/// Plancher du tampon cyclique, en millisecondes : la valeur de `BufferMs` du dernier
+/// `StartDevice`.
+///
+/// # Pourquoi une `static` plutôt qu'un champ du flux
+///
+/// `BufferMs` est un paramètre **du pilote**, pas du câble ni du flux : une seule valeur
+/// pour tout le périphérique, comme `ReserveSize`. La faire descendre jusqu'à
+/// `stream::WaveStream::allocate` par la chaîne `adapter` → `cable` → `wave` → `stream`
+/// aurait fait traverser quatre modules à une constante de démarrage, dont deux qui n'en
+/// ont que faire. Un atomique lu au moment de l'allocation dit la même chose en une ligne.
+///
+/// `Relaxed` : écrit une fois par `StartDevice`, avant qu'aucun flux n'existe, et lu à
+/// `PASSIVE_LEVEL` par `AllocateAudioBuffer`. Aucune relation d'ordre à établir avec un
+/// autre champ — le raisonnement de `cable::Cable::connected`, à l'identique.
+static BUFFER_MS: AtomicU32 = AtomicU32::new(params::DEFAULT_BUFFER_MS);
+
+/// Le plancher du tampon cyclique, en millisecondes (paramètre `BufferMs`).
+///
+/// Toujours dans `MIN_BUFFER_MS..=MAX_BUFFER_MS` : c'est `params::sanitize` qui l'écrête
+/// avant l'écriture, et `conduit_kmd_core::buffer_bytes_with_floor` l'écrête de nouveau de
+/// son côté. La valeur avant le premier `StartDevice` est le défaut.
+///
+/// IRQL : quelconque.
+#[must_use]
+pub(crate) fn buffer_ms() -> u32 {
+    BUFFER_MS.load(Ordering::Relaxed)
 }
 
 /// Lit les trois valeurs et journalise ce qui les a empêchées d'arriver.
@@ -456,6 +549,122 @@ unsafe fn read_all(key: HANDLE, log: EventLog) -> RawParams {
         }
     }
     raw
+}
+
+// ---------------------------------------------------------------------------------
+// `CableFormat<n>` : le format de chaque câble, lu au démarrage (M1b-05).
+// ---------------------------------------------------------------------------------
+
+/// Pose le format par défaut sur les seize câbles.
+///
+/// Appelée quand la clé est inaccessible, et pour la raison d'idempotence expliquée dans
+/// [`read_params`] : sans elle, un `StartDevice` sans clé laisserait en place les formats
+/// du démarrage précédent, et les descripteurs ne correspondraient plus à ce que le
+/// registre décrit.
+fn defaut_pour_tous_les_cables() {
+    for cable in 0..CABLE_FORMAT_VALUE_NAMES.len() {
+        apply_cable_format(cable as u32, CABLE_FORMAT_DEFAULT);
+    }
+}
+
+/// Lit les seize `CableFormat<n>` et les dépose dans le magasin des descripteurs.
+///
+/// **Ne peut pas échouer**, comme tout ce module : chaque valeur absente, illisible,
+/// inexploitable ou aberrante donne [`CABLE_FORMAT_DEFAULT`] et une entrée de journal qui
+/// nomme le câble et le champ fautif.
+///
+/// Une valeur **absente** est consignée pour la même raison que les trois paramètres et
+/// que le masque : l'INF écrit les seize (`[ConduitCable_HW_AddReg]`, engendré par
+/// `portcls/tests/inf.rs`), donc sur un poste installé proprement leur absence signifie
+/// qu'on les a supprimées — ou que le poste vient d'une version antérieure à M1b-05, cas
+/// que le message nomme aussi.
+///
+/// # Safety
+///
+/// `key` est un descripteur de clé ouvert en `KEY_READ`, et l'appelant est à
+/// `PASSIVE_LEVEL`.
+unsafe fn read_all_cable_formats(key: HANDLE, log: EventLog) {
+    for (index, nom) in CABLE_FORMAT_VALUE_NAMES.iter().enumerate() {
+        let cable = index as u32;
+        // SAFETY: contrat de la fonction relayé.
+        let lue = unsafe { read_dword(key, nom) };
+        let brut = match lue {
+            Lecture::Valeur(valeur) => Some(valeur),
+            Lecture::Absente => {
+                kmd_event!(
+                    log,
+                    code::ABSENTE
+                        .saturating_add(RANG_FORMAT)
+                        .saturating_add(cable),
+                    "{CABLE_FORMAT_LABEL} {cable} ({nom}) absent de la clé du périphérique \
+                     (mise à jour depuis une version antérieure, ou valeur supprimée), \
+                     repli sur {:#010x}",
+                    CABLE_FORMAT_DEFAULT.encode()
+                );
+                None
+            }
+            Lecture::Illisible(status) => {
+                kmd_event!(
+                    log,
+                    code::ILLISIBLE
+                        .saturating_add(RANG_FORMAT)
+                        .saturating_add(cable),
+                    "{CABLE_FORMAT_LABEL} {cable} ({nom}) illisible ({status:#010x}), \
+                     repli sur {:#010x}",
+                    CABLE_FORMAT_DEFAULT.encode()
+                );
+                None
+            }
+            Lecture::Inexploitable { kind, len } => {
+                kmd_event!(
+                    log,
+                    code::INEXPLOITABLE
+                        .saturating_add(RANG_FORMAT)
+                        .saturating_add(cable),
+                    "{CABLE_FORMAT_LABEL} {cable} ({nom}) : type {kind}, {len} octets \
+                     (REG_DWORD attendu), repli sur {:#010x}",
+                    CABLE_FORMAT_DEFAULT.encode()
+                );
+                None
+            }
+            Lecture::TropGrande(taille) => {
+                kmd_event!(
+                    log,
+                    code::INEXPLOITABLE
+                        .saturating_add(RANG_FORMAT)
+                        .saturating_add(cable),
+                    "{CABLE_FORMAT_LABEL} {cable} ({nom}) : {taille} octets, trop grande \
+                     pour un REG_DWORD, repli sur {:#010x}",
+                    CABLE_FORMAT_DEFAULT.encode()
+                );
+                None
+            }
+        };
+        let format = match brut {
+            Some(brut) => {
+                let (format, correction) = CableFormat::sanitize(cable, brut);
+                if let Some(correction) = correction {
+                    kmd_log!("registre : {correction}");
+                    kmd_event!(
+                        log,
+                        code::HORS_BORNES
+                            .saturating_add(RANG_FORMAT)
+                            .saturating_add(cable),
+                        "{correction}"
+                    );
+                }
+                format
+            }
+            None => CABLE_FORMAT_DEFAULT,
+        };
+        apply_cable_format(cable, format);
+        kmd_log!(
+            "registre : {CABLE_FORMAT_LABEL} {cable} = {} Hz, {} canaux, profondeur {:?}",
+            format.sample_rate,
+            format.channels,
+            format.depth
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------

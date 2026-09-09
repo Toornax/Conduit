@@ -14,8 +14,21 @@
 //! - les échantillons sont en petit-boutiste (`from_le_bytes`/`to_le_bytes`), le
 //!   seul ordre que Windows x86/ARM64 utilise pour l'audio.
 //!
-//! Formats M1a : F32 et I16 (PCM24 et la matrice complète arrivent en M1b-05 ;
-//! [`SampleFormat`] est `#[non_exhaustive]` pour cela).
+//! Formats (M1b-05) : F32, PCM24 et I16, dans les deux sens — les neuf couples sont
+//! servis. [`SampleFormat`] reste `#[non_exhaustive]` : la matrice de M1b-05 est close,
+//! mais rien n'oblige la suivante à l'être.
+//!
+//! # PCM24 casse un alignement que les deux autres donnaient gratuitement
+//!
+//! F32 et I16 font 4 et 2 octets ; toute trame de *n* canaux y est alignée sur la taille
+//! d'un échantillon, et les tampons cycliques du moteur audio (multiples de la page) le
+//! sont aussi. PCM24 fait **3** octets : une trame stéréo en fait 6, une trame à 5 canaux
+//! en fait 15, et plus rien n'est une puissance de deux. Trois conséquences, toutes déjà
+//! traitées ici : aucune lecture ne passe par un `u32` transtypé (les trois octets se
+//! lisent et s'écrivent un par un, [`i24_from_le`]), la taille du tampon reste un multiple
+//! **de la trame** et non de la page ([`frames_in`] le vérifie, `crate::format` l'arrondit),
+//! et les conversions itèrent par `chunks_exact` sur des tailles constantes plutôt que par
+//! indexation.
 //!
 //! IRQL : tout ce module est appelable à `DISPATCH_LEVEL`.
 
@@ -28,6 +41,10 @@ use core::num::NonZeroUsize;
 pub enum SampleFormat {
     /// IEEE 754 simple précision, plage nominale [−1, 1].
     F32,
+    /// PCM signé 24 bits, **conteneur de 3 octets** (et non 24 bits significatifs dans un
+    /// conteneur de 32) : c'est ce que `KSDATARANGE_AUDIO` annonce en
+    /// `Minimum/MaximumBitsPerSample = 24`, et c'est ce que le tampon contient.
+    Pcm24,
     /// PCM signé 16 bits.
     I16,
 }
@@ -37,8 +54,15 @@ impl SampleFormat {
     pub const fn bytes_per_sample(self) -> u32 {
         match self {
             Self::F32 => 4,
+            Self::Pcm24 => 3,
             Self::I16 => 2,
         }
+    }
+
+    /// Taille du conteneur en **bits**, celle que `wBitsPerSample` et les bornes de
+    /// `KSDATARANGE_AUDIO` portent.
+    pub const fn bits_per_sample(self) -> u32 {
+        self.bytes_per_sample().saturating_mul(8)
     }
 }
 
@@ -113,7 +137,8 @@ impl std::error::Error for RingError {}
 /// La trame `k` (pour `k` dans `0..count`) est lue à l'indice
 /// `(src_start_frame + k) mod src_frames` et écrite à l'indice
 /// `(dst_start_frame + k) mod dst_frames`, avec conversion d'échantillons si les
-/// formats diffèrent ([`i16_to_f32`], [`f32_to_i16`]).
+/// formats diffèrent ([`i16_to_f32`], [`f32_to_i16`], [`i24_to_f32`], [`f32_to_i24`],
+/// [`i16_to_i24`], [`i24_to_i16`]).
 ///
 /// # Erreurs
 ///
@@ -171,8 +196,9 @@ pub fn copy_frames(
 /// Écrit `count` trames de silence dans le tampon cyclique `dst` à partir de
 /// `start_frame` (même sémantique modulo que [`copy_frames`]).
 ///
-/// Des octets nuls valent 0,0 en F32 et 0 en I16 : le silence est le même pour tous
-/// les formats supportés.
+/// Des octets nuls valent 0,0 en F32, 0 en PCM24 et 0 en I16 : le silence est le même
+/// pour tous les formats supportés, ce qui vaut d'être vérifié plutôt que supposé (un
+/// format à décalage — PCM non signé, µ-law — casserait cette propriété).
 ///
 /// # Erreurs
 ///
@@ -227,37 +253,125 @@ pub fn f32_to_i16(v: f32) -> i16 {
     }
 }
 
+/// Valeur PCM24 la plus négative (−2^23), celle que −1,0 donne exactement.
+pub const I24_MIN: i32 = -8_388_608;
+/// Valeur PCM24 la plus positive (2^23 − 1).
+pub const I24_MAX: i32 = 8_388_607;
+
+/// PCM24 → F32 : division par 8 388 608, la transposition exacte de [`i16_to_f32`] —
+/// [`I24_MIN`] ↦ −1,0 exactement, [`I24_MAX`] ↦ 0,999999881.
+///
+/// `v` est supposé dans `I24_MIN..=I24_MAX` ([`read_i24_le`] ne peut rien produire
+/// d'autre) ; au-delà, le résultat sort simplement de [−1, 1], sans panique.
+pub fn i24_to_f32(v: i32) -> f32 {
+    v as f32 / 8_388_608.0
+}
+
+/// F32 → PCM24 : borné à [−1, 1] puis multiplié par 8 388 607 et arrondi au plus proche
+/// (demi vers l'extérieur), **exactement** la convention de [`f32_to_i16`].
+///
+/// Le facteur [`I24_MAX`] (et non 2^23) rend la conversion symétrique et lui interdit de
+/// déborder ; `NaN` donne 0, `clamp` le propageant et `as i32` le transformant en 0. Le
+/// résultat est toujours dans `I24_MIN..=I24_MAX`, ce qu'un `f32` ne garantit pas
+/// gratuitement — un `f32` ne représente pas tous les entiers de cette plage, et
+/// 8 388 607,0 s'y arrondit à 8 388 607,0 mais 8 388 607,5 à 8 388 608,0. D'où l'écrêtage
+/// final, qui n'est pas décoratif.
+pub fn f32_to_i24(v: f32) -> i32 {
+    let scaled = v.clamp(-1.0, 1.0) * 8_388_607.0;
+    let arrondi = if scaled >= 0.0 {
+        (scaled + 0.5) as i32
+    } else {
+        (scaled - 0.5) as i32
+    };
+    arrondi.clamp(I24_MIN, I24_MAX)
+}
+
+/// I16 → PCM24 : décalage de 8 bits, **exact et sans perte** (l'échelle des deux formats
+/// entiers est la même puissance de deux).
+///
+/// C'est le seul couple de la matrice dont l'aller-retour est l'identité :
+/// [`i24_to_i16`] rend bien la valeur de départ.
+pub fn i16_to_i24(v: i16) -> i32 {
+    i32::from(v).saturating_mul(256)
+}
+
+/// PCM24 → I16 : division par 256 **arrondie au plus proche**, puis écrêtée.
+///
+/// L'arrondi (le `+ 128` avant le décalage) plutôt qu'une troncature : sans lui, tout
+/// échantillon négatif serait tiré d'un pas vers −∞, ce qui ajoute une composante continue
+/// audible sur un signal de faible niveau. L'écrêtage ne mord que sur les 128 valeurs les
+/// plus hautes de PCM24, que l'arrondi ferait déborder de 32 767.
+pub fn i24_to_i16(v: i32) -> i16 {
+    let arrondi = v.saturating_add(128) >> 8;
+    arrondi.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+}
+
 /// Convertit une trame de `src` (format `src_format`) vers `dst` (format
 /// `dst_format`). Les deux tranches ont exactement une trame du même nombre de
 /// canaux (garanti par `chunks_exact` et la vérification des dispositions).
+///
+/// Les neuf couples sont écrits en toutes lettres : les trois identités par recopie
+/// d'octets, les six conversions par [`convert_samples`], dont les deux tailles de
+/// conteneur sont des paramètres `const`. Une taille fausse ne compilerait pas.
 fn convert_frame(src: &[u8], src_format: SampleFormat, dst: &mut [u8], dst_format: SampleFormat) {
+    use SampleFormat::{Pcm24, F32, I16};
     match (src_format, dst_format) {
-        (SampleFormat::F32, SampleFormat::F32) | (SampleFormat::I16, SampleFormat::I16) => {
-            write_bytes(dst, src);
+        (F32, F32) | (Pcm24, Pcm24) | (I16, I16) => write_bytes(dst, src),
+        (I16, F32) => convert_samples::<2, 4>(src, dst, |s| {
+            i16_to_f32(i16::from_le_bytes(s)).to_le_bytes()
+        }),
+        (F32, I16) => convert_samples::<4, 2>(src, dst, |s| {
+            f32_to_i16(f32::from_le_bytes(s)).to_le_bytes()
+        }),
+        (Pcm24, F32) => {
+            convert_samples::<3, 4>(src, dst, |s| i24_to_f32(i24_from_le(s)).to_le_bytes());
         }
-        (SampleFormat::I16, SampleFormat::F32) => {
-            for (s, d) in src.chunks_exact(2).zip(dst.chunks_exact_mut(4)) {
-                write_bytes(d, &i16_to_f32(read_i16_le(s)).to_le_bytes());
-            }
+        (F32, Pcm24) => {
+            convert_samples::<4, 3>(src, dst, |s| i24_to_le(f32_to_i24(f32::from_le_bytes(s))));
         }
-        (SampleFormat::F32, SampleFormat::I16) => {
-            for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(2)) {
-                write_bytes(d, &f32_to_i16(read_f32_le(s)).to_le_bytes());
-            }
+        (I16, Pcm24) => {
+            convert_samples::<2, 3>(src, dst, |s| i24_to_le(i16_to_i24(i16::from_le_bytes(s))));
+        }
+        (Pcm24, I16) => {
+            convert_samples::<3, 2>(src, dst, |s| i24_to_i16(i24_from_le(s)).to_le_bytes());
         }
     }
 }
 
-/// Lit un `i16` petit-boutiste ; 0 si la tranche n'a pas exactement 2 octets
-/// (impossible derrière `chunks_exact(2)`).
-fn read_i16_le(bytes: &[u8]) -> i16 {
-    <[u8; 2]>::try_from(bytes).map_or(0, i16::from_le_bytes)
+/// Applique `convertir` à chaque échantillon de `src` (conteneur de `S` octets) vers
+/// `dst` (conteneur de `D` octets), sur le nombre commun d'échantillons.
+///
+/// `chunks_exact` des deux côtés : aucune indexation, aucun reste, et `zip` s'arrête au
+/// plus court — la trame étant garantie de même nombre de canaux par [`copy_frames`], les
+/// deux comptes sont en fait égaux.
+fn convert_samples<const S: usize, const D: usize>(
+    src: &[u8],
+    dst: &mut [u8],
+    convertir: impl Fn([u8; S]) -> [u8; D],
+) {
+    for (s, d) in src.chunks_exact(S).zip(dst.chunks_exact_mut(D)) {
+        // `chunks_exact(S)` ne rend que des tranches de `S` octets : le `Ok` est certain,
+        // et le motif remplace un `unwrap` interdit par les lints du crate.
+        if let Ok(octets) = <[u8; S]>::try_from(s) {
+            write_bytes(d, &convertir(octets));
+        }
+    }
 }
 
-/// Lit un `f32` petit-boutiste ; 0,0 si la tranche n'a pas exactement 4 octets
-/// (impossible derrière `chunks_exact(4)`).
-fn read_f32_le(bytes: &[u8]) -> f32 {
-    <[u8; 4]>::try_from(bytes).map_or(0.0, f32::from_le_bytes)
+/// Lit un entier signé de 24 bits petit-boutiste, **avec extension de signe** : les trois
+/// octets sont placés en poids fort d'un `i32` puis décalés arithmétiquement.
+///
+/// C'est le seul endroit du module où le signe ne se déduit pas du type : un
+/// `i32::from_le_bytes([a, b, c, 0])` rendrait 16 777 215 pour −1.
+fn i24_from_le([a, b, c]: [u8; 3]) -> i32 {
+    i32::from_le_bytes([0, a, b, c]) >> 8
+}
+
+/// Écrit un entier signé de 24 bits en petit-boutiste : les trois octets de poids faible,
+/// le quatrième (le signe étendu) étant redondant.
+fn i24_to_le(v: i32) -> [u8; 3] {
+    let [a, b, c, _] = v.to_le_bytes();
+    [a, b, c]
 }
 
 /// Copie `src` dans `dst` octet par octet, sur la longueur commune (jamais de
@@ -319,35 +433,57 @@ mod tests {
     use std::string::ToString;
     use std::vec::Vec;
 
+    /// Lit un `i16` petit-boutiste depuis une tranche de deux octets.
+    fn read_i16_le(bytes: &[u8]) -> i16 {
+        <[u8; 2]>::try_from(bytes).map_or(0, i16::from_le_bytes)
+    }
+
+    /// Lit un `f32` petit-boutiste depuis une tranche de quatre octets.
+    fn read_f32_le(bytes: &[u8]) -> f32 {
+        <[u8; 4]>::try_from(bytes).map_or(0.0, f32::from_le_bytes)
+    }
+
+    /// Lit un PCM24 signé petit-boutiste depuis une tranche de trois octets.
+    fn read_i24_le(bytes: &[u8]) -> i32 {
+        <[u8; 3]>::try_from(bytes).map_or(0, i24_from_le)
+    }
+
     /// Valeur de test « unique » pour la trame `frame`, canal `channel` : entier
-    /// `frame × 8 + channel`, réduit modulo 1 024 et mis à l'échelle en F32 pour
-    /// rester dans [0, 1) et distinct après conversion vers I16 (pas de 1/1024 ↦
-    /// 32 valeurs I16). Les fenêtres vérifiées font moins de 1 024 échantillons.
+    /// `frame × 8 + channel`, réduit modulo 1 024 et mis à l'échelle dans chaque format
+    /// pour rester **positif, distinct, et distinct après toute conversion** — c'est cette
+    /// dernière propriété qui donne leur force aux tests de recouvrement, une conversion
+    /// qui écraserait deux trames voisines sur la même valeur les rendrait aveugles.
+    ///
+    /// D'où l'échelle : 1/1 024 en F32 (pas de 32 valeurs I16 et de 8 192 valeurs PCM24),
+    /// 8 192 en PCM24 (pas de 32 valeurs I16), 1 en I16. Les fenêtres vérifiées font moins
+    /// de 1 024 échantillons.
     fn sample_bytes(format: SampleFormat, frame: usize, channel: usize) -> Vec<u8> {
-        let n = frame * 8 + channel;
+        let n = (frame * 8 + channel) % 1024;
         match format {
-            SampleFormat::F32 => ((n % 1024) as f32 / 1024.0).to_le_bytes().to_vec(),
-            SampleFormat::I16 => ((n % 32_768) as i16).to_le_bytes().to_vec(),
+            SampleFormat::F32 => (n as f32 / 1024.0).to_le_bytes().to_vec(),
+            SampleFormat::Pcm24 => i24_to_le(n as i32 * 8_192).to_vec(),
+            SampleFormat::I16 => (n as i16).to_le_bytes().to_vec(),
         }
     }
 
     /// Même valeur que [`sample_bytes`] en format `src`, convertie en format `dst`
-    /// par les fonctions publiques du module.
+    /// par les fonctions publiques du module — les neuf couples.
     fn converted_sample_bytes(
         src: SampleFormat,
         dst: SampleFormat,
         frame: usize,
         channel: usize,
     ) -> Vec<u8> {
+        use SampleFormat::{Pcm24, F32, I16};
         let raw = sample_bytes(src, frame, channel);
         match (src, dst) {
-            (SampleFormat::F32, SampleFormat::F32) | (SampleFormat::I16, SampleFormat::I16) => raw,
-            (SampleFormat::I16, SampleFormat::F32) => {
-                i16_to_f32(read_i16_le(&raw)).to_le_bytes().to_vec()
-            }
-            (SampleFormat::F32, SampleFormat::I16) => {
-                f32_to_i16(read_f32_le(&raw)).to_le_bytes().to_vec()
-            }
+            (F32, F32) | (Pcm24, Pcm24) | (I16, I16) => raw,
+            (I16, F32) => i16_to_f32(read_i16_le(&raw)).to_le_bytes().to_vec(),
+            (F32, I16) => f32_to_i16(read_f32_le(&raw)).to_le_bytes().to_vec(),
+            (Pcm24, F32) => i24_to_f32(read_i24_le(&raw)).to_le_bytes().to_vec(),
+            (F32, Pcm24) => i24_to_le(f32_to_i24(read_f32_le(&raw))).to_vec(),
+            (I16, Pcm24) => i24_to_le(i16_to_i24(read_i16_le(&raw))).to_vec(),
+            (Pcm24, I16) => i24_to_i16(read_i24_le(&raw)).to_le_bytes().to_vec(),
         }
     }
 
@@ -361,10 +497,12 @@ mod tests {
             .collect()
     }
 
-    /// Sentinelle négative (jamais produite par [`sample_bytes`]).
+    /// Sentinelle négative (jamais produite par [`sample_bytes`], qui ne rend que des
+    /// valeurs positives ou nulles, dans les trois formats).
     fn sentinel(format: SampleFormat) -> Vec<u8> {
         match format {
             SampleFormat::F32 => (-5.0f32).to_le_bytes().to_vec(),
+            SampleFormat::Pcm24 => i24_to_le(-5 * 8_192).to_vec(),
             SampleFormat::I16 => (-5i16).to_le_bytes().to_vec(),
         }
     }
@@ -374,7 +512,11 @@ mod tests {
     }
 
     fn any_format() -> impl Strategy<Value = SampleFormat> {
-        prop_oneof![Just(SampleFormat::F32), Just(SampleFormat::I16)]
+        prop_oneof![
+            Just(SampleFormat::F32),
+            Just(SampleFormat::Pcm24),
+            Just(SampleFormat::I16)
+        ]
     }
 
     #[test]
@@ -387,7 +529,26 @@ mod tests {
         assert_eq!(l.frame_bytes(), 32);
         assert_eq!(stereo(SampleFormat::I16).frame_bytes(), 4);
         assert_eq!(SampleFormat::F32.bytes_per_sample(), 4);
+        assert_eq!(SampleFormat::Pcm24.bytes_per_sample(), 3);
         assert_eq!(SampleFormat::I16.bytes_per_sample(), 2);
+        assert_eq!(SampleFormat::F32.bits_per_sample(), 32);
+        assert_eq!(SampleFormat::Pcm24.bits_per_sample(), 24);
+        assert_eq!(SampleFormat::I16.bits_per_sample(), 16);
+        // PCM24 casse les alignements que les deux autres donnaient : une trame à 5
+        // canaux fait 15 octets, et rien n'y est une puissance de deux (voir l'en-tête).
+        assert_eq!(stereo(SampleFormat::Pcm24).frame_bytes(), 6);
+        assert_eq!(
+            FrameLayout::new(5, SampleFormat::Pcm24)
+                .unwrap()
+                .frame_bytes(),
+            15
+        );
+        assert_eq!(
+            FrameLayout::new(8, SampleFormat::Pcm24)
+                .unwrap()
+                .frame_bytes(),
+            24
+        );
     }
 
     #[test]
@@ -512,6 +673,96 @@ mod tests {
         assert_eq!(i16_to_f32(i16::MAX), 32_767.0 / 32_768.0);
     }
 
+    /// PCM24 aux bornes : mêmes conventions que I16, transposées à 24 bits.
+    #[test]
+    fn conversion_extremes_pcm24() {
+        assert_eq!(f32_to_i24(1.0), I24_MAX);
+        assert_eq!(f32_to_i24(-1.0), -I24_MAX);
+        assert_eq!(f32_to_i24(2.0), I24_MAX);
+        assert_eq!(f32_to_i24(-2.0), -I24_MAX);
+        assert_eq!(f32_to_i24(f32::INFINITY), I24_MAX);
+        assert_eq!(f32_to_i24(f32::NEG_INFINITY), -I24_MAX);
+        assert_eq!(f32_to_i24(f32::NAN), 0);
+        assert_eq!(f32_to_i24(0.0), 0);
+        assert_eq!(f32_to_i24(-0.0), 0);
+        assert_eq!(i24_to_f32(I24_MIN), -1.0);
+        assert_eq!(i24_to_f32(0), 0.0);
+        assert_eq!(i24_to_f32(I24_MAX), 8_388_607.0 / 8_388_608.0);
+
+        // I16 ↔ PCM24 : le seul couple de la matrice dont l'aller-retour est l'identité.
+        assert_eq!(i16_to_i24(i16::MIN), I24_MIN);
+        assert_eq!(i16_to_i24(i16::MAX), 8_388_352);
+        assert_eq!(i16_to_i24(0), 0);
+        assert_eq!(i16_to_i24(1), 256);
+        assert_eq!(i16_to_i24(-1), -256);
+        assert_eq!(i24_to_i16(I24_MIN), i16::MIN);
+        assert_eq!(i24_to_i16(I24_MAX), i16::MAX);
+        assert_eq!(i24_to_i16(0), 0);
+        // L'arrondi au plus proche, et non la troncature vers −∞ : sans le `+ 128`, tout
+        // échantillon négatif serait tiré d'un pas et le signal gagnerait une composante
+        // continue.
+        assert_eq!(i24_to_i16(127), 0);
+        assert_eq!(i24_to_i16(128), 1);
+        assert_eq!(i24_to_i16(-128), 0);
+        assert_eq!(i24_to_i16(-129), -1);
+        // L'écrêtage haut ne mord que sur les 128 dernières valeurs de PCM24.
+        assert_eq!(i24_to_i16(8_388_479), i16::MAX);
+        assert_eq!(i24_to_i16(8_388_480), i16::MAX);
+    }
+
+    /// Les trois octets d'un PCM24 se relisent avec leur signe, dans les deux sens.
+    #[test]
+    fn pcm24_bytes_are_sign_extended() {
+        // −1 : `FF FF FF`. Sans extension de signe, la lecture rendrait 16 777 215.
+        assert_eq!(i24_to_le(-1), [0xFF, 0xFF, 0xFF]);
+        assert_eq!(i24_from_le([0xFF, 0xFF, 0xFF]), -1);
+        assert_eq!(i24_to_le(I24_MIN), [0x00, 0x00, 0x80]);
+        assert_eq!(i24_from_le([0x00, 0x00, 0x80]), I24_MIN);
+        assert_eq!(i24_to_le(I24_MAX), [0xFF, 0xFF, 0x7F]);
+        assert_eq!(i24_from_le([0xFF, 0xFF, 0x7F]), I24_MAX);
+        assert_eq!(i24_to_le(0), [0, 0, 0]);
+        assert_eq!(i24_from_le([0, 0, 0]), 0);
+        // Petit-boutiste : 0x00_0102 s'écrit `02 01 00`.
+        assert_eq!(i24_to_le(0x0000_0102), [0x02, 0x01, 0x00]);
+    }
+
+    /// La copie convertit bien dans les six sens croisés, sur une trame connue.
+    #[test]
+    fn copy_converts_across_the_matrix() {
+        use SampleFormat::{Pcm24, F32, I16};
+        let couples = [
+            (I16, F32),
+            (F32, I16),
+            (Pcm24, F32),
+            (F32, Pcm24),
+            (I16, Pcm24),
+            (Pcm24, I16),
+        ];
+        for (src_format, dst_format) in couples {
+            let src_l = stereo(src_format);
+            let dst_l = stereo(dst_format);
+            let src = filled(src_l, 4);
+            let mut dst: Vec<u8> = (0..4 * 2).flat_map(|_| sentinel(dst_format)).collect();
+            copy_frames(&src, src_l, 0, &mut dst, dst_l, 0, 4).unwrap();
+            let attendu: Vec<u8> = (0..4)
+                .flat_map(|f| {
+                    (0..2).flat_map(move |c| converted_sample_bytes(src_format, dst_format, f, c))
+                })
+                .collect();
+            assert_eq!(dst, attendu, "{src_format:?} → {dst_format:?}");
+        }
+    }
+
+    /// Le silence est le même octet nul dans les trois formats : c'est ce qui permet à
+    /// [`silence`] d'ignorer la disposition.
+    #[test]
+    fn le_silence_est_nul_dans_les_trois_formats() {
+        assert_eq!(0.0f32.to_le_bytes(), [0, 0, 0, 0]);
+        assert_eq!(0i16.to_le_bytes(), [0, 0]);
+        assert_eq!(i24_to_le(0), [0, 0, 0]);
+        assert_eq!(i24_from_le([0, 0, 0]), 0);
+    }
+
     #[test]
     fn error_display_is_french() {
         assert_eq!(RingError::EmptyBuffer.to_string(), "le tampon est vide");
@@ -605,6 +856,32 @@ mod tests {
             5,
             &[5, 5, 3, 4, 5],
         );
+        // PCM24 : trames de 3, 15 et 21 octets — aucune puissance de deux, aucun tampon
+        // aligné sur la page, et c'est exactement le point de M1b-05 (voir l'en-tête).
+        run_loop(
+            SampleFormat::Pcm24,
+            SampleFormat::Pcm24,
+            5,
+            441,
+            333,
+            &[100; 20],
+        );
+        run_loop(
+            SampleFormat::F32,
+            SampleFormat::Pcm24,
+            7,
+            97,
+            97,
+            &[1, 96, 97, 3],
+        );
+        run_loop(
+            SampleFormat::Pcm24,
+            SampleFormat::I16,
+            1,
+            5,
+            5,
+            &[5, 5, 3, 4, 5],
+        );
     }
 
     proptest! {
@@ -688,6 +965,59 @@ mod tests {
             prop_assert!((-32_767..=32_767).contains(&v));
             if x >= 1.0 { prop_assert_eq!(v, 32_767); }
             if x <= -1.0 { prop_assert_eq!(v, -32_767); }
+        }
+
+        /// Aller-retour F32 → PCM24 → F32 : erreur ≤ 1,5 / 2^23, l'homologue exact de
+        /// [`round_trip_f32_i16`] à 24 bits.
+        #[test]
+        fn round_trip_f32_i24(x in -1.0f32..=1.0) {
+            let y = i24_to_f32(f32_to_i24(x));
+            prop_assert!((y - x).abs() <= 1.5 / 8_388_608.0 + f32::EPSILON, "{x} → {y}");
+        }
+
+        /// **Aller-retour exact** I16 → PCM24 → I16 : les deux formats entiers partagent
+        /// la même échelle en puissance de deux, la conversion ne perd donc rien. C'est le
+        /// seul couple de la matrice dont on peut l'exiger.
+        #[test]
+        fn round_trip_i16_i24_est_exact(v in any::<i16>()) {
+            prop_assert_eq!(i24_to_i16(i16_to_i24(v)), v);
+        }
+
+        /// PCM24 → I16 → PCM24 : la division par 256 coûte au plus un demi-pas, soit
+        /// 128 unités PCM24, plus l'écrêtage des 128 valeurs hautes.
+        #[test]
+        fn round_trip_i24_i16(v in I24_MIN..=I24_MAX) {
+            let w = i16_to_i24(i24_to_i16(v));
+            prop_assert!((w - v).abs() <= 256, "{v} → {w}");
+        }
+
+        /// Hors plage en PCM24 : écrêtage garanti, et le résultat tient toujours dans les
+        /// trois octets qu'[`i24_to_le`] écrit — sans quoi la valeur relue serait un
+        /// tout autre nombre.
+        #[test]
+        fn clamped_out_of_range_i24(x in any::<f32>()) {
+            let v = f32_to_i24(x);
+            prop_assert!((-I24_MAX..=I24_MAX).contains(&v));
+            prop_assert_eq!(i24_from_le(i24_to_le(v)), v);
+            if x >= 1.0 { prop_assert_eq!(v, I24_MAX); }
+            if x <= -1.0 { prop_assert_eq!(v, -I24_MAX); }
+        }
+
+        /// Les trois octets et l'entier se correspondent sur tout le domaine PCM24, et
+        /// aucun entier hors domaine ne s'y faufile.
+        #[test]
+        fn pcm24_aller_retour_octets(v in I24_MIN..=I24_MAX) {
+            prop_assert_eq!(i24_from_le(i24_to_le(v)), v);
+        }
+
+        /// Quels que soient les trois octets, la lecture reste dans le domaine PCM24 :
+        /// c'est ce qui autorise [`i24_to_f32`] à supposer la plage sans la vérifier.
+        #[test]
+        fn pcm24_lu_reste_dans_le_domaine(octets in any::<[u8; 3]>()) {
+            let v = i24_from_le(octets);
+            prop_assert!((I24_MIN..=I24_MAX).contains(&v));
+            prop_assert_eq!(i24_to_le(v), octets);
+            prop_assert!((-1.0..=1.0).contains(&i24_to_f32(v)));
         }
 
         /// `silence` met à zéro exactement `count` trames.

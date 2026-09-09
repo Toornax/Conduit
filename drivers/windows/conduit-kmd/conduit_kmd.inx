@@ -169,6 +169,45 @@ HKR,,BufferMs,0x10001,10
 ; périphérique (F-52). Défaut ENGENDRÉ depuis conduit_kmd_core::config.
 HKR,,ActiveCables,0x10001,0x00000003
 
+; Format de chaque câble (M1b-05, F-02 et F-03). Un REG_DWORD par câble, lu UNE FOIS au
+; démarrage — comme ReserveSize, et pas comme ActiveCables : le pilote ne le réécrit
+; jamais. Disposition, du poids faible au poids fort :
+;
+;   octet 0  fréquence  1 = 44 100 Hz, 2 = 48 000 Hz, 3 = 96 000 Hz
+;   octet 1  profondeur 1 = PCM 16 bits, 2 = PCM 24 bits, 3 = float 32 bits
+;   octet 2  canaux     1 à 8
+;   octet 3  réservé, doit être nul
+;
+; 0x00020302 = 48 kHz, float32, 2 canaux. La profondeur est une PRÉFÉRENCE transmise à
+; l'espace utilisateur : le câble déclare de toute façon les trois (le pilote les convertit
+; à la volée). La fréquence et le nombre de canaux, eux, sont figés — le pilote ne
+; rééchantillonne pas et ne remappe pas les canaux, les deux bouts d'un câble doivent donc
+; s'accorder, et ils n'y arrivent que parce qu'on ne leur propose rien d'autre.
+;
+; CHANGER UN FORMAT DEMANDE DE REDÉMARRER LE PÉRIPHÉRIQUE : les tables KS sont immuables et
+; PortCls en retient les pointeurs pour toute la vie du filtre. Le service d'assistance
+; écrit la valeur puis redémarre le devnode par cfgmgr32 — environ une seconde de silence
+; sur les seize câbles. Modifier la valeur à la main marche aussi, au démarrage suivant.
+;
+; Valeur aberrante : repli sur 0x00020302 et journal d'événements, JAMAIS d'échec de
+; chargement. Défaut ENGENDRÉ depuis conduit_kmd_core::config::CABLE_FORMAT_DEFAULT.
+HKR,,CableFormat0,0x10001,0x00020302
+HKR,,CableFormat1,0x10001,0x00020302
+HKR,,CableFormat2,0x10001,0x00020302
+HKR,,CableFormat3,0x10001,0x00020302
+HKR,,CableFormat4,0x10001,0x00020302
+HKR,,CableFormat5,0x10001,0x00020302
+HKR,,CableFormat6,0x10001,0x00020302
+HKR,,CableFormat7,0x10001,0x00020302
+HKR,,CableFormat8,0x10001,0x00020302
+HKR,,CableFormat9,0x10001,0x00020302
+HKR,,CableFormat10,0x10001,0x00020302
+HKR,,CableFormat11,0x10001,0x00020302
+HKR,,CableFormat12,0x10001,0x00020302
+HKR,,CableFormat13,0x10001,0x00020302
+HKR,,CableFormat14,0x10001,0x00020302
+HKR,,CableFormat15,0x10001,0x00020302
+
 ; Interfaces KS des sous-périphériques, câble par câble. Le deuxième champ est le nom de
 ; référence du sous-périphérique, tel que PcRegisterSubdevice le reçoit : il doit
 ; correspondre exactement aux constantes de `portcls::adapter`

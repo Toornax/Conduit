@@ -64,10 +64,13 @@
 //!
 //! # Ce que ce module ne fait pas
 //!
-//! Il ne change pas le nombre de canaux par lui-même : le pilote scelle `CHANNELS` dans
-//! ses tables KS et refuse toute autre valeur tant que **M1b-05** n'est pas faite. Le
-//! refus du service ([`Statut::CanauxNonApplicables`]) est propagé tel quel, avec le nom
-//! de la tâche dans le message.
+//! Il ne change pas le nombre de canaux par lui-même. Depuis **M1b-05** le pilote sert 1 à
+//! 8 canaux par câble, mais il ne peut pas en changer à chaud : ses tables KS sont
+//! immuables et PortCls en retient les pointeurs pour toute la vie du filtre. Le changement
+//! demande d'écrire `CableFormat<n>` dans la clé matérielle du périphérique puis de
+//! redémarrer le devnode, et ce chemin n'est pas encore exposé. Le refus du service
+//! ([`Statut::CanauxNonApplicables`]) est propagé tel quel, avec le nombre de canaux
+//! réellement servi dans le message.
 //!
 //! # Aucun test de ce module ne touche la machine
 //!
@@ -83,7 +86,7 @@ use conduit_core::types::ChannelCount;
 use conduit_kmd_core::config::CABLE_MAX;
 use conduit_kmd_core::params::{MAX_CHANNELS, MIN_CHANNELS};
 
-use crate::protocole::{Reponse, Requete, Statut, CANAUX_APPLICABLES, PROTOCOLE_VERSION};
+use crate::protocole::{Reponse, Requete, Statut, CANAUX_PAR_DEFAUT, PROTOCOLE_VERSION};
 
 // ---------------------------------------------------------------------------------
 // Les identifiants d'endpoint de repli.
@@ -240,19 +243,22 @@ pub fn ordre_de_renommage(cable: CableId, voulu: &str) -> Result<Requete, CableE
 /// Le nombre de canaux que le pilote sert, quand la réponse ne le dit pas.
 ///
 /// [`Reponse::canaux`] vaut 0 pour un ordre qui ne vise aucun câble — un `lister`, par
-/// exemple. On retombe alors sur la valeur du contrat, qui est aujourd'hui la **seule**
-/// que le pilote applique ([`CANAUX_APPLICABLES`], M1b-05).
-const CANAUX_DEFAUT: ChannelCount = match ChannelCount::new(CANAUX_APPLICABLES as u8) {
+/// exemple. On retombe alors sur la valeur du contrat ([`CANAUX_PAR_DEFAUT`]), celle d'un
+/// poste fraîchement installé. Depuis M1b-05 ce n'est plus la seule valeur possible, et
+/// c'est ce qui rend ce repli **approximatif par nature** : un `lister` ne dit pas le
+/// format de chaque câble, faute d'un champ pour les seize. Un `activer` ou un `canaux`,
+/// eux, visent un câble et rendent son compte réel.
+const CANAUX_DEFAUT: ChannelCount = match ChannelCount::new(CANAUX_PAR_DEFAUT as u8) {
     Some(canaux) => canaux,
-    // Injoignable : le contrat borne `CANAUX_APPLICABLES` à `MIN_CHANNELS..=MAX_CHANNELS`,
+    // Injoignable : le contrat borne `CANAUX_PAR_DEFAUT` à `MIN_CHANNELS..=MAX_CHANNELS`,
     // et `ChannelCount` accepte 1 à 8. Un repli plutôt qu'un `unwrap` : ce fichier ne
     // contient aucune panique atteignable.
     None => ChannelCount::STEREO,
 };
 
 // Le repli ci-dessus n'est jamais pris tant que les deux bornes coïncident.
-const _: () = assert!(MIN_CHANNELS <= CANAUX_APPLICABLES && CANAUX_APPLICABLES <= MAX_CHANNELS);
-const _: () = assert!(CANAUX_APPLICABLES <= ChannelCount::MAX as u32);
+const _: () = assert!(MIN_CHANNELS <= CANAUX_PAR_DEFAUT && CANAUX_PAR_DEFAUT <= MAX_CHANNELS);
+const _: () = assert!(CANAUX_PAR_DEFAUT <= ChannelCount::MAX as u32);
 
 /// Le nombre de canaux qu'annonce une réponse, ou `CANAUX_DEFAUT` si elle n'en annonce
 /// pas (0) ou en annonce un que `ChannelCount` refuse.
@@ -342,11 +348,14 @@ pub fn verifier(reponse: &Reponse, cable: Option<CableId>) -> Result<(), CableEr
         Statut::CanauxInvalides => CableError::Unsupported(format!(
             "nombre de canaux hors des bornes du pilote ({MIN_CHANNELS} à {MAX_CHANNELS})"
         )),
-        // Le refus que M1b-05 lèvera. Le message nomme la tâche : c'est ce qui distingue
-        // « pas encore fait » de « ne marchera jamais ».
+        // Depuis M1b-05, `detail` porte le compte **réellement servi par ce câble-là**, et
+        // le message nomme la manœuvre qui le changerait plutôt qu'une tâche à faire :
+        // « ce câble sert 6 canaux » se comprend, « paramètre invalide » non.
         Statut::CanauxNonApplicables => CableError::Unsupported(format!(
-            "le pilote n'applique que {detail} canaux : le nombre de canaux est scellé \
-             dans ses tables KS tant que M1b-05 n'est pas faite"
+            "ce câble sert {detail} canaux : en changer demande d'écrire son format dans \
+             la clé matérielle du périphérique puis de redémarrer celui-ci — environ une \
+             seconde de silence sur tous les câbles — et « conduitctl » ne sait pas encore \
+             le demander"
         )),
         Statut::PiloteAbsent => CableError::Driver(
             "le pilote Conduit n'expose aucun filtre de topologie pour ce câble : il n'est \
@@ -388,7 +397,7 @@ pub fn verifier(reponse: &Reponse, cable: Option<CableId>) -> Result<(), CableEr
 mod windows {
     use super::{
         cable_nomme, info, liste, nom, ordre_de_renommage, premier_libre, verifier, CableError,
-        CableId, CableInfo, ChannelCount, CABLE_MAX, CANAUX_APPLICABLES,
+        CableId, CableInfo, ChannelCount, CABLE_MAX, CANAUX_PAR_DEFAUT,
     };
     use crate::protocole::{Reponse, Requete, NOM_TUBE};
     use crate::tube::{demander, ErreurClient};
@@ -568,14 +577,28 @@ mod windows {
         /// le dit, avec la commande qui termine le travail : le défaire serait détruire
         /// ce que l'appelant a obtenu pour n'avoir pas obtenu le reste.
         ///
-        /// Un nombre de canaux différent de celui que le pilote sert est refusé **avant**
+        /// Un nombre de canaux différent de celui que le câble sert est refusé **avant**
         /// d'activer quoi que ce soit : activer puis échouer sur les canaux laisserait
         /// derrière un câble que l'appelant n'a pas demandé.
+        ///
+        /// # Pourquoi le contrôle porte encore sur le défaut
+        ///
+        /// `create` **choisit** son câble (le premier libre) : il ne peut donc pas relire à
+        /// l'avance le format de celui qu'il prendra, et un `--channels 6` ne réussirait que
+        /// si le câble tiré au sort se trouvait réglé sur six. Refuser tout ce qui n'est pas
+        /// le défaut est le comportement prévisible ; l'alternative — activer, constater, se
+        /// rétracter — laisserait des câbles allumés derrière elle.
+        ///
+        /// Ce contrôle deviendra une **relecture** le jour où `create` saura demander un
+        /// format : il faudra alors écrire `CableFormat<n>` puis redémarrer le
+        /// périphérique, ce que le service ne sait pas encore faire.
         fn create(&mut self, spec: CableSpec) -> Result<CableInfo, CableError> {
-            if u32::from(spec.channels.get()) != CANAUX_APPLICABLES {
+            if u32::from(spec.channels.get()) != CANAUX_PAR_DEFAUT {
                 return Err(CableError::Unsupported(format!(
-                    "le pilote n'applique que {CANAUX_APPLICABLES} canaux : le nombre de \
-                     canaux est scellé dans ses tables KS tant que M1b-05 n'est pas faite"
+                    "un câble neuf est en {CANAUX_PAR_DEFAUT} canaux : en demander un autre \
+                     nombre à la création supposerait d'écrire son format dans la clé \
+                     matérielle du périphérique puis de redémarrer celui-ci, ce que \
+                     Conduit ne sait pas encore faire"
                 )));
             }
             // Le nom voulu, et le câble qu'il désigne s'il en désigne un. Un nom libre
@@ -877,9 +900,11 @@ mod tests {
                     assert!(texte.contains("conduit-helper installer"), "{texte}");
                 }
                 Statut::CanauxNonApplicables => {
-                    // Le refus **nomme la tâche** : c'est ce qui le distingue d'un
-                    // « ça ne marchera jamais ».
-                    assert!(texte.contains("M1b-05"), "{texte}");
+                    // Le refus **nomme la manœuvre** — écrire le format, redémarrer le
+                    // périphérique — et le compte servi. C'est ce qui le distingue d'un
+                    // « paramètre invalide » sur lequel personne ne sait quoi faire.
+                    assert!(texte.contains("redémarrer"), "{texte}");
+                    assert!(texte.contains("canaux"), "{texte}");
                 }
                 Statut::VersionInconnue => {
                     assert!(texte.contains("réinstallez"), "{texte}");
@@ -1027,7 +1052,7 @@ mod tests {
         // Hors bornes : le repli du contrat, pas une panique.
         assert_eq!(canaux(9), CANAUX_DEFAUT);
         assert_eq!(canaux(u32::MAX), CANAUX_DEFAUT);
-        assert_eq!(CANAUX_DEFAUT.get() as u32, CANAUX_APPLICABLES);
+        assert_eq!(CANAUX_DEFAUT.get() as u32, CANAUX_PAR_DEFAUT);
         // Un `lister` ne vise aucun câble : ses canaux sont ceux du contrat.
         let mut r = reponse(0b1, 0b1);
         r.canaux = 0;

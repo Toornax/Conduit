@@ -61,7 +61,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use conduit_kmd_core::config::{ACTIVE_CABLES_DEFAULT, ACTIVE_CABLES_VALUE_NAME};
+use conduit_kmd_core::config::{
+    ACTIVE_CABLES_DEFAULT, ACTIVE_CABLES_VALUE_NAME, CABLE_FORMAT_DEFAULT, CABLE_FORMAT_VALUE_NAMES,
+};
 use conduit_kmd_core::params::Param;
 use portcls::{
     CABLE_COUNT, TOPO_CAPTURE_NAMES, TOPO_RENDER_NAMES, WAVE_CAPTURE_NAMES, WAVE_RENDER_NAMES,
@@ -456,6 +458,32 @@ const ENTETE_MASQUE: &str = r#"
 ; périphérique (F-52). Défaut ENGENDRÉ depuis conduit_kmd_core::config.
 "#;
 
+/// Commentaire des formats de câble, qui prolongent la même section.
+const ENTETE_FORMATS: &str = r#"
+; Format de chaque câble (M1b-05, F-02 et F-03). Un REG_DWORD par câble, lu UNE FOIS au
+; démarrage — comme ReserveSize, et pas comme ActiveCables : le pilote ne le réécrit
+; jamais. Disposition, du poids faible au poids fort :
+;
+;   octet 0  fréquence  1 = 44 100 Hz, 2 = 48 000 Hz, 3 = 96 000 Hz
+;   octet 1  profondeur 1 = PCM 16 bits, 2 = PCM 24 bits, 3 = float 32 bits
+;   octet 2  canaux     1 à 8
+;   octet 3  réservé, doit être nul
+;
+; 0x00020302 = 48 kHz, float32, 2 canaux. La profondeur est une PRÉFÉRENCE transmise à
+; l'espace utilisateur : le câble déclare de toute façon les trois (le pilote les convertit
+; à la volée). La fréquence et le nombre de canaux, eux, sont figés — le pilote ne
+; rééchantillonne pas et ne remappe pas les canaux, les deux bouts d'un câble doivent donc
+; s'accorder, et ils n'y arrivent que parce qu'on ne leur propose rien d'autre.
+;
+; CHANGER UN FORMAT DEMANDE DE REDÉMARRER LE PÉRIPHÉRIQUE : les tables KS sont immuables et
+; PortCls en retient les pointeurs pour toute la vie du filtre. Le service d'assistance
+; écrit la valeur puis redémarre le devnode par cfgmgr32 — environ une seconde de silence
+; sur les seize câbles. Modifier la valeur à la main marche aussi, au démarrage suivant.
+;
+; Valeur aberrante : repli sur 0x00020302 et journal d'événements, JAMAIS d'échec de
+; chargement. Défaut ENGENDRÉ depuis conduit_kmd_core::config::CABLE_FORMAT_DEFAULT.
+"#;
+
 /// Commentaire et en-tête de `[…NT.Interfaces]`.
 const ENTETE_INTERFACES: &str = r#"
 ; Interfaces KS des sous-périphériques, câble par câble. Le deuxième champ est le nom de
@@ -506,6 +534,25 @@ fn parametres_attendus() -> Vec<String> {
 /// donneraient deux états différents.
 fn masque_attendu() -> String {
     format!("HKR,,{ACTIVE_CABLES_VALUE_NAME},0x10001,{ACTIVE_CABLES_DEFAULT:#010x}")
+}
+
+/// Les seize lignes `HKR` des formats de câble (M1b-05), avec leur défaut commun.
+///
+/// En **hexadécimal** comme le masque, et pour la même raison : `131842` ne dit rien à qui
+/// ouvre `regedit`, `0x00020302` se lit champ par champ (48 kHz, float32, 2 canaux) dès
+/// qu'on connaît la disposition, et le commentaire de la section la donne.
+///
+/// Seize valeurs et non une seule, contrairement au masque : un format ne tient pas dans un
+/// bit, et personne n'a besoin qu'une écriture couvre les seize d'un coup — changer un
+/// format demande de toute façon un redémarrage du devnode.
+///
+/// Source unique : `conduit_kmd_core::config::CABLE_FORMAT_DEFAULT`, le repli sur lequel
+/// `conduit_kmd::registry` se rabat quand la valeur manque ou n'est pas décodable.
+fn formats_attendus() -> Vec<String> {
+    CABLE_FORMAT_VALUE_NAMES
+        .iter()
+        .map(|nom| format!("HKR,,{nom},0x10001,{:#010x}", CABLE_FORMAT_DEFAULT.encode()))
+        .collect()
 }
 
 /// Les lignes d'un bloc littéral, sans le saut de ligne de mise en page initial.
@@ -570,6 +617,11 @@ fn inf_attendu() -> String {
     ajouter(&mut std::iter::once(String::new()));
     ajouter(&mut bloc(ENTETE_MASQUE).map(str::to_owned));
     ajouter(&mut std::iter::once(masque_attendu()));
+    ajouter(&mut std::iter::once(String::new()));
+
+    // Seize `HKR` de plus : le format de chaque câble (M1b-05).
+    ajouter(&mut bloc(ENTETE_FORMATS).map(str::to_owned));
+    ajouter(&mut formats_attendus().into_iter());
     ajouter(&mut std::iter::once(String::new()));
 
     // Dix `AddInterface` par câble, groupés par câble.
@@ -813,6 +865,26 @@ fn defauts_de_parametres_identiques_au_pilote() {
          « {ACTIVE_CABLES_VALUE_NAME} » dans la clé matérielle et retient \
          {ACTIVE_CABLES_DEFAULT:#010x} à défaut : l'INF doit écrire exactement cette \
          valeur.\nSection commitée : {section:#?}"
+    );
+
+    // Les seize formats de câble (M1b-05, F-02/F-03) : même exigence que le masque, seize
+    // fois. Un poste installé sur une valeur que le pilote ne tient pas pour son défaut
+    // servirait des câbles à un format et l'INF en décrirait un autre, sans que rien ne le
+    // signale — jusqu'à ce qu'on supprime la valeur et que le format change tout seul.
+    for attendue in formats_attendus() {
+        assert!(
+            section.contains(&attendue.as_str()),
+            "[ConduitCable_HW_AddReg] : « {attendue} » manquante. Le pilote lit les seize \
+             valeurs « CableFormat<n> » dans la clé matérielle et retient \
+             {:#010x} à défaut : l'INF doit écrire exactement cette valeur.\n\
+             Section commitée : {section:#?}",
+            CABLE_FORMAT_DEFAULT.encode()
+        );
+    }
+    assert_eq!(
+        formats_attendus().len(),
+        CABLE_COUNT,
+        "un format par câble, ni plus ni moins"
     );
 
     // F-52 (désinstallation propre) : PnP retire les `HKR` de la clé matérielle avec le

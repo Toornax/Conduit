@@ -34,20 +34,37 @@
 //! Windows ne tournant que sur des architectures petit-boutistes, la différence est
 //! documentaire — mais elle dit d'où vient chaque tampon.
 //!
-//! # Ce que ce module valide et n'applique pas
+//! # Ce que ce module valide, et ce qui l'applique (M1b-05)
 //!
 //! Le champ [`CableState::channels`] est **validé** contre les bornes de
-//! [`crate::params`] et **rien de plus** : son application appartient à M1b-05.
-//! `conduit_kmd::descriptors::CHANNELS` est aujourd'hui scellée dans les tables KS
-//! (`KSDATARANGE_AUDIO`, `MaximumChannels`) et dans des assertions à la compilation
-//! (`topo.rs` : `CHANNELS as usize <= MAX_CHANNELS`) ; l'accepter dans la structure
-//! d'échange sans le refuser à la validation ferait croire au service d'assistance qu'il
-//! peut le régler. Le gestionnaire de propriété exige donc [`DEFAULT_CHANNELS`] tant que
-//! M1b-05 n'a pas rendu la valeur dynamique — voir [`CableState::channels_applicables`].
+//! [`crate::params`] et rendu par la propriété ; ce n'est plus une valeur morte. Depuis
+//! M1b-05 les descripteurs KS du pilote sont une table indexée par (fréquence, canaux) et
+//! le nombre de canaux est celui que le registre fixe pour le câble, par la valeur
+//! `CableFormat<n>` dont [`CableFormat`] est le codec.
+//!
+//! **Le nombre de canaux se lit ici et ne s'écrit pas.** La structure d'échange est
+//! `GET`/`SET`, mais son champ `channels` n'est pas un réglage : un format ne peut pas
+//! changer sans redémarrer le périphérique (les tables KS sont immuables et PortCls en
+//! retient les pointeurs à vie), et le seul chemin qui redémarre le devnode est en espace
+//! utilisateur — `cfgmgr32`, dans le service d'assistance. Un `SET` qui prétendrait
+//! changer les canaux rendrait `STATUS_SUCCESS` pour un réglage sans effet jusqu'au
+//! prochain démarrage, ce qui est pire qu'un refus : le gestionnaire exige donc que le
+//! champ **égale la valeur courante du câble** ([`CableState::channels_appliquables`]).
+//!
+//! # Le format d'un câble est une configuration, pas un état
+//!
+//! [`ACTIVE_CABLES_VALUE_NAME`] est de l'**état** : le pilote l'écrit à chaque `SET`, une
+//! seule valeur pour les seize câbles. [`CABLE_FORMAT_VALUE_NAMES`] est de la
+//! **configuration** : le pilote ne fait que la **lire au démarrage**, exactement comme
+//! `ReserveSize`, et c'est le service qui l'écrit puis redémarre le devnode. D'où une
+//! valeur **par câble** — un format ne tient pas dans deux bits, et personne n'a besoin
+//! qu'une écriture couvre les seize d'un coup, puisqu'il faut de toute façon redémarrer.
 
 use core::fmt;
 
+use crate::format::{sample_rate_index, RATE_44100, RATE_48000, RATE_96000};
 use crate::params::{DEFAULT_CHANNELS, MAX_CHANNELS, MAX_RESERVE, MIN_CHANNELS};
+use crate::ring::SampleFormat;
 
 // ---------------------------------------------------------------------------------
 // Le jeu de propriétés.
@@ -151,7 +168,17 @@ pub const PID_MARQUE_CABLE: u32 = 1;
 /// un domaine élargi, une sémantique modifiée. Le service d'assistance compare, refuse de
 /// piloter un pilote qu'il ne connaît pas, et le dit ; sans ce numéro, la panne serait un
 /// `STATUS_INVALID_PARAMETER` inexplicable sur une longueur d'un octet de trop.
-pub const CONFIG_VERSION: u32 = 1;
+///
+/// # Pourquoi 2
+///
+/// La forme de [`CableState`] n'a pas bougé d'un octet en M1b-05 ; sa **sémantique**, si,
+/// et c'est exactement le cas que ce numéro doit couvrir. En version 1, `channels` valait
+/// toujours 2 et un `SET` était refusé au-delà : un service pouvait en déduire que le
+/// pilote était stéréo. En version 2, il porte le nombre de canaux réellement servi par ce
+/// câble-là, entre 1 et 8, et le `SET` exige cette valeur-là et non plus 2
+/// ([`CableState::channels_appliquables`]). Un service v1 devant un pilote v2 lirait « 6 »
+/// et conclurait à un pilote cassé ; il reçoit un refus de version, qui dit quoi faire.
+pub const CONFIG_VERSION: u32 = 2;
 
 /// Nombre de câbles que le contrat sait adresser : le plafond de la réserve
 /// ([`crate::params::MAX_RESERVE`], SPEC F-06).
@@ -227,8 +254,9 @@ pub struct CableState {
     pub connected: u32,
     /// Nombre de canaux du câble, dans `MIN_CHANNELS..=MAX_CHANNELS`.
     ///
-    /// **Validé, pas appliqué** (M1b-05) : voir l'en-tête de module et
-    /// [`CableState::channels_applicables`]. Le domaine est celui de
+    /// **Lu, pas réglé** (M1b-05) : au `GET`, c'est le nombre de canaux que le câble sert
+    /// réellement, celui de [`CableFormat::channels`] lu au démarrage ; au `SET`, il doit
+    /// l'égaler ([`CableState::channels_appliquables`]). Le domaine est celui de
     /// [`crate::params::Param::Channels`] — une seule définition des bornes, comme pour
     /// le registre.
     pub channels: u32,
@@ -330,20 +358,25 @@ impl CableState {
         self.connected != 0
     }
 
-    /// Le nombre de canaux est-il celui que le pilote sait **servir** aujourd'hui ?
+    /// Le nombre de canaux demandé est-il celui que **ce câble** sert (`courants`) ?
     ///
     /// [`Self::from_bytes`] accepte tout le domaine `MIN_CHANNELS..=MAX_CHANNELS`, parce
-    /// que c'est le domaine du contrat et que le fuzzer doit l'explorer en entier. Mais
-    /// tant que M1b-05 n'a pas rendu les canaux dynamiques, `descriptors::CHANNELS` est
-    /// scellée dans les tables KS et dans des assertions à la compilation : servir un
-    /// `SET` à six canaux rendrait `STATUS_SUCCESS` pour un réglage qui n'agirait sur
-    /// rien, ce qui est pire qu'un refus. Le gestionnaire refuse donc, et ce prédicat
-    /// nomme la frontière au lieu de la laisser dans un `if` anonyme.
+    /// que c'est le domaine du contrat et que le fuzzer doit l'explorer en entier. Le
+    /// gestionnaire de `SET`, lui, exige l'égalité avec la valeur courante — non plus
+    /// avec [`DEFAULT_CHANNELS`], comme avant M1b-05, mais avec ce que le registre a fixé
+    /// pour ce câble-là.
     ///
-    /// **À supprimer avec M1b-05**, pas avant.
+    /// La raison a changé de nature et pas de conclusion. Avant M1b-05, le pilote ne
+    /// *savait* pas servir autre chose que deux canaux. Depuis, il sait les servir tous —
+    /// mais pas **en changer à chaud** : les tables KS sont immuables et PortCls en retient
+    /// les pointeurs pour toute la vie du filtre (`descriptors::Shared`). Accepter un `SET`
+    /// à six canaux rendrait `STATUS_SUCCESS` pour un réglage qui n'agirait sur rien avant
+    /// le prochain démarrage du périphérique, ce qui est pire qu'un refus. Le changement
+    /// de format passe donc par le registre **et** un redémarrage du devnode, tous deux en
+    /// espace utilisateur.
     #[must_use]
-    pub const fn channels_applicables(&self) -> bool {
-        self.channels == DEFAULT_CHANNELS
+    pub const fn channels_appliquables(&self, courants: u32) -> bool {
+        self.channels == courants
     }
 
     /// Sérialise l'état en [`CABLE_STATE_BYTES`] octets, champ par champ, aux décalages
@@ -568,6 +601,304 @@ pub const fn sanitize_mask(raw: u32) -> (u32, Option<MaskFix>) {
     }
 }
 
+// ---------------------------------------------------------------------------------
+// `CableFormat<n>` : le format d'un câble, un `REG_DWORD` par câble (M1b-05).
+// ---------------------------------------------------------------------------------
+
+/// Noms des valeurs `REG_DWORD` qui portent le format de chaque câble, dans la clé
+/// **matérielle** du périphérique (`HKR`, comme [`ACTIVE_CABLES_VALUE_NAME`] et pour la
+/// même raison : PnP les supprime avec le périphérique, F-52).
+///
+/// Écrites en toutes lettres plutôt qu'engendrées par concaténation : le crate est
+/// `no_std` et sans allocation, un nom se compose donc à la compilation ou pas du tout —
+/// et ces seize chaînes sont ce que l'INF écrit, ce que le pilote lit, ce que le service
+/// réécrit et ce qu'un administrateur voit dans `regedit`. Une seule liste, quatre
+/// lecteurs.
+pub const CABLE_FORMAT_VALUE_NAMES: [&str; CABLE_MAX as usize] = [
+    "CableFormat0",
+    "CableFormat1",
+    "CableFormat2",
+    "CableFormat3",
+    "CableFormat4",
+    "CableFormat5",
+    "CableFormat6",
+    "CableFormat7",
+    "CableFormat8",
+    "CableFormat9",
+    "CableFormat10",
+    "CableFormat11",
+    "CableFormat12",
+    "CableFormat13",
+    "CableFormat14",
+    "CableFormat15",
+];
+
+/// Nom lisible du format, en français, pour le journal.
+pub const CABLE_FORMAT_LABEL: &str = "format du câble";
+
+/// Le nom de valeur du câble `cable`, ou `None` au-delà du dernier.
+#[must_use]
+pub fn cable_format_value_name(cable: u32) -> Option<&'static str> {
+    usize::try_from(cable)
+        .ok()
+        .and_then(|i| CABLE_FORMAT_VALUE_NAMES.get(i))
+        .copied()
+}
+
+/// Code de fréquence dans l'octet de poids faible : 44 100 Hz.
+pub const CODE_RATE_44100: u32 = 1;
+/// Code de fréquence : 48 000 Hz.
+pub const CODE_RATE_48000: u32 = 2;
+/// Code de fréquence : 96 000 Hz.
+pub const CODE_RATE_96000: u32 = 3;
+
+/// Code de profondeur dans le deuxième octet : PCM 16 bits.
+pub const CODE_DEPTH_PCM16: u32 = 1;
+/// Code de profondeur : PCM 24 bits (conteneur de trois octets).
+pub const CODE_DEPTH_PCM24: u32 = 2;
+/// Code de profondeur : flottant 32 bits.
+pub const CODE_DEPTH_F32: u32 = 3;
+
+/// Décalage du champ « fréquence » dans le `REG_DWORD`.
+const DECALAGE_RATE: u32 = 0;
+/// Décalage du champ « profondeur préférée ».
+const DECALAGE_DEPTH: u32 = 8;
+/// Décalage du champ « canaux ».
+const DECALAGE_CHANNELS: u32 = 16;
+/// Décalage du champ réservé.
+const DECALAGE_RESERVE: u32 = 24;
+/// Masque d'un champ : un octet.
+const MASQUE_CHAMP: u32 = 0xFF;
+
+/// Le format d'un câble : la fréquence et le nombre de canaux qu'il **fige**, plus la
+/// profondeur qu'il **préfère**.
+///
+/// # Pourquoi trois champs alors que deux seulement figent quelque chose
+///
+/// La fréquence et les canaux sont figés parce que [`crate::ring::copy_frames`] ne sait ni
+/// rééchantillonner ni remapper les canaux : les deux bouts du câble doivent s'accorder,
+/// et le pilote ne déclare donc que ceux-là ([`crate::format::cable_formats`]). La
+/// profondeur, elle, se convertit à la volée dans les neuf sens — les trois sont donc
+/// **toujours** déclarées, quelle que soit la valeur de ce champ.
+///
+/// [`Self::depth`] n'est pas un réglage du pilote mais une **préférence** que la
+/// configuration transporte pour ses lecteurs d'espace utilisateur : le dorsal WASAPI
+/// ouvre ses flux dans ce format, `conduitctl` l'affiche. Le pilote la lit, la valide et
+/// la journalise ; il n'en tire aucun descripteur, et c'est précisément ce qui garde le
+/// nombre de variantes à 3 × 8 = **24** par sens au lieu de 72.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CableFormat {
+    /// Fréquence d'échantillonnage en Hz : une des trois de [`crate::format::SAMPLE_RATES`].
+    pub sample_rate: u32,
+    /// Profondeur préférée (voir la note de structure : préférence, pas restriction).
+    pub depth: SampleFormat,
+    /// Nombre de canaux, dans `MIN_CHANNELS..=MAX_CHANNELS`.
+    pub channels: u8,
+}
+
+/// Le format d'un câble neuf : **48 kHz, float32, 2 canaux**, soit `0x0002_0302`.
+///
+/// 48 kHz est la fréquence par défaut de Windows ; float32 est ce que le moteur audio
+/// emploie en mode partagé ; deux canaux, c'est ce que M1a servait et ce qu'un câble
+/// virtuel sert le plus souvent. C'est aussi la valeur que l'INF écrit pour les seize
+/// câbles à l'installation (`[ConduitCable_HW_AddReg]`, engendré par
+/// `portcls/tests/inf.rs`) et celle sur laquelle la lecture se replie.
+pub const CABLE_FORMAT_DEFAULT: CableFormat = CableFormat {
+    sample_rate: RATE_48000,
+    depth: SampleFormat::F32,
+    channels: DEFAULT_CHANNELS as u8,
+};
+
+/// Ce qui a fait refuser un encodage de [`CableFormat::decode`] : un champ, une valeur.
+///
+/// Chaque variante porte le code trouvé, pas seulement le fait qu'on a refusé — même
+/// principe que [`ConfigError`] et [`crate::params::Correction`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FormatCodeError {
+    /// Code de fréquence hors de `{1, 2, 3}`.
+    Rate(u32),
+    /// Code de profondeur hors de `{1, 2, 3}`.
+    Depth(u32),
+    /// Nombre de canaux hors de `MIN_CHANNELS..=MAX_CHANNELS`.
+    Channels(u32),
+    /// Octet de poids fort non nul.
+    Reserve(u32),
+}
+
+impl fmt::Display for FormatCodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rate(code) => write!(
+                f,
+                "code de fréquence {code} inconnu ({CODE_RATE_44100} = 44 100 Hz, \
+                 {CODE_RATE_48000} = 48 000 Hz, {CODE_RATE_96000} = 96 000 Hz)"
+            ),
+            Self::Depth(code) => write!(
+                f,
+                "code de profondeur {code} inconnu ({CODE_DEPTH_PCM16} = PCM 16 bits, \
+                 {CODE_DEPTH_PCM24} = PCM 24 bits, {CODE_DEPTH_F32} = float 32 bits)"
+            ),
+            Self::Channels(brut) => {
+                write!(f, "{brut} canaux hors de {MIN_CHANNELS} à {MAX_CHANNELS}")
+            }
+            Self::Reserve(brut) => write!(f, "octet de poids fort non nul ({brut:#04x})"),
+        }
+    }
+}
+
+/// Ce que [`CableFormat::sanitize`] a corrigé : la valeur lue, celle retenue, et la
+/// cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CableFormatFix {
+    /// Numéro du câble concerné, pour que la ligne de journal se suffise à elle-même.
+    pub cable: u32,
+    /// Encodage trouvé dans le registre, tel quel.
+    pub found: u32,
+    /// Encodage retenu à la place.
+    pub applied: u32,
+    /// Le champ fautif et sa valeur.
+    pub cause: FormatCodeError,
+}
+
+impl fmt::Display for CableFormatFix {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{CABLE_FORMAT_LABEL} {} = {:#010x} : {}, repli sur {:#010x}",
+            self.cable, self.found, self.cause, self.applied
+        )
+    }
+}
+
+impl CableFormat {
+    /// L'encodage `REG_DWORD` de ce format.
+    ///
+    /// Un octet par champ, du poids faible au poids fort : fréquence, profondeur, canaux,
+    /// réservé nul. Le défaut se lit `0x0002_0302` dans `regedit` — **et c'est le point**.
+    /// Un encodage compact (trois bits de fréquence, deux de profondeur…) tiendrait dans un
+    /// octet et serait illisible ; un administrateur qui ouvre la clé doit pouvoir dire ce
+    /// que la valeur signifie, et un journal qui l'affiche en hexadécimal doit être
+    /// utilisable. Vingt-quatre bits perdus dans un `REG_DWORD` ne coûtent rien.
+    #[must_use]
+    pub const fn encode(self) -> u32 {
+        let rate = match sample_rate_index(self.sample_rate) {
+            Some(0) => CODE_RATE_44100,
+            Some(1) => CODE_RATE_48000,
+            Some(2) => CODE_RATE_96000,
+            // Inatteignable pour une valeur construite par `decode` ou `sanitize` ; le
+            // repli sur le défaut vaut mieux qu'un encodage que personne ne saura relire.
+            _ => CODE_RATE_48000,
+        };
+        let depth = match self.depth {
+            SampleFormat::I16 => CODE_DEPTH_PCM16,
+            SampleFormat::Pcm24 => CODE_DEPTH_PCM24,
+            SampleFormat::F32 => CODE_DEPTH_F32,
+        };
+        let channels = self.channels as u32;
+        // Chaque champ tient dans son octet (les codes vont de 1 à 3, les canaux de 1 à
+        // 8) : les décalages ne peuvent pas déborder, et `wrapping_shl` remplace un
+        // opérateur que les lints du crate refusent.
+        (rate & MASQUE_CHAMP).wrapping_shl(DECALAGE_RATE)
+            | (depth & MASQUE_CHAMP).wrapping_shl(DECALAGE_DEPTH)
+            | (channels & MASQUE_CHAMP).wrapping_shl(DECALAGE_CHANNELS)
+    }
+
+    /// **Le** parseur : un `REG_DWORD` vers un format valide, ou le champ fautif.
+    ///
+    /// Pur, sans allocation, sans panique, appelable à n'importe quel IRQL et fuzzable en
+    /// mode utilisateur (M1b-08), comme [`CableState::from_bytes`]. L'ordre des contrôles
+    /// suit celui des octets, pour que la cause nommée soit la **première** anomalie.
+    ///
+    /// L'octet de poids fort est exigé nul, et pour la raison qui fait exiger nul le
+    /// [`CableState::reserved`] : c'est ce qui garde la place libre. Un client qui y
+    /// écrirait n'importe quoi aujourd'hui rendrait impossible d'y loger un vrai champ
+    /// demain sans le casser.
+    pub const fn decode(raw: u32) -> Result<Self, FormatCodeError> {
+        let rate_code = raw.wrapping_shr(DECALAGE_RATE) & MASQUE_CHAMP;
+        let depth_code = raw.wrapping_shr(DECALAGE_DEPTH) & MASQUE_CHAMP;
+        let channels = raw.wrapping_shr(DECALAGE_CHANNELS) & MASQUE_CHAMP;
+        let reserve = raw.wrapping_shr(DECALAGE_RESERVE) & MASQUE_CHAMP;
+
+        let sample_rate = match rate_code {
+            CODE_RATE_44100 => RATE_44100,
+            CODE_RATE_48000 => RATE_48000,
+            CODE_RATE_96000 => RATE_96000,
+            autre => return Err(FormatCodeError::Rate(autre)),
+        };
+        let depth = match depth_code {
+            CODE_DEPTH_PCM16 => SampleFormat::I16,
+            CODE_DEPTH_PCM24 => SampleFormat::Pcm24,
+            CODE_DEPTH_F32 => SampleFormat::F32,
+            autre => return Err(FormatCodeError::Depth(autre)),
+        };
+        if channels < MIN_CHANNELS || channels > MAX_CHANNELS {
+            return Err(FormatCodeError::Channels(channels));
+        }
+        if reserve != 0 {
+            return Err(FormatCodeError::Reserve(reserve));
+        }
+        Ok(Self {
+            sample_rate,
+            depth,
+            channels: channels as u8,
+        })
+    }
+
+    /// Lit un encodage venu du registre : **jamais d'échec**.
+    ///
+    /// Comme [`crate::params::sanitize`] et [`sanitize_mask`], et pour la même raison —
+    /// refuser de charger pour une faute de frappe dans un `REG_DWORD` coûterait à
+    /// l'administrateur toutes les cartes son virtuelles du poste. Un encodage aberrant
+    /// donne [`CABLE_FORMAT_DEFAULT`] **en entier** et une ligne de journal qui nomme le
+    /// champ fautif.
+    ///
+    /// Le repli est global et non champ par champ, contrairement à
+    /// [`crate::params::sanitize`] qui écrête chaque paramètre séparément : les trois
+    /// champs décrivent **un** format, et rendre « 96 kHz sur les canaux par défaut » pour
+    /// une valeur dont seul l'octet des canaux est faux fabriquerait une configuration que
+    /// personne n'a demandée. Reprendre le défaut entier est le seul repli qui reste
+    /// explicable dans le journal.
+    #[must_use]
+    pub const fn sanitize(cable: u32, raw: u32) -> (Self, Option<CableFormatFix>) {
+        match Self::decode(raw) {
+            Ok(format) => (format, None),
+            Err(cause) => (
+                CABLE_FORMAT_DEFAULT,
+                Some(CableFormatFix {
+                    cable,
+                    found: raw,
+                    applied: CABLE_FORMAT_DEFAULT.encode(),
+                    cause,
+                }),
+            ),
+        }
+    }
+
+    /// Le rang de la fréquence dans [`crate::format::SAMPLE_RATES`], donc la première
+    /// moitié de l'index de variante des descripteurs du pilote.
+    #[must_use]
+    pub const fn rate_index(self) -> Option<usize> {
+        sample_rate_index(self.sample_rate)
+    }
+}
+
+// L'encodage du défaut est bien celui qu'on annonce partout — dans l'INF, dans la
+// documentation, dans le journal. Une divergence donnerait un INF qui écrit une valeur et
+// un pilote qui en attend une autre : tous les câbles se replieraient, avec seize lignes
+// de journal, sur un format qui se trouverait être le bon.
+const _: () = assert!(CABLE_FORMAT_DEFAULT.encode() == 0x0002_0302);
+const _: () = assert!(matches!(
+    CableFormat::decode(0x0002_0302),
+    Ok(f) if f.sample_rate == RATE_48000 && f.channels == 2
+));
+// Aller-retour sur les bornes du domaine : le codec ne perd rien.
+const _: () = assert!(matches!(
+    CableFormat::decode(CABLE_FORMAT_DEFAULT.encode()),
+    Ok(CABLE_FORMAT_DEFAULT)
+));
+// Le nombre de noms de valeur couvre exactement les câbles adressables.
+const _: () = assert!(CABLE_FORMAT_VALUE_NAMES.len() == CABLE_MAX as usize);
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -578,6 +909,7 @@ pub const fn sanitize_mask(raw: u32) -> (u32, Option<MaskFix>) {
 )]
 mod tests {
     use super::*;
+    use crate::format::{cable_formats, RATE_44100, RATE_96000};
     use proptest::prelude::*;
     use std::string::ToString;
     use std::vec::Vec;
@@ -631,7 +963,9 @@ mod tests {
             "deux propriétés du même jeu ne peuvent pas partager un identifiant : \
              PortCls cherche la première entrée de même Set/Id et servirait la mauvaise"
         );
-        assert_eq!(CONFIG_VERSION, 1);
+        // M1b-05 : `channels` a changé de sémantique sans changer de forme, ce qui est
+        // exactement le cas que ce numéro doit couvrir (voir sa documentation).
+        assert_eq!(CONFIG_VERSION, 2);
     }
 
     /// Le `pid` de la marque : celui qu'écrit le service et celui que lit le dorsal.
@@ -805,12 +1139,17 @@ mod tests {
             }
         }
 
-        // Le domaine est plus large que ce que M1b-04 sait appliquer : la validation
-        // accepte 1 à 8, le gestionnaire n'appliquera que 2 (voir l'en-tête de module).
+        // Le domaine est celui du contrat (1 à 8) ; le gestionnaire, lui, exige la valeur
+        // **courante du câble** — non plus 2 en dur, depuis M1b-05.
         let huit = CableState::from_bytes(&octets(0, 1, MAX_CHANNELS, 0)).unwrap();
-        assert!(!huit.channels_applicables(), "M1b-05 n'est pas faite");
+        assert!(huit.channels_appliquables(MAX_CHANNELS), "câble à 8 canaux");
+        assert!(
+            !huit.channels_appliquables(DEFAULT_CHANNELS),
+            "un câble stéréo ne peut pas passer à 8 canaux sans redémarrer le devnode"
+        );
         let deux = CableState::from_bytes(&octets(0, 1, DEFAULT_CHANNELS, 0)).unwrap();
-        assert!(deux.channels_applicables());
+        assert!(deux.channels_appliquables(DEFAULT_CHANNELS));
+        assert!(!deux.channels_appliquables(MAX_CHANNELS));
     }
 
     /// Table du champ réservé : nul, ou refusé.
@@ -964,7 +1303,187 @@ mod tests {
         assert!(is_active(masque, 0) && is_active(masque, 1) && !is_active(masque, 2));
     }
 
+    /// Table du codec de format : les valeurs nominales, les bornes, et l'encodage lisible.
+    #[test]
+    fn cable_format_table() {
+        let cases: [(u32, u32, SampleFormat, u8); 8] = [
+            // Le défaut, tel qu'il se lit dans `regedit` : 48 kHz, float32, 2 canaux.
+            (0x0002_0302, RATE_48000, SampleFormat::F32, 2),
+            // Les deux autres fréquences, aux deux bornes des canaux.
+            (0x0001_0101, RATE_44100, SampleFormat::I16, 1),
+            (0x0008_0203, RATE_96000, SampleFormat::Pcm24, 8),
+            (0x0006_0303, RATE_96000, SampleFormat::F32, 6),
+            (0x0002_0201, RATE_44100, SampleFormat::Pcm24, 2),
+            (0x0004_0102, RATE_48000, SampleFormat::I16, 4),
+            (0x0005_0302, RATE_48000, SampleFormat::F32, 5),
+            (0x0008_0101, RATE_44100, SampleFormat::I16, 8),
+        ];
+        for (raw, sample_rate, depth, channels) in cases {
+            let attendu = CableFormat {
+                sample_rate,
+                depth,
+                channels,
+            };
+            assert_eq!(CableFormat::decode(raw), Ok(attendu), "{raw:#010x}");
+            assert_eq!(attendu.encode(), raw, "{attendu:?}");
+            // Aucune correction pour une valeur du domaine.
+            let (retenu, fix) = CableFormat::sanitize(0, raw);
+            assert_eq!(retenu, attendu);
+            assert!(fix.is_none(), "{raw:#010x} corrigé à tort");
+        }
+        assert_eq!(CABLE_FORMAT_DEFAULT.encode(), 0x0002_0302);
+        assert_eq!(CableFormat::decode(0x0002_0302), Ok(CABLE_FORMAT_DEFAULT));
+    }
+
+    /// Table des encodages **invalides** : un champ fautif, une cause nommée, et jamais
+    /// d'échec — c'est la règle de `params::sanitize`, appliquée au format.
+    #[test]
+    fn cable_format_invalide_table() {
+        let cases: [(u32, FormatCodeError); 12] = [
+            // Zéro : le cas d'une valeur créée sans contenu.
+            (0x0000_0000, FormatCodeError::Rate(0)),
+            // Code de fréquence hors des trois.
+            (0x0002_0300, FormatCodeError::Rate(0)),
+            (0x0002_0304, FormatCodeError::Rate(4)),
+            (0x0002_03FF, FormatCodeError::Rate(255)),
+            // Code de profondeur hors des trois — la fréquence, elle, est bonne.
+            (0x0002_0002, FormatCodeError::Depth(0)),
+            (0x0002_0402, FormatCodeError::Depth(4)),
+            (0x0002_FF02, FormatCodeError::Depth(255)),
+            // Canaux hors bornes.
+            (0x0000_0302, FormatCodeError::Channels(0)),
+            (0x0009_0302, FormatCodeError::Channels(9)),
+            (0x00FF_0302, FormatCodeError::Channels(255)),
+            // Octet de poids fort non nul : la place réservée reste libre.
+            (0x0102_0302, FormatCodeError::Reserve(1)),
+            (0xFF02_0302, FormatCodeError::Reserve(255)),
+        ];
+        for (raw, cause) in cases {
+            assert_eq!(CableFormat::decode(raw), Err(cause), "{raw:#010x}");
+            // Le repli est le défaut **entier**, jamais un mélange (voir `sanitize`).
+            let (retenu, fix) = CableFormat::sanitize(7, raw);
+            assert_eq!(retenu, CABLE_FORMAT_DEFAULT, "{raw:#010x}");
+            let fix = fix.expect("un encodage refusé doit être signalé");
+            assert_eq!(fix.cable, 7);
+            assert_eq!(fix.found, raw);
+            assert_eq!(fix.applied, CABLE_FORMAT_DEFAULT.encode());
+            assert_eq!(fix.cause, cause);
+            // La ligne de journal nomme le câble, la valeur lue et le champ fautif.
+            let ligne = fix.to_string();
+            assert!(ligne.contains("câble"), "{ligne}");
+            assert!(ligne.contains("0x"), "{ligne}");
+        }
+        // L'ordre des contrôles suit celui des octets : les quatre champs fautifs à la
+        // fois, c'est la fréquence qui est signalée.
+        assert_eq!(
+            CableFormat::decode(0xFFFF_FFFF),
+            Err(FormatCodeError::Rate(255))
+        );
+    }
+
+    /// Le message du codec dit quel champ et quelle valeur, comme celui de [`ConfigError`].
+    #[test]
+    fn le_message_du_codec_nomme_le_champ() {
+        let ligne = FormatCodeError::Rate(9).to_string();
+        assert!(ligne.contains('9'), "{ligne}");
+        assert!(ligne.contains("44 100"), "{ligne}");
+        let ligne = FormatCodeError::Depth(9).to_string();
+        assert!(ligne.contains("profondeur"), "{ligne}");
+        assert!(ligne.contains("24 bits"), "{ligne}");
+        let ligne = FormatCodeError::Channels(9).to_string();
+        assert!(ligne.contains("canaux"), "{ligne}");
+        let ligne = FormatCodeError::Reserve(0x42).to_string();
+        assert!(ligne.contains("poids fort"), "{ligne}");
+        assert!(ligne.contains("0x42"), "{ligne}");
+    }
+
+    /// Les seize noms de valeur : un par câble, distincts, et de la forme que l'INF écrit.
+    #[test]
+    fn les_noms_de_valeur_couvrent_les_seize_cables() {
+        assert_eq!(CABLE_FORMAT_VALUE_NAMES.len(), CABLE_MAX as usize);
+        for (i, nom) in CABLE_FORMAT_VALUE_NAMES.iter().enumerate() {
+            assert_eq!(*nom, std::format!("CableFormat{i}"), "câble {i}");
+            assert_eq!(cable_format_value_name(i as u32), Some(*nom));
+        }
+        // Deux câbles ne peuvent pas partager un nom : ils partageraient un format.
+        let mut vus: Vec<&str> = CABLE_FORMAT_VALUE_NAMES.to_vec();
+        vus.sort_unstable();
+        vus.dedup();
+        assert_eq!(vus.len(), CABLE_MAX as usize);
+        assert_eq!(cable_format_value_name(CABLE_MAX), None);
+        assert_eq!(cable_format_value_name(u32::MAX), None);
+        // Le format ne se confond pas avec l'état actif : deux natures, deux valeurs.
+        assert!(!CABLE_FORMAT_VALUE_NAMES.contains(&ACTIVE_CABLES_VALUE_NAME));
+    }
+
+    /// Le format lu du registre alimente bien la liste de formats du pilote.
+    #[test]
+    fn le_format_lu_alimente_les_formats_declares() {
+        let (format, fix) = CableFormat::sanitize(3, 0x0006_0203);
+        assert!(fix.is_none());
+        assert_eq!(format.sample_rate, RATE_96000);
+        assert_eq!(format.channels, 6);
+        assert_eq!(format.depth, SampleFormat::Pcm24);
+        assert_eq!(format.rate_index(), Some(2));
+        // Les trois profondeurs sont déclarées quoi qu'il arrive : `depth` n'en restreint
+        // aucune, c'est une préférence pour l'espace utilisateur.
+        let declares = cable_formats(format.sample_rate, format.channels);
+        assert_eq!(declares.len(), 3);
+        for f in declares {
+            assert_eq!(f.sample_rate, RATE_96000);
+            assert_eq!(f.channels, 6);
+        }
+    }
+
     proptest! {
+        /// Le critère de M1b-08 sur le codec : **quelle que soit l'entrée**, il ne panique
+        /// pas, tout ce qu'il accepte se réencode à l'identique, et tout ce qu'il refuse
+        /// donne le défaut entier.
+        #[test]
+        fn le_codec_ne_panique_pas_et_l_aller_retour_est_fidele(raw in any::<u32>()) {
+            match CableFormat::decode(raw) {
+                Ok(format) => {
+                    prop_assert_eq!(format.encode(), raw);
+                    prop_assert_eq!(CableFormat::decode(format.encode()), Ok(format));
+                    // Toute sortie acceptée est dans les domaines annoncés.
+                    prop_assert!(crate::format::SAMPLE_RATES.contains(&format.sample_rate));
+                    prop_assert!(crate::format::SAMPLE_DEPTHS.contains(&format.depth));
+                    let ch = u32::from(format.channels);
+                    prop_assert!((MIN_CHANNELS..=MAX_CHANNELS).contains(&ch));
+                    prop_assert_eq!(CableFormat::sanitize(0, raw), (format, None));
+                }
+                Err(_) => {
+                    let (retenu, fix) = CableFormat::sanitize(0, raw);
+                    prop_assert_eq!(retenu, CABLE_FORMAT_DEFAULT);
+                    prop_assert!(fix.is_some());
+                }
+            }
+        }
+
+        /// Sur tout le domaine des trois champs : l'aller-retour est l'identité, et tout
+        /// format construit décrit une trame que `FrameLayout` sait former.
+        #[test]
+        fn tout_format_du_domaine_se_code_et_se_relit(
+            rate_index in 0usize..3,
+            depth_index in 0usize..3,
+            channels in 1u8..=8,
+        ) {
+            let sample_rate = crate::format::sample_rate_at(rate_index).unwrap();
+            let depth = crate::format::SAMPLE_DEPTHS[depth_index];
+            let format = CableFormat { sample_rate, depth, channels };
+            prop_assert_eq!(CableFormat::decode(format.encode()), Ok(format));
+            prop_assert_eq!(format.rate_index(), Some(rate_index));
+            // L'octet réservé reste nul, et chaque champ tient dans le sien.
+            let raw = format.encode();
+            prop_assert_eq!(raw >> 24, 0);
+            prop_assert_eq!((raw >> 16) & 0xFF, u32::from(channels));
+            prop_assert!(matches!((raw >> 8) & 0xFF, 1..=3));
+            prop_assert!(matches!(raw & 0xFF, 1..=3));
+            for f in cable_formats(sample_rate, channels) {
+                prop_assert!(f.layout().is_some());
+            }
+        }
+
         /// Le critère de M1b-08 : **quelle que soit l'entrée**, le parseur ne panique
         /// pas, et toute sortie acceptée se resérialise à l'identique.
         ///

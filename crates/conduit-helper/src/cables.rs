@@ -56,7 +56,7 @@ use conduit_backend_wasapi::cable::{
 use conduit_kmd_core::config::{is_active, with_active};
 
 use crate::journal::{Appelant, Journal};
-use crate::protocole::{Reponse, Requete, Statut, CANAUX_APPLICABLES};
+use crate::protocole::{Reponse, Requete, Statut};
 
 /// Le côté ouvert par le service. Voir l'en-tête de module.
 const COTE: FilterSide = FilterSide::Render;
@@ -259,15 +259,32 @@ fn ecrire_connexion(
 
 /// Règle le nombre de canaux d'un câble.
 ///
-/// **Le pilote ne sait pas encore appliquer autre chose que la valeur par défaut**
-/// (M1b-05) : le prédicat qui le dit est celui du contrat partagé,
-/// [`CableState::channels_applicables`], et non un `== 2` recopié ici. Une valeur qu'il
-/// refuserait est donc refusée **avant** l'écriture, avec un statut qui nomme la tâche
-/// manquante ; l'envoyer quand même donnerait un `ERROR_INVALID_PARAMETER` qui
-/// ressemblerait à un défaut du service.
+/// # Ce qui a changé avec M1b-05, et ce qui n'a pas changé
 ///
-/// Une valeur applicable, elle, part réellement dans le pilote : l'état de connexion
-/// courant est relu et réécrit tel quel, seuls les canaux changent.
+/// Le pilote sert désormais **1 à 8 canaux**, celui que `CableFormat<n>` fixe pour ce
+/// câble-là. Ce qu'il ne sait toujours pas faire, c'est **en changer à chaud** : ses tables
+/// KS sont immuables et PortCls en retient les pointeurs pour toute la vie du filtre. Le
+/// gestionnaire de propriété refuse donc toute valeur différente de celle que le câble sert
+/// ([`CableState::channels_appliquables`]), et cet ordre le refuse **avant** l'écriture, à
+/// la valeur près : ce n'est plus un `2` universel, c'est le compte relu sur le câble visé.
+///
+/// L'envoyer quand même donnerait un `ERROR_INVALID_PARAMETER` du pilote, qui ressemblerait
+/// à un défaut du service. Le refus, lui, porte dans `detail` le nombre réellement servi —
+/// de quoi afficher « ce câble est en 6 canaux » plutôt que « paramètre invalide ».
+///
+/// Une valeur **égale** à celle servie part quand même dans le pilote : la requête est
+/// alors sans effet, mais elle vaut confirmation, et le chemin d'écriture reste celui des
+/// autres ordres (relecture comprise).
+///
+/// # Ce qui manque encore, et où
+///
+/// Changer réellement le format d'un câble demande d'écrire `CableFormat<n>` dans la clé
+/// **matérielle** du périphérique puis de **redémarrer le devnode** (`cfgmgr32`, environ une
+/// seconde de silence sur les seize câbles). Les deux gestes sont en espace utilisateur, et
+/// c'est exactement là qu'ils doivent être — mais le chemin d'accès au périphérique
+/// (énumération `cfgmgr32`, chemin d'instance) vit dans `conduit_backend_wasapi::cable`, que
+/// ce service consomme sans le posséder. Tant qu'il n'expose pas ce chemin, l'ordre
+/// `canaux` ne peut que constater.
 fn regler_canaux(
     code: u8,
     cable: CableId,
@@ -275,13 +292,23 @@ fn regler_canaux(
     appelant: &Appelant,
     journal: &Journal,
 ) -> Reponse {
-    if canaux != CANAUX_APPLICABLES {
-        journal.info(&format!(
-            "refus : canaux {canaux} sur le câble {} demandés par {appelant} — le pilote \
-             n'applique que {CANAUX_APPLICABLES} tant que M1b-05 n'est pas faite",
-            cable.0
-        ));
-        return Reponse::refus_detaille(code, Statut::CanauxNonApplicables, CANAUX_APPLICABLES);
+    // Le compte réellement servi, relu sur le câble visé. `None` : le filtre n'a pas pu
+    // être lu — on laisse alors partir l'écriture, et c'est le pilote qui tranchera, ce qui
+    // vaut mieux qu'un refus fondé sur une supposition.
+    if let Some(servis) = canaux_du_cable(cable) {
+        let etat = CableState {
+            channels: canaux,
+            ..CableState::new(0, false)
+        };
+        if !etat.channels_appliquables(servis) {
+            journal.info(&format!(
+                "refus : canaux {canaux} sur le câble {} demandés par {appelant} — ce câble \
+                 sert {servis} canaux, et en changer demande d'écrire son format au registre \
+                 puis de redémarrer le périphérique",
+                cable.0
+            ));
+            return Reponse::refus_detaille(code, Statut::CanauxNonApplicables, servis);
+        }
     }
     ecrire(
         code,
@@ -297,6 +324,17 @@ fn regler_canaux(
             filtre.write_raw(&voulu.to_bytes()).map(|_| ())
         },
     )
+}
+
+/// Le nombre de canaux que sert le câble `cable`, ou `None` si son filtre est illisible.
+///
+/// Une ouverture de plus sur le chemin d'un ordre d'administration rare : le prix d'un
+/// refus qui dit la vérité plutôt qu'une constante.
+fn canaux_du_cable(cable: CableId) -> Option<u32> {
+    TopologyFilter::open(cable, COTE)
+        .and_then(|filtre| filtre.read_state())
+        .ok()
+        .map(|etat| etat.channels)
 }
 
 /// Le corps commun des trois ordres qui écrivent : énumérer, ouvrir, armer, écrire,
@@ -497,29 +535,31 @@ mod tests {
         }
     }
 
-    /// Les canaux non applicables sont refusés **sans** toucher au pilote, et la réponse
-    /// dit quelle valeur passerait.
+    /// Le prédicat de refus est celui du contrat, contre le compte **du câble** — plus
+    /// contre une constante.
     ///
-    /// Test hors machine : `regler_canaux` sort avant toute énumération dès que la
-    /// valeur n'est pas applicable, ce qui est précisément la propriété vérifiée ici.
+    /// Test hors machine : `canaux_du_cable` rendrait `None` ici (aucun pilote chargé), et
+    /// `regler_canaux` laisserait alors passer l'écriture. Ce qui se vérifie sans machine,
+    /// c'est la règle elle-même, sur les 64 couples possibles — et c'est elle qui a changé
+    /// avec M1b-05.
     #[test]
-    fn les_canaux_non_applicables_sont_refuses_avant_toute_ecriture() {
-        let journal = Journal::vers_stderr(crate::journal::Niveau::Erreur);
-        let appelant = Appelant::inconnu(0);
-        for canaux in [1, 3, 4, 6, 8] {
-            let reponse = regler_canaux(
-                crate::protocole::ORDRE_CANAUX,
-                CableId(1),
-                canaux,
-                &appelant,
-                &journal,
-            );
-            assert_eq!(reponse.statut, Statut::CanauxNonApplicables, "{canaux}");
-            // Le détail dit la valeur que le pilote accepte, pour que le client n'ait
-            // pas à la deviner.
-            assert_eq!(reponse.detail, CANAUX_APPLICABLES, "{canaux}");
+    fn le_refus_des_canaux_se_decide_contre_le_compte_du_cable() {
+        use conduit_kmd_core::params::{MAX_CHANNELS, MIN_CHANNELS};
+        for servis in MIN_CHANNELS..=MAX_CHANNELS {
+            for demandes in MIN_CHANNELS..=MAX_CHANNELS {
+                let etat = CableState {
+                    channels: demandes,
+                    ..CableState::new(0, false)
+                };
+                assert_eq!(
+                    etat.channels_appliquables(servis),
+                    demandes == servis,
+                    "{demandes} demandés sur un câble à {servis}"
+                );
+            }
         }
-        assert_eq!(CANAUX_APPLICABLES, 2);
+        // Le défaut du protocole reste ce qu'un poste neuf sert, et rien de plus.
+        assert_eq!(crate::protocole::CANAUX_PAR_DEFAUT, 2);
     }
 
     /// Le côté ouvert est le rendu, et l'étiquette du journal suit l'état.
