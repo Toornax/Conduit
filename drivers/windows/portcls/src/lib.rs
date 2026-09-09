@@ -17,6 +17,7 @@
 //! | [`topology`] | trait [`MiniportTopology`] ↔ `IMiniportTopologyVtbl` |
 //! | [`wavert`] | trait [`MiniportWaveRT`] ↔ `IMiniportWaveRTVtbl`, [`StreamObject`] (flux à type effacé rendu à `NewStream`) |
 //! | [`stream`] | traits [`MiniportWaveRTStream`] / [`MiniportWaveRTStreamNotification`] ↔ leurs vtables, [`AudioBuffer`] |
+//! | [`packet`] | mode paquets : traits [`MiniportWaveRTInputStream`] / [`MiniportWaveRTOutputStream`] et l'objet composite [`PacketStream`] à trois vtables |
 //! | [`received`] | enveloppes des interfaces reçues : [`ResourceList`], [`PortTopology`], [`PortWaveRT`], [`PortWaveRTStream`], [`RegistryKey`] |
 //! | [`property`] | trait [`PropertyHandler`] ↔ `PCPROPERTY_ITEM`/`PCPROPERTY_REQUEST` : les propriétés KS d'un miniport |
 //! | [`audio`] | sémantique des nœuds volume/sourdine au-dessus de [`property`] : trait [`AudioNodes`], gestionnaires [`Volume`] et [`Mute`], échelle en 1/65536 dB |
@@ -35,6 +36,11 @@
 //! `kernel`, que `conduit-kmd` active. Tout le reste (thunks, enveloppes reçues,
 //! `port_init`, [`power::is_powered`]) est indépendant de la feature et testé en mode
 //! utilisateur.
+//!
+//! La feature tire aussi la dépendance facultative `wdk`, pour la macro de trace
+//! [`pc_log!`] : elle n'écrit (`DbgPrint`) qu'en profil `dev`, et se réduit partout
+//! ailleurs à un bloc `if false` (module `log`). C'est elle qui journalise chaque
+//! `QueryInterface` reçu, avec l'IID demandé et le statut rendu.
 //!
 //! # Vtable par type : constante associée
 //!
@@ -86,12 +92,16 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+#[macro_use]
+mod log;
+
 pub mod adapter;
 pub mod audio;
 pub mod config;
 pub mod event;
 pub mod jack;
 pub mod miniport;
+pub mod packet;
 pub mod power;
 pub mod property;
 pub mod received;
@@ -112,6 +122,11 @@ pub use adapter::{
 #[cfg(feature = "kernel")]
 pub use adapter::{
     new_port, register_adapter_power_management, register_physical_connection, register_subdevice,
+};
+pub use packet::{
+    MiniportWaveRTInputStream, MiniportWaveRTOutputStream, PacketInterfaces, PacketStream,
+    PacketStreamPtr, PacketStreamVtbl, PacketWaveRTStream, ReadPacket, new_packet_stream_object,
+    try_new_packet_stream_object,
 };
 pub use audio::{
     ACCESS_FLAGS, AudioNodes, Channel, Mute, Trace, VOLUME_DELTA, VOLUME_MAX, VOLUME_MIN, Volume,

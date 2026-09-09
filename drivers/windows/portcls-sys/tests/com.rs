@@ -71,6 +71,10 @@ contrats_com! {
     IMiniportWaveRTStream / IMiniportWaveRTStreamVtbl : IID_IMiniportWaveRTStream [],
     IMiniportWaveRTStreamNotification / IMiniportWaveRTStreamNotificationVtbl :
         IID_IMiniportWaveRTStreamNotification [IID_IMiniportWaveRTStream],
+    IMiniportWaveRTInputStream / IMiniportWaveRTInputStreamVtbl :
+        IID_IMiniportWaveRTInputStream [],
+    IMiniportWaveRTOutputStream / IMiniportWaveRTOutputStreamVtbl :
+        IID_IMiniportWaveRTOutputStream [],
     IAdapterPowerManagement / IAdapterPowerManagementVtbl : IID_IAdapterPowerManagement [],
     IPort / IPortVtbl : IID_IPort [],
     IPortTopology / IPortTopologyVtbl : IID_IPortTopology [IID_IPort],
@@ -90,6 +94,29 @@ fn iunknown_repond_a_iid_iunknown_seulement() {
     assert_eq!(offset_of!(IUnknownVtbl, Release), 2 * SLOT);
     assert_eq!(size_of::<<IUnknown as ComInterface>::Vtbl>(), 3 * SLOT);
     assert_eq!(offset_of!(IUnknown, lpVtbl), 0);
+}
+
+/// IID du mode paquets, recopiés des `DEFINE_GUID` de `portcls.h` 26100 : ils sont
+/// distincts de ceux des interfaces de flux « classiques », auxquelles ils ne se
+/// substituent pas.
+#[test]
+fn iids_du_mode_paquets() {
+    assert_eq!(
+        guid(&IID_IMiniportWaveRTInputStream),
+        Guid::from_u128(0xCD8E756A_5FC7_4624_984B_2AF02925B91F)
+    );
+    assert_eq!(
+        guid(&IID_IMiniportWaveRTOutputStream),
+        Guid::from_u128(0x831FC7BC_6347_44BC_B47B_C0C657B5BF73)
+    );
+    for autre in [
+        guid(&IID_IMiniportWaveRTStream),
+        guid(&IID_IMiniportWaveRTStreamNotification),
+        IID_IUNKNOWN,
+    ] {
+        assert_ne!(guid(&IID_IMiniportWaveRTInputStream), autre);
+        assert_ne!(guid(&IID_IMiniportWaveRTOutputStream), autre);
+    }
 }
 
 /// `GUID` (bindgen) et `Guid` (conduit-com) : même disposition, et `IID_IUnknown` de

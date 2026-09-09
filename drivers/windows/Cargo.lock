@@ -408,6 +408,7 @@ dependencies = [
  "conduit-com",
  "conduit-kmd-core",
  "portcls-sys",
+ "wdk",
 ]
 
 [[package]]

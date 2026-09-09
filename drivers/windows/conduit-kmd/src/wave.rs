@@ -27,6 +27,11 @@
 //! `NewStream` refuserait ensuite — la panne que la documentation du gestionnaire par
 //! défaut décrit, et qui laisse le moteur audio parcourir une liste jusqu'à épuisement.
 //!
+//! L'objet rendu par `NewStream` est un **flux composite** (`portcls::packet`) : une seule
+//! allocation, un seul compteur de références, plusieurs têtes de vtable. Quelles
+//! interfaces du mode paquets il expose est décidé par `PacketInterfaces` au moment de sa
+//! création — voir `open_stream`.
+//!
 //! # Lecture du format
 //!
 //! PortCls remet une `KSDATAFORMAT` suivie de `FormatSize` octets. Rien n'est lu au-delà
@@ -47,8 +52,8 @@ use portcls::conduit_com::{
     ComRef, NtStatus, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
 };
 use portcls::{
-    MiniportWaveRT, PortWaveRT, PortWaveRTStream, ResourceList, StreamObject,
-    try_new_stream_notification_object,
+    MiniportWaveRT, PacketInterfaces, PortWaveRT, PortWaveRTStream, ResourceList, StreamObject,
+    try_new_packet_stream_object,
 };
 use portcls_sys::{
     GUID, IUnknown, KSDATAFORMAT, KSDATAFORMAT_SPECIFIER_WAVEFORMATEX,
@@ -198,8 +203,15 @@ fn open_stream(
     supported: SupportedFormat,
 ) -> Result<StreamObject, NtStatus> {
     let name = direction.stream_name();
+    // Mode paquets (étape 1.4) : un flux de rendu est une *sortie* du point de vue du
+    // moteur, qui y écrit ses paquets (`IMiniportWaveRTOutputStream`) ; un flux de capture
+    // est une *entrée*, dont il lit les paquets (`IMiniportWaveRTInputStream`).
+    let interfaces = match direction {
+        Direction::Render => PacketInterfaces::Output,
+        Direction::Capture => PacketInterfaces::Input,
+    };
     let stream = WaveStream::new(n, direction, cable, port_stream, supported)?;
-    let object = try_new_stream_notification_object(stream).ok_or_else(|| {
+    let object = try_new_packet_stream_object(stream, interfaces).ok_or_else(|| {
         kmd_log!("{name}{n}::NewStream : allocation du flux impossible");
         STATUS_INSUFFICIENT_RESOURCES
     })?;
@@ -214,7 +226,7 @@ fn open_stream(
         return Err(status);
     }
     kmd_log!(
-        "{name}{n}::NewStream broche {pin} format {supported:?} : flux {:p}",
+        "{name}{n}::NewStream broche {pin} format {supported:?} : flux {:p} ({interfaces:?})",
         object.as_raw()
     );
     Ok(StreamObject::from(object))
