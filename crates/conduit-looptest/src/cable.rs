@@ -6,16 +6,19 @@
 //! `conduit-kmd-core`, partagé avec le pilote. Ce module ne fait que **choisir** les
 //! requêtes et mettre en forme le compte rendu.
 //!
-//! Six actions, combinables dans un seul appel et exécutées dans cet ordre :
+//! Sept actions, combinables dans un seul appel et exécutées dans cet ordre :
 //!
 //! 1. `--cable-privilege` : l'état de `SeLoadDriverPrivilege` dans ce processus, sans
 //!    rien écrire ni armer ;
 //! 2. `--cable-etat` : l'état des seize câbles, plus la version du contrat servi ;
 //! 3. `--cable-compteurs` : les compteurs de la boucle locale, et le régime qu'ils
 //!    démontrent — la lecture de M1b-07 que seul le débogueur savait faire (M1b-21) ;
-//! 4. `--cable-set` : l'écriture, affichée avant et après ;
-//! 5. `--cable-chrono` : le délai entre l'écriture et l'endpoint MMDevice qui suit ;
-//! 6. `--cable-invalide` : la batterie d'entrées volontairement invalides.
+//! 4. `--cable-transport` : par sens, comment le moteur audio a alloué le tampon
+//!    (scrutation ou notifications) et combien d'allocations nous avons refusées — la
+//!    question du lot 0 du mode paquets WaveRT ;
+//! 5. `--cable-set` : l'écriture, affichée avant et après ;
+//! 6. `--cable-chrono` : le délai entre l'écriture et l'endpoint MMDevice qui suit ;
+//! 7. `--cable-invalide` : la batterie d'entrées volontairement invalides.
 //!
 //! # Le privilège est armé une fois, pour toute la durée des écritures
 //!
@@ -24,8 +27,8 @@
 //! en machine virtuelle a établi. [`run`] appelle donc [`armer_privilege`] **une seule
 //! fois**, avant les actions qui écrivent, et garde le garde jusqu'à son retour : il
 //! restaure alors le jeton dans l'état où il l'a trouvé. Une lecture
-//! (`--cable-privilege`, `--cable-etat`, `--cable-compteurs`) n'arme rien, parce qu'elle
-//! n'en a pas besoin.
+//! (`--cable-privilege`, `--cable-etat`, `--cable-compteurs`, `--cable-transport`) n'arme
+//! rien, parce qu'elle n'en a pas besoin.
 //!
 //! **Aucun flux audio n'est ouvert et aucun son n'émis** : `IOCTL_KS_PROPERTY` est une
 //! requête de contrôle, et le chronomètre ne fait qu'**énumérer** les endpoints. Les
@@ -41,8 +44,8 @@ use std::time::{Duration, Instant};
 use conduit_backend::{Backend, CableId, DeviceDirection};
 use conduit_backend_wasapi::cable::{
     armer_privilege, contract_version, etat_privilege, topology_interfaces, Armement, BadInput,
-    CableConfigError, CableCounters, CableState, EtatPrivilege, FilterSide, TopologyFilter,
-    CABLE_MAX,
+    CableConfigError, CableCounters, CableState, CableTransport, EtatPrivilege, FilterSide,
+    StreamSide, StreamTransport, TopologyFilter, CABLE_MAX,
 };
 use conduit_backend_wasapi::WasapiBackend;
 
@@ -93,7 +96,7 @@ pub fn run(args: &Args) -> Result<Rapport, String> {
     if args.cable_privilege {
         pousser(&mut texte, &bloc_privilege(&etat_privilege()));
     }
-    if !(args.cable_etat || args.cable_compteurs || args.writes_cable()) {
+    if !(args.cable_etat || args.cable_compteurs || args.cable_transport || args.writes_cable()) {
         return Ok(Rapport { texte, conforme });
     }
 
@@ -106,6 +109,10 @@ pub fn run(args: &Args) -> Result<Rapport, String> {
 
     if args.cable_compteurs {
         pousser(&mut texte, &compteurs_des_cables(&paths, side, args.cable));
+    }
+
+    if args.cable_transport {
+        pousser(&mut texte, &transport_des_cables(&paths, side, args.cable));
     }
 
     // Une seule fois, pour toutes les écritures : le garde vit jusqu'au `return` de
@@ -409,6 +416,168 @@ fn compteurs_des_cables(paths: &[String], side: FilterSide, vise: Option<u32>) -
                             "  Conduit {:>2} (index pilote {index}) : lecture refusée — {e}\n      \
                              Un pilote antérieur à M1b-21 n'a pas cette propriété : vérifiez la \
                              version avec --cable-etat.",
+                            cable.0
+                        );
+                    }
+                }
+            }
+            Err(CableConfigError::FiltreAbsent { .. }) => {
+                let _ = writeln!(
+                    out,
+                    "  Conduit {:>2} (index pilote {index}) : filtre absent",
+                    cable.0
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(out, "  Conduit {:>2} : {e}", cable.0);
+            }
+        }
+    }
+    if vus == 0 {
+        out.push_str(
+            "Aucun filtre de topologie Conduit : le pilote n'est pas chargé sur cette \
+             machine (voir docs/driver-dev.md).\n",
+        );
+    }
+    out
+}
+
+/// Les deux lignes d'un sens : le mode en toutes lettres, puis ce qu'il a obtenu — et le
+/// compte de refus **en évidence** quand il n'est pas nul.
+///
+/// Pure. Le mode occupe sa propre ligne parce que c'est **la** valeur qu'on vient chercher :
+/// noyée en fin de ligne parmi cinq nombres, elle demanderait une seconde lecture.
+fn lignes_sens(sens: StreamSide, bloc: &StreamTransport) -> String {
+    let mut out = format!("      {:<8}: {}\n", sens.label(), bloc.mode_label());
+    let _ = writeln!(
+        out,
+        "                NotificationCount {}, tampon {} octets ({} trames), {} événement(s), \
+         état KS {}",
+        bloc.notification_count,
+        bloc.buffer_bytes,
+        bloc.buffer_frames,
+        bloc.notification_events,
+        bloc.ks_state_label()
+    );
+    if bloc.refused_allocations == 0 {
+        out.push_str("                aucune allocation refusée\n");
+    } else {
+        let _ = writeln!(
+            out,
+            "                ALLOCATIONS REFUSÉES : {} depuis le dernier démarrage du \
+             périphérique",
+            bloc.refused_allocations
+        );
+    }
+    out
+}
+
+/// Ce que l'état du transport d'un câble **démontre**, en français.
+///
+/// Pure, et c'est ici qu'est écrit tout ce que le lot 0 cherche à savoir. Les quatre cas ne
+/// se confondent pas, et c'est le troisième qui coûte cher à manquer : un câble scruté avec
+/// des refus au compteur ne dit pas la même chose qu'un câble scruté sans aucun refus. Dans
+/// le premier cas, le repli en scrutation peut être **notre** fait ; dans le second, le
+/// moteur audio n'a jamais rien demandé d'autre.
+fn verdict(transport: &CableTransport) -> String {
+    let refus = transport.refused_total();
+    if transport.notifications_obtenues() {
+        let sens = if transport.render.notifie() {
+            if transport.capture.notifie() {
+                "des deux côtés"
+            } else {
+                "côté rendu"
+            }
+        } else {
+            "côté capture"
+        };
+        let mut out = format!(
+            "      → NOTIFICATIONS OBTENUES {sens} : un paquet WaveRT peut exister sur ce flux\n"
+        );
+        if refus > 0 {
+            let _ = writeln!(
+                out,
+                "        (mais {refus} allocation(s) ont été refusées : l'autre sens, ou une \
+                 tentative antérieure, s'est vu dire non)"
+            );
+        }
+        out
+    } else if refus > 0 {
+        format!(
+            "      → SCRUTATION, et {refus} allocation(s) REFUSÉES : le repli du moteur audio \
+             peut être NOTRE fait\n        Un refus le fait retomber en scrutation sans une ligne \
+             d'erreur. Ne concluez pas que Windows ne veut pas de notifications avant d'avoir \
+             regardé pourquoi nous avons dit non.\n"
+        )
+    } else if transport.render.buffer_bytes > 0 || transport.capture.buffer_bytes > 0 {
+        "      → SCRUTATION des deux côtés, aucun refus : le moteur audio n'a JAMAIS demandé \
+         de notifications sur ce câble\n"
+            .to_string()
+    } else {
+        "      → aucun tampon alloué : ce relevé ne prouve rien. Relancez-le pendant qu'une \
+         passe tourne.\n"
+            .to_string()
+    }
+}
+
+/// L'état du transport d'un câble : deux sens, puis le verdict.
+fn lignes_transport(cable: CableId, index: u32, transport: &CableTransport) -> String {
+    let mut out = format!("  Conduit {:>2} (index pilote {index})\n", cable.0);
+    for sens in StreamSide::ALL {
+        out.push_str(&lignes_sens(sens, transport.side(sens)));
+    }
+    out.push_str(&verdict(transport));
+    out
+}
+
+/// `--cable-transport` : ce que le moteur audio a demandé, sans débogueur.
+///
+/// `vise` restreint le relevé à un seul câble quand `--cable N` est donné ; sinon les seize
+/// sont lus, comme pour `--cable-etat`.
+///
+/// # Pourquoi cette option existe
+///
+/// Un paquet WaveRT n'existe que sur un tampon alloué par `AllocateBufferWithNotification`.
+/// Tous les journaux du dépôt montrent le moteur audio allouant **sans** notifications — 45
+/// allocations, aucun `RegisterNotificationEvent` — et l'audio passant quand même : il
+/// scrute. Mais ces journaux sont anciens, pris débogueur attaché, peut-être en session 0 ;
+/// or attacher le débogueur fausse ce qu'on mesure (17 passes sur 20 attaché contre 20 sur
+/// 20 détaché) et coûte un redémarrage, qui ferme la session console dont l'audio a besoin.
+/// Ce relevé passe par `IOCTL_KS_PROPERTY`, sans rien attacher et sans ouvrir de flux.
+fn transport_des_cables(paths: &[String], side: FilterSide, vise: Option<u32>) -> String {
+    let mut out = format!(
+        "état du transport WaveRT, filtres ouverts côté {} ({}<n>) :\n",
+        side.label(),
+        side.prefix()
+    );
+    out.push_str(
+        "  (le côté choisit le filtre, pas le sens : les DEUX sens viennent dans chaque \
+         réponse)\n",
+    );
+    out.push_str(
+        "  (remis à zéro à chaque démarrage du périphérique ; instantané non atomique, les \
+         compteurs de refus sont lus hors verrou et les deux sens l'un après l'autre)\n",
+    );
+    let numeros: Vec<u32> = match vise {
+        Some(n) => vec![n],
+        None => (1..=CABLE_MAX).collect(),
+    };
+    let mut vus = 0u32;
+    for numero in numeros {
+        let cable = CableId(numero);
+        // Décalage de un : « Conduit 1 » est l'index 0 du pilote.
+        let index = numero.saturating_sub(1);
+        match ouvrir(paths, cable, side) {
+            Ok(filtre) => {
+                vus = vus.saturating_add(1);
+                match filtre.read_transport() {
+                    Ok(transport) => out.push_str(&lignes_transport(cable, index, &transport)),
+                    Err(e) => {
+                        let _ = writeln!(
+                            out,
+                            "  Conduit {:>2} (index pilote {index}) : lecture refusée — {e}\n      \
+                             Un pilote antérieur au lot 0 du mode paquets n'a pas cette \
+                             propriété : vérifiez la version avec --cable-etat.",
                             cable.0
                         );
                     }
@@ -873,6 +1042,143 @@ mod tests {
                 "« {attendu} » absent de :\n{texte}"
             );
         }
+    }
+
+    /// Un transport où le rendu a obtenu des notifications et la capture scrute.
+    fn transport_mixte() -> CableTransport {
+        use conduit_backend_wasapi::cable::{AllocationMode, KsRunState};
+
+        CableTransport {
+            render: StreamTransport {
+                mode: AllocationMode::Notifications.code(),
+                notification_count: 2,
+                buffer_bytes: 1_920,
+                buffer_frames: 480,
+                notification_events: 1,
+                ks_state: KsRunState::Run.code(),
+                refused_allocations: 0,
+            },
+            capture: StreamTransport {
+                mode: AllocationMode::Polling.code(),
+                notification_count: 0,
+                buffer_bytes: 3_840,
+                buffer_frames: 960,
+                notification_events: 0,
+                ks_state: KsRunState::Run.code(),
+                refused_allocations: 0,
+            },
+            ..CableTransport::new(2)
+        }
+    }
+
+    /// Le verdict que le relevé prononce, pour chacune des quatre situations — et surtout la
+    /// différence entre « scrutation sans refus » et « scrutation avec refus », qui est
+    /// exactement la question du lot 0.
+    ///
+    /// Confondre les deux ferait conclure « Windows ne veut pas de paquets » d'un câble où
+    /// c'est nous qui avons dit non. Aucun journal ne le dirait : un refus fait retomber le
+    /// moteur en scrutation **sans une ligne d'erreur**.
+    #[test]
+    fn le_verdict_distingue_la_scrutation_choisie_de_la_scrutation_subie() {
+        use conduit_backend_wasapi::cable::AllocationMode;
+
+        let obtenu = verdict(&transport_mixte());
+        assert!(obtenu.contains("NOTIFICATIONS OBTENUES"), "{obtenu}");
+        assert!(obtenu.contains("rendu"), "{obtenu}");
+
+        // Scrutation des deux côtés, aucun refus : le moteur n'a jamais rien demandé.
+        let scrute = CableTransport {
+            render: StreamTransport {
+                mode: AllocationMode::Polling.code(),
+                buffer_bytes: 1_920,
+                buffer_frames: 480,
+                ..StreamTransport::new()
+            },
+            capture: StreamTransport {
+                mode: AllocationMode::Polling.code(),
+                buffer_bytes: 1_920,
+                buffer_frames: 480,
+                ..StreamTransport::new()
+            },
+            ..CableTransport::new(0)
+        };
+        let choisie = verdict(&scrute);
+        assert!(choisie.contains("JAMAIS demandé"), "{choisie}");
+
+        // La même scrutation, mais avec des refus : le repli peut être notre fait.
+        let subie = verdict(&CableTransport {
+            render: StreamTransport {
+                refused_allocations: 4,
+                ..scrute.render
+            },
+            ..scrute
+        });
+        assert!(subie.contains("REFUSÉES"), "{subie}");
+        assert!(subie.contains("NOTRE fait"), "{subie}");
+        assert_ne!(
+            choisie, subie,
+            "une scrutation subie et une scrutation choisie doivent se lire différemment : \
+             c'est toute la question du lot"
+        );
+
+        // Aucun tampon : le relevé le dit au lieu de laisser conclure.
+        let vide = verdict(&CableTransport::new(0));
+        assert!(vide.contains("ne prouve rien"), "{vide}");
+
+        // Les quatre verdicts sont distincts.
+        let tous = [obtenu, choisie, subie, vide];
+        for (rang, texte) in tous.iter().enumerate() {
+            assert!(!texte.is_empty());
+            assert!(
+                !tous.iter().skip(rang + 1).any(|autre| autre == texte),
+                "deux verdicts identiques : {texte}"
+            );
+        }
+    }
+
+    /// Le relevé imprime, pour chaque sens, le mode **en toutes lettres**, les cinq valeurs
+    /// et le compte de refus.
+    #[test]
+    fn les_lignes_de_transport_portent_les_deux_sens_et_les_refus() {
+        use conduit_backend_wasapi::cable::AllocationMode;
+
+        let transport = CableTransport {
+            render: StreamTransport {
+                refused_allocations: 42,
+                ..transport_mixte().render
+            },
+            ..transport_mixte()
+        };
+        let texte = lignes_transport(CableId(3), 2, &transport);
+        for attendu in [
+            "Conduit  3",
+            "index pilote 2",
+            "rendu",
+            "capture",
+            AllocationMode::Notifications.label(),
+            AllocationMode::Polling.label(),
+            "NotificationCount 2",
+            "1920 octets",
+            "480 trames",
+            "3840 octets",
+            "960 trames",
+            "RUN",
+            "ALLOCATIONS REFUSÉES : 42",
+            "aucune allocation refusée",
+        ] {
+            assert!(
+                texte.contains(attendu),
+                "« {attendu} » absent de :\n{texte}"
+            );
+        }
+        // Le mode est sur sa propre ligne : c'est la valeur qu'on vient chercher, elle ne
+        // doit pas se noyer parmi cinq nombres.
+        assert!(
+            texte.lines().any(|l| l
+                .trim_end()
+                .ends_with(AllocationMode::Notifications.label())),
+            "{texte}"
+        );
     }
 
     #[test]

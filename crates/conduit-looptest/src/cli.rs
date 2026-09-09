@@ -126,6 +126,15 @@ pub struct Args {
     /// n'ouvre aucun flux.
     #[arg(long = "cable-compteurs")]
     pub cable_compteurs: bool,
+    /// Lit et affiche l'état du transport (propriété `KSPROPERTY_CONDUIT_TRANSPORT`) :
+    /// par câble et **par sens**, comment le moteur audio a alloué le tampon —
+    /// `AllocateAudioBuffer` (scrutation) ou `AllocateBufferWithNotification` (paquets
+    /// possibles) —, le NotificationCount demandé, la taille du tampon en octets et en
+    /// trames, les événements enregistrés, l'état KS, et le compte cumulé d'allocations
+    /// REFUSÉES. Les seize câbles par défaut, ou le seul câble de `--cable N`. Ne change
+    /// rien et n'ouvre aucun flux — à lancer pendant qu'une passe tourne, ou juste après.
+    #[arg(long = "cable-transport")]
+    pub cable_transport: bool,
     /// Affiche l'état de SeLoadDriverPrivilege dans le jeton de ce processus (absent /
     /// présent mais désactivé / actif) et sort. N'écrit rien, n'arme rien, et ne
     /// demande ni le pilote ni un câble : c'est le diagnostic qui sépare « mauvais
@@ -233,21 +242,22 @@ impl Args {
     }
 
     /// Vrai si l'outil doit parler au **jeu de propriétés KS privé** du pilote au
-    /// lieu de mesurer une boucle (`--cable-etat`, `--cable-compteurs`, `--cable-set`,
-    /// `--cable-invalide`), ou simplement relever l'état du privilège d'écriture
-    /// (`--cable-privilege`).
+    /// lieu de mesurer une boucle (`--cable-etat`, `--cable-compteurs`,
+    /// `--cable-transport`, `--cable-set`, `--cable-invalide`), ou simplement relever
+    /// l'état du privilège d'écriture (`--cable-privilege`).
     ///
     /// C'est une action à part entière, comme `--list` et `--set-volume` : elle
     /// s'exécute, affiche son compte rendu et sort. Aucun flux n'est ouvert, aucun
     /// son n'est émis — configurer un câble ne doit pas avoir cet effet de bord.
     ///
-    /// Les cinq se combinent dans un seul appel, et s'exécutent dans cet ordre :
-    /// état du privilège, lecture de l'état des câbles, relevé des compteurs,
-    /// écriture, batterie d'entrées invalides.
+    /// Les six se combinent dans un seul appel, et s'exécutent dans cet ordre :
+    /// état du privilège, lecture de l'état des câbles, relevé des compteurs, relevé du
+    /// transport, écriture, batterie d'entrées invalides.
     pub fn controls_cable(&self) -> bool {
         self.cable_privilege
             || self.cable_etat
             || self.cable_compteurs
+            || self.cable_transport
             || self.cable_set.is_some()
             || self.cable_invalide
     }
@@ -549,11 +559,13 @@ mod tests {
         assert!(parse(&["--cable", "3", "--cable-set", "connecte"]).controls_cable());
         assert!(parse(&["--cable", "3", "--cable-invalide"]).controls_cable());
         assert!(parse(&["--cable-compteurs"]).controls_cable());
-        // Les cinq se combinent dans un seul appel.
+        assert!(parse(&["--cable-transport"]).controls_cable());
+        // Les six se combinent dans un seul appel.
         let tout = parse(&[
             "--cable-privilege",
             "--cable-etat",
             "--cable-compteurs",
+            "--cable-transport",
             "--cable",
             "2",
             "--cable-set",
@@ -564,6 +576,36 @@ mod tests {
         assert_eq!(tout.cable_vise(), Some(2));
         assert_eq!(tout.cable_set, Some(EtatCable::Deconnecte));
         assert!(tout.cable_compteurs);
+        assert!(tout.cable_transport);
+    }
+
+    /// `--cable-transport` est une **lecture**, comme `--cable-compteurs` : il se suffit à
+    /// lui-même, n'exige pas `--cable N`, n'arme aucun privilège, et exclut les actions qui
+    /// font autre chose.
+    ///
+    /// Le fait qu'il n'arme rien compte : c'est le relevé qu'on lance sur la machine où
+    /// l'audio ne passe pas, depuis une session console ordinaire. Exiger un droit
+    /// reviendrait à ne pas l'avoir.
+    #[test]
+    fn le_releve_du_transport_se_demande_seul_et_ne_prend_pas_le_privilege() {
+        let seul = parse(&["--cable-transport"]);
+        assert!(seul.validate().is_ok());
+        assert_eq!(seul.cable_vise(), None);
+        assert!(!seul.writes_cable());
+
+        // Restreint à un câble quand on le demande, sans que la validation l'exige.
+        let un = parse(&["--cable", "3", "--cable-transport"]);
+        assert!(un.validate().is_ok());
+        assert_eq!(un.cable, Some(3));
+
+        for (args, attendu) in [
+            (vec!["--cable-transport", "--list"], "--list"),
+            (vec!["--cable-transport", "--self-test"], "--self-test"),
+            (vec!["--cable-transport", "--loopback"], "--loopback"),
+        ] {
+            let err = parse(&args).validate().expect_err(&format!("{args:?}"));
+            assert!(err.contains(attendu), "{err}");
+        }
     }
 
     /// `--cable-compteurs` est une **lecture** : il se suffit à lui-même, n'exige pas
@@ -602,6 +644,7 @@ mod tests {
         assert!(!parse(&["--cable-etat"]).writes_cable());
         assert!(!parse(&["--cable-privilege"]).writes_cable());
         assert!(!parse(&["--cable-compteurs"]).writes_cable());
+        assert!(!parse(&["--cable-transport"]).writes_cable());
         assert!(parse(&["--cable", "3", "--cable-set", "connecte"]).writes_cable());
         assert!(parse(&["--cable", "3", "--cable-invalide"]).writes_cable());
     }

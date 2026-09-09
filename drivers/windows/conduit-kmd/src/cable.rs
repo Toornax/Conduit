@@ -111,7 +111,10 @@ use core::mem::ManuallyDrop;
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
-use conduit_kmd_core::config::{self, ACTIVE_CABLES_DEFAULT, CableCounters};
+use conduit_kmd_core::config::{
+    self, ACTIVE_CABLES_DEFAULT, AllocationMode, CableCounters, CableTransport, KsRunState,
+    StreamTransport,
+};
 use conduit_kmd_core::{
     FrameLayout, Loopback, Notifier, SilenceCause, StreamPosition, StreamView, VirtualClock,
     byte_offset, copy_frames, silence,
@@ -184,6 +187,15 @@ pub struct StreamState {
     /// Périodes de notification (`AllocateBufferWithNotification`), `None` pour un
     /// tampon sans notification.
     pub notifier: Option<Notifier>,
+    /// `NotificationCount` **demandé** par `AllocateBufferWithNotification` ; 0 sans
+    /// tampon ou pour un tampon alloué par `AllocateAudioBuffer`.
+    ///
+    /// Mémorisé plutôt que déduit de [`Self::notifier`], qui ne garde que la période en
+    /// trames : retrouver le compte en divisant la taille du tampon par cette période
+    /// rendrait la valeur exacte dans tous les cas sauf ceux qui intéressent — un tampon
+    /// libéré, une taille arrondie. C'est **ce que le moteur audio a demandé** qu'on veut
+    /// pouvoir lire, pas ce qu'on saurait recalculer.
+    pub notification_count: u32,
     /// Événements enregistrés par `RegisterNotificationEvent` (PortCls les garde vivants
     /// jusqu'au `UnregisterNotificationEvent` correspondant, ou jusqu'à la fermeture du
     /// flux).
@@ -206,7 +218,46 @@ impl StreamState {
             position: StreamPosition::new(),
             buffer: None,
             notifier: None,
+            notification_count: 0,
             events: [None; MAX_NOTIFICATION_EVENTS],
+        }
+    }
+
+    /// L'état du transport de ce flux, pour `KSPROPERTY_CONDUIT_TRANSPORT`.
+    ///
+    /// [`StreamTransport::refused_allocations`] est laissé à zéro : les refus sont comptés
+    /// par le **câble**, qui survit au flux, et [`Cable::transport_snapshot`] les remplit.
+    ///
+    /// Le mode n'est jamais [`AllocationMode::NoStream`] ici — l'existence de ce
+    /// [`StreamState`] prouve qu'une broche est ouverte. C'est le câble qui rend ce cas-là,
+    /// pour un emplacement vide.
+    ///
+    /// IRQL : `<= DISPATCH_LEVEL` (sous le verrou du flux).
+    pub fn transport(&self) -> StreamTransport {
+        let (mode, buffer_bytes, buffer_frames) = match self.buffer {
+            None => (AllocationMode::NoBuffer, 0, 0),
+            Some(buffer) => {
+                // `notifier` n'est `Some` que sur un tampon d'`AllocateBufferWithNotification` :
+                // c'est lui, et rien d'autre, qui distingue la scrutation des paquets.
+                let mode = if self.notifier.is_some() {
+                    AllocationMode::Notifications
+                } else {
+                    AllocationMode::Polling
+                };
+                // `frame_bytes ≠ 0` (disposition valide) : jamais `None`.
+                let frames = buffer.bytes.checked_div(self.frame_bytes()).unwrap_or(0);
+                (mode, buffer.bytes, frames)
+            }
+        };
+        let evenements = self.events.iter().flatten().count();
+        StreamTransport {
+            mode: mode.code(),
+            notification_count: self.notification_count,
+            buffer_bytes,
+            buffer_frames,
+            notification_events: u32::try_from(evenements).unwrap_or(u32::MAX),
+            ks_state: ks_run_state(self.state).code(),
+            refused_allocations: 0,
         }
     }
 
@@ -289,6 +340,25 @@ impl StreamState {
             // `events` sous ce même verrou ; `Wait = FALSE` : autorisé à `DISPATCH_LEVEL`.
             unsafe { KeSetEvent(event.as_ptr(), 0, 0) };
         }
+    }
+}
+
+/// Traduit un `KSSTATE` du WDK vers l'état du contrat portable.
+///
+/// Les quatre cas sont exhaustifs **par construction** : [`StreamState::new`] part de
+/// `KSSTATE_STOP` et `WaveStream::set_state` refuse tout autre `KSSTATE` par
+/// `STATUS_INVALID_PARAMETER`. Le repli sur [`KsRunState::Stop`] n'est donc pas atteignable.
+///
+/// Il est là pour une raison précise : sans lui, une valeur hors domaine partirait telle
+/// quelle vers l'espace utilisateur, où `CableTransport::from_bytes` refuserait l'instantané
+/// **entier** — le relevé des seize câbles disparaîtrait pour un champ. Un repli nommé vaut
+/// mieux qu'un diagnostic muet.
+const fn ks_run_state(state: KSSTATE::Type) -> KsRunState {
+    match state {
+        KSSTATE::KSSTATE_ACQUIRE => KsRunState::Acquire,
+        KSSTATE::KSSTATE_PAUSE => KsRunState::Pause,
+        KSSTATE::KSSTATE_RUN => KsRunState::Run,
+        _ => KsRunState::Stop,
     }
 }
 
@@ -566,6 +636,55 @@ impl Counters {
     }
 }
 
+/// Allocations de tampon **refusées**, un compteur par sens, hors verrou.
+///
+/// # Pourquoi le câble les porte, et non le flux
+///
+/// Un refus d'allocation fait retomber le moteur audio en scrutation **sans une ligne
+/// d'erreur** — c'est ce qui a coûté une journée de diagnostic le 2026-09-06 — et rien
+/// n'oblige le moteur à garder la broche ouverte après un refus. Un compteur logé dans le
+/// [`StreamState`] mourrait donc avec le flux qu'on cherche à comprendre, et le relevé fait
+/// une seconde plus tard montrerait un câble au repos sans la moindre trace du refus.
+///
+/// Remis à zéro par [`Cable::start`], comme les [`Counters`] de la boucle locale et pour la
+/// même raison : un compteur qui cumulerait les cycles de périphérique ferait lire une trace
+/// de cycle neuf comme une trace de cycle ancien.
+///
+/// Atomiques en `Relaxed`, sans verrou : voir la documentation du module. Il n'y a aucune
+/// relation d'ordre à publier entre ces deux compteurs et quoi que ce soit d'autre.
+#[derive(Debug)]
+struct AllocRefusals {
+    /// Allocations refusées côté rendu.
+    render: AtomicU64,
+    /// Allocations refusées côté capture.
+    capture: AtomicU64,
+}
+
+impl AllocRefusals {
+    const fn new() -> Self {
+        Self {
+            render: AtomicU64::new(0),
+            capture: AtomicU64::new(0),
+        }
+    }
+
+    /// Le compteur du sens `direction`.
+    const fn slot(&self, direction: Direction) -> &AtomicU64 {
+        match direction {
+            Direction::Render => &self.render,
+            Direction::Capture => &self.capture,
+        }
+    }
+
+    /// Remet les deux compteurs à zéro (nouveau cycle de périphérique).
+    ///
+    /// IRQL : `PASSIVE_LEVEL`, aucune broche ouverte : `Relaxed` suffit.
+    fn reset(&self) {
+        self.render.store(0, Ordering::Relaxed);
+        self.capture.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Erreur de [`Cable::attach`] : un flux est déjà ouvert dans ce sens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotOccupied;
@@ -582,6 +701,8 @@ pub struct Cable {
     timer: ExTimer,
     /// Compteurs atomiques de la boucle (hors verrou).
     counters: Counters,
+    /// Allocations de tampon refusées, par sens (hors verrou, [`AllocRefusals`]).
+    alloc_refusals: AllocRefusals,
     /// Nœuds volume et sourdine du filtre `TopoRender<n>` (hors verrou, [`NodeState`]).
     render_nodes: NodeState,
     /// Nœuds volume et sourdine du filtre `TopoCapture<n>`.
@@ -665,6 +786,7 @@ impl Cable {
             state: SpinLock::new(CableState::new()),
             timer: ExTimer::new(),
             counters: Counters::new(),
+            alloc_refusals: AllocRefusals::new(),
             render_nodes: NodeState::new(),
             capture_nodes: NodeState::new(),
             jack_events: SpinLock::new(ManuallyDrop::new(JackTargets::new())),
@@ -918,8 +1040,10 @@ impl Cable {
             self.timer.stop();
             // Les compteurs aussi : le pilote reste chargé d'un cycle à l'autre, et une
             // trace qui cumulerait les ticks des cycles précédents ferait croire à une
-            // image obsolète du pilote.
+            // image obsolète du pilote. Les refus d'allocation partent avec eux, et pour
+            // exactement la même raison.
             self.counters.reset();
+            self.alloc_refusals.reset();
         }
         // Les cibles d'événement ne sont **pas** effacées : elles sont posées par les
         // `Init` des miniports de topologie, qui suivent ce `start`, et retirées par leur
@@ -1282,6 +1406,88 @@ impl Cable {
             silenced_before_render: self.counters.silenced_before_render.load(Ordering::Relaxed),
             discarded_ticks: self.counters.discarded_ticks.load(Ordering::Relaxed),
             overruns: self.counters.overruns.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Compte une allocation de tampon **refusée** dans le sens `direction`.
+    ///
+    /// Appelée par `WaveStream::allocate` sur **toutes** ses sorties en erreur, quelle qu'en
+    /// soit la cause : une taille impossible, une division indivisible par le nombre de
+    /// périodes, un tampon déjà alloué, un échec de `AllocatePagesForMdl` ou de mappage. Du
+    /// point de vue du moteur audio, ce sont le même événement — un « non » — et c'est ce
+    /// « non » qui le fait retomber en scrutation. Les distinguer ici demanderait un compteur
+    /// par cause pour une information que la trace de `stream.rs` porte déjà en debug.
+    ///
+    /// IRQL : quelconque — un `fetch_add` atomique, aucun verrou pris.
+    pub fn note_allocation_refusal(&self, direction: Direction) {
+        self.alloc_refusals
+            .slot(direction)
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Un **instantané** de l'état du transport des deux sens, pour
+    /// `KSPROPERTY_CONDUIT_TRANSPORT` (lot 0 du mode paquets WaveRT).
+    ///
+    /// # Ici le verrou est pris, et c'est l'inverse du choix fait pour les compteurs
+    ///
+    /// [`Cable::counters_snapshot`] refuse de prendre le moindre verrou, et sa
+    /// documentation dit pourquoi. La différence tient à **où vit la donnée**. Les compteurs
+    /// sont déjà des atomiques : les lire sous le verrou du câble n'aurait rien rendu plus
+    /// vrai et aurait sérialisé la boucle locale avec un diagnostic. L'état du transport,
+    /// lui, vit **dans** le [`StreamState`], sous le verrou du flux — le tampon, le
+    /// notifieur, les événements et l'état KS y sont posés et retirés ensemble. Il n'y a que
+    /// deux façons de le lire : prendre ce verrou, ou en tenir une copie dans des atomiques
+    /// mises à jour à chaque transition. La seconde ferait une seconde source de vérité, qui
+    /// dériverait le jour où l'on oublierait un chemin — et **un diagnostic qui ment coûte
+    /// plus cher qu'un diagnostic absent**, ce que ce dépôt a déjà payé une fois.
+    ///
+    /// Le prix est borné et connu : l'ordre de verrouillage est celui du module (câble, puis
+    /// flux), le même que [`Cable::refresh_timer`] ; le verrou de chaque flux n'est tenu que
+    /// le temps de recopier sept champs ; et cette fonction n'est appelée que sur requête
+    /// d'un outil, pas à chaque tick. Ce n'est pas comparable au débogueur noyau, qui fausse
+    /// la mesure en permanence.
+    ///
+    /// # Non atomique entre les champs, comme les compteurs
+    ///
+    /// Les deux compteurs de refus sont lus **hors** de tout verrou, avant les blocs de sens :
+    /// une allocation peut donc être refusée entre les deux lectures, et l'instantané rendu
+    /// mélanger deux instants. Les deux sens sont eux-mêmes lus l'un après l'autre. C'est
+    /// sans effet sur ce qu'on cherche — un mode et un compte de refus se lisent
+    /// séparément —, et le dire vaut mieux que de le laisser croire.
+    ///
+    /// IRQL : `<= DISPATCH_LEVEL` (le spin lock du câble est pris).
+    pub fn transport_snapshot(&self) -> CableTransport {
+        // Hors verrou, et avant : un `fetch_add` du chemin d'allocation ne doit pas attendre
+        // que ce relevé ait fini.
+        let refus_rendu = self
+            .alloc_refusals
+            .slot(Direction::Render)
+            .load(Ordering::Relaxed);
+        let refus_capture = self
+            .alloc_refusals
+            .slot(Direction::Capture)
+            .load(Ordering::Relaxed);
+
+        let cable = self.state();
+        // Un emplacement vide est `AllocationMode::NoStream`, c'est-à-dire tout à zéro : la
+        // valeur par défaut du contrat décrit exactement un sens que personne n'a ouvert.
+        let sens = |direction: Direction| match cable.get(direction) {
+            None => StreamTransport::new(),
+            // SAFETY: le pointeur de l'emplacement désigne le `SpinLock<StreamState>` d'un
+            // flux vivant tant que la garde du câble est détenue (contrat du module) ;
+            // l'ordre câble puis flux est respecté, et la garde du flux meurt à la fin de
+            // cette expression.
+            Some(shared) => unsafe { shared.as_ref() }.lock().transport(),
+        };
+        let mut render = sens(Direction::Render);
+        let mut capture = sens(Direction::Capture);
+        render.refused_allocations = refus_rendu;
+        capture.refused_allocations = refus_capture;
+        CableTransport {
+            cable: self.index,
+            reserved: 0,
+            render,
+            capture,
         }
     }
 

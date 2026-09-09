@@ -151,10 +151,41 @@ impl WaveStream {
     }
 
     /// Alloue le tampon cyclique (voir le module), avec `notification_count` périodes
-    /// de notification par tour (`None` : `AllocateAudioBuffer`, sans notification).
+    /// de notification par tour (`None` : `AllocateAudioBuffer`, sans notification), et
+    /// **compte le refus** si l'allocation échoue.
+    ///
+    /// # Un seul endroit qui compte, et c'est pour cela qu'il enveloppe
+    ///
+    /// Le travail est dans [`Self::allocate_inner`], qui a huit sorties en erreur. Les
+    /// compter une par une reviendrait à en oublier une le jour où l'on en ajoute une
+    /// neuvième, et un compteur de refus qui rate un refus est pire qu'aucun compteur : il
+    /// **affirme** que le moteur audio n'a essuyé aucun « non ». L'enveloppe rend l'oubli
+    /// impossible.
+    ///
+    /// Le compteur vit sur le câble et non sur ce flux : voir `cable::AllocRefusals`.
     ///
     /// IRQL : `PASSIVE_LEVEL`.
     fn allocate(
+        &self,
+        notification_count: Option<u32>,
+        requested_bytes: u32,
+    ) -> Result<AudioBuffer, NtStatus> {
+        let issue = self.allocate_inner(notification_count, requested_bytes);
+        if let Err(status) = issue {
+            self.cable.note_allocation_refusal(self.direction);
+            kmd_log!(
+                "{}{}::Allocate REFUSÉ ({status:#010x}, notifications {notification_count:?}) : le moteur audio va retomber en scrutation sans le dire",
+                self.name(),
+                self.n
+            );
+        }
+        issue
+    }
+
+    /// Le travail de [`Self::allocate`], dont chaque sortie en erreur est un refus.
+    ///
+    /// IRQL : `PASSIVE_LEVEL`.
+    fn allocate_inner(
         &self,
         notification_count: Option<u32>,
         requested_bytes: u32,
@@ -164,6 +195,8 @@ impl WaveStream {
         // silencieusement en mode scrutation. C'est exactement ce qui a coûté une journée
         // de diagnostic le 2026-09-06 : la trace ne montrait que « notifications None »,
         // sans dire qu'une demande avec notifications avait été refusée juste avant.
+        // Depuis le lot 0 du mode paquets, le refus se lit **aussi** en release, par
+        // `KSPROPERTY_CONDUIT_TRANSPORT` : `kmd_log!` est vide hors debug.
         kmd_log!(
             "{}{}::Allocate(notifications {notification_count:?}, {requested_bytes} octets)",
             self.name(),
@@ -285,6 +318,9 @@ impl WaveStream {
             }
             state.buffer = Some(buffer);
             state.notifier = notifier;
+            // Ce que le moteur audio a **demandé**, pour que la propriété de transport le
+            // rende tel quel : 0 quand il n'a rien demandé.
+            state.notification_count = notification_count.unwrap_or(0);
         }
         // Hors du verrou du flux : `refresh_timer` prend celui du câble, qui le précède.
         self.cable.refresh_timer();
@@ -349,6 +385,7 @@ impl WaveStream {
             let mut state = self.shared.lock();
             let taken = state.buffer.take();
             state.notifier = None;
+            state.notification_count = 0;
             (taken, state.state)
         };
         // Hors du verrou du flux (ordre câble puis flux).
@@ -407,6 +444,7 @@ impl Drop for WaveStream {
         let leftover = {
             let mut state = self.shared.lock();
             state.notifier = None;
+            state.notification_count = 0;
             state.buffer.take()
         };
         if let Some(buffer) = leftover {

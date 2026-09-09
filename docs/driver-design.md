@@ -568,7 +568,10 @@ audio, remontée à 1 ms si elle est en dessous), et le mémorise dans l'état d
 taille rendue n'est **jamais** inférieure à la demande : « The actual size must be at
 least the requested size; otherwise, the Audio Session API (WASAPI) audio engine won't use
 the buffer, and stream creation will fail. » Une demande au-delà de 500 ms est donc
-**refusée** (`STATUS_UNSUCCESSFUL`, journalisé), pas écrêtée. Ce plafond est un
+**refusée** (`STATUS_UNSUCCESSFUL`, journalisé **et compté** — voir §6, le compteur de
+refus de `KSPROPERTY_CONDUIT_TRANSPORT` : `kmd_log!` est vide en release, et un refus fait
+retomber le moteur audio en scrutation sans une ligne d'erreur), pas écrêtée. Ce plafond
+est un
 garde-fou, pas une politique de latence : depuis que le dépassement fait échouer la
 création du flux au lieu d'écrêter, une borne serrée casserait des applications au lieu
 de raboter leur tampon — une station de travail audio en mode exclusif demande couramment
@@ -771,7 +774,8 @@ la configuration passe par un **jeu de propriétés KS privé** (`KSPROPSETID_Co
 GUID généré une fois et figé dans `conduit-kmd-core::config`) exposé par le filtre de
 topologie de chaque câble. Le helper ouvre l'interface `KSCATEGORY_TOPOLOGY` du câble
 et envoie `IOCTL_KS_PROPERTY` (`KSPROPERTY_CONDUIT_CABLE_STATE` get/set,
-`KSPROPERTY_CONDUIT_VERSION` get, `KSPROPERTY_CONDUIT_COUNTERS` get). Avantages :
+`KSPROPERTY_CONDUIT_VERSION` get, `KSPROPERTY_CONDUIT_COUNTERS` get,
+`KSPROPERTY_CONDUIT_TRANSPORT` get). Avantages :
 PortCls fait tout le routage, l'accès se fait par les handles standard, la validation
 est un simple parseur sur un tampon borné (fuzzable en mode utilisateur, M1b-08).
 
@@ -787,11 +791,40 @@ l'instantané est volontairement **non atomique** entre les six valeurs — pren
 verrou du câble à `PASSIVE_LEVEL` sérialiserait la boucle locale avec un diagnostic,
 alors qu'on ne lit que **quels** compteurs bougent.
 
-Toute apparition de propriété incrémente `CONFIG_VERSION` (2 → 3 en M1b-21) : le GUID du
-jeu est gravé et la longueur des tampons est refusée dès qu'elle change, ce numéro est
-donc la seule voie de versionnement du jeu. Un changement additif y est indiscernable
-d'un changement de forme, d'où la règle sur les messages : un outil qui constate une
-inadéquation dit que les millésimes diffèrent, jamais **ce qui** diffère.
+`KSPROPERTY_CONDUIT_TRANSPORT` (lot 0 du mode paquets WaveRT) rend une `CableTransport`
+de 72 octets : deux `ULONG` d'en-tête puis un bloc de 32 octets **par sens**, avec le mode
+d'allocation du flux courant (aucun flux / flux sans tampon / `AllocateAudioBuffer`,
+c'est-à-dire scrutation / `AllocateBufferWithNotification`), le `NotificationCount`
+demandé, la taille du tampon en octets **et** en trames, le nombre d'événements
+`RegisterNotificationEvent` enregistrés, l'état KS courant, et un compteur **cumulé**
+d'allocations refusées.
+
+Ce dernier champ est la raison d'être de la propriété. Un paquet WaveRT n'existe que sur
+un tampon alloué avec notifications ; tous les journaux du dépôt montrent le moteur audio
+allouant sans, et l'audio passant quand même — il scrute. Mais ces journaux sont anciens,
+pris débogueur attaché, peut-être en session 0, et un refus d'allocation de notre part
+fait retomber le moteur en scrutation **sans une ligne d'erreur** (une journée de
+diagnostic perdue ainsi le 2026-09-06). Sans ce compteur, « scrutation » ne distingue pas
+« Windows n'a rien demandé » de « nous avons dit non ». Pas de `SET` (une observation n'est
+pas un réglage) ni de contrôle de privilège, comme les compteurs : `conduit-looptest
+--cable-transport`.
+
+Un mot sur le verrouillage, parce qu'il diffère de celui des compteurs. Ceux-ci sont des
+atomiques et se lisent **sans** prendre le verrou du câble, précisément pour ne pas
+sérialiser la boucle locale avec un diagnostic. L'état du transport, lui, **vit** sous le
+verrou du flux : le tampon, le notifieur, les événements et l'état KS y sont posés et
+retirés ensemble. Le relevé prend donc les verrous dans l'ordre du pilote (câble puis
+flux), le temps de recopier sept champs. La seule autre voie aurait été d'en tenir une
+copie dans des atomiques mises à jour à chaque transition — une seconde source de vérité,
+qui dérive le jour où l'on oublie un chemin, et un diagnostic qui ment coûte plus cher
+qu'un diagnostic absent. Les deux compteurs de refus, eux, restent hors verrou : l'instantané
+est donc **non atomique** entre eux et le reste, et le relevé le dit.
+
+Toute apparition de propriété incrémente `CONFIG_VERSION` (2 → 3 en M1b-21, 3 → 4 avec le
+transport) : le GUID du jeu est gravé et la longueur des tampons est refusée dès qu'elle
+change, ce numéro est donc la seule voie de versionnement du jeu. Un changement additif y
+est indiscernable d'un changement de forme, d'où la règle sur les messages : un outil qui
+constate une inadéquation dit que les millésimes diffèrent, jamais **ce qui** diffère.
 
 Contrôle d'accès : le gestionnaire de propriété s'exécute dans le contexte du thread
 appelant ; toute écriture exige `SeSinglePrivilegeCheck(SE_LOAD_DRIVER_PRIVILEGE)`

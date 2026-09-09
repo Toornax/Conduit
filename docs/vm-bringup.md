@@ -214,6 +214,18 @@ de transport : attacher le débogueur noyau la fausse (17 passes sur 20 attaché
 sur 20 détaché, le 2026-09-08) et impose un redémarrage qui ferme la session console
 dont l'audio a besoin. DebugView reste utile pour tout le reste, en debug.
 
+**Ce que le moteur audio a demandé se relève de la même façon** :
+`conduit-looptest --cable-transport` dit, par câble et **par sens**, si le tampon courant
+a été alloué par `AllocateAudioBuffer` (le moteur **scrute**) ou par
+`AllocateBufferWithNotification` (un paquet WaveRT peut exister), avec le
+`NotificationCount` demandé, la taille du tampon en octets et en trames, les événements
+enregistrés, l'état KS, et surtout le **compte cumulé d'allocations refusées**. Ce dernier
+est celui qui compte : un refus fait retomber le moteur en scrutation **sans une ligne
+d'erreur**, si bien qu'un relevé montrant « scrutation » ne dit pas, à lui seul, si le
+moteur n'a jamais rien demandé ou si nous lui avons dit non. Le relevé prononce le verdict
+à notre place. À lancer **pendant** qu'une passe tourne, ou juste après : sans tampon
+alloué, il ne prouve rien et le dit.
+
 ## 5. M1a-08 — la capture reçoit ce que le rendu joue
 
 Enregistrer sur « Conduit 1 » pendant qu'une application y joue (Enregistreur vocal, ou

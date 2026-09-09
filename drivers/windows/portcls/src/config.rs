@@ -1,5 +1,5 @@
 //! Le jeu de propriétés KS **privé** de configuration (M1b-04, driver-design.md §6) :
-//! trait [`CableConfig`] que le miniport topologie implémente, et les trois
+//! trait [`CableConfig`] que le miniport topologie implémente, et les quatre
 //! [`PropertyHandler`] posés sur la brique de [`crate::property`].
 //!
 //! **Ce module ne stocke aucun état et ne valide rien lui-même**, comme [`crate::audio`]
@@ -13,20 +13,22 @@
 //! mode utilisateur, et il ne peut l'être que s'il ne dépend d'aucun type du WDK. Toute
 //! validation écrite **ici** échapperait au fuzzer.
 //!
-//! # Trois propriétés, un jeu
+//! # Quatre propriétés, un jeu
 //!
 //! | Propriété | Verbes | Valeur |
 //! |---|---|---|
 //! | [`KSPROPERTY_CONDUIT_CABLE_STATE`] | GET, SET, BASICSUPPORT | [`CableState`], 16 octets |
 //! | [`KSPROPERTY_CONDUIT_VERSION`] | GET, BASICSUPPORT | un `ULONG` |
 //! | [`KSPROPERTY_CONDUIT_COUNTERS`] | GET, BASICSUPPORT | [`CableCounters`], 56 octets |
+//! | [`KSPROPERTY_CONDUIT_TRANSPORT`] | GET, BASICSUPPORT | [`CableTransport`], 72 octets |
 //!
 //! Une seule est modifiable, et c'est la première : la version est celle du binaire chargé,
-//! les compteurs sont ce que la boucle locale a fait. **Un compteur n'est pas un réglage**,
-//! d'où l'absence de `SET` — et, faute d'écriture, aucun contrôle de privilège à faire :
-//! seule l'écriture en demandait un.
+//! les compteurs sont ce que la boucle locale a fait, le transport est ce que le moteur audio
+//! a demandé. **Ni un compteur ni une observation n'est un réglage**, d'où l'absence de `SET`
+//! — et, faute d'écriture, aucun contrôle de privilège à faire : seule l'écriture en
+//! demandait un.
 //!
-//! Les trois se posent dans la `PCAUTOMATION_TABLE` du **filtre** de topologie
+//! Les quatre se posent dans la `PCAUTOMATION_TABLE` du **filtre** de topologie
 //! (`PCFILTER_DESCRIPTOR::AutomationTable`), à côté de `KSPROPERTY_JACK_DESCRIPTION`, et
 //! non sur une broche ni sur un nœud : elles décrivent le câble entier, pas un point de
 //! son graphe. Le service d'assistance (M1b-20) ouvre l'interface `KSCATEGORY_TOPOLOGY` du
@@ -139,11 +141,14 @@
 
 use conduit_com::{NtStatus, STATUS_INVALID_PARAMETER};
 use conduit_kmd_core::config::{
-    CABLE_COUNTERS_BYTES, CABLE_STATE_BYTES, CONFIG_VERSION, CableCounters, CableState,
-    ConfigError, ConfigGuid, KSPROPERTY_CONDUIT_CABLE_STATE, KSPROPERTY_CONDUIT_COUNTERS,
-    KSPROPERTY_CONDUIT_VERSION, KSPROPSETID_CONDUIT, O_CABLE, O_CHANNELS, O_CONNECTED, O_RESERVED,
-    OC_CABLE, OC_COPIED, OC_DISCARDED_TICKS, OC_OVERRUNS, OC_RESERVED, OC_SILENCED_BEFORE_RENDER,
-    OC_SILENCED_NO_RENDER, OC_TICKS,
+    CABLE_COUNTERS_BYTES, CABLE_STATE_BYTES, CABLE_TRANSPORT_BYTES, CONFIG_VERSION, CableCounters,
+    CableState, CableTransport, ConfigError, ConfigGuid, KSPROPERTY_CONDUIT_CABLE_STATE,
+    KSPROPERTY_CONDUIT_COUNTERS, KSPROPERTY_CONDUIT_TRANSPORT, KSPROPERTY_CONDUIT_VERSION,
+    KSPROPSETID_CONDUIT, O_CABLE, O_CHANNELS, O_CONNECTED, O_RESERVED, OC_CABLE, OC_COPIED,
+    OC_DISCARDED_TICKS, OC_OVERRUNS, OC_RESERVED, OC_SILENCED_BEFORE_RENDER, OC_SILENCED_NO_RENDER,
+    OC_TICKS, OS_BUFFER_BYTES, OS_BUFFER_FRAMES, OS_KS_STATE, OS_MODE, OS_NOTIFICATION_COUNT,
+    OS_NOTIFICATION_EVENTS, OS_REFUSED_ALLOCATIONS, OT_CABLE, OT_CAPTURE, OT_RENDER, OT_RESERVED,
+    STREAM_TRANSPORT_BYTES, StreamTransport,
 };
 use portcls_sys::{
     GUID, GUID_NULL, KSPROPERTY_TYPE_BASICSUPPORT, KSPROPERTY_TYPE_GET, KSPROPERTY_TYPE_SET,
@@ -219,6 +224,14 @@ pub const VERSION_ACCESS_FLAGS: u32 = KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_BASI
 /// l'une de l'autre.
 pub const COUNTERS_ACCESS_FLAGS: u32 = KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_BASICSUPPORT;
 
+/// `Flags` du `PCPROPERTY_ITEM` du transport : `GET | BASICSUPPORT` (513), **sans `SET`**.
+///
+/// Troisième constante de même valeur, et pour la même raison que la deuxième : elles
+/// décrivent trois propriétés dont rien ne garantit qu'elles resteront d'accord. Ce que le
+/// transport décrit est une **observation** — ce que le moteur audio a demandé —, et une
+/// observation ne se règle pas plus qu'un compteur.
+pub const TRANSPORT_ACCESS_FLAGS: u32 = KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_BASICSUPPORT;
+
 /// Taille de la valeur de [`KSPROPERTY_CONDUIT_VERSION`] : un `ULONG`.
 const TAILLE_VERSION: usize = 4;
 
@@ -238,6 +251,18 @@ const _: () = assert!(OC_CABLE == 0 && OC_RESERVED == 4 && OC_TICKS == 8);
 const _: () = assert!(OC_COPIED == 16 && OC_SILENCED_NO_RENDER == 24);
 const _: () = assert!(OC_SILENCED_BEFORE_RENDER == 32 && OC_DISCARDED_TICKS == 40);
 const _: () = assert!(OC_OVERRUNS == 48 && OC_OVERRUNS + 8 == CABLE_COUNTERS_BYTES);
+const _: () = assert!(TRANSPORT_ACCESS_FLAGS == 513);
+const _: () = assert!(TRANSPORT_ACCESS_FLAGS & KSPROPERTY_TYPE_SET == 0);
+// Idem pour le transport : deux `ULONG` puis deux blocs de sens de 32 octets, chacun aligné
+// sur huit ; dans un bloc, six `ULONG` puis un `ULONGLONG`.
+const _: () = assert!(CABLE_TRANSPORT_BYTES == 72 && STREAM_TRANSPORT_BYTES == 32);
+const _: () = assert!(OT_CABLE == 0 && OT_RESERVED == 4);
+const _: () = assert!(OT_RENDER == 8 && OT_CAPTURE == 40);
+const _: () = assert!(OT_CAPTURE + STREAM_TRANSPORT_BYTES == CABLE_TRANSPORT_BYTES);
+const _: () = assert!(OS_MODE == 0 && OS_NOTIFICATION_COUNT == 4 && OS_BUFFER_BYTES == 8);
+const _: () = assert!(OS_BUFFER_FRAMES == 12 && OS_NOTIFICATION_EVENTS == 16);
+const _: () = assert!(OS_KS_STATE == 20 && OS_REFUSED_ALLOCATIONS == 24);
+const _: () = assert!(OS_REFUSED_ALLOCATIONS + 8 == STREAM_TRANSPORT_BYTES);
 
 // ---------------------------------------------------------------------------------
 // Trace.
@@ -278,6 +303,8 @@ const PROP_ETAT: &str = "état";
 const PROP_VERSION: &str = "version";
 /// Nom de propriété des traces des compteurs.
 const PROP_COMPTEURS: &str = "compteurs";
+/// Nom de propriété des traces du transport.
+const PROP_TRANSPORT: &str = "transport";
 /// Nom de verbe des traces de lecture.
 const VERBE_GET: &str = "GET";
 /// Nom de verbe des traces d'écriture.
@@ -361,6 +388,26 @@ pub trait CableConfig: Send + Sync + 'static {
     /// l'implémentation, elle, doit se contenter de chargements atomiques.
     fn counters(&self) -> CableCounters;
 
+    /// L'état du transport des **deux** sens du câble, pour
+    /// [`KSPROPERTY_CONDUIT_TRANSPORT`] (lot 0 du mode paquets WaveRT).
+    ///
+    /// Les deux sens, et pas seulement celui du filtre interrogé : la question porte sur le
+    /// câble, et un relevé des seize câbles ferait sinon trente-deux ouvertures de filtre au
+    /// lieu de seize. Les deux miniports d'un même câble rendent donc la même valeur, comme
+    /// pour [`Self::counters`].
+    ///
+    /// **Un instantané, pas une transaction** : l'implémentation lit les champs d'un sens
+    /// sous le verrou de ce flux, mais les compteurs de refus hors de tout verrou. Voir
+    /// `conduit_kmd::cable::Cable::transport_snapshot`, où le détail est écrit — et où est
+    /// écrit aussi pourquoi ce verrou-là, contrairement à celui des compteurs, ne pouvait pas
+    /// être évité.
+    ///
+    /// Le champ [`CableTransport::cable`] doit valoir [`Self::cable_index`] : c'est un écho,
+    /// et il n'y a rien à comparer puisque cette propriété n'a pas de `SET`.
+    ///
+    /// IRQL : `PASSIVE_LEVEL` (les propriétés KS sont traitées en ligne par PortCls).
+    fn transport(&self) -> CableTransport;
+
     /// Point de trace, appelé une fois par requête, après coup.
     ///
     /// Défaut : ne fait rien. Ne doit ni allouer ni bloquer.
@@ -419,6 +466,56 @@ fn ecrire_compteurs(value: &mut [u8], compteurs: &CableCounters) {
     champs.u64(OC_SILENCED_BEFORE_RENDER, compteurs.silenced_before_render);
     champs.u64(OC_DISCARDED_TICKS, compteurs.discarded_ticks);
     champs.u64(OC_OVERRUNS, compteurs.overruns);
+}
+
+/// Écrit le bloc d'un sens dans `champs`, au décalage **absolu** `base`.
+///
+/// L'appelant a déjà vérifié que la place y est ([`ecrire_transport`]) : cette fonction ne
+/// décide de rien, elle place sept champs à leurs décalages nommés, relatifs à `base`. Les
+/// additions sont `checked_add` par principe — les décalages sont des constantes, mais un
+/// débordement silencieux écrirait le champ ailleurs.
+fn ecrire_sens(champs: &mut Champs<'_>, base: usize, sens: &StreamTransport) {
+    let a = |offset: usize| base.checked_add(offset);
+    if let Some(o) = a(OS_MODE) {
+        champs.u32(o, sens.mode);
+    }
+    if let Some(o) = a(OS_NOTIFICATION_COUNT) {
+        champs.u32(o, sens.notification_count);
+    }
+    if let Some(o) = a(OS_BUFFER_BYTES) {
+        champs.u32(o, sens.buffer_bytes);
+    }
+    if let Some(o) = a(OS_BUFFER_FRAMES) {
+        champs.u32(o, sens.buffer_frames);
+    }
+    if let Some(o) = a(OS_NOTIFICATION_EVENTS) {
+        champs.u32(o, sens.notification_events);
+    }
+    if let Some(o) = a(OS_KS_STATE) {
+        champs.u32(o, sens.ks_state);
+    }
+    if let Some(o) = a(OS_REFUSED_ALLOCATIONS) {
+        champs.u64(o, sens.refused_allocations);
+    }
+}
+
+/// Écrit une [`CableTransport`] dans `value`, champ par champ, aux décalages du contrat
+/// portable.
+///
+/// **Tout ou rien**, comme [`ecrire_etat`] et [`ecrire_compteurs`], et pour la même raison :
+/// un instantané à demi écrit ferait lire au client un mode d'allocation d'un sens et une
+/// taille de tampon de l'autre — exactement le genre de relevé qui fait conclure de travers.
+/// Aucun transtypage vers un `*mut CableTransport` : `value` n'est aligné sur rien.
+fn ecrire_transport(value: &mut [u8], transport: &CableTransport) {
+    if value.len() < CABLE_TRANSPORT_BYTES {
+        return;
+    }
+    let mut champs = Champs { dest: value };
+    champs.u32(OT_CABLE, transport.cable);
+    // Toujours zéro : rien de la mémoire du noyau ne transite par le champ réservé.
+    champs.u32(OT_RESERVED, transport.reserved);
+    ecrire_sens(&mut champs, OT_RENDER, &transport.render);
+    ecrire_sens(&mut champs, OT_CAPTURE, &transport.capture);
 }
 
 /// Écrit un `ULONG` en tête de `value` s'il y tient (sinon rien : le thunk rendra la taille
@@ -707,6 +804,65 @@ impl<T: CableConfig> PropertyHandler<T> for ConduitCounters {
 }
 
 // ---------------------------------------------------------------------------------
+// Le gestionnaire du transport.
+// ---------------------------------------------------------------------------------
+
+/// [`KSPROPERTY_CONDUIT_TRANSPORT`] : ce que le moteur audio a demandé au câble, sens par
+/// sens (lot 0 du mode paquets WaveRT).
+///
+/// Une [`CableTransport`] de 72 octets, en **lecture seule** et **sans contrôle de
+/// privilège**, comme les compteurs et pour les mêmes raisons. Elle répond à une question
+/// qu'aucune ligne de journal ne sait poser en release : le tampon courant a-t-il été alloué
+/// par `AllocateAudioBuffer` (scrutation) ou par `AllocateBufferWithNotification` — seul mode
+/// sur lequel un paquet WaveRT puisse exister — et combien d'allocations avons-nous
+/// **refusées** ? Un refus fait retomber le moteur en scrutation sans une ligne d'erreur ;
+/// c'est ce qui a coûté une journée de diagnostic le 2026-09-06.
+///
+/// L'écho de câble n'est pas comparé — il n'y a rien à comparer sans `SET` — mais il est
+/// **rempli par le miniport**, donc par le câble du filtre visé.
+#[derive(Debug)]
+pub struct ConduitTransport;
+
+impl<T: CableConfig> PropertyHandler<T> for ConduitTransport {
+    fn get(req: &Request<'_, T>, value: &mut [u8]) -> Result<u32, NtStatus> {
+        // Lecture libre : voir `ConduitCableState::get`. Un diagnostic qui exigerait
+        // l'élévation ne servirait pas là où il sert.
+        let transport = req.target.transport();
+        ecrire_transport(value, &transport);
+        req.target.trace(&ConfigTrace {
+            property: PROP_TRANSPORT,
+            verb: VERBE_GET,
+            instance: req.instance,
+            cable: transport.cable,
+            // `ConfigTrace::state` porte une `CableState` ; le transport n'en est pas une,
+            // et le recopier dans la trace n'apprendrait rien que le tampon rendu ne dise
+            // déjà.
+            state: None,
+            status: conduit_com::STATUS_SUCCESS,
+            persisted: None,
+        });
+        // Taille **requise**, écrite ou non : contrat de `get`.
+        Ok(CABLE_TRANSPORT_BYTES as u32)
+    }
+
+    fn basic_support(req: &Request<'_, T>, value: &mut [u8]) -> Result<u32, NtStatus> {
+        // Structure de soixante-douze octets : aucune `VARENUM` ne la nomme, d'où un
+        // `PropTypeSet` nul, exactement comme pour l'état et les compteurs.
+        let ecrits = basic_support_ks(value, TRANSPORT_ACCESS_FLAGS, &GUID_NULL, 0);
+        req.target.trace(&ConfigTrace {
+            property: PROP_TRANSPORT,
+            verb: VERBE_BASICSUPPORT,
+            instance: req.instance,
+            cable: req.target.cable_index(),
+            state: None,
+            status: ecrits.map_or_else(|status| status, |_| conduit_com::STATUS_SUCCESS),
+            persisted: None,
+        });
+        ecrits
+    }
+}
+
+// ---------------------------------------------------------------------------------
 // Entrées de table prêtes à poser.
 // ---------------------------------------------------------------------------------
 
@@ -758,6 +914,21 @@ where
     )
 }
 
+/// Entrée de `PCAUTOMATION_TABLE` du **filtre** de topologie :
+/// `KSPROPSETID_Conduit`, [`KSPROPERTY_CONDUIT_TRANSPORT`], `GET | BASICSUPPORT` (lot 0 du
+/// mode paquets WaveRT).
+pub const fn transport_item<V, T>() -> PCPROPERTY_ITEM
+where
+    V: TargetVtbl<T>,
+    T: CableConfig,
+{
+    property::item::<V, T, ConduitTransport>(
+        &SET_CONDUIT,
+        KSPROPERTY_CONDUIT_TRANSPORT,
+        TRANSPORT_ACCESS_FLAGS,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     // Tests en mode utilisateur : les lints anti-panique du noyau y sont sans objet, une
@@ -783,12 +954,13 @@ mod tests {
         assert_ne!(SET_CONDUIT.Data1, GUID_NULL.Data1);
     }
 
-    /// Les drapeaux d'accès : l'état s'écrit, la version et les compteurs non.
+    /// Les drapeaux d'accès : l'état s'écrit, la version, les compteurs et le transport non.
     #[test]
     fn les_drapeaux_disent_qui_s_ecrit() {
         assert_eq!(CABLE_STATE_ACCESS_FLAGS, 515);
         assert_eq!(VERSION_ACCESS_FLAGS, 513);
         assert_eq!(COUNTERS_ACCESS_FLAGS, 513);
+        assert_eq!(TRANSPORT_ACCESS_FLAGS, 513);
         assert_ne!(CABLE_STATE_ACCESS_FLAGS & KSPROPERTY_TYPE_SET, 0);
         assert_eq!(VERSION_ACCESS_FLAGS & KSPROPERTY_TYPE_SET, 0);
         assert_eq!(
@@ -796,20 +968,27 @@ mod tests {
             0,
             "un compteur n'est pas un réglage : le bit SET ne doit pas être déclaré"
         );
-        // Les trois répondent à BASICSUPPORT : dès ce bit posé, PortCls ne répond plus à
+        assert_eq!(
+            TRANSPORT_ACCESS_FLAGS & KSPROPERTY_TYPE_SET,
+            0,
+            "une observation n'est pas un réglage : le bit SET ne doit pas être déclaré"
+        );
+        // Les quatre répondent à BASICSUPPORT : dès ce bit posé, PortCls ne répond plus à
         // notre place.
         assert_ne!(CABLE_STATE_ACCESS_FLAGS & KSPROPERTY_TYPE_BASICSUPPORT, 0);
         assert_ne!(VERSION_ACCESS_FLAGS & KSPROPERTY_TYPE_BASICSUPPORT, 0);
         assert_ne!(COUNTERS_ACCESS_FLAGS & KSPROPERTY_TYPE_BASICSUPPORT, 0);
+        assert_ne!(TRANSPORT_ACCESS_FLAGS & KSPROPERTY_TYPE_BASICSUPPORT, 0);
     }
 
-    /// Les trois entrées de table portent le même jeu et trois identifiants distincts.
+    /// Les quatre entrées de table portent le même jeu et quatre identifiants distincts.
     #[test]
-    fn les_trois_entrees_partagent_le_jeu_et_pas_l_identifiant() {
+    fn les_quatre_entrees_partagent_le_jeu_et_pas_l_identifiant() {
         let ids = [
             KSPROPERTY_CONDUIT_CABLE_STATE,
             KSPROPERTY_CONDUIT_VERSION,
             KSPROPERTY_CONDUIT_COUNTERS,
+            KSPROPERTY_CONDUIT_TRANSPORT,
         ];
         for (i, gauche) in ids.iter().enumerate() {
             for droite in ids.iter().skip(i + 1) {
@@ -823,6 +1002,72 @@ mod tests {
         assert_eq!(CABLE_STATE_BYTES, 16);
         assert_eq!(TAILLE_VERSION, 4);
         assert_eq!(CABLE_COUNTERS_BYTES, 56);
+        assert_eq!(CABLE_TRANSPORT_BYTES, 72);
+        // Les quatre longueurs sont distinctes : un client qui allouerait la mauvaise se
+        // fait refuser au lieu de lire une structure pour une autre.
+        let tailles = [
+            CABLE_STATE_BYTES,
+            TAILLE_VERSION,
+            CABLE_COUNTERS_BYTES,
+            CABLE_TRANSPORT_BYTES,
+        ];
+        for (i, gauche) in tailles.iter().enumerate() {
+            for droite in tailles.iter().skip(i + 1) {
+                assert_ne!(gauche, droite);
+            }
+        }
+    }
+
+    /// La sérialisation du transport écrit chaque champ à son décalage, ou rien du tout.
+    ///
+    /// Les quatorze valeurs sont toutes différentes d'un sens à l'autre : deux blocs
+    /// intervertis passeraient un aller-retour sur des zéros sans que rien ne le signale, et
+    /// c'est exactement l'erreur qui ferait lire « le rendu scrute » d'un câble où c'est la
+    /// capture qui scrute.
+    #[test]
+    fn la_serialisation_du_transport_est_tout_ou_rien() {
+        let transport = transport_temoin();
+
+        // Place suffisante : les quatorze champs, à leurs décalages.
+        let mut tampon = [0xAAu8; CABLE_TRANSPORT_BYTES];
+        ecrire_transport(&mut tampon, &transport);
+        assert_eq!(tampon, transport.to_bytes());
+        assert_eq!(CableTransport::from_bytes(&tampon), Ok(transport));
+
+        // Un octet de trop peu : rien n'est écrit, le tampon reste tel quel.
+        let mut court = [0xAAu8; CABLE_TRANSPORT_BYTES - 1];
+        ecrire_transport(&mut court, &transport);
+        assert_eq!(court, [0xAAu8; CABLE_TRANSPORT_BYTES - 1]);
+
+        // Tampon vide (interrogation de taille) : rien non plus, et aucune panique.
+        ecrire_transport(&mut [], &transport);
+
+        // Plus grand que nécessaire : les soixante-douze premiers octets, et rien au-delà.
+        let mut grand = [0xAAu8; CABLE_TRANSPORT_BYTES + 8];
+        ecrire_transport(&mut grand, &transport);
+        assert_eq!(&grand[..CABLE_TRANSPORT_BYTES], &transport.to_bytes()[..]);
+        assert_eq!(&grand[CABLE_TRANSPORT_BYTES..], &[0xAAu8; 8]);
+    }
+
+    /// Le champ réservé du transport part toujours à zéro, comme celui de l'état et celui
+    /// des compteurs.
+    #[test]
+    fn le_reserve_du_transport_part_a_zero() {
+        let cible = Faux {
+            cable: 3,
+            connected: true,
+            channels: 2,
+        };
+        let transport = cible.transport();
+        assert_eq!(transport.reserved, 0);
+        assert_eq!(
+            transport.cable,
+            cible.cable_index(),
+            "l'écho de câble doit être celui du miniport"
+        );
+        let mut tampon = [0xFFu8; CABLE_TRANSPORT_BYTES];
+        ecrire_transport(&mut tampon, &transport);
+        assert_eq!(&tampon[OT_RESERVED..OT_RESERVED + 4], &[0, 0, 0, 0]);
     }
 
     /// La sérialisation des compteurs écrit chaque champ à son décalage, ou rien du tout.
@@ -1014,6 +1259,46 @@ mod tests {
                 discarded_ticks: 100,
                 ..CableCounters::new(self.cable)
             }
+        }
+
+        fn transport(&self) -> CableTransport {
+            CableTransport {
+                cable: self.cable,
+                ..transport_temoin()
+            }
+        }
+    }
+
+    /// L'état de transport de référence des tests : un rendu **avec notifications**, une
+    /// capture en **scrutation**, et des refus des deux côtés.
+    ///
+    /// Les deux sens sont volontairement dans des modes différents et portent des valeurs
+    /// toutes distinctes : c'est la seule façon d'attraper deux blocs de trente-deux octets
+    /// écrits l'un à la place de l'autre. Le câble est celui du faux miniport.
+    fn transport_temoin() -> CableTransport {
+        use conduit_kmd_core::config::{AllocationMode, KsRunState};
+
+        CableTransport {
+            cable: 3,
+            reserved: 0,
+            render: StreamTransport {
+                mode: AllocationMode::Notifications.code(),
+                notification_count: 2,
+                buffer_bytes: 1_920,
+                buffer_frames: 480,
+                notification_events: 1,
+                ks_state: KsRunState::Run.code(),
+                refused_allocations: 7,
+            },
+            capture: StreamTransport {
+                mode: AllocationMode::Polling.code(),
+                notification_count: 0,
+                buffer_bytes: 3_840,
+                buffer_frames: 960,
+                notification_events: 0,
+                ks_state: KsRunState::Pause.code(),
+                refused_allocations: 11,
+            },
         }
     }
 

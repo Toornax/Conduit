@@ -120,8 +120,8 @@ pub use audio::{
 pub use conduit_kmd_core;
 pub use config::{
     CABLE_STATE_ACCESS_FLAGS, COUNTERS_ACCESS_FLAGS, CableConfig, ConduitCableState,
-    ConduitCounters, ConduitVersion, ConfigTrace, VERSION_ACCESS_FLAGS, cable_state_item,
-    counters_item, version_item,
+    ConduitCounters, ConduitTransport, ConduitVersion, ConfigTrace, TRANSPORT_ACCESS_FLAGS,
+    VERSION_ACCESS_FLAGS, cable_state_item, counters_item, transport_item, version_item,
 };
 pub use event::{
     EventEntry, EventHandler, EventRequest, EventSource, EventTrace, JACK_EVENT_FLAGS,
