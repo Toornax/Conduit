@@ -18,6 +18,15 @@
 //!
 //! Le rappel de rendu, lui, garde sa phase entre deux blocs (`FnMut`) et appelle
 //! [`analysis::fill`], qui n'alloue pas non plus.
+//!
+//! En **mode exclusif** (`--exclusif`), rien de plus n'est écrit ici non plus : la
+//! session pose `ExclusivePolicy::Required` sur le dorsal avant d'ouvrir quoi que ce
+//! soit, et c'est `conduit-backend-wasapi` qui négocie le format matériel, la période
+//! minimale du pilote et le réalignement du tampon. `Required` — et non `Preferred` —
+//! parce qu'un repli silencieux en partagé rendrait la mesure sans valeur : on
+//! mesurerait le moteur audio en croyant mesurer le transport. Ce que les flux ont
+//! réellement obtenu est relu sur la poignée (`FluxObserve`, interne) et imprimé
+//! sous l'en-tête.
 
 #![forbid(unsafe_code)]
 
@@ -30,11 +39,15 @@ use conduit_backend::{
     AudioCallback, Backend, CableId, DeviceDirection, DeviceHandle, DeviceInfo, StreamFormat,
     StreamIo,
 };
-use conduit_backend_wasapi::{EndpointVolumeControl, WasapiBackend};
+use conduit_backend_wasapi::{
+    EndpointVolumeControl, ExclusivePolicy, InitPath, ShareMode, StreamLatency, WasapiBackend,
+    WasapiHandle,
+};
 use conduit_core::types::SampleRate;
 
 use crate::analysis::{self, SineSpec};
 use crate::cli::Args;
+use crate::report::fr;
 use crate::volume::{Level, Range, RangeState, Reading, State};
 
 /// Câble retenu quand ni `--render` ni `--capture` ne désigne d'endpoint.
@@ -109,6 +122,20 @@ impl Recorder {
     }
 }
 
+/// Ce qu'un flux ouvert dit de lui-même, une fois la passe faite.
+///
+/// Rien n'est calculé ici et aucun champ n'est inventé : tout vient de
+/// `WasapiHandle::latency`, c'est-à-dire de ce que WASAPI a répondu à l'ouverture
+/// (`StreamLatency`, `InitPath`). C'est la seule façon honnête de dire le mode
+/// **effectif** d'un flux plutôt que celui qu'on avait demandé.
+#[derive(Debug, Clone, Copy)]
+struct FluxObserve {
+    /// Le rôle du flux dans la mesure : « rendu », « capture » ou « écho ».
+    role: &'static str,
+    /// Ce que le dorsal rapporte de son initialisation.
+    latency: StreamLatency,
+}
+
 /// Backend ouvert et endpoints choisis : réutilisés d'une passe à l'autre.
 #[derive(Debug)]
 pub struct Session {
@@ -118,9 +145,15 @@ pub struct Session {
     /// Vrai en `--loopback` : la capture est un écho de `render`, pas un endpoint
     /// à part.
     loopback: bool,
+    /// Vrai en `--exclusif` : les flux sont ouverts en mode exclusif WASAPI, et un
+    /// refus fait échouer l'ouverture ([`ExclusivePolicy::Required`]).
+    exclusif: bool,
     format: StreamFormat,
     spec: SineSpec,
     seconds: f64,
+    /// Ce que les flux de la **dernière passe** ont obtenu ; vide tant qu'aucune
+    /// passe n'a ouvert de flux.
+    observes: Vec<FluxObserve>,
 }
 
 impl Session {
@@ -131,9 +164,15 @@ impl Session {
     /// Message en français si le backend ne démarre pas ou si un endpoint manque
     /// (l'appelant en fait un code de retour 2).
     pub fn open(args: &Args, rate: SampleRate) -> Result<Self, String> {
-        let backend = WasapiBackend::new().map_err(|e| {
+        let mut backend = WasapiBackend::new().map_err(|e| {
             format!("backend WASAPI indisponible : {e} — le service audio Windows tourne-t-il ?")
         })?;
+        // `Required`, pas `Preferred` : en `--exclusif`, un repli en partagé donnerait
+        // une mesure du moteur audio là où on croyait mesurer le transport, et rien
+        // dans les chiffres ne le trahirait. Mieux vaut échouer en disant pourquoi.
+        if args.exclusif {
+            backend.set_exclusive_policy(ExclusivePolicy::Required);
+        }
         let devices = enumerate(&backend)?;
         let render = choose(&devices, DeviceDirection::Render, args.render.as_deref())?;
         let capture = if args.loopback || args.capture_disabled() {
@@ -177,6 +216,7 @@ impl Session {
             render,
             capture,
             loopback: args.loopback,
+            exclusif: args.exclusif,
             format: StreamFormat {
                 sample_rate: rate,
                 channels,
@@ -184,6 +224,7 @@ impl Session {
             },
             spec,
             seconds: args.seconds,
+            observes: Vec::new(),
         })
     }
 
@@ -255,15 +296,33 @@ impl Session {
                 self.format.channels,
             );
         }
-        format!(
-            "rendu   : {} ({})\ncapture : {}",
-            self.render.name,
-            self.render.id,
-            match &self.capture {
-                Some(d) => format!("{} ({})", d.name, d.id),
-                None => "aucune (--no-capture)".to_string(),
-            }
-        )
+        entete(&self.render, self.capture.as_ref(), self.mode_effectif())
+    }
+
+    /// Le mode de partage que les flux de cette session auront **effectivement**.
+    ///
+    /// Ce n'est pas une intention affichée pour faire joli : `--exclusif` pose
+    /// [`ExclusivePolicy::Required`] sur le dorsal, qui **fait échouer l'ouverture**
+    /// au lieu de rendre un flux partagé. Une passe qui démarre est donc exclusive,
+    /// ou n'a pas démarré du tout ; sans `--exclusif`, la politique du dorsal reste
+    /// [`ExclusivePolicy::Never`] et le partagé est tout aussi certain. Le format
+    /// matériel réellement négocié, lui, n'est connu qu'après l'ouverture :
+    /// [`Self::bloc_negocie`] le donne.
+    fn mode_effectif(&self) -> ShareMode {
+        if self.exclusif {
+            ShareMode::Exclusive
+        } else {
+            ShareMode::Shared
+        }
+    }
+
+    /// Ce que les flux de la dernière passe ont **obtenu** : format matériel
+    /// négocié, période et tampon alignés.
+    ///
+    /// `None` tant qu'aucune passe n'a ouvert de flux, et en mode partagé, où le bloc
+    /// n'apprendrait rien que les lignes `rendu :` / `capture :` ne disent déjà.
+    fn bloc_negocie(&self) -> Option<String> {
+        bloc_negocie(&self.observes)
     }
 
     /// Joue le sinus et enregistre ce qui revient : une passe.
@@ -272,11 +331,19 @@ impl Session {
     /// préambule qu'elle enregistre est jeté à l'analyse. En écho, « la capture »
     /// est l'écho de l'endpoint de rendu.
     ///
+    /// `ouvert` est appelé **juste après l'ouverture des flux**, avec le bloc
+    /// « négocié » quand il y en a un — le format matériel, la période et le tampon
+    /// que le mode exclusif a obtenus. C'est le seul
+    /// instant où l'appelant peut compléter l'en-tête avec le format que le matériel
+    /// a concédé, et il le faut **avant** la passe — vingt secondes de mesure ne
+    /// doivent pas s'écouler avant que la sortie ne dise dans quel mode elles
+    /// tournent.
+    ///
     /// # Erreurs
     ///
     /// Message en français si l'ouverture, le démarrage ou l'arrêt d'un flux
     /// échoue, ou si le tampon d'enregistrement a débordé.
-    pub fn record(&mut self) -> Result<Vec<f32>, String> {
+    pub fn record(&mut self, ouvert: &mut dyn FnMut(Option<&str>)) -> Result<Vec<f32>, String> {
         let channels = self.format.channels;
         let capacity = if self.records() {
             ((self.seconds + RECORD_MARGIN_S) * self.format.sample_rate.as_f64()).ceil() as usize
@@ -292,19 +359,23 @@ impl Session {
             }
             io.silence_output();
         });
-        let mut capture: Option<Box<dyn DeviceHandle>> = if self.loopback {
-            Some(Box::new(
+        // `open_handle` et non `open` : le type concret porte ce que le flux a
+        // réellement obtenu (`WasapiHandle::latency`), que le trait portable
+        // `DeviceHandle` ne connaît pas — c'est ce qui permet de dire le mode
+        // effectif au lieu du mode demandé.
+        let mut capture: Option<WasapiHandle> = if self.loopback {
+            Some(
                 self.backend
                     .open_loopback(&self.render.id, self.format, sink)
                     .map_err(|e| {
                         format!("ouverture de l'écho de « {} » : {e}", self.render.name)
                     })?,
-            ))
+            )
         } else {
             match &self.capture {
                 Some(info) => Some(
                     self.backend
-                        .open(&info.id, self.format, sink)
+                        .open_handle(&info.id, self.format, sink)
                         .map_err(|e| format!("ouverture de la capture « {} » : {e}", info.name))?,
                 ),
                 None => None,
@@ -315,7 +386,7 @@ impl Session {
         let mut phase = 0.0f64;
         let mut render = self
             .backend
-            .open(
+            .open_handle(
                 &self.render.id,
                 self.format,
                 Box::new(move |io: &mut StreamIo<'_>, _| {
@@ -325,6 +396,21 @@ impl Session {
                 }),
             )
             .map_err(|e| format!("ouverture du rendu « {} » : {e}", self.render.name))?;
+
+        // Relevé pendant que les flux existent : ce que WASAPI a répondu à
+        // l'ouverture, avant même de démarrer quoi que ce soit.
+        self.observes = core::iter::once(FluxObserve {
+            role: "rendu",
+            latency: render.latency(),
+        })
+        .chain(capture.as_ref().map(|handle| FluxObserve {
+            role: if self.loopback { "écho" } else { "capture" },
+            latency: handle.latency(),
+        }))
+        .collect();
+        // Les flux existent mais dorment encore : rien n'a été démarré, rien n'est
+        // joué. C'est le moment de compléter l'en-tête.
+        ouvert(self.bloc_negocie().as_deref());
 
         if let Some(capture) = capture.as_mut() {
             capture
@@ -363,6 +449,86 @@ impl Session {
             ));
         }
         Ok(recorder.take())
+    }
+}
+
+/// L'en-tête de la passe : un endpoint par ligne, avec le **mode de partage** que
+/// son flux aura.
+///
+/// Le mode est annoncé avant l'ouverture, et c'est exact : la politique du dorsal
+/// est soit `Never` (partagé garanti), soit `Required` (exclusif ou échec de
+/// l'ouverture). Une passe qui démarre est donc dans le mode annoncé. Ce que le
+/// matériel a concédé — format, période, tampon — n'est connu qu'ensuite, et
+/// s'imprime par [`bloc_negocie`].
+fn entete(render: &DeviceInfo, capture: Option<&DeviceInfo>, mode: ShareMode) -> String {
+    format!(
+        "rendu   : {} ({}) — {mode}\ncapture : {}",
+        render.name,
+        render.id,
+        match capture {
+            Some(d) => format!("{} ({}) — {mode}", d.name, d.id),
+            None => "aucune (--no-capture)".to_string(),
+        }
+    )
+}
+
+/// L'en-tête « négocié » : une ligne par flux ouvert, disant ce que WASAPI a
+/// accordé.
+///
+/// Rendu seulement quand au moins un flux est **exclusif**. En mode partagé, la
+/// période et le tampon sont ceux du moteur audio, que les lignes `rendu :` /
+/// `capture :` résument déjà par le mot « partagé » : un bloc de plus n'y ajouterait
+/// que du bruit. En exclusif, au contraire, le format n'est plus celui qu'on a
+/// demandé — le matériel l'impose — et la période est celle du pilote, éventuellement
+/// réalignée : ce sont les trois chiffres que la mesure du transport veut lire.
+fn bloc_negocie(observes: &[FluxObserve]) -> Option<String> {
+    if !observes
+        .iter()
+        .any(|flux| flux.latency.path.share_mode() == ShareMode::Exclusive)
+    {
+        return None;
+    }
+    let mut out = String::new();
+    for (rang, flux) in observes.iter().enumerate() {
+        out.push_str(if rang == 0 {
+            "négocié : "
+        } else {
+            "\n          "
+        });
+        out.push_str(&format!("{:<7} — {}", flux.role, ligne_flux(flux)));
+    }
+    Some(out)
+}
+
+/// La ligne d'un flux : ce que le dorsal rapporte, et rien d'autre.
+fn ligne_flux(flux: &FluxObserve) -> String {
+    let latence = flux.latency;
+    let ms = fr(latence.period.as_secs_f64() * 1000.0, 2);
+    match latence.path {
+        InitPath::Exclusive {
+            sample,
+            period_hns,
+            period_frames,
+            realigned,
+        } => format!(
+            "exclusif, {sample}, période {period_frames} trames ({period_hns} × 100 ns, \
+             {ms} ms), tampon {} trames{}",
+            latence.buffer_frames,
+            if realigned {
+                " — taille de tampon réalignée par le pilote"
+            } else {
+                ""
+            }
+        ),
+        // Un flux partagé au milieu d'un bloc exclusif : le cas ne se produit qu'en
+        // `--no-capture` inversé ou si le dorsal changeait de politique en cours de
+        // route. Le dire reste plus honnête que de l'omettre.
+        _ => format!(
+            "{}, période {} trames ({ms} ms), tampon {} trames",
+            latence.path.share_mode(),
+            latence.period_frames,
+            latence.buffer_frames
+        ),
     }
 }
 
@@ -644,6 +810,123 @@ fn check_same_cable(render: &DeviceInfo, capture: &DeviceInfo) -> Result<(), Str
 mod tests {
     use super::*;
     use conduit_backend::DeviceId;
+    use conduit_backend_wasapi::SampleType;
+
+    /// **Aucun test de ce module n'ouvre de flux ni n'émet de son** : tout ce qui
+    /// touche à WASAPI demande un vrai endpoint, et une passe exclusive prendrait la
+    /// carte son de la machine de développement pour elle seule. Ce qui est vérifié
+    /// ici est la mise en forme et le choix des endpoints, en mémoire.
+    ///
+    /// Un flux observé, tel que le dorsal le rapporterait.
+    fn flux(role: &'static str, path: InitPath, buffer_frames: usize) -> FluxObserve {
+        FluxObserve {
+            role,
+            latency: StreamLatency {
+                buffer_frames,
+                period_frames: 144,
+                period: Duration::from_micros(3_000),
+                stream_latency: Duration::ZERO,
+                path,
+                write_ahead_frames: 0,
+            },
+        }
+    }
+
+    /// Le chemin exclusif tel que M1b-32 le mesure sur le poste : PCM 24 dans un
+    /// conteneur 32, période minimale du pilote de 144 trames = 3 ms.
+    fn exclusif(realigned: bool) -> InitPath {
+        InitPath::Exclusive {
+            sample: SampleType::Pcm24In32,
+            period_hns: 30_000,
+            period_frames: 144,
+            realigned,
+        }
+    }
+
+    /// L'en-tête dit le mode de **chaque** flux, sans quoi une passe exclusive et une
+    /// passe partagée se ressembleraient trait pour trait dans la sortie — et c'est
+    /// justement ce qui les sépare qu'on mesure.
+    #[test]
+    fn l_entete_dit_le_mode_de_chaque_flux() {
+        let rendu = cable(1, DeviceDirection::Render);
+        let capture = cable(1, DeviceDirection::Capture);
+
+        let partage = entete(&rendu, Some(&capture), ShareMode::Shared);
+        assert_eq!(partage.lines().count(), 2, "{partage}");
+        assert!(
+            partage.lines().all(|ligne| ligne.contains("— partagé")),
+            "{partage}"
+        );
+
+        let exclusif = entete(&rendu, Some(&capture), ShareMode::Exclusive);
+        assert!(exclusif.starts_with("rendu   : Conduit 1"), "{exclusif}");
+        assert!(
+            exclusif.lines().all(|ligne| ligne.contains("— exclusif")),
+            "{exclusif}"
+        );
+        // L'identifiant d'endpoint reste affiché : c'est lui qu'on recopie dans
+        // `--render` pour rejouer la mesure.
+        assert!(exclusif.contains(rendu.id.as_str()), "{exclusif}");
+        assert!(exclusif.contains(capture.id.as_str()), "{exclusif}");
+
+        // `--no-capture` : pas de mode annoncé pour un flux qui n'existe pas.
+        let sans = entete(&rendu, None, ShareMode::Exclusive);
+        assert!(sans.contains("aucune (--no-capture)"), "{sans}");
+        assert_eq!(sans.matches("exclusif").count(), 1, "{sans}");
+    }
+
+    /// Le bloc « négocié » ne dit que ce que le dorsal a rapporté, et ne sort qu'en
+    /// exclusif : en partagé, il répéterait le mot que l'en-tête porte déjà.
+    #[test]
+    fn le_bloc_negocie_ne_sort_qu_en_exclusif() {
+        assert!(bloc_negocie(&[]).is_none());
+        assert!(bloc_negocie(&[flux("rendu", InitPath::Converted, 1_056)]).is_none());
+        assert!(
+            bloc_negocie(&[flux("écho", InitPath::Loopback { converted: false }, 480)]).is_none()
+        );
+
+        let bloc = bloc_negocie(&[
+            flux("rendu", exclusif(false), 144),
+            flux("capture", exclusif(false), 144),
+        ])
+        .expect("deux flux exclusifs");
+        assert!(bloc.starts_with("négocié : rendu"), "{bloc}");
+        assert_eq!(bloc.lines().count(), 2, "{bloc}");
+        // Le format matériel, la période dans les deux unités et le tampon : les
+        // trois chiffres que la mesure du transport vient lire.
+        assert!(bloc.contains("PCM 24 bits dans un conteneur 32"), "{bloc}");
+        assert!(bloc.contains("période 144 trames"), "{bloc}");
+        assert!(bloc.contains("30000 × 100 ns"), "{bloc}");
+        assert!(bloc.contains("3,00 ms"), "{bloc}");
+        assert!(bloc.contains("tampon 144 trames"), "{bloc}");
+        // Rien n'est inventé : sans réalignement, le mot n'apparaît pas.
+        assert!(!bloc.contains("réalignée"), "{bloc}");
+        assert!(bloc.contains("capture — exclusif"), "{bloc}");
+    }
+
+    /// Un tampon que le pilote a réaligné (`AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED`) le
+    /// dit : c'est le rite de passage du mode exclusif, et il explique une période
+    /// qui n'est pas celle qu'on avait demandée.
+    #[test]
+    fn le_realignement_du_tampon_est_dit() {
+        let bloc = bloc_negocie(&[flux("rendu", exclusif(true), 480)]).expect("un flux exclusif");
+        assert!(bloc.contains("réalignée par le pilote"), "{bloc}");
+        assert!(bloc.contains("tampon 480 trames"), "{bloc}");
+    }
+
+    /// Un flux partagé au milieu d'un bloc exclusif est **dit**, pas caché : le mode
+    /// affiché est celui que le dorsal rapporte, jamais celui qu'on a demandé.
+    #[test]
+    fn un_flux_partage_dans_un_bloc_exclusif_est_dit() {
+        let bloc = bloc_negocie(&[
+            flux("rendu", exclusif(false), 144),
+            flux("capture", InitPath::Converted, 1_056),
+        ])
+        .expect("un exclusif suffit");
+        assert!(bloc.contains("rendu   — exclusif"), "{bloc}");
+        assert!(bloc.contains("capture — partagé"), "{bloc}");
+        assert!(bloc.contains("tampon 1056 trames"), "{bloc}");
+    }
 
     /// Endpoint qui n'est pas un câble Conduit : `cable` vaut `None`, comme le
     /// backend le rend pour une vraie carte son.

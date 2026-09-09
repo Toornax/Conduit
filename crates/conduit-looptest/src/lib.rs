@@ -12,6 +12,7 @@
 //! conduit-looptest --json --repeat 10   # sortie machine
 //! conduit-looptest --self-test          # test de l'outil, sans périphérique
 //! conduit-looptest --loopback           # capture en écho : le moteur délivre-t-il ?
+//! conduit-looptest --exclusif --seconds 20     # rendu et capture en exclusif WASAPI
 //! conduit-looptest --list --show-volume # les endpoints, volume, coupure et plage
 //! conduit-looptest --set-volume 0.5 --unmute   # règle, affiche, et sort
 //! conduit-looptest --cable-etat                # l'état des 16 câbles (propriété KS)
@@ -44,6 +45,18 @@
 //! n'atteigne le pilote. Le sinus entendu en écho met le moteur audio hors de
 //! cause et laisse le pilote seul suspect ; un écho silencieux fait l'inverse.
 //! C'est la première mesure à prendre quand une capture n'entend pas un rendu.
+//!
+//! `--exclusif` ouvre les deux flux en **mode exclusif WASAPI**, événementiel : le
+//! moteur audio de Windows est court-circuité et chaque flux prend son endpoint pour
+//! lui seul. Aucun code WASAPI n'est écrit ici — la politique
+//! `ExclusivePolicy::Required` du dorsal fait tout le travail —, et `Required` veut
+//! dire que l'exclusif refusé est une **erreur** : un repli silencieux en partagé
+//! ferait mesurer le moteur audio en croyant mesurer le transport (notifications
+//! WaveRT). L'en-tête dit le mode de chaque flux, puis, dès que les flux sont
+//! ouverts, le format matériel négocié, la période et le tampon obtenus. Ce n'est pas
+//! le mode normal d'un câble : un câble Conduit est fait pour coexister avec les
+//! autres applications. Incompatible avec `--loopback`, dont l'écho n'existe qu'en
+//! partagé.
 //!
 //! **Le volume de l'endpoint est vérifié avant chaque mesure.** Un endpoint coupé
 //! ou à zéro rend la boucle muette, et ce silence-là est indiscernable d'un pilote
@@ -125,8 +138,9 @@ impl Source<'_> {
         }
     }
 
-    /// Une passe d'enregistrement.
-    fn record(&mut self, args: &cli::Args) -> Result<Vec<f32>, String> {
+    /// Une passe d'enregistrement. `entete` demande de compléter l'en-tête avec ce
+    /// que les flux ont négocié, dès leur ouverture et avant la mesure.
+    fn record(&mut self, args: &cli::Args, entete: bool) -> Result<Vec<f32>, String> {
         match self {
             // 50 ms de préambule : le décalage qu'une vraie capture voit avant
             // que le rendu ne démarre.
@@ -136,8 +150,18 @@ impl Source<'_> {
                 args.rate as usize / 20,
                 args.glitch_frame(),
             )),
-            Source::Live(session) => session.record(),
+            Source::Live(session) => session.record(&mut |bloc| imprime_negocie(entete, bloc)),
         }
+    }
+}
+
+/// Le bloc « négocié » rendu par une ouverture de flux, quand il y a lieu de
+/// l'imprimer : à la première passe, et hors `--json` (dont le document n'a pas de
+/// place pour un en-tête de texte).
+#[cfg(windows)]
+fn imprime_negocie(actif: bool, bloc: Option<&str>) {
+    if let (true, Some(bloc)) = (actif, bloc) {
+        println!("{bloc}");
     }
 }
 
@@ -211,7 +235,9 @@ fn run_passes(args: &cli::Args, mut source: Source<'_>) -> Result<ExitCode, Stri
     let skip = args.skip_frames_at(spec.sample_rate);
     let mut passes = Vec::with_capacity(args.repeat);
     for index in 1..=args.repeat {
-        let recording = source.record(args)?;
+        // Le format matériel n'est connu qu'une fois les flux ouverts : il complète
+        // l'en-tête à la première passe, et ne se répète pas ensuite.
+        let recording = source.record(args, index == 1 && !args.json)?;
         let pass = match pass::evaluate(index, &recording, &spec, &options, &tolerances, skip) {
             Ok(pass) => pass,
             Err(e) => return Err(no_signal_report(args, &e)),
@@ -274,7 +300,8 @@ fn no_signal_report(args: &cli::Args, error: &pass::Unusable) -> String {
 #[cfg(windows)]
 fn play_only(args: &cli::Args, session: &mut loopback::Session) -> Result<ExitCode, String> {
     for index in 1..=args.repeat {
-        session.record()?;
+        let entete = index == 1 && !args.json;
+        session.record(&mut |bloc| imprime_negocie(entete, bloc))?;
         if !args.json {
             println!(
                 "passe {index}/{} : {} s jouées sans erreur (mode --no-capture, rien à analyser)",

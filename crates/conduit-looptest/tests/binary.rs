@@ -176,6 +176,26 @@ fn l_etat_du_privilege_se_lit_sans_rien_armer() {
     assert!(!out.contains("--cable N"), "{out}");
 }
 
+/// `--exclusif` et `--loopback` se contredisent, et le refus **précède** toute
+/// ouverture : aucun flux n'est ouvert, aucun son n'est émis, sur la machine de
+/// développement comme ailleurs.
+#[test]
+fn l_exclusif_et_l_echo_se_contredisent() {
+    let (code, _, err) = run(&["--exclusif", "--loopback"]);
+    assert_eq!(code, Some(2), "{err}");
+    assert!(err.contains("--exclusif"), "{err}");
+    assert!(err.contains("--loopback"), "{err}");
+}
+
+/// L'option existe et s'explique dans l'aide : c'est ce que la VM lit avant de
+/// lancer une passe exclusive. `--help` n'ouvre rien.
+#[test]
+fn l_aide_annonce_le_mode_exclusif() {
+    let (code, out, err) = run(&["--help"]);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("--exclusif"), "{out}");
+}
+
 #[test]
 fn echo_et_capture_se_contredisent() {
     let (code, _, err) = run(&["--loopback", "--capture", "Conduit 1"]);

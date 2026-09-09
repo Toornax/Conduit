@@ -462,6 +462,7 @@ cargo run -p conduit-looptest -- --repeat 10               # le critère de la R
 cargo run -p conduit-looptest -- --json --repeat 10        # sortie machine
 cargo run -p conduit-looptest -- --self-test               # test de l'outil, sans périphérique
 cargo run -p conduit-looptest -- --loopback                # écho : le moteur délivre-t-il ?
+cargo run -p conduit-looptest -- --exclusif --seconds 20   # rendu et capture en exclusif WASAPI
 cargo run -p conduit-looptest -- --list --show-volume      # les endpoints, volume et coupure compris
 cargo run -p conduit-looptest -- --set-volume 0.5 --unmute # règle --render/--capture, affiche, sort
 ```
@@ -504,11 +505,30 @@ compterait comme un trou), et le mélange contient ce que jouent les autres
 applications — à fermer pour une mesure propre. `--loopback` est incompatible avec
 `--capture`, `--no-capture` et `--self-test`.
 
+`--exclusif` ouvre le rendu **et** la capture en **mode exclusif WASAPI**,
+événementiel (§ 4 quater, M1b-32). Aucun code WASAPI n'est ajouté à l'outil : la
+session pose simplement `ExclusivePolicy::Required` sur le dorsal avant d'ouvrir, et
+c'est `conduit-backend-wasapi` qui négocie le format matériel, la période minimale du
+pilote et le réalignement du tampon. `Required` et non `Preferred` : un repli
+silencieux en partagé ferait mesurer le moteur audio en croyant mesurer le transport,
+et rien dans les chiffres ne le trahirait — un refus est donc une **erreur**, avec sa
+raison. L'en-tête dit le mode de chaque flux (`— exclusif` / `— partagé`), puis, dès
+que les flux sont ouverts, une ligne `négocié :` par flux donne le format matériel
+accepté, la période (en trames, en unités de 100 ns et en millisecondes) et la taille
+de tampon, avec la mention du réalignement s'il a eu lieu. Trois conséquences : le
+flux prend l'endpoint **pour lui seul** (aucune autre application n'y joue pendant la
+passe), `--block` n'est plus qu'un souhait — la période est celle du pilote — et
+`--rate`/`--channels` doivent être acceptés tels quels par le matériel. C'est un outil
+de mesure du transport (notifications WaveRT), **pas** le mode normal d'un câble :
+un câble Conduit est fait pour coexister avec le reste du système (SPEC §5.6).
+Incompatible avec `--loopback`, dont l'écho n'existe qu'en mode partagé.
+
 Options utiles : `--render`/`--capture` (identifiant exact ou fragment de nom, ou
 `none`), `--freq`, `--rate`, `--channels`, `--seconds`, `--block`, `--amplitude`,
 `--skip-ms` (marge jetée après la détection du signal), `--phase-tolerance`,
-`--no-capture` (joue seulement), `--loopback` (capture en écho), `--show-volume`,
-`--set-volume`, `--unmute`. **Codes de retour** : `0` toutes les passes
+`--no-capture` (joue seulement), `--loopback` (capture en écho), `--exclusif` (mode
+exclusif des deux côtés), `--show-volume`, `--set-volume`, `--unmute`. **Codes de
+retour** : `0` toutes les passes
 passent, `1` au moins une échoue (le pilote est en cause), `2` l'environnement ne
 permet pas le test (endpoint absent, backend indisponible, options incohérentes,
 système autre que Windows) — c'est la distinction qui compte en CI.

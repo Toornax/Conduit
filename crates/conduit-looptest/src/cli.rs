@@ -95,6 +95,17 @@ pub struct Args {
     /// moteur audio délivre quelque chose.
     #[arg(long)]
     pub loopback: bool,
+    /// Ouvre le rendu **et** la capture en mode exclusif WASAPI, événementiel : les
+    /// flux court-circuitent le moteur audio de Windows et prennent chacun leur
+    /// endpoint pour eux seuls — aucune autre application ne peut y jouer pendant la
+    /// passe. Le format et la période cessent d'être négociables : le matériel les
+    /// impose (`--block` n'est plus qu'un souhait, `--rate` et `--channels` doivent
+    /// être acceptés tels quels), et un refus est une **erreur**, jamais un repli
+    /// silencieux en partagé. C'est un outil de mesure du transport (notifications
+    /// WaveRT), pas le mode normal d'un câble : un câble Conduit est fait pour
+    /// coexister avec le reste du système.
+    #[arg(long)]
+    pub exclusif: bool,
     /// Sortie JSON.
     #[arg(long)]
     pub json: bool,
@@ -366,6 +377,20 @@ impl Args {
                         .to_string(),
                 );
             }
+            // L'écho prélève le mélange **du moteur audio**, et le mode exclusif est
+            // précisément celui où il n'y a plus de moteur : WASAPI ne sait pas ouvrir
+            // un `AUDCLNT_STREAMFLAGS_LOOPBACK` en exclusif, et le dorsal le refuse déjà
+            // (`loopback::check_shared`). Le dire ici évite d'aller chercher la réponse
+            // dans un message d'ouverture.
+            if self.exclusif {
+                return Err(
+                    "--loopback prélève le mélange du moteur audio de Windows, qui n'existe \
+                     qu'en mode partagé : un écho exclusif n'a pas de sens et WASAPI le \
+                     refuse. Gardez l'un des deux — --exclusif mesure le transport, \
+                     --loopback met le moteur hors de cause"
+                        .to_string(),
+                );
+            }
         }
         Ok(rate)
     }
@@ -508,6 +533,56 @@ mod tests {
             let err = parse(&args).validate().expect_err(&format!("{args:?}"));
             assert!(err.contains(attendu), "{err}");
         }
+    }
+
+    /// `--exclusif` est **opt-in** et ne change rien tant qu'il n'est pas demandé :
+    /// le mode partagé reste le défaut, ici comme dans le dorsal
+    /// (`ExclusivePolicy::Never`).
+    #[test]
+    fn le_mode_exclusif_est_opt_in() {
+        assert!(!parse(&[]).exclusif);
+        assert!(parse(&["--exclusif"]).exclusif);
+        assert!(parse(&["--exclusif"]).validate().is_ok());
+    }
+
+    /// L'écho et l'exclusif se contredisent : le premier prélève le mélange du moteur
+    /// audio, le second supprime le moteur. Le refus le dit, et nomme les deux options.
+    #[test]
+    fn l_exclusif_et_l_echo_se_contredisent() {
+        let err = parse(&["--exclusif", "--loopback"])
+            .validate()
+            .expect_err("exclusif + loopback");
+        assert!(err.contains("--exclusif"), "{err}");
+        assert!(err.contains("--loopback"), "{err}");
+        assert!(err.contains("partagé"), "{err}");
+    }
+
+    /// Tout le reste de la ligne de commande continue de marcher avec `--exclusif` :
+    /// il ne fait que changer le **mode d'ouverture** des deux flux, pas ce qui est
+    /// mesuré ni ce qui est piloté. Les options `--cable-*`, qui n'ouvrent aucun flux,
+    /// ne sont pas concernées et ne sont donc pas refusées.
+    #[test]
+    fn l_exclusif_se_combine_avec_le_reste() {
+        let a = parse(&[
+            "--exclusif",
+            "--render",
+            "Conduit 1",
+            "--capture",
+            "Conduit 1",
+            "--repeat",
+            "10",
+            "--seconds",
+            "20",
+        ]);
+        assert!(a.validate().is_ok());
+        assert!(a.exclusif);
+        assert_eq!(a.repeat, 10);
+        assert_eq!(a.seconds, 20.0);
+        assert!(parse(&["--exclusif", "--no-capture"]).validate().is_ok());
+        assert!(parse(&["--exclusif", "--cable-etat"]).validate().is_ok());
+        assert!(parse(&["--exclusif", "--cable-transport"])
+            .validate()
+            .is_ok());
     }
 
     #[test]
