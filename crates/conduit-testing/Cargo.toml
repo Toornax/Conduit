@@ -11,5 +11,11 @@ publish = false
 
 [dependencies]
 
+# `tests/fuzz.rs` relit les manifestes des crates `crates/*/fuzz` (leurs `[[bin]]` et leur
+# `[workspace]` vide) sans lancer cargo : c'est la moitié de la parade qui tourne partout,
+# bac à sable Nix compris.
+[dev-dependencies]
+toml = "0.8"
+
 [lints]
 workspace = true

@@ -845,6 +845,9 @@ dependencies = [
 [[package]]
 name = "conduit-testing"
 version = "0.1.0"
+dependencies = [
+ "toml 0.8.23",
+]
 
 [[package]]
 name = "conduitctl"

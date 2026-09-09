@@ -647,9 +647,9 @@ Niveaux : unitaires par module ; intégration `conduit-engine/tests/scenarios.rs
 (F-11 à F-22 enchaînés) ; bout en bout `conduitd/tests` et `conduitctl/tests`
 (démon en processus + client IPC, et vrais binaires).
 
-### Fuzzing (M0-74, M1b-08)
+### Fuzzing (M0-74, M1b-08, M1b-21)
 
-Six cibles `cargo-fuzz`, réparties en trois crates `fuzz/`, chacun **à côté du crate
+Sept cibles `cargo-fuzz`, réparties en trois crates `fuzz/`, chacun **à côté du crate
 qu'il éprouve** — c'est la convention de `cargo-fuzz`, qui se lance depuis le répertoire
 du crate cible, et ce que le dépôt faisait déjà pour `conduit-protocol` :
 
@@ -659,7 +659,8 @@ du crate cible, et ce que le dépôt faisait déjà pour `conduit-protocol` :
 | `conduit-protocol` | `config` | l'analyseur de configuration TOML de `conduitd` |
 | `conduit-kmd-core` | `etat-cable` | `CableState::from_bytes`, le parseur de la propriété KS |
 | `conduit-kmd-core` | `parametres-registre` | `decode_dword` puis `sanitize`, la lecture des paramètres |
-| `conduit-kmd-core` | `formats` | `validate`, `buffer_bytes`, `buffer_bytes_for_notifications` |
+| `conduit-kmd-core` | `formats` | `CableFormat::sanitize`, `cable_formats`, l'arithmétique de variantes, `validate` et le dimensionnement du tampon |
+| `conduit-kmd-core` | `intersection` | `wavefmt::intersect` et la forme du `WAVEFORMATEX[TENSIBLE]` rendu |
 | `conduit-helper` | `protocole` | `decouper`, `Requete::from_bytes`, `Reponse::from_bytes` |
 
 ```sh
@@ -667,6 +668,7 @@ cargo install cargo-fuzz            # ou : nix develop .#nightly
 cd crates/conduit-kmd-core && cargo +nightly fuzz run etat-cable
 cd crates/conduit-kmd-core && cargo +nightly fuzz run parametres-registre
 cd crates/conduit-kmd-core && cargo +nightly fuzz run formats
+cd crates/conduit-kmd-core && cargo +nightly fuzz run intersection
 cd crates/conduit-helper   && cargo +nightly fuzz run protocole
 cargo +nightly fuzz run <cible> -- -max_total_time=3600      # campagne bornée
 cargo +nightly fuzz run <cible> fuzz/artifacts/<cible>/<fichier>   # rejouer un plantage
@@ -708,8 +710,28 @@ Les crates `fuzz/` sont **hors du workspace racine** : `libfuzzer-sys` n'est
 constructible qu'en nightly. Le `exclude` du `Cargo.toml` racine ne suffit pas pour un
 crate logé **sous** un membre — cargo ne l'y honore pas, et `cargo fuzz` échoue alors sur
 « current package believes it's in a workspace when it's not » ; c'est le `[workspace]`
-vide de chaque `fuzz/Cargo.toml` qui les affranchit. Comme Miri, le fuzz n'est pas un
-check du flake : il exige le shell nightly (§7).
+vide de chaque `fuzz/Cargo.toml` qui les affranchit. Comme Miri, une campagne de fuzz
+n'est pas un check du flake : elle exige le shell nightly (§7) et n'a pas de fin.
+
+**Leur construction, elle, est vérifiée** — et il a fallu deux récidives pour l'écrire.
+Être hors du workspace veut dire qu'aucun `cargo test --workspace`, `cargo clippy
+--workspace`, `nix flake check` ni `check.ps1` ne voit une cible morte : `conduit-protocol`
+a passé des mois sans construire, puis la cible `formats` a cessé de compiler à la
+disparition de `M1A_FORMATS` (M1b-05) sans qu'une seule vérification vire au rouge. Le test
+`crates/conduit-testing/tests/fuzz.rs` ferme le trou. Il fait deux choses :
+
+- il relit chaque `crates/*/fuzz/Cargo.toml` — les `[[bin]]` pointent-ils sur des fichiers
+  qui existent, le `[workspace]` vide est-il toujours là — sans rien lancer, donc partout ;
+- il lance `cargo check --manifest-path` sur chacun. **Le nightly n'est pas nécessaire** :
+  `libfuzzer-sys` l'exige pour *lier* le binaire instrumenté, pas pour l'analyse, et la
+  chaîne stable du dépôt traverse très bien `fuzz_target!`. C'est ainsi que
+  `E0432: unresolved import ... M1A_FORMATS` redevient visible, en secondes.
+
+Le second se retire dans le bac à sable Nix (pas de réseau, et les crates `fuzz/` n'ont pas
+de `Cargo.lock` versionné à vendorer — même raison qui fait de `cargo-deny` un check crane
+et non un hook) ; il tourne dans le job `cargo` de la CI et sur les postes de développement.
+`CONDUIT_SANS_CHECK_FUZZ=1` le retire aussi, pour travailler hors ligne — à n'employer que
+là.
 
 ## 6. Conventions
 
