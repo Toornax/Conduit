@@ -190,6 +190,13 @@ pub(crate) mod code {
     /// codes de `CableFormat<n>`, pour qu'une entrée du journal désigne le câble fautif
     /// sans son texte.
     pub(crate) const DESCRIPTEUR: u32 = 0x0008_0000;
+    /// La topologie d'un câble ne déclare pas le même nombre de canaux que sa broche wave
+    /// (`topo::check_cable_topology`, M1b-05).
+    ///
+    /// Se compose comme [`DESCRIPTEUR`], dont il est le pendant côté topologie : un endpoint
+    /// naît de la connexion des deux filtres, et une divergence entre eux ne se voit ni dans
+    /// les tables ni dans le côté wave.
+    pub(crate) const TOPOLOGIE: u32 = 0x0009_0000;
 }
 
 /// Rang du paramètre dans [`Param::ALL`], pour composer un `UniqueErrorValue`.

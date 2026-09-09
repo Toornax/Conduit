@@ -97,6 +97,8 @@
 //! puis le canal `1`, et écrit avec le canal `-1`. Si la trace ne montre que des
 //! « canal 0 », c'est le `Reserved` qu'on lit. Vide en release (`kmd_log!`).
 
+use core::fmt;
+
 use conduit_kmd_core::FrameLayout;
 use portcls::conduit_com::{ComRef, NtStatus, STATUS_SUCCESS};
 use portcls::{
@@ -112,7 +114,8 @@ use portcls_sys::{
 use crate::cable::{Cable, Direction, MAX_CHANNELS, NodeState};
 use crate::descriptors::{
     PIN_COUNT, TOPO_CAPTURE_PIN_ENDPOINT, TOPO_RENDER_PIN_ENDPOINT, cable_format,
-    topo_capture_filter, topo_capture_filter_0, topo_render_filter, topo_render_filter_0,
+    declared_by_render_system_pin, topo_capture_filter, topo_capture_filter_0, topo_render_filter,
+    topo_render_filter_0,
 };
 use crate::privilege;
 
@@ -204,6 +207,113 @@ const _: () = {
     // Le stéréo reste le repli, et il est bien à sa place dans la table.
     assert!(KSAUDIO_SPEAKER_STEREO.count_ones() == 2);
 };
+
+// ---------------------------------------------------------------------------------
+// Le garde-fou de la topologie (M1b-05).
+//
+// `descriptors::check_cable_pins` referme l'intervalle du côté **wave** : il vérifie que la
+// broche système déclarera bien la fréquence et les canaux que le registre annonce. Il ne
+// dit rien du côté **topologie**, et un endpoint ne naît pas d'un filtre mais de la
+// connexion des deux. Ce que la topologie déclare du format ne passe pas par une
+// `KSDATARANGE` — les broches endpoint sont analogiques — mais par deux valeurs calculées à
+// l'exécution : le nombre de canaux des nœuds volume et sourdine (`AudioNodes::channels`,
+// que Windows lit par `BASICSUPPORT`) et la cartographie de haut-parleurs du jack
+// (`JackInfo::channel_mapping`). Toutes deux ont un repli **muet** — `mapping_rendu` rend
+// le masque stéréo hors domaine, `description` rend le filtre du câble 0 faute de rangée —
+// et `kmd_log!` est vide en release.
+//
+// [`check_cable_topology`] les confronte, au démarrage, à ce que la broche wave déclare
+// **réellement** (`descriptors::declared_by_render_system_pin`, lu au bout des pointeurs que
+// PortCls suivra) et non à la valeur qui a servi à bâtir les deux. Son échec part au journal
+// d'événements, comme celui de `check_cable_pins`.
+// ---------------------------------------------------------------------------------
+
+/// Ce qui sépare ce que la topologie d'un câble déclare de ce que sa broche wave déclare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopoMismatch {
+    /// Aucun descripteur de topologie pour ce câble : les deux miniports se replieraient
+    /// sur celui du câble 0 et l'endpoint porterait le nom d'un autre.
+    SansFiltre,
+    /// La broche système du filtre wave ne déclare rien de lisible — `check_cable_pins` l'a
+    /// déjà dit, mais ce garde-fou ne s'appuie pas sur l'ordre des appels.
+    SansPlage,
+    /// Les nœuds servent `noeuds` canaux là où la broche wave en déclare `broche`.
+    Canaux {
+        /// Ce que `AudioNodes::channels` rendra.
+        noeuds: ULONG,
+        /// Ce que la broche système déclare.
+        broche: ULONG,
+    },
+    /// Le masque `KSAUDIO_SPEAKER_*` du jack ne compte pas ses canaux (repli hors domaine
+    /// de [`mapping_rendu`]).
+    Cartographie {
+        /// Le masque que `JackInfo::channel_mapping` rendra au sens rendu.
+        masque: ULONG,
+        /// Le nombre de canaux qu'il devrait porter.
+        canaux: ULONG,
+    },
+}
+
+impl fmt::Display for TopoMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SansFiltre => f.write_str(
+                "aucun descripteur de filtre de topologie (repli silencieux sur celui du \
+                 câble 0 : l'endpoint portera le nom d'un autre câble)",
+            ),
+            Self::SansPlage => f.write_str(
+                "la broche système du filtre wave ne porte aucune plage audio lisible : \
+                 impossible de vérifier ce que la topologie déclare",
+            ),
+            Self::Canaux { noeuds, broche } => write!(
+                f,
+                "les nœuds de volume et de sourdine serviront {noeuds} canaux là où la \
+                 broche système en déclare {broche}"
+            ),
+            Self::Cartographie { masque, canaux } => write!(
+                f,
+                "la cartographie de haut-parleurs du jack ({masque:#010x}) porte {} \
+                 haut-parleurs pour {canaux} canaux",
+                masque.count_ones()
+            ),
+        }
+    }
+}
+
+/// Vérifie que la topologie du câble `cable` déclarera le **même** nombre de canaux que sa
+/// broche wave, et que la cartographie de haut-parleurs de son jack les compte bien.
+///
+/// Appelée par `adapter::start_device` pour chaque câble de la réserve, juste après
+/// `descriptors::check_cable_pins` et **avant** le premier `GetDescription` : les deux
+/// referment le même intervalle, l'un du côté wave, l'autre du côté topologie.
+///
+/// IRQL : quelconque ; ne lit que des `static` immuables et un atomique.
+///
+/// # Erreurs
+///
+/// [`TopoMismatch`], qui nomme la divergence.
+pub fn check_cable_topology(cable: u32) -> Result<(), TopoMismatch> {
+    if topo_render_filter(cable).is_none() || topo_capture_filter(cable).is_none() {
+        return Err(TopoMismatch::SansFiltre);
+    }
+    let (_, broche) = declared_by_render_system_pin(cable).ok_or(TopoMismatch::SansPlage)?;
+    // Ce que `AudioNodes::channels` et `CableConfig::channels` rendront, par le même chemin
+    // qu'elles : le magasin des formats, et non la valeur qui a bâti la table.
+    let noeuds = ULONG::from(cable_format(cable).channels);
+    if noeuds != broche {
+        return Err(TopoMismatch::Canaux { noeuds, broche });
+    }
+    // Ce que `JackInfo::channel_mapping` rendra au sens rendu : autant de haut-parleurs que
+    // de canaux, sans quoi le repli stéréo de `mapping_rendu` est passé par là.
+    let masque = mapping_rendu(cable_format(cable).channels);
+    if masque.count_ones() != noeuds {
+        return Err(TopoMismatch::Cartographie {
+            masque,
+            canaux: noeuds,
+        });
+    }
+    Ok(())
+}
 
 /// Miniport topologie du filtre `TopoRender<n>`.
 #[derive(Debug)]

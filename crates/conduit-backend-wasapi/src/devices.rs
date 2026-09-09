@@ -616,14 +616,34 @@ pub(crate) fn describe(
     // `IAudioClient` donne le format de mixage et la période. Un échec d'activation
     // n'empêche pas de décrire le périphérique : on retombe sur le format du
     // périphérique et la période par défaut du moteur.
-    let client: Option<IAudioClient> = activate_client(device).ok();
+    //
+    // Le **pourquoi** de l'échec est retenu, il ne l'était pas. Le diagnostic de M1b-05
+    // disait « `GetMixFormat` et `PKEY_AudioEngine_DeviceFormat` ont tous deux échoué »
+    // sans jamais dire *comment* : un `.ok()` avalait le HRESULT, seule information qui
+    // sépare un endpoint que Windows n'a pas su décrire (`AUDCLNT_E_UNSUPPORTED_FORMAT`)
+    // d'un endpoint devenu invalide (`AUDCLNT_E_DEVICE_INVALIDATED`) ou d'un service audio
+    // arrêté. C'est précisément l'information qui manquait pour instruire les formats de
+    // câble sans endpoint utilisable ; elle part désormais dans le message.
+    let client_ou_pourquoi = activate_client(device);
+    let mut pourquoi_mixage = None;
+    let mixage = match &client_ou_pourquoi {
+        Ok(client) => match mix_format(client) {
+            Ok(mix) => Some(mix.parsed),
+            Err(erreur) => {
+                pourquoi_mixage = Some(erreur.to_string());
+                None
+            }
+        },
+        Err(erreur) => {
+            pourquoi_mixage = Some(erreur.to_string());
+            None
+        }
+    };
+    let client: Option<&IAudioClient> = client_ou_pourquoi.as_ref().ok();
 
     // Format de mixage d'abord (ce qu'un flux partagé délivre sans conversion),
     // format du périphérique en repli.
-    let format = client
-        .as_ref()
-        .and_then(|client| mix_format(client).ok())
-        .map(|mix| mix.parsed)
+    let format = mixage
         .or_else(|| {
             property(
                 &store,
@@ -634,9 +654,12 @@ pub(crate) fn describe(
             .and_then(|value| value.as_blob().and_then(wave_format_from_bytes))
         })
         .ok_or_else(|| {
+            let pourquoi = pourquoi_mixage
+                .as_deref()
+                .unwrap_or("IAudioClient::GetMixFormat a échoué sans raison rendue");
             BackendError::Platform(format!(
-                "format de {id} illisible : IAudioClient::GetMixFormat et \
-                 PKEY_AudioEngine_DeviceFormat ont tous deux échoué"
+                "format de {id} illisible : {pourquoi} ; et \
+                 PKEY_AudioEngine_DeviceFormat est absent ou illisible"
             ))
         })?;
     let sample_rate = SampleRate::new(format.sample_rate).ok_or_else(|| {
@@ -648,12 +671,11 @@ pub(crate) fn describe(
     let channels = usize::from(format.channels);
 
     // Sans `IAudioClient`, aucun flux ne s'ouvrira : on n'annonce que le natif.
-    let sample_rates = match &client {
+    let sample_rates = match client {
         Some(_) => PROBED_RATES.to_vec(),
         None => vec![sample_rate],
     };
     let period_hns = client
-        .as_ref()
         .and_then(|client| device_period(client).ok().map(|p| p.default))
         .unwrap_or(DEFAULT_PERIOD_HNS);
 

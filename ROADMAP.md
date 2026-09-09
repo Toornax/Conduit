@@ -597,6 +597,71 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   activé **après** le démarrage se voit attribuer son `PKEY_AudioEngine_DeviceFormat` —
   l'expérience qui tranche est de retirer la plage PCM24 de `SAMPLE_DEPTHS` et de rejouer la
   séquence, ce qui ramène la broche à ce qu'elle déclarait avant M1b-05.
+  *Instruction documentaire du 2026-09-09, deuxième passe — la moitié « canaux » est
+  tranchée, sur pièces.* La page « Default Data-Intersection Handlers » du WDK
+  (`learn.microsoft.com/windows-hardware/drivers/audio/default-data-intersection-handlers`)
+  décrit les limites du handler d'intersection **par défaut** de PortCls — celui auquel notre
+  `DataRangeIntersection` renvoie en rendant `STATUS_NOT_IMPLEMENTED` : il ne traite que les
+  formats **PCM**, ne connaît que « *Only mono and stereo audio streams* », et **ne sait
+  produire aucun format contenant un `WAVEFORMATEXTENSIBLE`** — c'est-à-dire exactement la
+  structure qu'il faut pour porter un `dwChannelMask` au-delà de deux canaux. La même page
+  conclut qu'un pilote non-PCM ou multicanal doit écrire son propre handler ; « Extensible
+  Wave-Format Descriptors » dit de son côté qu'un `WAVEFORMATEX` simple ne peut décrire
+  correctement que le mono et le stéréo ; et « Data-Intersection Handlers » est le seul
+  endroit de la documentation qui relie explicitement le **moteur audio** au handler
+  d'intersection du filtre wave. SYSVAD confirme par l'abstention : son
+  `CMiniportWaveRT::DataRangeIntersection` finit par rendre `STATUS_NOT_IMPLEMENTED`, et sa
+  table de broche ne déclare que du stéréo (`SPEAKER_HOST_MAX_CHANNELS = 2`), de 24 à
+  96 kHz. **Donc : six canaux ne peuvent pas marcher tant que le pilote n'implémente pas son
+  propre `DataRangeIntersection`**, rendant un `KSDATAFORMAT_WAVEFORMATEX` étendu en
+  `WAVEFORMATEXTENSIBLE` (`wFormatTag = WAVE_FORMAT_EXTENSIBLE`, `cbSize = 22`,
+  `dwChannelMask`, `SubFormat`), avec la taille requise majorée de 22 octets et
+  `OutputBufferLength == 0` traité en `STATUS_BUFFER_OVERFLOW`. Rien n'est *faux* dans le
+  pilote : c'est une limite documentée du repli qu'on avait choisi, et le commentaire
+  d'`audio_range` — « PortCls intersecte lui-même, une plage ponctuelle ne lui laisse rien à
+  choisir » — est vrai jusqu'au stéréo et faux au-delà.
+  *Ce que la documentation ne dit pas*, et il faut le dire aussi : **rien n'explique le
+  96 kHz**. SYSVAD déclare 88,2 et 96 kHz en stéréo et une `KSDATARANGE_AUDIO` de 24 000 à
+  96 000 Hz. Aucune borne dépendant de la fréquence n'est documentée pour
+  `AllocateAudioBuffer`, `GetDeviceDescription` ni `GetHWLatency` (qui rend `VOID` et ne peut
+  pas échouer) ; `KSPROPERTY_AUDIO_CHANNEL_CONFIG` est un vestige DirectSound, déprécié
+  depuis Vista, et n'est requis nulle part pour le multicanal WASAPI ; aucune page ne donne
+  l'ordre des requêtes du générateur d'endpoints ni son repli quand l'INF ne pose pas
+  `PKEY_AudioEngine_OEMFormat` — le **seul** levier documenté pour fixer le format par défaut
+  d'un endpoint. Enfin, `AUDCLNT_E_UNSUPPORTED_FORMAT` n'est pas documenté comme code de
+  retour de `GetMixFormat` : le candidat cohérent est `AUDCLNT_E_DEVICE_INVALIDATED`.
+  *Le confondant que le tableau ci-dessus ne sépare pas* : les deux formats qui marchent
+  (`0x00020302` et `0x00020202`) sont **la même variante de descripteurs**, la variante 9,
+  qui est aussi celle du **défaut de compilation** ; les deux qui échouent sont des variantes
+  que le pilote n'avait jamais servies. Le tableau fait donc varier deux choses à la fois —
+  ce que Windows voit, et le fait d'être ou non sur la rangée par défaut — et ne peut pas les
+  séparer. Aucune mesure faite à ce jour ne le peut.
+  *L'expérience qui les sépare*, une seule fournée de câbles neufs, activés par la propriété
+  KS comme le témoin :
+
+  | `CableFormat<n>` | Format | Variante | Attendu |
+  |---|---|---|---|
+  | `0x00020301` | 44,1 kHz, 2 canaux, F32 | 1 | **marche** si le pilote est hors de cause (44,1 kHz stéréo est le format le plus banal qui soit, et il est dans le domaine du handler par défaut) |
+  | `0x00010302` | 48 kHz, **1 canal**, F32 | 8 | **marche** si le pilote est hors de cause (le mono est explicitement supporté par le handler par défaut) |
+  | `0x00030302` | 48 kHz, **3 canaux**, F32 | 10 | **échoue** dans tous les cas : au-delà du stéréo, borne documentée — c'est le contrôle négatif |
+
+  Lecture : *les deux premiers marchent* → le pilote sert bien autre chose que sa variante
+  par défaut, la moitié « canaux » est expliquée, et il ne reste à instruire que le 96 kHz,
+  seul. *Les deux premiers échouent* → l'axe n'est ni la fréquence ni les canaux mais
+  « toute variante autre que celle du défaut », le défaut est dans le pilote et
+  `check_cable_pins` ne le couvre pas ; l'étape suivante est alors de lire
+  `KSPROPERTY_PIN_DATARANGES` depuis l'espace utilisateur sur le filtre wave fautif **et** sur
+  le témoin, et de comparer les 88 octets. *Un des deux seulement échoue* → l'axe est celui
+  qui reste, et le suspect se réduit à lui.
+  *Deux garde-fous ajoutés en attendant.* `topo::check_cable_topology`, appelé par
+  `StartDevice` à côté de `check_cable_pins`, confronte ce que la **topologie** déclarera — le
+  nombre de canaux des nœuds volume et sourdine, la cartographie `KSAUDIO_SPEAKER_*` du
+  jack — à ce que la broche wave déclare réellement, lu au bout des pointeurs que PortCls
+  suivra ; il rend bruyants, au journal d'événements, deux replis muets en release
+  (`mapping_rendu`, qui rend le masque stéréo hors domaine, et `description`, qui rend le
+  filtre du câble 0 faute de rangée). Et l'énumération WASAPI porte désormais le **HRESULT**
+  de `GetMixFormat` dans son message au lieu de « a échoué » : c'est l'information la plus
+  discriminante qui manquait au tableau, et un `.ok()` l'avalait.
 - [ ] **M1b-06** `feat(driver): gestion d'alimentation et arrêt propre`
   *Fait quand* : veille/reprise 50 fois avec flux ouvert, sans erreur ni fuite.
   *Code livré le 2026-09-09* : enveloppe de `PcRegisterAdapterPowerManagement`,

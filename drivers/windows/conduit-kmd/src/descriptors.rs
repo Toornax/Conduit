@@ -1454,6 +1454,26 @@ pub fn check_cable_pins(cable: u32) -> Result<(), PinMismatch> {
     Ok(())
 }
 
+/// Ce que la broche système du filtre `WaveRender` du câble `cable` déclarera
+/// **réellement** à PortCls : fréquence en Hz et nombre de canaux, lus au bout des mêmes
+/// pointeurs que [`check_cable_pins`] traverse. `None` si le format du câble n'a pas de
+/// variante, si la table n'a pas cette rangée, ou si la broche ne porte pas de plage audio.
+///
+/// Existe pour que [`crate::topo::check_cable_topology`] confronte ce que la **topologie**
+/// déclare — le nombre de canaux des nœuds, la cartographie de haut-parleurs du jack — à ce
+/// que la broche wave déclare, plutôt qu'à la valeur qui a servi à bâtir les deux. Un
+/// endpoint naît de la connexion des deux filtres : les faire diverger est exactement le
+/// genre de faute que ni les assertions `const` (qui ne voient que les tables) ni
+/// `check_cable_pins` (qui ne regarde que le côté wave) n'attraperaient.
+///
+/// IRQL : quelconque ; ne lit que des `static` immuables et un atomique.
+#[must_use]
+pub fn declared_by_render_system_pin(cable: u32) -> Option<(ULONG, ULONG)> {
+    let variant = cable_format(cable).variant()?;
+    let render = WAVE_RENDER_FILTER_TABLE.get().get(variant)?;
+    declared_by_pin(render, WAVE_RENDER_PIN_SYSTEM)
+}
+
 // ---------------------------------------------------------------------------------
 // Invariants (§4.1), vérifiés à la compilation.
 // ---------------------------------------------------------------------------------

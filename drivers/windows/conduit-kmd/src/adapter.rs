@@ -54,7 +54,7 @@ use crate::descriptors::{
 use crate::eventlog::{EventLog, kmd_event};
 use crate::power;
 use crate::registry;
-use crate::topo::{TopoCapture, TopoRender};
+use crate::topo::{TopoCapture, TopoRender, check_cable_topology};
 use crate::wave::{WaveCapture, WaveRender};
 
 /// Un sous-périphérique enregistré : l'`IUnknown` de son port, tel que
@@ -345,6 +345,21 @@ pub unsafe fn start_device(
                      clé du périphérique annonce."
                 );
             }
+        }
+        // Le même intervalle, refermé de l'autre côté : un endpoint naît de la connexion du
+        // filtre wave et du filtre de topologie, et rien ne vérifiait que les deux
+        // s'accordaient sur le nombre de canaux (voir `topo::check_cable_topology`). Même
+        // règle qu'au-dessus : on le dit, on n'échoue pas.
+        if let Err(ecart) = check_cable_topology(n) {
+            kmd_log!("StartDevice : câble {n} — {ecart}");
+            kmd_event!(
+                log,
+                registry::code::TOPOLOGIE
+                    .saturating_add(registry::RANG_FORMAT)
+                    .saturating_add(n),
+                "câble {n} : {ecart}. L'endpoint apparaîtra, mais Windows pourrait ne pas \
+                 savoir lui calculer de format."
+            );
         }
     }
 
