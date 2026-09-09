@@ -753,6 +753,16 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   la commande documentée dans le guide était morte. `workspace.exclude` n'affranchit pas un
   crate logé **sous** un membre du workspace — il faut un `[workspace]` vide dans son propre
   manifeste. Un harnais de fuzzing cassé qu'on croit fonctionnel est pire que pas de harnais.
+  *Le même piège s'est refermé une deuxième fois* : la cible `formats` a cessé de compiler
+  quand M1b-05 a supprimé `M1A_FORMATS`, et **aucune vérification ne le voyait** — les
+  crates `fuzz/` vivent dans leur propre workspace, précisément pour ne pas être tirés par
+  `--workspace`. La parade est un test **du workspace** (`conduit-testing/tests/fuzz.rs`)
+  qui fait `cargo check --manifest-path` sur chaque `crates/*/fuzz/Cargo.toml` : il part
+  donc à chaque `cargo test`, sans réintégrer les crates. Vérifié dans les deux sens en
+  réintroduisant le défaut. Le nightly n'est **pas** nécessaire — `libfuzzer-sys` ne l'exige
+  que pour lier le binaire instrumenté, pas pour l'analyse.
+  Une septième cible a été ajoutée pour `wavefmt::intersect`, la négociation de format dont
+  la moitié des octets vient de Windows : **33 841 780** exécutions, zéro plantage.
   *Défaut trouvé et délibérément non corrigé par le fuzzer* : `SupportedFormat::accepts`
   compare le nombre de canaux demandé **sans vérifier que celui de l'entrée soit
   représentable** — un format accepté dont `layout()` vaut `None`. Inatteignable tant que la
