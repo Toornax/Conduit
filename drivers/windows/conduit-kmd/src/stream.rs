@@ -4,15 +4,38 @@
 //! notifications (§5.3, étape 5). Implémente `portcls::MiniportWaveRTStreamNotification`,
 //! donc aussi `MiniportWaveRTStream`.
 //!
-//! # Mode paquets : pas servi, pas exposé
+//! # Mode paquets : pas servi, exposé seulement sous `PacketMode = 1`
 //!
-//! Le flux satisfait aussi les bornes `MiniportWaveRTInputStream` et
-//! `MiniportWaveRTOutputStream` (`portcls::packet`), mais **uniquement par leurs
-//! défauts**, qui refusent : aucune des quatre méthodes n'est écrite ici. `wave.rs`
-//! construit donc tous les flux avec `PacketInterfaces::None`, si bien que ces méthodes
-//! sont **inatteignables** — PortCls n'obtient jamais l'adresse des têtes satellites. Un
-//! IID rendu serait une promesse de service ; les servir viendra avec sa mesure, ou ne
-//! viendra pas.
+//! Le flux implémente `MiniportWaveRTInputStream` et `MiniportWaveRTOutputStream`
+//! (`portcls::packet`), mais **aucune des quatre méthodes ne sert quoi que ce soit** : elles
+//! rendent toutes le `STATUS_NOT_SUPPORTED` que rendaient les défauts du trait, et se
+//! contentent de **compter** (voir la section suivante). Elles sont écrites plutôt que laissées
+//! aux défauts pour cette seule raison : un défaut ne peut pas compter.
+//!
+//! Le pilote livré construit tous ses flux avec `PacketInterfaces::None` (`wave::open_stream`),
+//! si bien que ces méthodes restent **inatteignables** — PortCls n'obtient jamais l'adresse des
+//! têtes satellites. Le paramètre de registre `PacketMode`, à 1, les expose : c'est
+//! l'**expérience** du lot 2, décrite en entier sur
+//! `conduit_kmd_core::params::DEFAULT_PACKET_MODE`, et elle ne se livre jamais. Un IID rendu
+//! reste une promesse de service ; ce qui est mesuré ici est précisément le coût de ne pas la
+//! tenir.
+//!
+//! # Ce que les quatre méthodes comptent, et pourquoi elles refusent quand même
+//!
+//! Chaque appel note, dans le [`Cable`] — pas dans le flux, qui peut se fermer aussitôt
+//! après — : la méthode et le sens, l'IRQL courant (`KeGetCurrentIrql`, pour **vérifier** le
+//! `PASSIVE_LEVEL` que `portcls.h` promet plutôt que le supposer) et l'horodatage QPC, dont le
+//! premier et le dernier sont retenus. Les `QueryInterface` sur les deux IID de paquets sont
+//! comptés de la même façon, **exposés ou non** (`portcls::packet`, points d'observation).
+//!
+//! Le statut rendu est celui des défauts du trait, à dessein : `STATUS_NOT_SUPPORTED`. En
+//! changer ferait mesurer autre chose que ce que le pilote livré ferait s'il exposait par
+//! accident, et c'est bien ce risque-là qu'on quantifie.
+//!
+//! **Rien de paginé dans ces quatre méthodes** : elles sont à `PASSIVE_LEVEL` par contrat mais
+//! sur le chemin du flux, et SYSVAD les marque explicitement non paginées. Ce workspace n'a
+//! aucune section paginée — c'est à ne pas casser, pas à faire —, et ce qu'elles exécutent se
+//! réduit à des atomiques et un `KeQueryPerformanceCounter`.
 //!
 //! Un seul type pour les deux sens : rendu et capture ne diffèrent que par leur
 //! [`Direction`] — l'emplacement du câble qu'ils occupent, et le rôle que la boucle
@@ -66,6 +89,7 @@
 
 use core::ptr::{self, NonNull};
 
+use conduit_kmd_core::config::PacketExposure;
 use conduit_kmd_core::{
     Notifier, SupportedFormat, buffer_bytes_for_notifications_with_floor, buffer_bytes_with_floor,
 };
@@ -75,14 +99,21 @@ use portcls::conduit_com::{
 };
 use portcls::{
     AudioBuffer, MiniportWaveRTInputStream, MiniportWaveRTOutputStream, MiniportWaveRTStream,
-    MiniportWaveRTStreamNotification, PortWaveRTStream, physical_address,
+    MiniportWaveRTStreamNotification, PortWaveRTStream, ReadPacket, STATUS_NOT_SUPPORTED,
+    physical_address,
 };
-use portcls_sys::{_MEMORY_CACHING_TYPE, KSRTAUDIO_HWLATENCY, KSSTATE, PKEVENT, PMDL};
+use portcls_sys::{
+    _MEMORY_CACHING_TYPE, KSAUDIO_PRESENTATION_POSITION, KSRTAUDIO_HWLATENCY, KSSTATE, PKEVENT,
+    PMDL,
+};
+use wdk_sys::ntddk::KeGetCurrentIrql;
 use wdk_sys::{
     KEVENT, PAGE_SIZE, STATUS_DEVICE_BUSY, STATUS_INVALID_DEVICE_REQUEST, STATUS_NOT_FOUND,
 };
 
-use crate::cable::{Buffer, Cable, Direction, MAX_NOTIFICATION_EVENTS, SharedStream, StreamState};
+use crate::cable::{
+    Buffer, Cable, Direction, MAX_NOTIFICATION_EVENTS, PacketMethod, SharedStream, StreamState,
+};
 use crate::clock;
 
 /// Borne haute d'adresse physique pour `AllocatePagesForMdl` : aucune contrainte pour
@@ -111,7 +142,14 @@ pub struct WaveStream {
 
 impl WaveStream {
     /// Flux à l'arrêt du sens `direction` pour le câble `cable` (numéro `n`), au format
-    /// `format`. Lit la fréquence du compteur de performance une fois pour toutes.
+    /// `format`, exposant les interfaces de paquets `packet_exposure`. Lit la fréquence du
+    /// compteur de performance une fois pour toutes.
+    ///
+    /// `packet_exposure` est **l'image** de la `PacketInterfaces` que l'appelant passera à
+    /// `try_new_packet_stream_object` : c'est `wave::open_stream` qui décide des deux, d'un
+    /// seul geste, pour qu'aucun chemin ne puisse annoncer autre chose que ce qu'il expose. La
+    /// valeur n'est mémorisée que pour le relevé (`KSPROPERTY_CONDUIT_PACKETS`) ; le
+    /// `QueryInterface` composite, lui, ne consulte que la `PacketInterfaces` de l'objet COM.
     ///
     /// Erreurs : `STATUS_INVALID_PARAMETER` si le format n'a pas de disposition de
     /// trame, `STATUS_UNSUCCESSFUL` si la fréquence QPC est nulle.
@@ -126,6 +164,7 @@ impl WaveStream {
         cable: &'static Cable,
         port_stream: PortWaveRTStream,
         format: SupportedFormat,
+        packet_exposure: PacketExposure,
     ) -> Result<Self, NtStatus> {
         let layout = format.layout().ok_or(STATUS_INVALID_PARAMETER)?;
         let clock = clock::virtual_clock(format.sample_rate).ok_or(STATUS_UNSUCCESSFUL)?;
@@ -136,8 +175,34 @@ impl WaveStream {
             port_stream,
             format,
             frame_bytes: layout.frame_bytes(),
-            shared: SharedStream::new(StreamState::new(clock, layout)),
+            shared: SharedStream::new(StreamState::new(clock, layout, packet_exposure)),
         })
+    }
+
+    /// Note un appel d'une méthode du mode paquets, puis rend le statut qui le **refuse**.
+    ///
+    /// Un seul point de passage pour les quatre méthodes : le relevé d'IRQL, l'horodatage et
+    /// le statut rendu y sont écrits une fois, et aucune des quatre ne peut diverger des
+    /// autres par distraction. C'est la même raison qui a fait envelopper
+    /// [`Self::allocate_inner`] — un compteur qui rate un cas est pire qu'aucun compteur.
+    ///
+    /// L'IRQL est relevé **ici**, au plus près de l'appel : le mesurer plus loin donnerait
+    /// l'IRQL de notre propre code, qui ne l'a pas changé mais qui n'est plus la réponse à la
+    /// question posée.
+    ///
+    /// IRQL : `PASSIVE_LEVEL` par contrat (`portcls.h`), et rien ici n'exige mieux ; code non
+    /// paginé, sans allocation ni verrou.
+    fn refuser_paquet(&self, methode: PacketMethod) -> NtStatus {
+        // SAFETY: `KeGetCurrentIrql` n'a aucune précondition et n'a pas de paramètre.
+        let irql = u32::from(unsafe { KeGetCurrentIrql() });
+        self.cable.note_packet_call(self.direction, methode, irql);
+        kmd_log!(
+            "{}{}::{methode:?} REFUSÉ ({STATUS_NOT_SUPPORTED:#010x}, IRQL {irql}) : le mode \
+             paquets est exposé et non servi (PacketMode = 1)",
+            self.name(),
+            self.n
+        );
+        STATUS_NOT_SUPPORTED
     }
 
     /// Nom du flux pour la journalisation (`RenderStream` ou `CaptureStream`).
@@ -618,12 +683,54 @@ impl MiniportWaveRTStreamNotification for WaveStream {
 }
 
 // ---------------------------------------------------------------------------------
-// Mode paquets : les deux bornes du composite, satisfaites par leurs seuls défauts (qui
-// refusent). Rien n'est écrit ici, et rien n'est exposé — `wave.rs` construit les flux
-// avec `PacketInterfaces::None`, donc aucune de ces méthodes n'est atteignable. Les
-// servir, c'est le jour où on saura, par la mesure, que le moteur les emprunte.
+// Mode paquets : les quatre méthodes **refusent** et **comptent** (lot 2).
+//
+// Elles rendent exactement ce que rendaient les défauts du trait — `STATUS_NOT_SUPPORTED` —
+// et n'existent que pour compter, ce qu'un défaut ne sait pas faire. Elles ne sont
+// atteignables que sous `PacketMode = 1`, qui expose les interfaces sans les servir : c'est
+// l'expérience du lot, décrite sur `conduit_kmd_core::params::DEFAULT_PACKET_MODE`, et elle
+// ne se livre jamais. Les servir, c'est le jour où on saura, par la mesure, que le moteur
+// les emprunte — c'est précisément ce que ces compteurs vont dire.
+//
+// Aucune n'écrit dans l'état du flux, aucune ne prend de verrou, aucune n'alloue : ce qui
+// s'exécute sous PortCls se réduit à des atomiques du câble et à un
+// `KeQueryPerformanceCounter`. Rien de paginé (voir l'en-tête de module).
 // ---------------------------------------------------------------------------------
 
-impl MiniportWaveRTInputStream for WaveStream {}
+impl MiniportWaveRTInputStream for WaveStream {
+    // IRQL: PASSIVE_LEVEL (contrat), code non paginé.
+    fn read_packet(&self) -> Result<ReadPacket, NtStatus> {
+        Err(self.refuser_paquet(PacketMethod::GetReadPacket))
+    }
 
-impl MiniportWaveRTOutputStream for WaveStream {}
+    // IRQL: <= DISPATCH_LEVEL (celui de `QueryInterface`) — deux `fetch_add`.
+    fn note_input_query(&self, rendu: bool) {
+        self.cable.note_packet_query(self.direction, rendu);
+    }
+}
+
+impl MiniportWaveRTOutputStream for WaveStream {
+    // IRQL: PASSIVE_LEVEL (contrat), code non paginé.
+    fn set_write_packet(&self, packet_number: u32, flags: u32, eos_packet_length: u32) -> NtStatus {
+        // Les trois arguments ne sont pas lus : ce serait prétendre traiter le paquet. Le
+        // refus est le même quel que soit ce que le moteur audio annonce, et c'est ce refus
+        // qu'on mesure.
+        let _ = (packet_number, flags, eos_packet_length);
+        self.refuser_paquet(PacketMethod::SetWritePacket)
+    }
+
+    // IRQL: PASSIVE_LEVEL (contrat), code non paginé.
+    fn presentation_position(&self) -> Result<KSAUDIO_PRESENTATION_POSITION, NtStatus> {
+        Err(self.refuser_paquet(PacketMethod::PresentationPosition))
+    }
+
+    // IRQL: PASSIVE_LEVEL (contrat), code non paginé.
+    fn packet_count(&self) -> Result<u32, NtStatus> {
+        Err(self.refuser_paquet(PacketMethod::PacketCount))
+    }
+
+    // IRQL: <= DISPATCH_LEVEL (celui de `QueryInterface`) — deux `fetch_add`.
+    fn note_output_query(&self, rendu: bool) {
+        self.cable.note_packet_query(self.direction, rendu);
+    }
+}

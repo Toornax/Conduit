@@ -33,6 +33,10 @@
 //! ordinaire : le mode paquets n'est pas servi, et un pilote n'annonce pas ce qu'il ne
 //! sert pas. Voir `open_stream` et la documentation de `PacketInterfaces::None`.
 //!
+//! La seule exception est le paramètre de registre `PacketMode` à 1, qui expose les
+//! interfaces du sens du flux **sans les servir** : une expérience de mesure, jamais livrée,
+//! décrite sur `conduit_kmd_core::params::DEFAULT_PACKET_MODE` et lue par `open_stream`.
+//!
 //! # Lecture du format
 //!
 //! PortCls remet une `KSDATAFORMAT` suivie de `FormatSize` octets. Rien n'est lu au-delà
@@ -47,7 +51,9 @@ use core::sync::atomic::AtomicBool;
 
 use conduit_kmd_core::wavefmt::WAVEFORMATEXTENSIBLE_CB_SIZE;
 use conduit_kmd_core::{
-    RequestedFormat, SampleKind, SupportedFormat, cable_formats, config::CableFormat, validate,
+    RequestedFormat, SampleKind, SupportedFormat, cable_formats,
+    config::{CableFormat, PacketExposure},
+    validate,
 };
 use portcls::conduit_com::{
     ComRef, NtStatus, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
@@ -204,15 +210,39 @@ fn open_stream(
     supported: SupportedFormat,
 ) -> Result<StreamObject, NtStatus> {
     let name = direction.stream_name();
-    // Mode paquets : l'objet est composite, mais n'expose RIEN. `PacketInterfaces::None`
-    // fait répondre son `QueryInterface` exactement comme celui d'un flux ordinaire —
-    // aucun IID de plus. C'est délibéré : le pilote ne sert pas encore les quatre
-    // méthodes, et exposer une interface qu'on ne sert pas laisserait le moteur audio
-    // basculer sur un chemin qui lui répondrait `STATUS_NOT_SUPPORTED`, au risque de
-    // casser un transport qui fonctionne. Le sens du flux dira `Output` pour le rendu et
-    // `Input` pour la capture le jour où les méthodes existeront, pas avant.
-    let interfaces = PacketInterfaces::None;
-    let stream = WaveStream::new(n, direction, cable, port_stream, supported)?;
+    // Mode paquets. Par défaut l'objet est composite mais n'expose RIEN :
+    // `PacketInterfaces::None` fait répondre son `QueryInterface` exactement comme celui
+    // d'un flux ordinaire — aucun IID de plus. C'est le pilote livré, et c'est délibéré :
+    // les quatre méthodes ne servent rien, et exposer une interface qu'on ne sert pas
+    // laisserait le moteur audio basculer sur un chemin qui lui répondrait
+    // `STATUS_NOT_SUPPORTED`, au risque de casser un transport qui fonctionne.
+    //
+    // Le paramètre de registre `PacketMode`, à 1, expose quand même — et sans rien servir.
+    // C'est une EXPÉRIENCE, décrite en entier sur
+    // `conduit_kmd_core::params::DEFAULT_PACKET_MODE` : elle sert à mesurer ce que le moteur
+    // audio fait d'interfaces disponibles (les demande-t-il ? les emprunte-t-il ? à quel
+    // IRQL ?), sur une machine d'essai, et elle ne se livre jamais. Le relevé
+    // `KSPROPERTY_CONDUIT_PACKETS` en rend le résultat.
+    //
+    // Le paramètre est lu au `StartDevice` et déposé dans un atomique
+    // (`registry::packet_mode`) : ce n'est pas une lecture de registre par flux, et une
+    // modification dans `regedit` ne prend effet qu'au prochain démarrage du périphérique.
+    //
+    // Le sens : le moteur audio ÉCRIT dans le tampon d'un flux de rendu, d'où
+    // `IMiniportWaveRTOutputStream` ; il LIT celui d'un flux de capture, d'où
+    // `IMiniportWaveRTInputStream`. C'est la sémantique de `PacketInterfaces` (voir
+    // `portcls::packet`, « sens du flux, et le cas `None` »), et l'inverser exposerait à
+    // chaque flux l'interface que le moteur ne lui demandera jamais — un relevé tout à zéro
+    // qu'on lirait comme un désintérêt du moteur.
+    let (interfaces, exposure) = if crate::registry::packet_mode() {
+        match direction {
+            Direction::Render => (PacketInterfaces::Output, PacketExposure::Output),
+            Direction::Capture => (PacketInterfaces::Input, PacketExposure::Input),
+        }
+    } else {
+        (PacketInterfaces::None, PacketExposure::NotExposed)
+    };
+    let stream = WaveStream::new(n, direction, cable, port_stream, supported, exposure)?;
     let object = try_new_packet_stream_object(stream, interfaces).ok_or_else(|| {
         kmd_log!("{name}{n}::NewStream : allocation du flux impossible");
         STATUS_INSUFFICIENT_RESOURCES

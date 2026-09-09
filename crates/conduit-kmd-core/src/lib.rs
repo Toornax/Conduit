@@ -19,9 +19,10 @@
 //! - les périodes de notification ([`notify`]) : quand signaler les événements
 //!   enregistrés par `IMiniportWaveRTStreamNotification`, à partir de la position
 //!   absolue, bouclage compris ;
-//! - les bornes des paramètres de registre ([`params`]) : réserve de câbles, canaux et
-//!   durée de tampon, écrêtés vers leur borne avec un rapport de ce qui a été corrigé,
-//!   pour qu'un registre aberrant ne fasse jamais échouer le chargement (M1b-01) ;
+//! - les bornes des paramètres de registre ([`params`]) : réserve de câbles, canaux,
+//!   durée de tampon et mode paquets, écrêtés vers leur borne avec un rapport de ce qui a
+//!   été corrigé, pour qu'un registre aberrant ne fasse jamais échouer le chargement
+//!   (M1b-01) ;
 //! - le contrat du jeu de propriétés KS privé de configuration ([`config`]) : le GUID du
 //!   jeu, la structure d'échange et **tout** son parseur, plus le masque de bits qui
 //!   persiste l'état actif des câbles (M1b-04, M1b-08) ;
@@ -84,13 +85,16 @@ pub mod wavefmt;
 
 pub use config::{
     cable_bit, is_active, sanitize_mask, with_active, AllocationMode, CableCounters, CableFormat,
-    CableFormatFix, CableState, CableTransport, ConfigError, ConfigGuid, CountersError,
-    FormatCodeError, KsRunState, MaskFix, StreamSide, StreamTransport, TransportError,
-    ACTIVE_CABLES_DEFAULT, ACTIVE_CABLES_LABEL, ACTIVE_CABLES_MASK, ACTIVE_CABLES_VALUE_NAME,
-    ALLOCATION_MODE_MAX, CABLE_COUNTERS_BYTES, CABLE_FORMAT_DEFAULT, CABLE_FORMAT_LABEL,
-    CABLE_FORMAT_VALUE_NAMES, CABLE_MAX, CABLE_STATE_BYTES, CABLE_TRANSPORT_BYTES, CONFIG_VERSION,
-    KSPROPERTY_CONDUIT_CABLE_STATE, KSPROPERTY_CONDUIT_COUNTERS, KSPROPERTY_CONDUIT_TRANSPORT,
-    KSPROPERTY_CONDUIT_VERSION, KSPROPSETID_CONDUIT, KS_RUN_STATE_MAX, STREAM_TRANSPORT_BYTES,
+    CableFormatFix, CablePackets, CableState, CableTransport, ConfigError, ConfigGuid,
+    CountersError, FormatCodeError, KsRunState, MaskFix, PacketExposure, PacketsError,
+    StreamPackets, StreamSide, StreamTransport, TransportError, ACTIVE_CABLES_DEFAULT,
+    ACTIVE_CABLES_LABEL, ACTIVE_CABLES_MASK, ACTIVE_CABLES_VALUE_NAME, ALLOCATION_MODE_MAX,
+    CABLE_COUNTERS_BYTES, CABLE_FORMAT_DEFAULT, CABLE_FORMAT_LABEL, CABLE_FORMAT_VALUE_NAMES,
+    CABLE_MAX, CABLE_PACKETS_BYTES, CABLE_STATE_BYTES, CABLE_TRANSPORT_BYTES, CONFIG_VERSION,
+    KSPROPERTY_CONDUIT_CABLE_STATE, KSPROPERTY_CONDUIT_COUNTERS, KSPROPERTY_CONDUIT_PACKETS,
+    KSPROPERTY_CONDUIT_TRANSPORT, KSPROPERTY_CONDUIT_VERSION, KSPROPSETID_CONDUIT,
+    KS_RUN_STATE_MAX, PACKET_EXPOSURE_MAX, PACKET_IRQL_MAX, STREAM_PACKETS_BYTES,
+    STREAM_TRANSPORT_BYTES,
 };
 pub use format::{
     buffer_bytes, buffer_bytes_for_notifications, buffer_bytes_for_notifications_with_floor,

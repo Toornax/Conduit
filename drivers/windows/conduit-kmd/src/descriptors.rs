@@ -142,7 +142,8 @@ use portcls::{
     CABLE_COUNT, CABLE_STATE_ACCESS_FLAGS, COUNTERS_ACCESS_FLAGS, JACK_ACCESS_FLAGS,
     JACK_EVENT_FLAGS, JACK_INFO_CHANGE_ID, PIN_NAME_GUIDS, TRANSPORT_ACCESS_FLAGS,
     VERSION_ACCESS_FLAGS, cable_state_item, counters_item, jack_description_item,
-    jack_info_change_item, mute_item, transport_item, version_item, volume_item, with_events,
+    jack_info_change_item, mute_item, packets_item, transport_item, version_item, volume_item,
+    with_events,
 };
 use portcls_sys::{
     GUID, IMiniportTopologyVtbl, KSCATEGORY_AUDIO, KSDATAFORMAT, KSDATAFORMAT__bindgen_ty_1,
@@ -815,9 +816,10 @@ static RENDER_MUTE_PROPERTIES: Shared<[PCPROPERTY_ITEM; 1]> = Shared(RENDER_MUTE
 static CAPTURE_VOLUME_PROPERTIES: Shared<[PCPROPERTY_ITEM; 1]> = Shared(CAPTURE_VOLUME_ITEMS);
 static CAPTURE_MUTE_PROPERTIES: Shared<[PCPROPERTY_ITEM; 1]> = Shared(CAPTURE_MUTE_ITEMS);
 
-/// Les cinq propriétés du **filtre** `TopoRender` : le jack (M1b-03), puis l'état et la
+/// Les six propriétés du **filtre** `TopoRender` : le jack (M1b-03), puis l'état et la
 /// version du jeu privé `KSPROPSETID_Conduit` (M1b-04), puis les compteurs de la boucle
-/// locale (M1b-21), puis l'état du transport (lot 0 du mode paquets WaveRT).
+/// locale (M1b-21), puis l'état du transport (lot 0 du mode paquets WaveRT), puis le relevé
+/// du mode paquets lui-même (lot 2).
 ///
 /// L'ordre n'a pas d'importance pour PortCls, qui cherche par `Set`/`Id`, mais celui-ci se
 /// lit dans l'ordre d'apparition des tâches.
@@ -827,23 +829,25 @@ const RENDER_FILTER_ITEMS: [PCPROPERTY_ITEM; FILTER_PROPERTY_COUNT] = [
     version_item::<IMiniportTopologyVtbl, TopoRender>(),
     counters_item::<IMiniportTopologyVtbl, TopoRender>(),
     transport_item::<IMiniportTopologyVtbl, TopoRender>(),
+    packets_item::<IMiniportTopologyVtbl, TopoRender>(),
 ];
-/// Les cinq mêmes propriétés du **filtre** `TopoCapture`, monomorphisées sur son type.
+/// Les six mêmes propriétés du **filtre** `TopoCapture`, monomorphisées sur son type.
 const CAPTURE_FILTER_ITEMS: [PCPROPERTY_ITEM; FILTER_PROPERTY_COUNT] = [
     jack_description_item::<IMiniportTopologyVtbl, TopoCapture>(),
     cable_state_item::<IMiniportTopologyVtbl, TopoCapture>(),
     version_item::<IMiniportTopologyVtbl, TopoCapture>(),
     counters_item::<IMiniportTopologyVtbl, TopoCapture>(),
     transport_item::<IMiniportTopologyVtbl, TopoCapture>(),
+    packets_item::<IMiniportTopologyVtbl, TopoCapture>(),
 ];
 
 /// Nombre de propriétés portées par un filtre de topologie : jack, état, version,
-/// compteurs, transport.
+/// compteurs, transport, paquets.
 ///
-/// Nommée plutôt qu'écrite cinq fois : c'est elle que
+/// Nommée plutôt qu'écrite six fois : c'est elle que
 /// `PCAUTOMATION_TABLE::PropertyCount` reçoit, par déduction du tableau dans
 /// [`property_automation`].
-const FILTER_PROPERTY_COUNT: usize = 5;
+const FILTER_PROPERTY_COUNT: usize = 6;
 
 static RENDER_FILTER_PROPERTIES: Shared<[PCPROPERTY_ITEM; FILTER_PROPERTY_COUNT]> =
     Shared(RENDER_FILTER_ITEMS);

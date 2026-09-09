@@ -100,7 +100,7 @@
 use core::fmt;
 
 use conduit_kmd_core::FrameLayout;
-use conduit_kmd_core::config::{CableCounters, CableTransport};
+use conduit_kmd_core::config::{CableCounters, CablePackets, CableTransport};
 use portcls::conduit_com::{ComRef, NtStatus, STATUS_SUCCESS};
 use portcls::{
     AudioNodes, CableConfig, ConfigTrace, EventSource, EventTrace, JackInfo, JackTarget, JackTrace,
@@ -510,6 +510,17 @@ impl CableConfig for TopoRender {
         self.cable.transport_snapshot()
     }
 
+    // IRQL: PASSIVE_LEVEL — les deux sens, comme le transport. Le mode effectif vient du
+    // registre et non du câble : `Cable::packets_snapshot` ne connaît pas les paramètres du
+    // pilote, et c'est ici — au point où l'on répond à la propriété — qu'on sait dire dans
+    // quel mode les compteurs ont été pris.
+    fn packets(&self) -> CablePackets {
+        CablePackets {
+            packet_mode: u32::from(crate::registry::packet_mode()),
+            ..self.cable.packets_snapshot()
+        }
+    }
+
     // IRQL: PASSIVE_LEVEL
     fn trace(&self, trace: &ConfigTrace<'_>) {
         kmd_log!("TopoRender{} : {trace:?}", self.n);
@@ -703,6 +714,14 @@ impl CableConfig for TopoCapture {
     // IRQL: PASSIVE_LEVEL — voir `TopoRender` : les deux sens, quel que soit le filtre visé.
     fn transport(&self) -> CableTransport {
         self.cable.transport_snapshot()
+    }
+
+    // IRQL: PASSIVE_LEVEL — voir `TopoRender`, y compris pour le mode effectif.
+    fn packets(&self) -> CablePackets {
+        CablePackets {
+            packet_mode: u32::from(crate::registry::packet_mode()),
+            ..self.cable.packets_snapshot()
+        }
     }
 
     // IRQL: PASSIVE_LEVEL

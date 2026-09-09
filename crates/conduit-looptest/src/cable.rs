@@ -15,7 +15,11 @@
 //!    démontrent — la lecture de M1b-07 que seul le débogueur savait faire (M1b-21) ;
 //! 4. `--cable-transport` : par sens, comment le moteur audio a alloué le tampon
 //!    (scrutation ou notifications) et combien d'allocations nous avons refusées — la
-//!    question du lot 0 du mode paquets WaveRT ;
+//!    question du lot 0 du mode paquets WaveRT —, **puis** ce qu'il a fait des interfaces
+//!    du mode paquets : le `PacketMode` effectif, ce que chaque flux expose, les
+//!    `QueryInterface` reçus et rendus, et les appels refusés par méthode, avec leur IRQL
+//!    et leurs horodatages (lot 2). Les deux relevés répondent à la même question et
+//!    sortent ensemble ;
 //! 5. `--cable-set` : l'écriture, affichée avant et après ;
 //! 6. `--cable-chrono` : le délai entre l'écriture et l'endpoint MMDevice qui suit ;
 //! 7. `--cable-invalide` : la batterie d'entrées volontairement invalides.
@@ -44,8 +48,8 @@ use std::time::{Duration, Instant};
 use conduit_backend::{Backend, CableId, DeviceDirection};
 use conduit_backend_wasapi::cable::{
     armer_privilege, contract_version, etat_privilege, topology_interfaces, Armement, BadInput,
-    CableConfigError, CableCounters, CableState, CableTransport, EtatPrivilege, FilterSide,
-    StreamSide, StreamTransport, TopologyFilter, CABLE_MAX,
+    CableConfigError, CableCounters, CablePackets, CableState, CableTransport, EtatPrivilege,
+    FilterSide, StreamPackets, StreamSide, StreamTransport, TopologyFilter, CABLE_MAX,
 };
 use conduit_backend_wasapi::WasapiBackend;
 
@@ -530,6 +534,104 @@ fn lignes_transport(cable: CableId, index: u32, transport: &CableTransport) -> S
     out
 }
 
+/// Les quatre lignes de paquets d'un sens : ce que le flux courant expose, les
+/// `QueryInterface` reçus, les appels par méthode, puis l'IRQL et les horodatages.
+///
+/// Pure. L'exposition occupe sa propre ligne, comme le mode d'allocation de [`lignes_sens`]
+/// et pour la même raison : c'est **la** valeur qu'on vient chercher.
+fn lignes_sens_paquets(sens: StreamSide, bloc: &StreamPackets) -> String {
+    let mut out = format!("      {:<8}: {}\n", sens.label(), bloc.exposure_label());
+    let _ = writeln!(
+        out,
+        "                QueryInterface de paquets : {} reçus, {} rendus",
+        bloc.queries, bloc.queries_granted
+    );
+    let _ = writeln!(
+        out,
+        "                appels REFUSÉS : SetWritePacket {}, GetReadPacket {}, GetPacketCount \
+         {}, GetOutputStreamPresentationPosition {}",
+        bloc.set_write_packet, bloc.get_read_packet, bloc.packet_count, bloc.presentation_position
+    );
+    if bloc.emprunte() {
+        let _ = writeln!(
+            out,
+            "                IRQL dernier {}, max {} (PASSIVE_LEVEL = 0) ; QPC premier {}, \
+             dernier {}",
+            bloc.irql_last, bloc.irql_max, bloc.first_qpc, bloc.last_qpc
+        );
+    }
+    out
+}
+
+/// Ce que le relevé de paquets d'un câble **démontre**, en français.
+///
+/// Pure, et c'est ici qu'est écrit ce que le lot 2 cherche à savoir : le moteur audio
+/// scrute-t-il par politique, ou parce qu'il ne trouve pas les interfaces de paquets ? Les
+/// six cas ne se confondent pas, et deux d'entre eux tranchent la question — le deuxième
+/// (rien d'exposé, mais le moteur demande) et le cinquième (exposé, obtenu, jamais emprunté).
+fn verdict_paquets(paquets: &CablePackets) -> String {
+    let demandes = paquets.queries_total();
+    let appels = paquets.appels_total();
+    if appels > 0 {
+        return format!(
+            "      → {appels} APPEL(S) REFUSÉ(S) par STATUS_NOT_SUPPORTED, IRQL max {} : le \
+             moteur audio EMPRUNTE un chemin que nous ne servons pas.\n        C'est \
+             exactement le danger que `PacketMode` sert à mesurer, et la raison de ne jamais \
+             le livrer à 1. Remettez 0 et redémarrez le périphérique.\n",
+            paquets.irql_max()
+        );
+    }
+    if !paquets.mode_actif() {
+        if demandes == 0 {
+            return "      → rien n'est exposé (PacketMode = 0) et le moteur audio n'a JAMAIS \
+                    demandé les IID de paquets\n        Sa scrutation n'est donc pas la \
+                    conséquence de notre silence : c'est une politique.\n"
+                .to_string();
+        }
+        return format!(
+            "      → rien n'est exposé (PacketMode = 0) mais le moteur audio a DEMANDÉ les IID \
+             de paquets {demandes} fois\n        Notre silence est une cause plausible de la \
+             scrutation. Pour trancher, posez PacketMode = 1 sur une machine d'essai, \
+             redémarrez le périphérique, et relisez ce relevé.\n"
+        );
+    }
+    if !paquets.exposition_courante() {
+        return "      → PacketMode = 1, mais aucun flux ouvert n'expose d'interface de \
+                paquets\n        Soit aucun flux ne tourne (relancez pendant une passe), soit \
+                les flux courants ont été ouverts avant le dernier réglage — le paramètre est \
+                lu au démarrage du périphérique.\n"
+            .to_string();
+    }
+    if demandes == 0 {
+        return "      → interfaces EXPOSÉES, 0 QueryInterface : le moteur audio ne cherche même \
+                pas le mode paquets sur ce flux\n"
+            .to_string();
+    }
+    format!(
+        "      → interfaces EXPOSÉES, {demandes} QueryInterface dont {} rendus, 0 appel : le \
+         moteur audio les obtient et NE LES EMPRUNTE PAS\n",
+        paquets.queries_granted_total()
+    )
+}
+
+/// Le relevé de paquets d'un câble : le mode effectif, deux sens, puis le verdict.
+fn lignes_paquets(paquets: &CablePackets) -> String {
+    let mut out = format!(
+        "    mode paquets : PacketMode = {} ({})\n",
+        paquets.packet_mode,
+        if paquets.mode_actif() {
+            "interfaces EXPOSÉES sans être servies — expérience, à ne jamais livrer"
+        } else {
+            "rien n'est exposé : le pilote livré"
+        }
+    );
+    for sens in StreamSide::ALL {
+        out.push_str(&lignes_sens_paquets(sens, paquets.side(sens)));
+    }
+    out.push_str(&verdict_paquets(paquets));
+    out
+}
+
 /// `--cable-transport` : ce que le moteur audio a demandé, sans débogueur.
 ///
 /// `vise` restreint le relevé à un seul câble quand `--cable N` est donné ; sinon les seize
@@ -558,6 +660,11 @@ fn transport_des_cables(paths: &[String], side: FilterSide, vise: Option<u32>) -
         "  (remis à zéro à chaque démarrage du périphérique ; instantané non atomique, les \
          compteurs de refus sont lus hors verrou et les deux sens l'un après l'autre)\n",
     );
+    out.push_str(
+        "  (le relevé du mode paquets suit celui du transport, sur le même filtre : \
+         PacketMode se règle dans la clé Device Parameters du périphérique et n'est lu \
+         qu'au démarrage de celui-ci)\n",
+    );
     let numeros: Vec<u32> = match vise {
         Some(n) => vec![n],
         None => (1..=CABLE_MAX).collect(),
@@ -579,6 +686,21 @@ fn transport_des_cables(paths: &[String], side: FilterSide, vise: Option<u32>) -
                              Un pilote antérieur au lot 0 du mode paquets n'a pas cette \
                              propriété : vérifiez la version avec --cable-etat.",
                             cable.0
+                        );
+                    }
+                }
+                // Le relevé de paquets suit celui du transport, sur le même filtre déjà
+                // ouvert : les deux répondent à la même question — le moteur audio peut-il
+                // faire des paquets sur ce câble, et le veut-il ? — et les lire séparément
+                // obligerait à comparer deux sorties.
+                match filtre.read_packets() {
+                    Ok(paquets) => out.push_str(&lignes_paquets(&paquets)),
+                    Err(e) => {
+                        let _ = writeln!(
+                            out,
+                            "    mode paquets : lecture refusée — {e}\n      Un pilote \
+                             antérieur au lot 2 du mode paquets n'a pas cette propriété : \
+                             vérifiez la version avec --cable-etat."
                         );
                     }
                 }
@@ -1179,6 +1301,153 @@ mod tests {
                 .ends_with(AllocationMode::Notifications.label())),
             "{texte}"
         );
+    }
+
+    /// Le verdict du relevé de paquets, pour chacune des six situations — et surtout la
+    /// différence entre « le moteur ne demande jamais » et « il demande et nous refusons »,
+    /// qui est exactement la question du lot 2.
+    #[test]
+    fn le_verdict_des_paquets_distingue_les_six_situations() {
+        use conduit_backend_wasapi::cable::PacketExposure;
+
+        // 1. Rien d'exposé, rien de demandé : le moteur scrute par politique.
+        let politique = verdict_paquets(&CablePackets::new(0));
+        assert!(politique.contains("JAMAIS"), "{politique}");
+        assert!(politique.contains("politique"), "{politique}");
+
+        // 2. Rien d'exposé, mais le moteur demande : notre silence est en cause. C'est le
+        //    verdict qui vaut à lui seul le lot, et il ne coûte aucune exposition.
+        let demande = verdict_paquets(&CablePackets {
+            render: StreamPackets {
+                exposure: PacketExposure::NotExposed.code(),
+                queries: 4,
+                ..StreamPackets::new()
+            },
+            ..CablePackets::new(0)
+        });
+        assert!(demande.contains("DEMANDÉ"), "{demande}");
+        assert!(demande.contains("PacketMode = 1"), "{demande}");
+
+        // 3. Mode actif mais aucun flux n'expose : le relevé le dit au lieu de laisser
+        //    conclure.
+        let trop_tot = verdict_paquets(&CablePackets {
+            packet_mode: 1,
+            ..CablePackets::new(0)
+        });
+        assert!(trop_tot.contains("aucun flux"), "{trop_tot}");
+
+        // 4. Exposé, jamais demandé : le moteur ne cherche même pas.
+        let ignore = verdict_paquets(&CablePackets {
+            packet_mode: 1,
+            render: StreamPackets {
+                exposure: PacketExposure::Output.code(),
+                ..StreamPackets::new()
+            },
+            ..CablePackets::new(0)
+        });
+        assert!(ignore.contains("0 QueryInterface"), "{ignore}");
+
+        // 5. Exposé, obtenu, jamais emprunté : la lecture que l'énoncé du lot demande.
+        let obtenu = verdict_paquets(&CablePackets {
+            packet_mode: 1,
+            render: StreamPackets {
+                exposure: PacketExposure::Output.code(),
+                queries: 2,
+                queries_granted: 2,
+                ..StreamPackets::new()
+            },
+            ..CablePackets::new(0)
+        });
+        assert!(obtenu.contains("EXPOSÉES"), "{obtenu}");
+        assert!(obtenu.contains("0 appel"), "{obtenu}");
+
+        // 6. Emprunté : le cas qui justifie de ne jamais livrer `PacketMode = 1`.
+        let emprunte = verdict_paquets(&CablePackets {
+            packet_mode: 1,
+            render: StreamPackets {
+                exposure: PacketExposure::Output.code(),
+                queries: 2,
+                queries_granted: 2,
+                set_write_packet: 9,
+                irql_max: 0,
+                ..StreamPackets::new()
+            },
+            ..CablePackets::new(0)
+        });
+        assert!(emprunte.contains("9 APPEL(S) REFUSÉ(S)"), "{emprunte}");
+        assert!(emprunte.contains("IRQL max 0"), "{emprunte}");
+
+        // Les six verdicts sont distincts : deux situations différentes ne doivent pas se
+        // lire pareil.
+        let tous = [politique, demande, trop_tot, ignore, obtenu, emprunte];
+        for (rang, texte) in tous.iter().enumerate() {
+            assert!(!texte.is_empty());
+            assert!(
+                !tous.iter().skip(rang + 1).any(|autre| autre == texte),
+                "deux verdicts identiques : {texte}"
+            );
+        }
+    }
+
+    /// Le relevé de paquets imprime le mode effectif, l'exposition de chaque sens en toutes
+    /// lettres, les `QueryInterface` et les appels par méthode.
+    #[test]
+    fn les_lignes_de_paquets_portent_le_mode_les_deux_sens_et_les_appels() {
+        use conduit_backend_wasapi::cable::PacketExposure;
+
+        let paquets = CablePackets {
+            cable: 2,
+            packet_mode: 1,
+            render: StreamPackets {
+                exposure: PacketExposure::Output.code(),
+                irql_last: 0,
+                irql_max: 0,
+                reserved: 0,
+                set_write_packet: 13,
+                get_read_packet: 0,
+                packet_count: 5,
+                presentation_position: 7,
+                queries: 29,
+                queries_granted: 29,
+                first_qpc: 1_000,
+                last_qpc: 2_000,
+            },
+            capture: StreamPackets {
+                exposure: PacketExposure::Input.code(),
+                ..StreamPackets::new()
+            },
+        };
+        let texte = lignes_paquets(&paquets);
+        for attendu in [
+            "PacketMode = 1",
+            "rendu",
+            "capture",
+            PacketExposure::Output.label(),
+            PacketExposure::Input.label(),
+            "29 reçus, 29 rendus",
+            "SetWritePacket 13",
+            "GetPacketCount 5",
+            "GetOutputStreamPresentationPosition 7",
+            "IRQL dernier 0, max 0",
+            "QPC premier 1000, dernier 2000",
+        ] {
+            assert!(
+                texte.contains(attendu),
+                "« {attendu} » absent de :\n{texte}"
+            );
+        }
+        // L'exposition est sur sa propre ligne, comme le mode d'allocation du transport.
+        assert!(
+            texte
+                .lines()
+                .any(|l| l.trim_end().ends_with(PacketExposure::Output.label())),
+            "{texte}"
+        );
+        // Un sens sans appel n'imprime pas de ligne d'IRQL : il n'y a rien à en dire, et une
+        // ligne de zéros ferait croire à une mesure.
+        let repos = lignes_paquets(&CablePackets::new(0));
+        assert!(!repos.contains("IRQL"), "{repos}");
+        assert!(repos.contains("PacketMode = 0"), "{repos}");
     }
 
     #[test]

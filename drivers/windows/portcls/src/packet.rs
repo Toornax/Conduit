@@ -45,6 +45,12 @@
 //! `GetPosition` **et** les quatre méthodes sur le même objet (`minwavertstream.h`), ce
 //! qui est exactement ce que l'objet composite ci-dessous permet en Rust.
 //!
+//! La règle n'a **pas** été amendée par le lot 2, qui expose délibérément sans servir : c'est
+//! une **expérience de mesure**, derrière un paramètre de registre à 0 par défaut et jamais
+//! livré à 1, dont l'objet est précisément de quantifier ce que la règle redoute. Voir
+//! `conduit_kmd_core::params::DEFAULT_PACKET_MODE`, qui porte toute la réserve, et
+//! [`PacketInterfaces::None`].
+//!
 //! # Quatre interfaces, un seul objet
 //!
 //! Les deux interfaces du mode paquets dérivent de `IUnknown` **seul** : leur vtable
@@ -131,6 +137,20 @@
 //! constante **distincte** (`<T as PacketStreamVtbl>::VTBL`, dont seul le slot 0 change)
 //! de `<PacketStream<T> as StreamNotificationVtbl>::VTBL`.
 //!
+//! # Deux points d'observation, et ce qu'ils ne changent pas
+//!
+//! [`MiniportWaveRTInputStream::note_input_query`] et
+//! [`MiniportWaveRTOutputStream::note_output_query`] sont appelés par le `QueryInterface`
+//! composite chaque fois qu'un des deux IID de paquets est demandé — **exposé ou non** —, avec
+//! un booléen qui dit lequel des deux cas s'est produit. Leur défaut ne fait rien, comme les
+//! points de trace du reste du dépôt.
+//!
+//! Ils ne déforment pas le `QueryInterface` générique : la décision d'exposer reste celle de
+//! [`PacketInterfaces`] seule, l'ordre des tests est inchangé, et un IID inconnu suit
+//! exactement le même chemin qu'avant. Ce qu'ils ajoutent est la seule mesure qui distingue
+//! « le moteur audio ne demande jamais le mode paquets » de « il le demande et nous le
+//! refusons » — et le second se mesure **sans rien exposer**, donc sans rien promettre.
+//!
 //! # IRQL
 //!
 //! Toutes les méthodes des deux interfaces sont à `PASSIVE_LEVEL`
@@ -206,6 +226,29 @@ pub trait MiniportWaveRTInputStream: MiniportWaveRTStream {
     fn read_packet(&self) -> Result<ReadPacket, NtStatus> {
         Err(STATUS_NOT_SUPPORTED)
     }
+
+    /// **Observation**, pas une méthode de l'interface : le `QueryInterface` composite vient
+    /// de recevoir `IID_IMiniportWaveRTInputStream`.
+    ///
+    /// `rendu` dit si la tête satellite a été rendue (l'interface est exposée) ou si l'IID a
+    /// été refusé comme n'importe quel IID inconnu. **Les deux cas sont notifiés**, et c'est
+    /// tout l'intérêt : à `PacketInterfaces::None`, un `rendu = false` répétitif prouve que le
+    /// moteur audio *demande* le mode paquets sans qu'on ait rien exposé — une mesure qui ne
+    /// coûte aucune promesse de service.
+    ///
+    /// Le pendant de [`MiniportWaveRTOutputStream::note_output_query`], et le seul point de ce
+    /// module qui parle au flux sans qu'une méthode PortCls ait été appelée. Il vit sur ce
+    /// trait-ci, et non sur `MiniportWaveRTStream`, parce qu'il concerne **cette
+    /// interface-là** : le flux apprend qu'on lui a demandé son IID d'entrée.
+    ///
+    /// Défaut : ne fait rien, comme les points de trace du reste du dépôt.
+    ///
+    /// IRQL : `<= DISPATCH_LEVEL` — c'est celui de `QueryInterface`, plus permissif que
+    /// celui des quatre méthodes. Une implémentation doit s'en tenir à des atomiques : ni
+    /// verrou pris ailleurs, ni allocation, ni code paginé.
+    fn note_input_query(&self, rendu: bool) {
+        let _ = rendu;
+    }
 }
 
 /// Contrat de `IMiniportWaveRTOutputStream` (`portcls.h`), vu du pilote : le mode paquets
@@ -262,6 +305,15 @@ pub trait MiniportWaveRTOutputStream: MiniportWaveRTStream {
     fn packet_count(&self) -> Result<u32, NtStatus> {
         Err(STATUS_NOT_SUPPORTED)
     }
+
+    /// **Observation** : le `QueryInterface` composite vient de recevoir
+    /// `IID_IMiniportWaveRTOutputStream`.
+    ///
+    /// Voir [`MiniportWaveRTInputStream::note_input_query`], dont c'est le symétrique — mêmes
+    /// règles, même IRQL, même défaut qui ne fait rien.
+    fn note_output_query(&self, rendu: bool) {
+        let _ = rendu;
+    }
 }
 
 /// Un flux capable de servir le mode paquets : les quatre interfaces réunies.
@@ -296,7 +348,12 @@ pub enum PacketInterfaces {
     ///
     /// Passer à [`Input`](Self::Input) ou [`Output`](Self::Output) est donc un
     /// changement de contrat observable en machine, pas un réglage : il ne se fait
-    /// qu'avec les méthodes derrière.
+    /// qu'avec les méthodes derrière — **ou** à titre d'expérience assumée, sur une machine
+    /// d'essai, pour mesurer ce que le moteur audio en fait. C'est le seul usage du
+    /// paramètre de registre `PacketMode` du pilote
+    /// (`conduit_kmd_core::params::DEFAULT_PACKET_MODE`) : 0 par défaut, jamais livré à 1, et
+    /// les quatre méthodes y refusent en comptant. L'exception ne dilue pas la règle, elle la
+    /// chiffre.
     None,
     /// Flux de **capture** : `IMiniportWaveRTInputStream` seule (le moteur lit).
     Input,
@@ -594,6 +651,17 @@ unsafe extern "C" fn query_interface_composite<T: PacketWaveRTStream>(
     } else {
         None
     };
+
+    // Prévenir le flux qu'on lui a demandé un IID de paquets, **exposé ou non** : c'est la
+    // seule façon de distinguer « le moteur audio ne demande jamais le mode paquets » de
+    // « il le demande et nous le refusons », et le second cas se mesure sans rien exposer.
+    // Les défauts des deux méthodes ne font rien : un flux qui ne veut pas savoir ne paie
+    // rien, et le `QueryInterface` générique n'est pas touché.
+    if demande == IID_INPUT_STREAM {
+        me.inner.note_input_query(satellite.is_some());
+    } else if demande == IID_OUTPUT_STREAM {
+        me.inner.note_output_query(satellite.is_some());
+    }
 
     match satellite {
         Some(tete) => {

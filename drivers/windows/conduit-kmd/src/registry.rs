@@ -1,27 +1,27 @@
 //! Lecture des paramètres de registre au démarrage (M1b-01, driver-design.md §2.1) et
 //! persistance de l'état actif des câbles (M1b-04, §6).
 //!
-//! `StartDevice` lit trois `REG_DWORD` dans la **clé matérielle** du périphérique —
-//! `ReserveSize`, `Channels`, `BufferMs` — les confronte à leurs bornes par
+//! `StartDevice` lit quatre `REG_DWORD` dans la **clé matérielle** du périphérique —
+//! `ReserveSize`, `Channels`, `BufferMs`, `PacketMode` — les confronte à leurs bornes par
 //! [`conduit_kmd_core::params::sanitize`], et journalise ce qu'il a corrigé. Il y lit
 //! aussi le masque `ActiveCables` ([`read_active_cables`]), que le gestionnaire de
 //! propriété privée réécrit ensuite à chaque changement ([`write_active_cables`]).
 //!
 //! # Trois natures, trois chemins
 //!
-//! Les trois paramètres, le masque et les seize formats partagent la même clé et les mêmes
+//! Les quatre paramètres, le masque et les seize formats partagent la même clé et les mêmes
 //! primitives, mais **pas la même nature**, et c'est pourquoi ils ne passent pas par la
 //! même fonction :
 //!
-//! | | `ReserveSize`, `Channels`, `BufferMs` | `CableFormat<n>` | `ActiveCables` |
+//! | | `ReserveSize`, `Channels`, `BufferMs`, `PacketMode` | `CableFormat<n>` | `ActiveCables` |
 //! |---|---|---|---|
 //! | Qui écrit | l'administrateur (et l'INF, une fois) | le **service**, puis redémarrage du devnode | le **pilote**, à chaque `SET` |
 //! | Quand c'est lu | `StartDevice` | `StartDevice` | `StartDevice` |
 //! | Ce que c'est | de la configuration | de la configuration | de l'**état** |
 //!
-//! Fondre `ActiveCables` dans [`read_params`] aurait demandé un quatrième `Param` dans le
-//! crate portable, donc un quatrième défaut, un quatrième rang de code d'événement et une
-//! quatrième correction — pour une valeur que l'administrateur n'est pas censé régler à la
+//! Fondre `ActiveCables` dans [`read_params`] aurait demandé un `Param` de plus dans le
+//! crate portable, donc un défaut de plus, un rang de code d'événement de plus et une
+//! correction de plus — pour une valeur que l'administrateur n'est pas censé régler à la
 //! main et que le pilote écrase à la première demande de l'utilisateur. Le prix de la
 //! séparation est **une ouverture de clé de plus** au démarrage, négligeable devant les
 //! seize câbles à enregistrer.
@@ -146,10 +146,11 @@ const PARTIAL_INFO_BYTES: usize = DATA_OFFSET.saturating_add(80);
 /// Unités UTF-16 réservées à un nom de valeur.
 const NAME_UNITS: usize = 32;
 
-// Les quatre noms tiennent dans le tampon (noms ASCII : un octet par unité UTF-16).
+// Les cinq noms tiennent dans le tampon (noms ASCII : un octet par unité UTF-16).
 const _: () = assert!(Param::Reserve.value_name().len() < NAME_UNITS);
 const _: () = assert!(Param::Channels.value_name().len() < NAME_UNITS);
 const _: () = assert!(Param::BufferMs.value_name().len() < NAME_UNITS);
+const _: () = assert!(Param::PacketMode.value_name().len() < NAME_UNITS);
 const _: () = assert!(ACTIVE_CABLES_VALUE_NAME.len() < NAME_UNITS);
 // Les seize noms de format aussi : « CableFormat15 » fait treize caractères ASCII, mais la
 // vérifier plutôt que la compter est ce qui tiendra le jour où `CABLE_MAX` passera à trois
@@ -197,6 +198,13 @@ pub(crate) mod code {
     /// naît de la connexion des deux filtres, et une divergence entre eux ne se voit ni dans
     /// les tables ni dans le côté wave.
     pub(crate) const TOPOLOGIE: u32 = 0x0009_0000;
+    /// Le pilote tourne avec une **expérience** activée par le registre (lot 2 du mode
+    /// paquets : `PacketMode = 1`).
+    ///
+    /// Le seul code de ce module qui ne signale ni une anomalie ni une correction, mais un
+    /// pilote qui se comporte volontairement autrement qu'en service. Il se compose avec
+    /// [`super::RANG_PACKET_MODE`], comme les autres codes de paramètre.
+    pub(super) const EXPERIENCE: u32 = 0x000B_0000;
     /// Aucune intersection entre ce que Windows demande et ce que le câble déclare
     /// (`intersect::Negotiation::resolve`, M1b-21).
     ///
@@ -216,10 +224,17 @@ const fn rang(param: Param) -> u32 {
         Param::Reserve => 0,
         Param::Channels => 1,
         Param::BufferMs => 2,
+        // Surtout pas 3 : les rangs sont une numérotation **commune** à tout ce module, et 3
+        // à 19 sont déjà pris par le masque et les seize formats. Un `PacketMode` glissé à 3
+        // ferait porter le même `UniqueErrorValue` à deux pannes sans rapport, et le journal
+        // d'événements est précisément ce qui doit rester lisible quand le texte de l'entrée
+        // n'arrive pas jusqu'à l'Observateur.
+        Param::PacketMode => RANG_PACKET_MODE,
     }
 }
 
-/// Rang de `ActiveCables` dans les codes d'événement, à la suite des trois paramètres.
+/// Rang de `ActiveCables` dans les codes d'événement, à la suite des trois premiers
+/// paramètres.
 const RANG_MASQUE: u32 = 3;
 
 /// Rang du premier `CableFormat<n>` : les seize occupent 4 à 19, à la suite du masque.
@@ -229,13 +244,23 @@ const RANG_MASQUE: u32 = 3;
 /// (voir [`crate::eventlog`]).
 pub(crate) const RANG_FORMAT: u32 = 4;
 
-// Les rangs des seize formats tiennent dans l'octet de poids faible du code d'événement :
-// au-delà, ils déborderaient sur l'octet qui dit la nature de l'anomalie, et deux pannes
-// différentes porteraient le même code.
+/// Rang de `PacketMode`, à la suite des seize formats : 20.
+///
+/// À la fin plutôt qu'à sa place dans [`Param::ALL`], parce que les rangs des formats et du
+/// masque sont **déjà** posés et qu'un poste installé peut avoir des entrées de journal qui
+/// les portent. Renuméroter ferait relire de travers une entrée d'hier.
+const RANG_PACKET_MODE: u32 = RANG_FORMAT.saturating_add(CABLE_FORMAT_VALUE_NAMES.len() as u32);
+
+// Les rangs des seize formats, puis celui du mode paquets, tiennent dans l'octet de poids
+// faible du code d'événement : au-delà, ils déborderaient sur l'octet qui dit la nature de
+// l'anomalie, et deux pannes différentes porteraient le même code.
 const _: () = assert!(
-    RANG_FORMAT.saturating_add(CABLE_FORMAT_VALUE_NAMES.len() as u32) <= 0xFF,
+    RANG_PACKET_MODE <= 0xFF,
     "les rangs de code d'événement débordent sur l'octet de nature"
 );
+// Et aucun rang n'en recouvre un autre : le masque après les trois premiers paramètres, les
+// seize formats après le masque, le mode paquets après les formats.
+const _: () = assert!(RANG_MASQUE == 3 && RANG_FORMAT == 4 && RANG_PACKET_MODE == 20);
 
 /// Nom de valeur encodé en UTF-16 sur la pile, avec l'`UNICODE_STRING` qui le décrit.
 ///
@@ -470,16 +495,37 @@ pub(crate) unsafe fn read_params(device: PDEVICE_OBJECT, log: EventLog) -> Param
     // `BufferMs` devient effectif ici (M1b-05) : il était lu, validé et journalisé depuis
     // M1b-01, et n'agissait sur rien.
     BUFFER_MS.store(params.buffer_ms, Ordering::Relaxed);
+    // `PacketMode` devient effectif ici (lot 2 du mode paquets), et c'est le **seul** endroit
+    // où il est lu : `wave::open_stream` consulte l'atomique, pas le registre. Un changement
+    // dans `regedit` ne prend donc effet qu'au prochain démarrage du périphérique, comme pour
+    // tous les paramètres de ce module.
+    PACKET_MODE.store(u32::from(params.packet_mode), Ordering::Relaxed);
     // `Channels` est journalisé « (ignoré) » plutôt que passé sous silence : il est encore
     // dans l'INF et dans `regedit`, et un administrateur qui vient de le régler doit lire
     // pourquoi rien n'a bougé, au lieu de le déduire (voir `conduit_kmd_core::params`).
     kmd_log!(
-        "registre : réserve {} câbles, tampon {} ms, Channels = {} (ignoré, supplanté par \
-         les CableFormat<n>)",
+        "registre : réserve {} câbles, tampon {} ms, mode paquets {}, Channels = {} (ignoré, \
+         supplanté par les CableFormat<n>)",
         params.reserve,
         params.buffer_ms,
+        params.packet_mode,
         params.channels
     );
+    // Un `PacketMode = 1` ne doit exister que sur une machine d'essai : le dire au journal
+    // d'événements est ce qui le fait remarquer sur un poste où il n'aurait rien à faire.
+    // Ce n'est pas une correction — la valeur est dans ses bornes — mais une **expérience en
+    // cours**, et un pilote qui expose des interfaces qu'il ne sert pas doit l'annoncer.
+    if params.packet_mode_actif() {
+        kmd_event!(
+            log,
+            code::EXPERIENCE.saturating_add(RANG_PACKET_MODE),
+            "{} ({}) = 1 : les interfaces du mode paquets seront EXPOSÉES sans être servies \
+             (les quatre méthodes refusent). Expérience de mesure, à ne jamais laisser sur un \
+             poste en service — remettre 0 et redémarrer le périphérique",
+            Param::PacketMode.label(),
+            Param::PacketMode.value_name()
+        );
+    }
     params
 }
 
@@ -509,6 +555,37 @@ static BUFFER_MS: AtomicU32 = AtomicU32::new(params::DEFAULT_BUFFER_MS);
 #[must_use]
 pub(crate) fn buffer_ms() -> u32 {
     BUFFER_MS.load(Ordering::Relaxed)
+}
+
+/// Mode paquets demandé par le registre : la valeur de `PacketMode` du dernier
+/// `StartDevice`, 0 ou 1.
+///
+/// # Une `static`, et lue au démarrage — pas à chaque flux
+///
+/// Même raisonnement que [`BUFFER_MS`] : c'est un paramètre **du pilote**, pas du câble ni du
+/// flux, et le faire descendre par la chaîne `adapter` → `cable` → `wave` ferait traverser
+/// trois modules à une constante de démarrage. `wave::open_stream` lit cet atomique.
+///
+/// La conséquence est celle de tous les paramètres de ce module et elle vaut d'être écrite :
+/// **modifier `PacketMode` dans `regedit` ne change rien tant que le périphérique n'a pas
+/// redémarré**. C'est aussi ce que le relevé rend
+/// ([`conduit_kmd_core::config::CablePackets::packet_mode`]) : le mode **effectif**, celui
+/// d'ici, et non ce que la clé contient à l'instant de la requête.
+///
+/// `Relaxed` : écrit une fois par `StartDevice`, avant qu'aucun flux n'existe, et lu à
+/// `PASSIVE_LEVEL` par `NewStream`. Aucune relation d'ordre à établir avec un autre champ.
+static PACKET_MODE: AtomicU32 = AtomicU32::new(params::DEFAULT_PACKET_MODE);
+
+/// Les interfaces du mode paquets doivent-elles être **exposées** sur les nouveaux flux ?
+///
+/// Faux par défaut et sur tout poste livré. Vrai, elles sont exposées **sans être servies** :
+/// c'est une expérience de mesure, et toute la réserve est écrite sur
+/// [`conduit_kmd_core::params::DEFAULT_PACKET_MODE`].
+///
+/// IRQL : quelconque.
+#[must_use]
+pub(crate) fn packet_mode() -> bool {
+    PACKET_MODE.load(Ordering::Relaxed) != 0
 }
 
 /// Lit les trois valeurs et journalise ce qui les a empêchées d'arriver.
@@ -569,6 +646,7 @@ unsafe fn read_all(key: HANDLE, log: EventLog) -> RawParams {
             Param::Reserve => raw.reserve = valeur,
             Param::Channels => raw.channels = valeur,
             Param::BufferMs => raw.buffer_ms = valeur,
+            Param::PacketMode => raw.packet_mode = valeur,
         }
     }
     raw

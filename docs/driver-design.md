@@ -23,6 +23,12 @@ Statut : brouillon 0.1 (2026-09-05), à ajuster par ADR à mesure que le spike a
   **sans une ligne de pilote** ; et le pilote se contente de lire son registre et de
   recopier des trames sans les transformer. Point de vigilance connu : les seize minuteurs
   à 1 ms, un par câble, sont ce qu'il y a de plus lourd dans le pilote (§5.3).
+- **Paramètres du registre** (clé matérielle du périphérique, lus au `StartDevice`,
+  bornes dans `conduit-kmd-core::params`) : `ReserveSize`, `Channels` (supplanté par
+  `CableFormat<n>`), `BufferMs`, et `PacketMode` — ce dernier étant une **expérience de
+  mesure** du mode paquets WaveRT (§6), à 0 par défaut, jamais livrée à 1 : elle expose des
+  interfaces que le pilote ne sert pas. Aucun n'est nécessaire au chargement : hors bornes,
+  écrêté et journalisé, jamais d'échec (M1b-01).
 - **Réserve fixe** (ADR-004) : 16 câbles enregistrés au démarrage, inactifs masqués par
   l'état de jack. Le spike M1a n'en enregistre qu'un ; la réserve arrive en M1b-02.
 - **Rust d'abord** (ADR-003) : `windows-drivers-rs` (crates publiés `wdk-sys`/`wdk-build`
@@ -75,7 +81,7 @@ Contient tout ce qui se raisonne et se teste sans noyau :
 | `loopback` | plan de copie d'un tick (M1a-08) : `Loopback::plan(rendu, capture, avance)` → copie, silence, rien, ou débordement ; curseur et lien « même instant virtuel » entre les deux flux (§5.3) | tables de cas, proptest (blocs contigus sans trou ni recouvrement, décalage constant, bornes des tampons, jamais de panique) |
 | `notify` | périodes de notification (M1a-07) : `Notifier::advance(frames)` dit si une frontière de `buffer_frames / count` a été franchie depuis le dernier signal, sur la position absolue | tables de cas, proptest (cohérence avec la formulation cyclique en octets) |
 | `config` | structures `#[repr(C)]` de la propriété privée de configuration (M1b-04) et leur validation (`validate(&[u8]) -> Result<CableConfig, ConfigError>`) | fuzz (M1b-08), Miri |
-| `params` | bornes des paramètres de registre (réserve, canaux, tampon) et repli par défaut (M1b-01) | tables de cas |
+| `params` | bornes des paramètres de registre (réserve, canaux, tampon, mode paquets) et repli par défaut (M1b-01) | tables de cas |
 
 Règles : `#![no_std]`, `#![forbid(unsafe_code)]`, lints `clippy::panic`,
 `clippy::unwrap_used`, `clippy::expect_used`, `clippy::indexing_slicing`,
@@ -775,7 +781,7 @@ GUID généré une fois et figé dans `conduit-kmd-core::config`) exposé par le
 topologie de chaque câble. Le helper ouvre l'interface `KSCATEGORY_TOPOLOGY` du câble
 et envoie `IOCTL_KS_PROPERTY` (`KSPROPERTY_CONDUIT_CABLE_STATE` get/set,
 `KSPROPERTY_CONDUIT_VERSION` get, `KSPROPERTY_CONDUIT_COUNTERS` get,
-`KSPROPERTY_CONDUIT_TRANSPORT` get). Avantages :
+`KSPROPERTY_CONDUIT_TRANSPORT` get, `KSPROPERTY_CONDUIT_PACKETS` get). Avantages :
 PortCls fait tout le routage, l'accès se fait par les handles standard, la validation
 est un simple parseur sur un tampon borné (fuzzable en mode utilisateur, M1b-08).
 
@@ -820,11 +826,43 @@ qui dérive le jour où l'on oublie un chemin, et un diagnostic qui ment coûte 
 qu'un diagnostic absent. Les deux compteurs de refus, eux, restent hors verrou : l'instantané
 est donc **non atomique** entre eux et le reste, et le relevé le dit.
 
+`KSPROPERTY_CONDUIT_PACKETS` (lot 2 du mode paquets WaveRT) rend une `CablePackets` de 168
+octets : deux `ULONG` d'en-tête — l'écho de câble et le **`PacketMode` effectif**, celui que
+le pilote a retenu au dernier `StartDevice` — puis un bloc de 80 octets **par sens**, avec
+l'exposition du flux courant (aucun flux / flux sans interface exposée /
+`IMiniportWaveRTInputStream` / `IMiniportWaveRTOutputStream`), l'IRQL du dernier appel et le
+maximum vu, un champ réservé, les appels **refusés** des quatre méthodes du mode paquets, les
+`QueryInterface` reçus sur les deux IID de paquets et ceux auxquels le pilote a répondu, et
+les horodatages QPC du premier et du dernier appel. Tout est cumulé depuis le dernier
+`StartDevice` sauf l'exposition, qui décrit le flux courant.
+
+Elle tranche la question que le lot 0 a laissée ouverte : le moteur audio scrute-t-il **par
+politique**, ou parce qu'il ne trouve pas les interfaces de paquets, que le pilote n'expose
+pas ? Le paramètre de registre `PacketMode` (§1, `conduit-kmd-core::params`) les expose sur
+une machine d'essai **sans les servir** — les quatre méthodes rendent `STATUS_NOT_SUPPORTED`
+et se contentent de compter — et cette propriété rend ce qui s'est passé ensuite. Elle est
+utile même à `PacketMode = 0` : les `QueryInterface` sont comptés que l'IID soit rendu ou non,
+si bien qu'un compteur de demandes non nul prouve que le moteur cherche le mode paquets sans
+qu'on ait rien promis. Pas de `SET` (le mode se règle par le registre **et** un redémarrage du
+périphérique ; accepter une écriture rendrait `STATUS_SUCCESS` pour un réglage sans effet) ni
+de contrôle de privilège, comme les compteurs et le transport : `conduit-looptest
+--cable-transport` sort les deux relevés ensemble.
+
+Un **sélecteur voisin** plutôt que des champs de plus dans `CableTransport`, et c'est le même
+arbitrage qu'entre le transport et les compteurs, appliqué une deuxième fois. Le transport
+décrit le **flux courant** et disparaît avec la broche ; ces compteurs-ci sont cumulés sur le
+**câble**, précisément pour survivre au flux qu'on cherche à comprendre — un moteur qui essuie
+un `STATUS_NOT_SUPPORTED` n'a aucune obligation de garder sa broche ouverte. Et les fondre
+ferait grandir une valeur dont la longueur est refusée dès qu'elle change, c'est-à-dire
+casserait tout client du transport pour une information qui ne le concerne pas. Les deux choix
+montent `CONFIG_VERSION` ; un seul des deux casse des clients.
+
 Toute apparition de propriété incrémente `CONFIG_VERSION` (2 → 3 en M1b-21, 3 → 4 avec le
-transport) : le GUID du jeu est gravé et la longueur des tampons est refusée dès qu'elle
-change, ce numéro est donc la seule voie de versionnement du jeu. Un changement additif y
-est indiscernable d'un changement de forme, d'où la règle sur les messages : un outil qui
-constate une inadéquation dit que les millésimes diffèrent, jamais **ce qui** diffère.
+transport, 4 → 5 avec le relevé de paquets) : le GUID du jeu est gravé et la longueur des
+tampons est refusée dès qu'elle change, ce numéro est donc la seule voie de versionnement du
+jeu. Un changement additif y est indiscernable d'un changement de forme, d'où la règle sur les
+messages : un outil qui constate une inadéquation dit que les millésimes diffèrent, jamais
+**ce qui** diffère.
 
 Contrôle d'accès : le gestionnaire de propriété s'exécute dans le contexte du thread
 appelant ; toute écriture exige `SeSinglePrivilegeCheck(SE_LOAD_DRIVER_PRIVILEGE)`

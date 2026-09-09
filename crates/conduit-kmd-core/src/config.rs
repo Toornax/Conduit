@@ -1,8 +1,8 @@
 //! Contrat du jeu de propriétés KS **privé** de configuration (M1b-04,
-//! `docs/driver-design.md` §6) : le GUID du jeu, les identifiants de propriété, les trois
-//! structures d'échange ([`CableState`], [`CableCounters`] depuis M1b-21 et
-//! [`CableTransport`] depuis le lot 0 du mode paquets), leurs parseurs, et le masque de bits
-//! qui persiste l'état des câbles.
+//! `docs/driver-design.md` §6) : le GUID du jeu, les identifiants de propriété, les quatre
+//! structures d'échange ([`CableState`], [`CableCounters`] depuis M1b-21, [`CableTransport`]
+//! depuis le lot 0 du mode paquets et [`CablePackets`] depuis le lot 2), leurs parseurs, et le
+//! masque de bits qui persiste l'état des câbles.
 //!
 //! Tout est ici et **rien n'appelle le noyau** : ce module est le contrat que le service
 //! d'assistance (M1b-20) et le pilote se partagent, celui que M1b-08 fuzzera en mode
@@ -17,7 +17,8 @@
 //! (`…(A;;GRGWGX;;;WD)`, « Tout le monde ») le laisse ouvrir nos filtres KS, comme tout
 //! adaptateur audio. Le contenu et la **longueur** du tampon sont donc hostiles. D'où la
 //! règle qui gouverne [`CableState::from_bytes`] — et, à l'identique,
-//! [`CableCounters::from_bytes`] et [`CableTransport::from_bytes`] :
+//! [`CableCounters::from_bytes`], [`CableTransport::from_bytes`] et
+//! [`CablePackets::from_bytes`] :
 //!
 //! **toute longueur inattendue est refusée, y compris un préfixe valide suivi d'octets en
 //! trop.** Accepter un préfixe est le défaut classique de ce genre de parseur : il rend le
@@ -72,7 +73,7 @@
 use core::fmt;
 
 use crate::format::{sample_rate_index, RATE_44100, RATE_48000, RATE_96000};
-use crate::params::{DEFAULT_CHANNELS, MAX_CHANNELS, MAX_RESERVE, MIN_CHANNELS};
+use crate::params::{DEFAULT_CHANNELS, MAX_CHANNELS, MAX_PACKET_MODE, MAX_RESERVE, MIN_CHANNELS};
 use crate::ring::SampleFormat;
 
 // ---------------------------------------------------------------------------------
@@ -205,6 +206,50 @@ pub const KSPROPERTY_CONDUIT_COUNTERS: u32 = 2;
 /// pas là où il sert.
 pub const KSPROPERTY_CONDUIT_TRANSPORT: u32 = 3;
 
+/// `KSPROPERTY_CONDUIT_PACKETS` : ce que le moteur audio a fait des interfaces du **mode
+/// paquets** (`GET` seulement, lot 2).
+///
+/// La valeur échangée est une [`CablePackets`]. Comme pour les trois propriétés précédentes,
+/// le câble n'est pas désigné par un paramètre de la requête mais par le filtre auquel elle
+/// s'adresse ; [`CablePackets::cable`] n'est qu'un **écho**, et il n'y a rien à comparer
+/// puisqu'il n'y a pas de `SET`.
+///
+/// # La question que ce sélecteur rend mesurable
+///
+/// Le lot 0 a montré, sans débogueur, que le moteur audio alloue **par scrutation** en mode
+/// partagé (`AllocateAudioBuffer`, aucun événement) et **avec notifications** pour un client
+/// WASAPI exclusif événementiel. Reste la question qu'aucun relevé ne tranchait : le moteur
+/// scrute-t-il **par politique**, ou parce qu'il ne trouve pas les interfaces de paquets, que
+/// le pilote n'expose pas ? Le paramètre de registre `PacketMode`
+/// ([`crate::params::DEFAULT_PACKET_MODE`]) permet de les **exposer** sur une machine
+/// d'essai — sans les servir —, et cette propriété rend ce qui s'est passé ensuite : les
+/// `QueryInterface` reçus sur les deux IID, ceux auxquels on a répondu, et les appels de
+/// méthode, par sens et par méthode, avec leur IRQL et leur horodatage.
+///
+/// # Un sélecteur voisin, et non des champs de plus dans [`CableTransport`]
+///
+/// Le même raisonnement que celui qui a séparé le transport des compteurs, appliqué une
+/// deuxième fois. [`CableTransport`] décrit le **flux courant** et disparaît avec la broche ;
+/// ce que cette propriété porte est **cumulé depuis le dernier `StartDevice`** et vit sur le
+/// câble, précisément pour survivre au flux qu'on cherche à comprendre — un moteur qui essuie
+/// un `STATUS_NOT_SUPPORTED` n'a aucune obligation de garder sa broche ouverte. Les fondre
+/// ferait en outre grandir une valeur **dont la longueur est refusée dès qu'elle change**,
+/// c'est-à-dire casserait tout client du transport pour une information qui ne le concerne
+/// pas. La justification complète est sur [`CONFIG_VERSION`].
+///
+/// # Ce que la propriété rend vrai même à `PacketMode = 0`
+///
+/// Les `QueryInterface` sont comptés **que l'IID soit exposé ou non** : à 0, un
+/// `queries` non nul dit que le moteur a demandé le mode paquets et s'est fait refuser
+/// comme n'importe quel IID inconnu. C'est déjà une mesure, et elle ne coûte aucune
+/// exposition.
+///
+/// # Pas de `SET`, et pas de contrôle de privilège
+///
+/// Même raison que pour [`KSPROPERTY_CONDUIT_COUNTERS`] et
+/// [`KSPROPERTY_CONDUIT_TRANSPORT`] : une observation n'est pas un réglage.
+pub const KSPROPERTY_CONDUIT_PACKETS: u32 = 4;
+
 /// Le `pid` de la **marque de câble** dans le magasin de propriétés d'un endpoint
 /// MMDevices : la valeur `{3f1b27a4-8c6e-4d02-9b75-e4a0d61c8f3b},1`.
 ///
@@ -290,7 +335,27 @@ pub const PID_MARQUE_CABLE: u32 = 1;
 /// exactement les mêmes états et les mêmes compteurs. La règle sur les messages ne change
 /// donc pas — un outil qui constate une inadéquation dit que les millésimes diffèrent,
 /// jamais **ce qui** diffère.
-pub const CONFIG_VERSION: u32 = 4;
+///
+/// # Pourquoi 5 : la même règle, appliquée une troisième fois
+///
+/// [`KSPROPERTY_CONDUIT_PACKETS`] apparaît (lot 2 du mode paquets WaveRT), sans toucher à un
+/// octet de [`CableState`], de [`CableCounters`] ni de [`CableTransport`], ni à leur
+/// sémantique. Le numéro monte quand même, pour la raison des deux paragraphes précédents,
+/// mot pour mot : le GUID du jeu est gravé et la longueur des tampons est refusée dès qu'elle
+/// change, donc ce numéro est la **seule** voie de versionnement qui reste.
+///
+/// C'est aussi ce qui justifie d'avoir ajouté un **sélecteur** plutôt que des champs à
+/// [`StreamTransport`]. Les deux choix montent ce numéro — un champ de plus est un changement
+/// observable autant qu'une propriété de plus — mais l'un des deux casse en outre tous les
+/// clients de [`KSPROPERTY_CONDUIT_TRANSPORT`], dont la longueur est refusée dès qu'elle
+/// bouge, pour une information qui ne les concerne pas. Le raisonnement est celui déjà écrit
+/// sur [`KSPROPERTY_CONDUIT_TRANSPORT`], « un sélecteur voisin, et non des champs de plus » ;
+/// il se répète ici parce que les natures se répètent : le transport décrit **le flux
+/// courant** et disparaît avec la broche, les compteurs de paquets sont **cumulés depuis le
+/// dernier `StartDevice`** et survivent au flux qu'on cherche à comprendre.
+///
+/// Le passage de 4 à 5 est **additif**, comme les deux précédents.
+pub const CONFIG_VERSION: u32 = 5;
 
 /// Nombre de câbles que le contrat sait adresser : le plafond de la réserve
 /// ([`crate::params::MAX_RESERVE`], SPEC F-06).
@@ -1723,6 +1788,711 @@ impl CableTransport {
 }
 
 // ---------------------------------------------------------------------------------
+// Le mode paquets : ce que le moteur audio en a fait (lot 2).
+// ---------------------------------------------------------------------------------
+
+/// Les interfaces du mode paquets exposées sur le flux **courant** d'un sens.
+///
+/// C'est l'image, dans le contrat, de `portcls::PacketInterfaces` : le pilote construit tous
+/// ses flux avec `None` sauf quand le paramètre de registre `PacketMode` vaut 1, auquel cas il
+/// expose celle du sens du flux — [`Self::Input`] pour la **capture** (le moteur lit) et
+/// [`Self::Output`] pour le **rendu** (le moteur écrit).
+///
+/// # Quatre cas, dont deux qu'un relevé confondrait sans eux
+///
+/// - [`Self::NoStream`] : personne n'a ouvert ce sens. Un relevé fait au mauvais moment
+///   ressemble à cela et ne prouve **rien** ;
+/// - [`Self::NotExposed`] : un flux est ouvert et n'expose **aucune** interface de paquets.
+///   C'est le pilote livré, et la seule façon de le distinguer du cas précédent ;
+/// - [`Self::Input`] / [`Self::Output`] : les interfaces sont exposées sur le flux courant —
+///   c'est-à-dire que le `QueryInterface` du flux **peut** rendre une tête satellite. Elles ne
+///   sont pour autant **pas servies** : les quatre méthodes refusent (voir
+///   [`crate::params::DEFAULT_PACKET_MODE`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PacketExposure {
+    /// Aucun flux ouvert dans ce sens.
+    #[default]
+    NoStream,
+    /// Flux ouvert, aucune interface de paquets exposée (`PacketInterfaces::None`).
+    NotExposed,
+    /// Flux de **capture** : `IMiniportWaveRTInputStream` exposée, non servie.
+    Input,
+    /// Flux de **rendu** : `IMiniportWaveRTOutputStream` exposée, non servie.
+    Output,
+}
+
+/// Le plus grand code de [`PacketExposure`] : tout ce qui dépasse est refusé par
+/// [`CablePackets::from_bytes`].
+pub const PACKET_EXPOSURE_MAX: u32 = 3;
+
+impl PacketExposure {
+    /// Le code qui voyage dans [`StreamPackets::exposure`].
+    #[must_use]
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::NoStream => 0,
+            Self::NotExposed => 1,
+            Self::Input => 2,
+            Self::Output => 3,
+        }
+    }
+
+    /// L'exposition d'un code reçu, `None` au-delà de [`PACKET_EXPOSURE_MAX`].
+    #[must_use]
+    pub const fn from_code(code: u32) -> Option<Self> {
+        match code {
+            0 => Some(Self::NoStream),
+            1 => Some(Self::NotExposed),
+            2 => Some(Self::Input),
+            3 => Some(Self::Output),
+            _ => None,
+        }
+    }
+
+    /// L'exposition **en toutes lettres**, pour un relevé lisible d'un coup d'œil.
+    ///
+    /// Le nom de l'interface PortCls y figure : c'est lui qu'on cherche dans `portcls.h` et
+    /// dans une trace.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NoStream => "aucun flux ouvert",
+            Self::NotExposed => "flux ouvert, aucune interface exposée",
+            Self::Input => "IMiniportWaveRTInputStream exposée (non servie)",
+            Self::Output => "IMiniportWaveRTOutputStream exposée (non servie)",
+        }
+    }
+
+    /// Une interface de paquets est-elle exposée sur le flux courant ?
+    #[must_use]
+    pub const fn exposee(self) -> bool {
+        matches!(self, Self::Input | Self::Output)
+    }
+}
+
+/// Plus grande valeur acceptée pour un IRQL : 255, le plafond du `KIRQL` de `wdm.h`, qui est
+/// un `UCHAR`.
+///
+/// Ce n'est pas un jugement sur les IRQL plausibles — `PASSIVE_LEVEL` est le seul attendu, et
+/// en voir un autre serait précisément la découverte du lot — mais sur la **largeur du
+/// champ** : au-delà de 255, le pilote et le client ne parlent pas de la même chose.
+pub const PACKET_IRQL_MAX: u32 = 255;
+
+/// `StreamPackets::exposure` (`ULONG`) : décalage 0 dans le bloc d'un sens.
+pub const OSP_EXPOSURE: usize = 0;
+/// `StreamPackets::irql_last` (`ULONG`) : décalage 4.
+pub const OSP_IRQL_LAST: usize = 4;
+/// `StreamPackets::irql_max` (`ULONG`) : décalage 8.
+pub const OSP_IRQL_MAX: usize = 8;
+/// `StreamPackets::reserved` (`ULONG`) : décalage 12.
+pub const OSP_RESERVED: usize = 12;
+/// `StreamPackets::set_write_packet` (`ULONGLONG`) : décalage 16.
+pub const OSP_SET_WRITE_PACKET: usize = 16;
+/// `StreamPackets::get_read_packet` (`ULONGLONG`) : décalage 24.
+pub const OSP_GET_READ_PACKET: usize = 24;
+/// `StreamPackets::packet_count` (`ULONGLONG`) : décalage 32.
+pub const OSP_PACKET_COUNT: usize = 32;
+/// `StreamPackets::presentation_position` (`ULONGLONG`) : décalage 40.
+pub const OSP_PRESENTATION_POSITION: usize = 40;
+/// `StreamPackets::queries` (`ULONGLONG`) : décalage 48.
+pub const OSP_QUERIES: usize = 48;
+/// `StreamPackets::queries_granted` (`ULONGLONG`) : décalage 56.
+pub const OSP_QUERIES_GRANTED: usize = 56;
+/// `StreamPackets::first_qpc` (`ULONGLONG`) : décalage 64.
+pub const OSP_FIRST_QPC: usize = 64;
+/// `StreamPackets::last_qpc` (`ULONGLONG`) : décalage 72.
+pub const OSP_LAST_QPC: usize = 72;
+
+/// Taille du bloc de paquets d'un sens, en octets : **80**.
+pub const STREAM_PACKETS_BYTES: usize = 80;
+
+/// Ce que le mode paquets a produit dans **un sens** d'un câble, depuis le dernier
+/// `StartDevice`.
+///
+/// # Quatre `ULONG` puis huit `ULONGLONG`, et pourquoi dans cet ordre
+///
+/// `#[repr(C)]`, alignement 8, **rembourrage explicite** : les quatre `ULONG` pavent les seize
+/// premiers octets, si bien que le premier `ULONGLONG` tombe sur un multiple de huit sans que
+/// le compilateur ait à insérer un trou. Même règle que sur [`CableCounters`] et
+/// [`StreamTransport`] : un rembourrage implicite serait de la mémoire noyau non initialisée
+/// recopiée vers l'espace utilisateur au `GET`.
+///
+/// # Cumulé sur le câble, pas sur le flux
+///
+/// Tous les compteurs de ce bloc sauf [`Self::exposure`] vivent sur le **câble**, comme
+/// [`StreamTransport::refused_allocations`] et pour la même raison : un moteur audio qui
+/// essuie un `STATUS_NOT_SUPPORTED` n'a aucune obligation de garder sa broche ouverte, et un
+/// compteur qui mourrait avec le flux serait vide au moment où on le relève. Ils sont remis à
+/// zéro à chaque `StartDevice`, avec les compteurs de la boucle locale.
+/// [`Self::exposure`], elle, décrit le flux **courant** et disparaît avec lui.
+///
+/// # Ce que chaque compteur démontre
+///
+/// - [`Self::queries`] monte, [`Self::queries_granted`] à zéro : le moteur **demande** le mode
+///   paquets et nous le lui refusons — c'est le relevé attendu à `PacketMode = 0`, et il
+///   répond déjà à la question du lot ;
+/// - `queries` à zéro : le moteur ne demande **jamais** les interfaces sur ce flux. La
+///   scrutation est alors une politique, pas une conséquence de notre silence ;
+/// - `queries_granted` monte et les quatre compteurs d'appels restent à zéro : le moteur a
+///   obtenu les interfaces et **ne les emprunte pas** ;
+/// - un compteur d'appels non nul : le moteur emprunte une méthode que nous refusons. C'est le
+///   cas qui justifie que ce paramètre ne soit jamais livré à 1.
+///
+/// [`Self::irql_max`] et les deux horodatages disent **dans quelles conditions** : le contrat
+/// annonce `PASSIVE_LEVEL` (`portcls.h`, `_IRQL_requires_max_(PASSIVE_LEVEL)`), et un IRQL
+/// maximal non nul serait une découverte à part entière.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(C)]
+pub struct StreamPackets {
+    /// Code de [`PacketExposure`] : ce que le flux **courant** de ce sens expose.
+    pub exposure: u32,
+    /// IRQL du **dernier** appel de méthode de paquets, 0 si aucun.
+    ///
+    /// `KeGetCurrentIrql`, relevé dans la méthode elle-même. Zéro veut donc dire deux choses
+    /// — `PASSIVE_LEVEL`, ou aucun appel — que les compteurs d'appels séparent.
+    pub irql_last: u32,
+    /// IRQL **maximal** vu sur ce sens, 0 si aucun appel.
+    ///
+    /// Ce que le contrat promet est `PASSIVE_LEVEL`, donc 0 ; c'est la valeur qui dirait, si
+    /// elle bougeait, que le code des quatre méthodes ne peut rien faire de paginé — ce qu'il
+    /// ne fait déjà pas.
+    pub irql_max: u32,
+    /// Rembourrage **explicite**, toujours nul.
+    ///
+    /// Deux rôles, comme [`CableCounters::reserved`] : garder la place d'un futur champ
+    /// 32 bits, et amener le premier `ULONGLONG` sur un multiple de huit sans trou implicite.
+    /// [`CablePackets::from_bytes`] le refuse non nul — c'est ce refus qui garde la place
+    /// réellement libre.
+    pub reserved: u32,
+    /// Appels de `IMiniportWaveRTOutputStream::SetWritePacket` reçus dans ce sens.
+    pub set_write_packet: u64,
+    /// Appels de `IMiniportWaveRTInputStream::GetReadPacket` reçus dans ce sens.
+    pub get_read_packet: u64,
+    /// Appels de `IMiniportWaveRTOutputStream::GetPacketCount` reçus dans ce sens.
+    pub packet_count: u64,
+    /// Appels de `IMiniportWaveRTOutputStream::GetOutputStreamPresentationPosition` reçus dans
+    /// ce sens.
+    pub presentation_position: u64,
+    /// `QueryInterface` reçus sur **l'un des deux IID de paquets** par le flux de ce sens,
+    /// que l'IID soit exposé ou non.
+    ///
+    /// Les deux IID confondus : ce qui se mesure est que le moteur ait demandé le mode paquets
+    /// à ce flux-là, et un flux ne se voit demander que l'IID de son sens dans les faits.
+    pub queries: u64,
+    /// Ceux de [`Self::queries`] auxquels le pilote a **répondu** en rendant une tête
+    /// satellite.
+    ///
+    /// Toujours zéro à `PacketMode = 0` : c'est l'écart entre les deux compteurs qui
+    /// distingue « le moteur ne demande pas » de « nous refusons ».
+    pub queries_granted: u64,
+    /// Compteur de performance (`KeQueryPerformanceCounter`) du **premier** appel de méthode
+    /// de paquets sur ce sens, 0 si aucun.
+    pub first_qpc: u64,
+    /// Compteur de performance du **dernier** appel de méthode de paquets, 0 si aucun.
+    ///
+    /// Avec [`Self::first_qpc`], il donne la durée pendant laquelle le moteur a insisté :
+    /// deux appels à une seconde d'intervalle et deux appels collés ne racontent pas la même
+    /// histoire, et le nombre d'appels seul ne les distingue pas.
+    pub last_qpc: u64,
+}
+
+/// `CablePackets::cable` (`ULONG`) : décalage 0.
+pub const OCP_CABLE: usize = 0;
+/// `CablePackets::packet_mode` (`ULONG`) : décalage 4.
+pub const OCP_MODE: usize = 4;
+/// `CablePackets::render` ([`StreamPackets`]) : décalage 8.
+pub const OCP_RENDER: usize = 8;
+/// `CablePackets::capture` ([`StreamPackets`]) : décalage 88.
+pub const OCP_CAPTURE: usize = 88;
+
+/// Taille de la valeur de [`KSPROPERTY_CONDUIT_PACKETS`], en octets : **168**.
+///
+/// Fixe et vérifiée par assertion `const` contre `size_of::<CablePackets>()`, comme les trois
+/// autres structures d'échange.
+pub const CABLE_PACKETS_BYTES: usize = 168;
+
+/// Ce que le mode paquets a produit sur les **deux** sens d'un câble, tel qu'il traverse
+/// `IOCTL_KS_PROPERTY`.
+///
+/// # Les deux sens dans une seule valeur
+///
+/// Comme [`CableTransport`], et pour les mêmes raisons : la question porte sur le câble, et un
+/// relevé des seize câbles ferait sinon trente-deux ouvertures de filtre au lieu de seize.
+///
+/// # Un en-tête sans champ réservé, et pourquoi
+///
+/// [`Self::cable`] et [`Self::packet_mode`] pavent à eux deux les huit premiers octets : le
+/// premier bloc de sens tombe sur un multiple de huit sans trou implicite, ce que le champ
+/// `reserved` assurait ailleurs. Le rembourrage explicite existe toujours, mais il est **dans
+/// chaque bloc de sens** ([`StreamPackets::reserved`]), où il est refusé non nul de la même
+/// façon : la place d'un futur champ y est aussi bien gardée, et deux fois plutôt qu'une.
+///
+/// # Un instantané, pas une transaction
+///
+/// Les compteurs sont lus **hors de tout verrou** (ce sont des atomiques indépendants) et les
+/// deux expositions sous le verrou de leur flux : l'instantané peut donc mélanger deux
+/// instants. C'est le même choix que pour [`CableCounters`] et [`CableTransport`], pour la
+/// même raison — la mesure ne doit pas sérialiser ce qu'elle mesure — et il est sans effet sur
+/// ce qu'on cherche : on regarde quels compteurs **bougent**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(C)]
+pub struct CablePackets {
+    /// Numéro du câble, de 0 à [`CABLE_MAX`] − 1. Un **écho**, comme
+    /// [`CableTransport::cable`].
+    pub cable: u32,
+    /// Le paramètre `PacketMode` **effectif** : la valeur que le pilote a retenue au dernier
+    /// `StartDevice`, 0 ou 1.
+    ///
+    /// Effectif et non « ce que le registre contient » : une valeur hors bornes est écrêtée et
+    /// une valeur absente donne le défaut ([`crate::params::sanitize`]). Le relire ici évite
+    /// de conclure d'après `regedit` sur un pilote qui n'a pas redémarré depuis la
+    /// modification — le paramètre est lu au `StartDevice`, pas à chaque flux.
+    pub packet_mode: u32,
+    /// Le sens rendu, où le moteur audio **écrit** (`IMiniportWaveRTOutputStream`).
+    pub render: StreamPackets,
+    /// Le sens capture, où le moteur audio **lit** (`IMiniportWaveRTInputStream`).
+    pub capture: StreamPackets,
+}
+
+// La taille annoncée est celle des structures, et chaque décalage nommé est celui que
+// `repr(C)` produit — même couple d'assertions que pour les trois autres structures, en
+// remplacement d'un golden : c'est notre structure, pas une structure du WDK.
+const _: () = assert!(size_of::<StreamPackets>() == STREAM_PACKETS_BYTES);
+const _: () = assert!(align_of::<StreamPackets>() == 8);
+const _: () = assert!(core::mem::offset_of!(StreamPackets, exposure) == OSP_EXPOSURE);
+const _: () = assert!(core::mem::offset_of!(StreamPackets, irql_last) == OSP_IRQL_LAST);
+const _: () = assert!(core::mem::offset_of!(StreamPackets, irql_max) == OSP_IRQL_MAX);
+const _: () = assert!(core::mem::offset_of!(StreamPackets, reserved) == OSP_RESERVED);
+const _: () =
+    assert!(core::mem::offset_of!(StreamPackets, set_write_packet) == OSP_SET_WRITE_PACKET);
+const _: () = assert!(core::mem::offset_of!(StreamPackets, get_read_packet) == OSP_GET_READ_PACKET);
+const _: () = assert!(core::mem::offset_of!(StreamPackets, packet_count) == OSP_PACKET_COUNT);
+const _: () = assert!(
+    core::mem::offset_of!(StreamPackets, presentation_position) == OSP_PRESENTATION_POSITION
+);
+const _: () = assert!(core::mem::offset_of!(StreamPackets, queries) == OSP_QUERIES);
+const _: () = assert!(core::mem::offset_of!(StreamPackets, queries_granted) == OSP_QUERIES_GRANTED);
+const _: () = assert!(core::mem::offset_of!(StreamPackets, first_qpc) == OSP_FIRST_QPC);
+const _: () = assert!(core::mem::offset_of!(StreamPackets, last_qpc) == OSP_LAST_QPC);
+// Quatre `ULONG` contigus, puis huit `ULONGLONG` alignés sur huit : aucun trou, donc aucun
+// octet de rembourrage implicite à recopier vers l'espace utilisateur.
+const _: () = assert!(OSP_RESERVED.saturating_add(TAILLE_MOT) == OSP_SET_WRITE_PACKET);
+const _: () = assert!(OSP_SET_WRITE_PACKET == TAILLE_MOT_LONG.saturating_mul(2));
+const _: () = assert!(OSP_LAST_QPC.saturating_add(TAILLE_MOT_LONG) == STREAM_PACKETS_BYTES);
+
+const _: () = assert!(size_of::<CablePackets>() == CABLE_PACKETS_BYTES);
+const _: () = assert!(align_of::<CablePackets>() == 8);
+const _: () = assert!(core::mem::offset_of!(CablePackets, cable) == OCP_CABLE);
+const _: () = assert!(core::mem::offset_of!(CablePackets, packet_mode) == OCP_MODE);
+const _: () = assert!(core::mem::offset_of!(CablePackets, render) == OCP_RENDER);
+const _: () = assert!(core::mem::offset_of!(CablePackets, capture) == OCP_CAPTURE);
+// Les deux `ULONG` de tête pavent les huit premiers octets, puis les deux blocs de sens se
+// suivent sans trou : les deux sont alignés sur huit et la structure s'arrête net.
+const _: () = assert!(OCP_MODE.saturating_add(TAILLE_MOT) == OCP_RENDER);
+const _: () = assert!(OCP_RENDER.saturating_add(STREAM_PACKETS_BYTES) == OCP_CAPTURE);
+const _: () = assert!(OCP_CAPTURE.saturating_add(STREAM_PACKETS_BYTES) == CABLE_PACKETS_BYTES);
+const _: () = assert!(OCP_RENDER == TAILLE_MOT_LONG);
+// Les quatre longueurs d'échange sont distinctes : un client qui allouerait la mauvaise se
+// fait refuser au lieu de lire une structure pour une autre.
+const _: () = assert!(CABLE_PACKETS_BYTES != CABLE_STATE_BYTES);
+const _: () = assert!(CABLE_PACKETS_BYTES != CABLE_COUNTERS_BYTES);
+const _: () = assert!(CABLE_PACKETS_BYTES != CABLE_TRANSPORT_BYTES);
+
+/// Ce qui a fait refuser une [`CablePackets`] : un cas, une cause, une ligne de journal.
+///
+/// Distinct des trois autres pour la même raison qu'elles le sont entre elles : les longueurs
+/// attendues diffèrent, et un message qui annoncerait « 72 attendus » pour une structure de
+/// 168 octets serait un diagnostic faux.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PacketsError {
+    /// Longueur du tampon différente de [`CABLE_PACKETS_BYTES`] — plus courte **ou** plus
+    /// longue, préfixe valide compris (voir la règle en tête de module).
+    Longueur {
+        /// Octets reçus.
+        recus: usize,
+    },
+    /// [`CablePackets::cable`] au-delà du dernier câble.
+    Cable(u32),
+    /// [`CablePackets::packet_mode`] hors de `{0, 1}`.
+    Mode(u32),
+    /// [`StreamPackets::exposure`] au-delà de [`PACKET_EXPOSURE_MAX`], dans le sens nommé.
+    Exposure {
+        /// Le sens dont le bloc porte le code fautif.
+        sens: StreamSide,
+        /// Le code reçu.
+        code: u32,
+    },
+    /// Un IRQL au-delà de [`PACKET_IRQL_MAX`], dans le sens nommé.
+    Irql {
+        /// Le sens dont le bloc porte la valeur fautive.
+        sens: StreamSide,
+        /// La valeur reçue.
+        valeur: u32,
+    },
+    /// [`StreamPackets::reserved`] non nul, dans le sens nommé.
+    Reserved {
+        /// Le sens dont le bloc porte le champ non nul.
+        sens: StreamSide,
+        /// La valeur reçue.
+        valeur: u32,
+    },
+}
+
+impl fmt::Display for PacketsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Longueur { recus } => write!(
+                f,
+                "valeur de {recus} octets, {CABLE_PACKETS_BYTES} attendus exactement"
+            ),
+            Self::Cable(cable) => write!(f, "câble {cable} inconnu (0 à {} )", {
+                CABLE_MAX.saturating_sub(1)
+            }),
+            Self::Mode(brut) => write!(f, "mode paquets {brut} hors de 0 et 1"),
+            Self::Exposure { sens, code } => write!(
+                f,
+                "exposition {code} inconnue côté {} (0 à {PACKET_EXPOSURE_MAX})",
+                sens.label()
+            ),
+            Self::Irql { sens, valeur } => write!(
+                f,
+                "IRQL {valeur} côté {} au-delà de {PACKET_IRQL_MAX} (KIRQL est un UCHAR)",
+                sens.label()
+            ),
+            Self::Reserved { sens, valeur } => write!(
+                f,
+                "champ réservé non nul côté {} ({valeur:#010x})",
+                sens.label()
+            ),
+        }
+    }
+}
+
+/// Écrit un `ULONG` au décalage `offset` d'un tampon d'alignement quelconque, ou ne fait
+/// rien si la place n'y est pas.
+///
+/// Le pendant en écriture de [`mot`], et la raison d'être des deux est la même : les octets
+/// sont **recopiés**, jamais transtypés. Une fonction plutôt qu'un littéral de cent
+/// soixante-huit octets — [`CableState::to_bytes`] et ses voisines énumèrent chaque octet
+/// pour rester `const fn`, ce qui ne se transpose pas à une structure de cette taille sans
+/// devenir illisible, et ne rapporterait rien : aucun appelant n'en a besoin dans un
+/// contexte constant.
+fn poser_mot(dest: &mut [u8], offset: usize, valeur: u32) {
+    if let Some(place) = offset
+        .checked_add(TAILLE_MOT)
+        .and_then(|fin| dest.get_mut(offset..fin))
+    {
+        place.copy_from_slice(&valeur.to_ne_bytes());
+    }
+}
+
+/// Écrit un `ULONGLONG` au décalage `offset` (voir [`poser_mot`]).
+fn poser_mot_long(dest: &mut [u8], offset: usize, valeur: u64) {
+    if let Some(place) = offset
+        .checked_add(TAILLE_MOT_LONG)
+        .and_then(|fin| dest.get_mut(offset..fin))
+    {
+        place.copy_from_slice(&valeur.to_ne_bytes());
+    }
+}
+
+impl StreamPackets {
+    /// Le bloc d'un sens où rien ne s'est passé : tout à zéro, donc
+    /// [`PacketExposure::NoStream`] et aucun appel.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            exposure: 0,
+            irql_last: 0,
+            irql_max: 0,
+            reserved: 0,
+            set_write_packet: 0,
+            get_read_packet: 0,
+            packet_count: 0,
+            presentation_position: 0,
+            queries: 0,
+            queries_granted: 0,
+            first_qpc: 0,
+            last_qpc: 0,
+        }
+    }
+
+    /// L'exposition du flux courant, ou `None` si le code n'en désigne aucune.
+    ///
+    /// Jamais `None` sur une valeur venue de [`CablePackets::from_bytes`], qui refuse tout
+    /// code hors domaine ; l'`Option` couvre la structure bâtie à la main.
+    #[must_use]
+    pub const fn exposure(&self) -> Option<PacketExposure> {
+        PacketExposure::from_code(self.exposure)
+    }
+
+    /// L'exposition **en toutes lettres**, avec un repli nommé pour un code que ce contrat ne
+    /// connaît pas — un pilote plus récent que l'outil doit s'y lire, pas disparaître.
+    #[must_use]
+    pub const fn exposure_label(&self) -> &'static str {
+        match self.exposure() {
+            Some(exposition) => exposition.label(),
+            None => "exposition inconnue de cet outil",
+        }
+    }
+
+    /// Une interface de paquets est-elle exposée sur le flux courant de ce sens ?
+    #[must_use]
+    pub const fn exposee(&self) -> bool {
+        matches!(self.exposure(), Some(exposition) if exposition.exposee())
+    }
+
+    /// Les appels des **quatre** méthodes, cumulés.
+    ///
+    /// `saturating_add` : un total qui reculerait serait le pire des relevés (même règle que
+    /// [`CableTransport::refused_total`]).
+    #[must_use]
+    pub const fn appels(&self) -> u64 {
+        self.set_write_packet
+            .saturating_add(self.get_read_packet)
+            .saturating_add(self.packet_count)
+            .saturating_add(self.presentation_position)
+    }
+
+    /// Le moteur audio a-t-il **emprunté** le mode paquets sur ce sens ?
+    ///
+    /// Vrai dès qu'une des quatre méthodes a été appelée — c'est-à-dire dès qu'un
+    /// `STATUS_NOT_SUPPORTED` a été rendu sur un chemin que le moteur croyait servi.
+    #[must_use]
+    pub const fn emprunte(&self) -> bool {
+        self.appels() > 0
+    }
+
+    /// Lit le bloc d'un sens au décalage `base` d'un tampon d'alignement quelconque.
+    ///
+    /// Ne valide **rien** : les domaines sont jugés par [`CablePackets::from_bytes`], qui seul
+    /// sait de quel sens il s'agit et peut donc le nommer dans son refus.
+    fn lire(data: &[u8], base: usize) -> Option<Self> {
+        Some(Self {
+            exposure: mot(data, base.checked_add(OSP_EXPOSURE)?)?,
+            irql_last: mot(data, base.checked_add(OSP_IRQL_LAST)?)?,
+            irql_max: mot(data, base.checked_add(OSP_IRQL_MAX)?)?,
+            reserved: mot(data, base.checked_add(OSP_RESERVED)?)?,
+            set_write_packet: mot_long(data, base.checked_add(OSP_SET_WRITE_PACKET)?)?,
+            get_read_packet: mot_long(data, base.checked_add(OSP_GET_READ_PACKET)?)?,
+            packet_count: mot_long(data, base.checked_add(OSP_PACKET_COUNT)?)?,
+            presentation_position: mot_long(data, base.checked_add(OSP_PRESENTATION_POSITION)?)?,
+            queries: mot_long(data, base.checked_add(OSP_QUERIES)?)?,
+            queries_granted: mot_long(data, base.checked_add(OSP_QUERIES_GRANTED)?)?,
+            first_qpc: mot_long(data, base.checked_add(OSP_FIRST_QPC)?)?,
+            last_qpc: mot_long(data, base.checked_add(OSP_LAST_QPC)?)?,
+        })
+    }
+
+    /// Écrit le bloc au décalage **absolu** `base` de `dest`.
+    fn ecrire(&self, dest: &mut [u8], base: usize) {
+        let champs: [(usize, u32); 4] = [
+            (OSP_EXPOSURE, self.exposure),
+            (OSP_IRQL_LAST, self.irql_last),
+            (OSP_IRQL_MAX, self.irql_max),
+            (OSP_RESERVED, self.reserved),
+        ];
+        for (offset, valeur) in champs {
+            if let Some(absolu) = base.checked_add(offset) {
+                poser_mot(dest, absolu, valeur);
+            }
+        }
+        let longs: [(usize, u64); 8] = [
+            (OSP_SET_WRITE_PACKET, self.set_write_packet),
+            (OSP_GET_READ_PACKET, self.get_read_packet),
+            (OSP_PACKET_COUNT, self.packet_count),
+            (OSP_PRESENTATION_POSITION, self.presentation_position),
+            (OSP_QUERIES, self.queries),
+            (OSP_QUERIES_GRANTED, self.queries_granted),
+            (OSP_FIRST_QPC, self.first_qpc),
+            (OSP_LAST_QPC, self.last_qpc),
+        ];
+        for (offset, valeur) in longs {
+            if let Some(absolu) = base.checked_add(offset) {
+                poser_mot_long(dest, absolu, valeur);
+            }
+        }
+    }
+
+    /// Le premier champ hors domaine de ce bloc, s'il y en a un.
+    fn refus(&self, sens: StreamSide) -> Option<PacketsError> {
+        if self.exposure > PACKET_EXPOSURE_MAX {
+            return Some(PacketsError::Exposure {
+                sens,
+                code: self.exposure,
+            });
+        }
+        if self.irql_last > PACKET_IRQL_MAX {
+            return Some(PacketsError::Irql {
+                sens,
+                valeur: self.irql_last,
+            });
+        }
+        if self.irql_max > PACKET_IRQL_MAX {
+            return Some(PacketsError::Irql {
+                sens,
+                valeur: self.irql_max,
+            });
+        }
+        if self.reserved != 0 {
+            return Some(PacketsError::Reserved {
+                sens,
+                valeur: self.reserved,
+            });
+        }
+        None
+    }
+}
+
+impl CablePackets {
+    /// Un câble où le mode paquets n'a rien produit : tout à zéro, sauf le numéro.
+    #[must_use]
+    pub const fn new(cable: u32) -> Self {
+        Self {
+            cable,
+            packet_mode: 0,
+            render: StreamPackets::new(),
+            capture: StreamPackets::new(),
+        }
+    }
+
+    /// Le bloc du sens `sens`.
+    #[must_use]
+    pub const fn side(&self, sens: StreamSide) -> &StreamPackets {
+        match sens {
+            StreamSide::Render => &self.render,
+            StreamSide::Capture => &self.capture,
+        }
+    }
+
+    /// Le paramètre `PacketMode` effectif est-il à 1 ?
+    ///
+    /// **Ne doit jamais l'être sur un poste livré** : voir
+    /// [`crate::params::DEFAULT_PACKET_MODE`].
+    #[must_use]
+    pub const fn mode_actif(&self) -> bool {
+        self.packet_mode != 0
+    }
+
+    /// Une interface de paquets est-elle exposée sur au moins un des deux flux courants ?
+    #[must_use]
+    pub const fn exposition_courante(&self) -> bool {
+        self.render.exposee() || self.capture.exposee()
+    }
+
+    /// Les `QueryInterface` de paquets reçus des deux côtés, cumulés.
+    #[must_use]
+    pub const fn queries_total(&self) -> u64 {
+        self.render.queries.saturating_add(self.capture.queries)
+    }
+
+    /// Ceux auxquels le pilote a répondu, des deux côtés.
+    #[must_use]
+    pub const fn queries_granted_total(&self) -> u64 {
+        self.render
+            .queries_granted
+            .saturating_add(self.capture.queries_granted)
+    }
+
+    /// Les appels des quatre méthodes, des deux côtés.
+    #[must_use]
+    pub const fn appels_total(&self) -> u64 {
+        self.render.appels().saturating_add(self.capture.appels())
+    }
+
+    /// L'IRQL maximal vu sur les deux sens.
+    #[must_use]
+    pub const fn irql_max(&self) -> u32 {
+        if self.render.irql_max >= self.capture.irql_max {
+            self.render.irql_max
+        } else {
+            self.capture.irql_max
+        }
+    }
+
+    /// Le moteur audio a-t-il emprunté le mode paquets d'un côté ou de l'autre ?
+    #[must_use]
+    pub const fn emprunte(&self) -> bool {
+        self.appels_total() > 0
+    }
+
+    /// Sérialise l'état en [`CABLE_PACKETS_BYTES`] octets : deux `ULONG`, puis les deux blocs
+    /// de sens à [`OCP_RENDER`] et [`OCP_CAPTURE`].
+    ///
+    /// Le pilote n'utilise pas cette fonction pour répondre à un `GET` — il écrit directement
+    /// dans le tampon `Value`, d'alignement quelconque, par `portcls::property::Champs` — mais
+    /// elle en est le miroir exact, et c'est elle que l'aller-retour du proptest vérifie.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; CABLE_PACKETS_BYTES] {
+        let mut octets = [0u8; CABLE_PACKETS_BYTES];
+        poser_mot(&mut octets, OCP_CABLE, self.cable);
+        poser_mot(&mut octets, OCP_MODE, self.packet_mode);
+        self.render.ecrire(&mut octets, OCP_RENDER);
+        self.capture.ecrire(&mut octets, OCP_CAPTURE);
+        octets
+    }
+
+    /// **Le** parseur du relevé de paquets : des octets hostiles vers un instantané valide, ou
+    /// une cause de refus.
+    ///
+    /// Pure, sans allocation, sans panique, sans appel noyau — appelable à n'importe quel IRQL
+    /// et fuzzable en mode utilisateur, comme [`CableState::from_bytes`].
+    ///
+    /// La longueur est vérifiée **avant** tout le reste et exigée **exacte** : ni plus courte,
+    /// ni plus longue, ni un préfixe valide suivi d'octets en trop.
+    ///
+    /// # Ce qui est validé, et ce qui ne l'est pas
+    ///
+    /// Quatre domaines fermés : le câble, le mode ({0, 1}, celui de
+    /// [`crate::params::Param::PacketMode`]), l'exposition de chaque sens et la largeur des
+    /// deux IRQL — plus le champ réservé de chaque bloc, exigé nul.
+    ///
+    /// Les compteurs, eux, ne le sont pas : **tout `u64` est une valeur légitime**, et surtout
+    /// aucune **cohérence entre champs** n'est exigée. `queries_granted > queries`,
+    /// `first_qpc > last_qpc`, des appels sans exposition : tout cela a l'air impossible et
+    /// arrive pour de bon, l'instantané n'étant pas pris d'un seul coup et l'exposition
+    /// décrivant le flux courant tandis que les compteurs décrivent tout le cycle. Refuser une
+    /// telle valeur transformerait une observation légitime en erreur de protocole, et ferait
+    /// disparaître du relevé le seul instant qui l'intéressait.
+    ///
+    /// # Erreurs
+    ///
+    /// [`PacketsError`], qui nomme le **premier** champ fautif dans l'ordre de la structure, le
+    /// rendu avant la capture.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, PacketsError> {
+        if data.len() != CABLE_PACKETS_BYTES {
+            return Err(PacketsError::Longueur { recus: data.len() });
+        }
+        // Les lectures ne peuvent plus échouer (la longueur est exacte) ; le `ok_or` remplace
+        // un `unwrap` interdit par les lints du crate.
+        let longueur = || PacketsError::Longueur { recus: data.len() };
+        let cable = mot(data, OCP_CABLE).ok_or_else(longueur)?;
+        let packet_mode = mot(data, OCP_MODE).ok_or_else(longueur)?;
+        let render = StreamPackets::lire(data, OCP_RENDER).ok_or_else(longueur)?;
+        let capture = StreamPackets::lire(data, OCP_CAPTURE).ok_or_else(longueur)?;
+
+        if cable >= CABLE_MAX {
+            return Err(PacketsError::Cable(cable));
+        }
+        if packet_mode > MAX_PACKET_MODE {
+            return Err(PacketsError::Mode(packet_mode));
+        }
+        if let Some(err) = render.refus(StreamSide::Render) {
+            return Err(err);
+        }
+        if let Some(err) = capture.refus(StreamSide::Capture) {
+            return Err(err);
+        }
+        Ok(Self {
+            cable,
+            packet_mode,
+            render,
+            capture,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------------
 // Persistance : un masque de bits, une seule valeur de registre.
 // ---------------------------------------------------------------------------------
 
@@ -2239,18 +3009,20 @@ mod tests {
         assert_ne!(KSPROPSETID_CONDUIT.data1, 0xCAA7_4E3D);
     }
 
-    /// Les quatre identifiants de propriété sont distincts et stables.
+    /// Les cinq identifiants de propriété sont distincts et stables.
     #[test]
     fn les_identifiants_de_propriete_sont_distincts() {
         assert_eq!(KSPROPERTY_CONDUIT_CABLE_STATE, 0);
         assert_eq!(KSPROPERTY_CONDUIT_VERSION, 1);
         assert_eq!(KSPROPERTY_CONDUIT_COUNTERS, 2);
         assert_eq!(KSPROPERTY_CONDUIT_TRANSPORT, 3);
+        assert_eq!(KSPROPERTY_CONDUIT_PACKETS, 4);
         let ids = [
             KSPROPERTY_CONDUIT_CABLE_STATE,
             KSPROPERTY_CONDUIT_VERSION,
             KSPROPERTY_CONDUIT_COUNTERS,
             KSPROPERTY_CONDUIT_TRANSPORT,
+            KSPROPERTY_CONDUIT_PACKETS,
         ];
         for (i, gauche) in ids.iter().enumerate() {
             for droite in ids.iter().skip(i + 1) {
@@ -2263,8 +3035,8 @@ mod tests {
         }
         // Une propriété qui apparaît est un changement observable du jeu, et ce numéro en
         // est la seule voie (voir sa documentation) : 3 avec les compteurs, 4 avec le
-        // transport.
-        assert_eq!(CONFIG_VERSION, 4);
+        // transport, 5 avec le relevé de paquets.
+        assert_eq!(CONFIG_VERSION, 5);
     }
 
     /// Le `pid` de la marque : celui qu'écrit le service et celui que lit le dorsal.
@@ -2390,6 +3162,189 @@ mod tests {
                 refused_allocations: 11,
             },
         }
+    }
+
+    /// Un relevé de paquets dont **aucune** valeur ne se confond avec une autre.
+    ///
+    /// Même rôle que [`transport_temoin`] : vingt-six champs dont vingt-deux pourraient valoir
+    /// la même chose, et deux blocs de sens intervertis passeraient un aller-retour sur des
+    /// zéros sans que rien ne le signale.
+    fn paquets_temoin() -> CablePackets {
+        CablePackets {
+            cable: 5,
+            packet_mode: 1,
+            render: StreamPackets {
+                exposure: PacketExposure::Output.code(),
+                irql_last: 0,
+                irql_max: 2,
+                reserved: 0,
+                set_write_packet: 13,
+                get_read_packet: 17,
+                packet_count: 19,
+                presentation_position: 23,
+                queries: 29,
+                queries_granted: 31,
+                first_qpc: 37,
+                last_qpc: 41,
+            },
+            capture: StreamPackets {
+                exposure: PacketExposure::Input.code(),
+                irql_last: 1,
+                irql_max: 3,
+                reserved: 0,
+                set_write_packet: 43,
+                get_read_packet: 47,
+                packet_count: 53,
+                presentation_position: 59,
+                queries: 61,
+                queries_granted: 67,
+                first_qpc: 71,
+                last_qpc: 73,
+            },
+        }
+    }
+
+    /// La disposition du relevé de paquets : 168 octets, deux `ULONG` puis deux blocs de 80,
+    /// aucun trou — et chaque champ se relit **à son décalage nommé**.
+    #[test]
+    fn la_disposition_des_paquets_est_celle_des_decalages_nommes() {
+        assert_eq!(CABLE_PACKETS_BYTES, 168);
+        assert_eq!(STREAM_PACKETS_BYTES, 80);
+        assert_eq!(size_of::<CablePackets>(), CABLE_PACKETS_BYTES);
+        assert_eq!(size_of::<StreamPackets>(), STREAM_PACKETS_BYTES);
+        assert_eq!(align_of::<CablePackets>(), 8);
+        assert_eq!(align_of::<StreamPackets>(), 8);
+
+        // Deux `ULONG` de tête, puis deux blocs contigus, chacun aligné sur huit.
+        assert_eq!(OCP_CABLE, 0);
+        assert_eq!(OCP_MODE, TAILLE_MOT);
+        assert_eq!(OCP_RENDER, TAILLE_MOT * 2);
+        assert_eq!(OCP_CAPTURE, OCP_RENDER + STREAM_PACKETS_BYTES);
+        assert_eq!(OCP_CAPTURE + STREAM_PACKETS_BYTES, CABLE_PACKETS_BYTES);
+        assert_eq!(OCP_RENDER % 8, 0);
+        assert_eq!(OCP_CAPTURE % 8, 0);
+
+        // Chaque champ à son décalage, et pas à celui du voisin.
+        let paquets = paquets_temoin();
+        let brut = paquets.to_bytes();
+        assert_eq!(mot(&brut, OCP_CABLE), Some(5));
+        assert_eq!(mot(&brut, OCP_MODE), Some(1));
+        for (sens, base) in [
+            (StreamSide::Render, OCP_RENDER),
+            (StreamSide::Capture, OCP_CAPTURE),
+        ] {
+            let bloc = paquets.side(sens);
+            assert_eq!(mot(&brut, base + OSP_EXPOSURE), Some(bloc.exposure));
+            assert_eq!(mot(&brut, base + OSP_IRQL_LAST), Some(bloc.irql_last));
+            assert_eq!(mot(&brut, base + OSP_IRQL_MAX), Some(bloc.irql_max));
+            assert_eq!(mot(&brut, base + OSP_RESERVED), Some(0));
+            assert_eq!(
+                mot_long(&brut, base + OSP_SET_WRITE_PACKET),
+                Some(bloc.set_write_packet)
+            );
+            assert_eq!(
+                mot_long(&brut, base + OSP_GET_READ_PACKET),
+                Some(bloc.get_read_packet)
+            );
+            assert_eq!(
+                mot_long(&brut, base + OSP_PACKET_COUNT),
+                Some(bloc.packet_count)
+            );
+            assert_eq!(
+                mot_long(&brut, base + OSP_PRESENTATION_POSITION),
+                Some(bloc.presentation_position)
+            );
+            assert_eq!(mot_long(&brut, base + OSP_QUERIES), Some(bloc.queries));
+            assert_eq!(
+                mot_long(&brut, base + OSP_QUERIES_GRANTED),
+                Some(bloc.queries_granted)
+            );
+            assert_eq!(mot_long(&brut, base + OSP_FIRST_QPC), Some(bloc.first_qpc));
+            assert_eq!(mot_long(&brut, base + OSP_LAST_QPC), Some(bloc.last_qpc));
+        }
+        assert_eq!(CablePackets::from_bytes(&brut), Ok(paquets));
+    }
+
+    /// Ce que le relevé de paquets **démontre** : les lectures que le lot 2 doit permettre.
+    #[test]
+    fn le_releve_de_paquets_distingue_les_regimes() {
+        // Rien d'exposé, rien de demandé : le pilote livré, et le moteur qui ne demande
+        // jamais le mode paquets.
+        let repos = CablePackets::new(0);
+        assert!(!repos.mode_actif());
+        assert!(!repos.exposition_courante());
+        assert_eq!(repos.queries_total(), 0);
+        assert!(!repos.emprunte());
+        assert_eq!(repos.irql_max(), 0);
+
+        // Le moteur demande et nous refusons : c'est déjà une mesure, et elle ne coûte
+        // aucune exposition.
+        let demande = CablePackets {
+            render: StreamPackets {
+                exposure: PacketExposure::NotExposed.code(),
+                queries: 4,
+                ..StreamPackets::new()
+            },
+            ..CablePackets::new(1)
+        };
+        assert_eq!(demande.queries_total(), 4);
+        assert_eq!(demande.queries_granted_total(), 0);
+        assert!(!demande.exposition_courante());
+        assert!(!demande.emprunte());
+
+        // Exposé, obtenu, jamais emprunté : le moteur ne bascule pas sur le chemin des
+        // paquets même quand il l'a sous la main.
+        let ignore = CablePackets {
+            packet_mode: 1,
+            render: StreamPackets {
+                exposure: PacketExposure::Output.code(),
+                queries: 2,
+                queries_granted: 2,
+                ..StreamPackets::new()
+            },
+            ..CablePackets::new(2)
+        };
+        assert!(ignore.mode_actif());
+        assert!(ignore.exposition_courante());
+        assert_eq!(ignore.queries_granted_total(), 2);
+        assert!(!ignore.emprunte());
+
+        // Emprunté : le cas qui justifie de ne jamais livrer `PacketMode = 1`.
+        let emprunte = paquets_temoin();
+        assert!(emprunte.emprunte());
+        assert_eq!(emprunte.render.appels(), 13 + 17 + 19 + 23);
+        assert_eq!(emprunte.capture.appels(), 43 + 47 + 53 + 59);
+        assert_eq!(emprunte.appels_total(), 274);
+        assert_eq!(emprunte.irql_max(), 3);
+        assert!(emprunte.render.exposee());
+        assert!(emprunte.capture.exposee());
+    }
+
+    /// Les codes d'exposition sont un aller-retour exact, et rien au-delà du plafond.
+    #[test]
+    fn les_codes_d_exposition_sont_fermes() {
+        let cas = [
+            (PacketExposure::NoStream, 0, false),
+            (PacketExposure::NotExposed, 1, false),
+            (PacketExposure::Input, 2, true),
+            (PacketExposure::Output, 3, true),
+        ];
+        for (exposition, code, exposee) in cas {
+            assert_eq!(exposition.code(), code);
+            assert_eq!(PacketExposure::from_code(code), Some(exposition));
+            assert_eq!(exposition.exposee(), exposee);
+            assert!(!exposition.label().is_empty());
+        }
+        assert_eq!(PACKET_EXPOSURE_MAX, 3);
+        assert_eq!(PacketExposure::from_code(PACKET_EXPOSURE_MAX + 1), None);
+        assert_eq!(PacketExposure::default(), PacketExposure::NoStream);
+        // Un pilote plus récent que l'outil se lit « inconnue », il ne disparaît pas.
+        let inconnu = StreamPackets {
+            exposure: 99,
+            ..StreamPackets::new()
+        };
+        assert!(inconnu.exposure_label().contains("inconnue"));
+        assert!(!inconnu.exposee());
     }
 
     /// La disposition du transport : 72 octets, deux `ULONG` puis deux blocs de 32, aucun
@@ -3526,6 +4481,86 @@ mod tests {
                 CableTransport::from_bytes(&transport.to_bytes()).is_ok(),
                 valide
             );
+        }
+
+        /// Le relevé de paquets ne panique sur aucune entrée, et ce qu'il accepte se
+        /// resérialise à l'octet près.
+        #[test]
+        fn le_releve_de_paquets_survit_a_tout(
+            octets in proptest::collection::vec(any::<u8>(), 0..200)
+        ) {
+            match CablePackets::from_bytes(&octets) {
+                Ok(paquets) => {
+                    prop_assert_eq!(octets.len(), CABLE_PACKETS_BYTES);
+                    let refait = paquets.to_bytes();
+                    prop_assert_eq!(refait.as_slice(), octets.as_slice());
+                    prop_assert!(paquets.cable < CABLE_MAX);
+                    prop_assert!(paquets.packet_mode <= MAX_PACKET_MODE);
+                    for sens in StreamSide::ALL {
+                        let bloc = paquets.side(sens);
+                        prop_assert!(bloc.exposure().is_some());
+                        prop_assert!(bloc.irql_last <= PACKET_IRQL_MAX);
+                        prop_assert!(bloc.irql_max <= PACKET_IRQL_MAX);
+                        prop_assert_eq!(bloc.reserved, 0);
+                    }
+                }
+                Err(err) => {
+                    let longueur = matches!(err, PacketsError::Longueur { .. });
+                    prop_assert_eq!(longueur, octets.len() != CABLE_PACKETS_BYTES);
+                    prop_assert!(!err.to_string().is_empty());
+                }
+            }
+        }
+
+        /// Sur tout le domaine : accepté si et seulement si l'écho, le mode, l'exposition,
+        /// les deux IRQL et le champ réservé de chaque sens sont dans leurs bornes. Les
+        /// compteurs et les horodatages n'en ont **aucune**, et aucune cohérence entre
+        /// champs n'est exigée.
+        #[test]
+        fn le_releve_de_paquets_accepte_exactement_ses_domaines(
+            cable in any::<u32>(),
+            mode in any::<u32>(),
+            exposition_rendu in any::<u32>(),
+            exposition_capture in any::<u32>(),
+            irql in any::<u32>(),
+            reserve in any::<u32>(),
+            appels in any::<u64>(),
+            qpc in any::<u64>(),
+        ) {
+            let paquets = CablePackets {
+                cable,
+                packet_mode: mode,
+                render: StreamPackets {
+                    exposure: exposition_rendu,
+                    irql_last: irql,
+                    irql_max: 0,
+                    reserved: 0,
+                    set_write_packet: appels,
+                    get_read_packet: appels,
+                    packet_count: u64::MAX,
+                    presentation_position: 0,
+                    // Volontairement incohérent : plus de réponses que de demandes, et un
+                    // premier horodatage après le dernier. Le contrat l'accepte.
+                    queries: 0,
+                    queries_granted: appels,
+                    first_qpc: qpc,
+                    last_qpc: 0,
+                },
+                capture: StreamPackets {
+                    exposure: exposition_capture,
+                    irql_last: 0,
+                    irql_max: 0,
+                    reserved: reserve,
+                    ..StreamPackets::new()
+                },
+            };
+            let valide = cable < CABLE_MAX
+                && mode <= MAX_PACKET_MODE
+                && exposition_rendu <= PACKET_EXPOSURE_MAX
+                && exposition_capture <= PACKET_EXPOSURE_MAX
+                && irql <= PACKET_IRQL_MAX
+                && reserve == 0;
+            prop_assert_eq!(CablePackets::from_bytes(&paquets.to_bytes()).is_ok(), valide);
         }
 
         /// Le masque : poser puis retirer un bit est l'identité, et l'écrêtage ne touche

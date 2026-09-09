@@ -3,9 +3,9 @@
 //!
 //! Au démarrage, `StartDevice` lit la clé `Parameters` du périphérique
 //! (`docs/driver-design.md` §4, table des modules : « lit les paramètres (M1b-01) »)
-//! et en tire trois valeurs `REG_DWORD` — taille de la réserve de câbles, nombre de
-//! canaux, durée du tampon. Ce module les confronte à leurs bornes et rend des
-//! paramètres utilisables **quoi qu'il arrive**, plus un rapport de ce qui a été
+//! et en tire quatre valeurs `REG_DWORD` — taille de la réserve de câbles, nombre de
+//! canaux, durée du tampon, mode paquets. Ce module les confronte à leurs bornes et rend
+//! des paramètres utilisables **quoi qu'il arrive**, plus un rapport de ce qui a été
 //! corrigé.
 //!
 //! # Pourquoi ce module écrête là où [`crate::format`] refuse
@@ -58,6 +58,9 @@
 //!   d'installateur (une valeur d'INF qui disparaît laisse une clé sur les postes déjà
 //!   installés), pas de ce module ; jusque-là, mieux vaut le dire ici que le laisser
 //!   croire.
+//! - **Mode paquets** : effectif depuis le lot 2 du mode paquets WaveRT, et c'est le seul
+//!   paramètre dont l'effet soit une **expérience** et non un réglage. Voir
+//!   [`DEFAULT_PACKET_MODE`], qui porte la réserve en entier.
 //!
 //! Tout ici est sans allocation ni panique ; l'appel a lieu à `PASSIVE_LEVEL`
 //! (`StartDevice`), mais rien n'interdit un appel à `DISPATCH_LEVEL`.
@@ -148,15 +151,61 @@ pub const MAX_BUFFER_MS: u32 = crate::format::MAX_BUFFER_MS;
 /// l'importance que le plancher descende bien sous 5 ms.
 pub const DEFAULT_BUFFER_MS: u32 = 10;
 
+/// Valeur minimale du mode paquets : 0, « n'expose rien ».
+pub const MIN_PACKET_MODE: u32 = 0;
+
+/// Valeur maximale du mode paquets : 1, « expose sans servir ».
+///
+/// Un booléen, et volontairement pas une énumération de modes : il n'y a que deux états à
+/// distinguer, et le second n'est pas un mode de fonctionnement mais une **expérience**
+/// (voir [`DEFAULT_PACKET_MODE`]). Un domaine plus large inviterait à en ajouter un
+/// troisième sans passer par la mesure.
+pub const MAX_PACKET_MODE: u32 = 1;
+
+/// Mode paquets par défaut : **0**, et il n'est jamais livré autrement.
+///
+/// # Ce que ce paramètre fait, exactement
+///
+/// À 1, `conduit_kmd::wave::open_stream` construit le flux composite avec les interfaces
+/// de paquets du sens du flux ([`crate::config::PacketExposure`]) au lieu de
+/// `PacketInterfaces::None` : PortCls obtient donc l'adresse des têtes satellites si le
+/// moteur audio les demande par `QueryInterface`, et les quatre méthodes deviennent
+/// **atteignables**. Elles refusent toutes (`STATUS_NOT_SUPPORTED`) et se contentent de
+/// **compter** — appels par sens et par méthode, IRQL, horodatage QPC — que
+/// [`crate::config::KSPROPERTY_CONDUIT_PACKETS`] rend lisible sans débogueur.
+///
+/// # Une expérience, pas un réglage : ne jamais livrer à 1
+///
+/// La règle du mode paquets est écrite en tête de `portcls::packet` et elle n'est pas
+/// amendée ici : **exposer une interface qu'on ne sert pas est plus dangereux que ne rien
+/// exposer**. Un moteur audio qui bascule sur le chemin des paquets et se fait répondre
+/// `STATUS_NOT_SUPPORTED` peut casser un transport qui marchait. Ce paramètre existe pour
+/// **mesurer** ce que le moteur fait d'interfaces exposées — les demande-t-il ? les
+/// emprunte-t-il ? à quel IRQL ? — sur une machine d'essai où casser le son est sans
+/// conséquence, et pour rien d'autre.
+///
+/// Il n'active donc **rien qui soit servi**, son défaut est 0, l'INF écrit 0, et aucun
+/// poste livré ne doit porter 1. Le jour où les quatre méthodes seront réellement
+/// implémentées, ce paramètre disparaîtra — ce ne sera plus une expérience mais le
+/// comportement du pilote.
+pub const DEFAULT_PACKET_MODE: u32 = 0;
+
 // Cohérences que le compilateur peut vérifier : le défaut est dans ses bornes, et le
 // plafond des canaux ne dépasse pas ce que `FrameLayout` sait décrire.
 const _: () = assert!(MIN_RESERVE <= DEFAULT_RESERVE && DEFAULT_RESERVE <= MAX_RESERVE);
 const _: () = assert!(MIN_CHANNELS <= DEFAULT_CHANNELS && DEFAULT_CHANNELS <= MAX_CHANNELS);
 const _: () = assert!(MIN_BUFFER_MS <= DEFAULT_BUFFER_MS && DEFAULT_BUFFER_MS <= MAX_BUFFER_MS);
+// Le mode paquets est un booléen dont le défaut est le plancher. Les trois valeurs sont
+// écrites en toutes lettres plutôt que comparées entre elles : `MIN_PACKET_MODE` étant le
+// minimum du type, `MIN <= DEFAULT <= MAX` est une tautologie que le compilateur signale, et
+// ce qu'il faut réellement garder est que le **défaut n'expose rien** — un changement de
+// cette valeur doit être un acte, pas une distraction.
+const _: () = assert!(MIN_PACKET_MODE == 0 && MAX_PACKET_MODE == 1 && DEFAULT_PACKET_MODE == 0);
 const _: () = assert!(MAX_CHANNELS == FrameLayout::MAX_CHANNELS as u32);
 // Les valeurs retenues tiennent dans le `u8` de `Params` (voir `narrow`).
 const _: () = assert!(MAX_RESERVE <= u8::MAX as u32);
 const _: () = assert!(MAX_CHANNELS <= u8::MAX as u32);
+const _: () = assert!(MAX_PACKET_MODE <= u8::MAX as u32);
 
 /// Type `REG_DWORD` de `winnt.h` : entier de 32 bits, stocké dans le boutisme de la
 /// machine (`REG_DWORD` et `REG_DWORD_LITTLE_ENDIAN` sont la même valeur, 4).
@@ -206,7 +255,7 @@ pub const fn decode_dword(kind: u32, data: &[u8]) -> Option<u32> {
     }
 }
 
-/// Un des trois paramètres de registre.
+/// Un des quatre paramètres de registre.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Param {
     /// Nombre de câbles enregistrés au démarrage.
@@ -215,11 +264,19 @@ pub enum Param {
     Channels,
     /// Durée du tampon, en millisecondes.
     BufferMs,
+    /// Mode paquets : 0 (rien d'exposé) ou 1 (**expérience**, voir
+    /// [`DEFAULT_PACKET_MODE`]).
+    PacketMode,
 }
 
 impl Param {
-    /// Les trois paramètres, dans l'ordre où [`Report`] range leurs corrections.
-    pub const ALL: [Self; 3] = [Self::Reserve, Self::Channels, Self::BufferMs];
+    /// Les quatre paramètres, dans l'ordre où [`Report`] range leurs corrections.
+    pub const ALL: [Self; 4] = [
+        Self::Reserve,
+        Self::Channels,
+        Self::BufferMs,
+        Self::PacketMode,
+    ];
 
     /// Nom de la valeur dans la clé `Parameters` du périphérique.
     ///
@@ -230,6 +287,7 @@ impl Param {
             Self::Reserve => "ReserveSize",
             Self::Channels => "Channels",
             Self::BufferMs => "BufferMs",
+            Self::PacketMode => "PacketMode",
         }
     }
 
@@ -239,6 +297,7 @@ impl Param {
             Self::Reserve => "réserve",
             Self::Channels => "canaux",
             Self::BufferMs => "tampon (ms)",
+            Self::PacketMode => "mode paquets",
         }
     }
 
@@ -248,6 +307,7 @@ impl Param {
             Self::Reserve => (MIN_RESERVE, MAX_RESERVE),
             Self::Channels => (MIN_CHANNELS, MAX_CHANNELS),
             Self::BufferMs => (MIN_BUFFER_MS, MAX_BUFFER_MS),
+            Self::PacketMode => (MIN_PACKET_MODE, MAX_PACKET_MODE),
         }
     }
 
@@ -257,6 +317,7 @@ impl Param {
             Self::Reserve => DEFAULT_RESERVE,
             Self::Channels => DEFAULT_CHANNELS,
             Self::BufferMs => DEFAULT_BUFFER_MS,
+            Self::PacketMode => DEFAULT_PACKET_MODE,
         }
     }
 }
@@ -305,12 +366,12 @@ impl fmt::Display for Correction {
     }
 }
 
-/// Corrections appliquées par [`sanitize`] : de zéro à trois, une par paramètre.
+/// Corrections appliquées par [`sanitize`] : de zéro à quatre, une par paramètre.
 ///
 /// Taille fixe, aucune allocation. L'ordre est celui de [`Param::ALL`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Report {
-    corrections: [Option<Correction>; 3],
+    corrections: [Option<Correction>; Param::ALL.len()],
 }
 
 impl Report {
@@ -319,7 +380,7 @@ impl Report {
         self.corrections.iter().all(Option::is_none)
     }
 
-    /// Nombre de paramètres corrigés (0 à 3).
+    /// Nombre de paramètres corrigés (0 à 4).
     pub fn len(&self) -> usize {
         self.corrections.iter().flatten().count()
     }
@@ -335,7 +396,7 @@ impl Report {
     }
 }
 
-/// Les trois valeurs telles que lues dans le registre.
+/// Les quatre valeurs telles que lues dans le registre.
 ///
 /// `None` = valeur absente, d'un autre type que `REG_DWORD`, ou illisible : ces trois
 /// cas se traitent pareil (repli sur la valeur par défaut, sans correction à
@@ -349,6 +410,8 @@ pub struct RawParams {
     pub channels: Option<u32>,
     /// `BufferMs` : durée du tampon, en millisecondes.
     pub buffer_ms: Option<u32>,
+    /// `PacketMode` : 0 ou 1 (**expérience**, voir [`DEFAULT_PACKET_MODE`]).
+    pub packet_mode: Option<u32>,
 }
 
 impl RawParams {
@@ -357,6 +420,7 @@ impl RawParams {
         reserve: None,
         channels: None,
         buffer_ms: None,
+        packet_mode: None,
     };
 }
 
@@ -375,15 +439,27 @@ pub struct Params {
     pub channels: u8,
     /// Durée du tampon en millisecondes, dans `MIN_BUFFER_MS..=MAX_BUFFER_MS`.
     pub buffer_ms: u32,
+    /// Mode paquets, dans `MIN_PACKET_MODE..=MAX_PACKET_MODE` — c'est-à-dire 0 ou 1.
+    ///
+    /// **Une expérience, pas un réglage**, et jamais livrée à 1 : toute la réserve est
+    /// écrite sur [`DEFAULT_PACKET_MODE`].
+    pub packet_mode: u8,
 }
 
 impl Params {
-    /// Les valeurs par défaut : 16 câbles, 2 canaux, 10 ms.
+    /// Les valeurs par défaut : 16 câbles, 2 canaux, 10 ms, mode paquets éteint.
     pub const DEFAULT: Self = Self {
         reserve: narrow(DEFAULT_RESERVE),
         channels: narrow(DEFAULT_CHANNELS),
         buffer_ms: DEFAULT_BUFFER_MS,
+        packet_mode: narrow(DEFAULT_PACKET_MODE),
     };
+
+    /// Le mode paquets est-il demandé ? Faux par défaut, et faux sur tout poste livré.
+    #[must_use]
+    pub const fn packet_mode_actif(&self) -> bool {
+        self.packet_mode != 0
+    }
 }
 
 impl Default for Params {
@@ -457,14 +533,16 @@ pub const fn sanitize(raw: RawParams) -> (Params, Report) {
     let (reserve, reserve_fix) = clamp(Param::Reserve, raw.reserve);
     let (channels, channels_fix) = clamp(Param::Channels, raw.channels);
     let (buffer_ms, buffer_fix) = clamp(Param::BufferMs, raw.buffer_ms);
+    let (packet_mode, packet_fix) = clamp(Param::PacketMode, raw.packet_mode);
     (
         Params {
             reserve: narrow(reserve),
             channels: narrow(channels),
             buffer_ms,
+            packet_mode: narrow(packet_mode),
         },
         Report {
-            corrections: [reserve_fix, channels_fix, buffer_fix],
+            corrections: [reserve_fix, channels_fix, buffer_fix, packet_fix],
         },
     )
 }
@@ -502,6 +580,14 @@ mod tests {
     const fn buffer_ms(value: Option<u32>) -> RawParams {
         RawParams {
             buffer_ms: value,
+            ..RawParams::MISSING
+        }
+    }
+
+    /// Une clé où seul `packet_mode` est renseigné.
+    const fn packet_mode(value: Option<u32>) -> RawParams {
+        RawParams {
+            packet_mode: value,
             ..RawParams::MISSING
         }
     }
@@ -602,6 +688,38 @@ mod tests {
     }
 
     #[test]
+    fn packet_mode_table() {
+        // Bornes : 0 à 1, défaut 0. Le défaut n'expose rien, et c'est le seul état
+        // livrable : le paramètre est une expérience (voir `DEFAULT_PACKET_MODE`).
+        let cases: [(Option<u32>, u8, Option<Fix>); 5] = [
+            // Absente : rien n'est exposé, sans correction (installation neuve).
+            (None, 0, None),
+            (Some(0), 0, None),
+            // L'expérience, telle qu'on la demande en machine d'essai : dans les bornes,
+            // donc aucune correction à journaliser.
+            (Some(1), 1, None),
+            // Un de trop : écrêté à 1, comme les autres paramètres — un `2` reste une
+            // demande d'exposition, pas un refus de charger.
+            (Some(2), 1, Some(Fix::TooHigh)),
+            (Some(u32::MAX), 1, Some(Fix::TooHigh)),
+        ];
+        for (found, expected, fix) in cases {
+            let (params, report) = sanitize(packet_mode(found));
+            assert_eq!(params.packet_mode, expected, "mode paquets {found:?}");
+            assert_eq!(params.packet_mode_actif(), expected != 0);
+            assert_eq!(
+                report.get(Param::PacketMode).map(|c| c.fix),
+                fix,
+                "mode paquets {found:?}"
+            );
+        }
+        // Le défaut du contrat est bien « rien d'exposé » : c'est ce que l'INF écrit et ce
+        // qu'un poste livré doit porter.
+        assert_eq!(DEFAULT_PACKET_MODE, 0);
+        assert!(!Params::DEFAULT.packet_mode_actif());
+    }
+
+    #[test]
     fn cle_vide_et_cle_entierement_fausse() {
         let (params, report) = sanitize(RawParams::MISSING);
         assert_eq!(params, Params::DEFAULT);
@@ -609,26 +727,29 @@ mod tests {
         assert_eq!(report.len(), 0);
         assert_eq!(report.corrections().count(), 0);
 
-        // Les trois hors bornes en même temps : trois corrections, dans l'ordre de
+        // Les quatre hors bornes en même temps : quatre corrections, dans l'ordre de
         // `Param::ALL`, et un pilote qui charge quand même.
         let (params, report) = sanitize(RawParams {
             reserve: Some(99),
             channels: Some(0),
             buffer_ms: Some(60_000),
+            packet_mode: Some(7),
         });
         assert_eq!(
             params,
             Params {
                 reserve: 16,
                 channels: 1,
-                buffer_ms: 500
+                buffer_ms: 500,
+                packet_mode: 1,
             }
         );
-        assert_eq!(report.len(), 3);
+        assert_eq!(report.len(), 4);
         let mut signales = report.corrections();
         assert_eq!(signales.next().unwrap().param, Param::Reserve);
         assert_eq!(signales.next().unwrap().param, Param::Channels);
         assert_eq!(signales.next().unwrap().param, Param::BufferMs);
+        assert_eq!(signales.next().unwrap().param, Param::PacketMode);
         assert!(signales.next().is_none());
     }
 
@@ -707,11 +828,13 @@ mod tests {
             reserve: decode_dword(REG_DWORD, &[2, 0, 0, 0]),
             channels: decode_dword(REG_SZ, &[0x32, 0, 0, 0]),
             buffer_ms: decode_dword(REG_DWORD, &[0xF4, 0x01, 0, 0]),
+            packet_mode: decode_dword(REG_DWORD, &[1, 0, 0, 0]),
         };
         let (params, report) = sanitize(raw);
         assert_eq!(params.reserve, 2);
         assert_eq!(params.channels, DEFAULT_CHANNELS as u8);
         assert_eq!(params.buffer_ms, 500);
+        assert_eq!(params.packet_mode, 1);
         assert!(report.is_empty());
     }
 
@@ -757,11 +880,15 @@ mod tests {
             reserve in proptest::option::of(any::<u32>()),
             channels in proptest::option::of(any::<u32>()),
             buffer_ms in proptest::option::of(any::<u32>()),
+            packet_mode in proptest::option::of(any::<u32>()),
         ) {
-            let (params, _) = sanitize(RawParams { reserve, channels, buffer_ms });
+            let (params, _) = sanitize(RawParams { reserve, channels, buffer_ms, packet_mode });
             prop_assert!((MIN_RESERVE..=MAX_RESERVE).contains(&u32::from(params.reserve)));
             prop_assert!((MIN_CHANNELS..=MAX_CHANNELS).contains(&u32::from(params.channels)));
             prop_assert!((MIN_BUFFER_MS..=MAX_BUFFER_MS).contains(&params.buffer_ms));
+            prop_assert!(
+                (MIN_PACKET_MODE..=MAX_PACKET_MODE).contains(&u32::from(params.packet_mode))
+            );
         }
 
         /// Le rapport dit la vérité : une correction exactement quand la valeur lue
@@ -771,13 +898,15 @@ mod tests {
             reserve in proptest::option::of(any::<u32>()),
             channels in proptest::option::of(any::<u32>()),
             buffer_ms in proptest::option::of(any::<u32>()),
+            packet_mode in proptest::option::of(any::<u32>()),
         ) {
-            let raw = RawParams { reserve, channels, buffer_ms };
+            let raw = RawParams { reserve, channels, buffer_ms, packet_mode };
             let (params, report) = sanitize(raw);
             let applied = [
                 (Param::Reserve, reserve, u32::from(params.reserve)),
                 (Param::Channels, channels, u32::from(params.channels)),
                 (Param::BufferMs, buffer_ms, params.buffer_ms),
+                (Param::PacketMode, packet_mode, u32::from(params.packet_mode)),
             ];
             for (param, found, applied) in applied {
                 let (min, max) = param.bounds();

@@ -112,8 +112,8 @@ use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use conduit_kmd_core::config::{
-    self, ACTIVE_CABLES_DEFAULT, AllocationMode, CableCounters, CableTransport, KsRunState,
-    StreamTransport,
+    self, ACTIVE_CABLES_DEFAULT, AllocationMode, CableCounters, CablePackets, CableTransport,
+    KsRunState, PacketExposure, StreamPackets, StreamTransport,
 };
 use conduit_kmd_core::{
     FrameLayout, Loopback, Notifier, SilenceCause, StreamPosition, StreamView, VirtualClock,
@@ -200,6 +200,15 @@ pub struct StreamState {
     /// jusqu'au `UnregisterNotificationEvent` correspondant, ou jusqu'à la fermeture du
     /// flux).
     pub events: [Option<NonNull<KEVENT>>; MAX_NOTIFICATION_EVENTS],
+    /// Interfaces du **mode paquets** exposées par l'objet composite de ce flux, décidées à
+    /// sa création par `wave::open_stream` d'après le paramètre `PacketMode`.
+    ///
+    /// Immuable pour la vie du flux : `PacketInterfaces` est fixé à la construction de
+    /// l'objet COM et le `QueryInterface` composite le lit sans jamais l'écrire. Il est
+    /// mémorisé ici — c'est-à-dire dans ce que le **câble** sait atteindre — parce que c'est
+    /// la seule information du relevé de paquets qui décrive le flux courant et non le cycle
+    /// de périphérique : tout le reste est cumulé sur le câble ([`PacketCounters`]).
+    pub packet_exposure: PacketExposure,
 }
 
 // SAFETY: les pointeurs (`Buffer::mdl`, `Buffer::base`, `events`) désignent de la
@@ -209,8 +218,13 @@ pub struct StreamState {
 unsafe impl Send for StreamState {}
 
 impl StreamState {
-    /// Flux à l'arrêt, position 0, sans tampon ni événement.
-    pub const fn new(clock: VirtualClock, layout: FrameLayout) -> Self {
+    /// Flux à l'arrêt, position 0, sans tampon ni événement, exposant les interfaces de
+    /// paquets `packet_exposure` (voir le champ).
+    pub const fn new(
+        clock: VirtualClock,
+        layout: FrameLayout,
+        packet_exposure: PacketExposure,
+    ) -> Self {
         Self {
             clock,
             layout,
@@ -220,6 +234,7 @@ impl StreamState {
             notifier: None,
             notification_count: 0,
             events: [None; MAX_NOTIFICATION_EVENTS],
+            packet_exposure,
         }
     }
 
@@ -685,6 +700,214 @@ impl AllocRefusals {
     }
 }
 
+/// Laquelle des quatre méthodes du mode paquets le moteur audio vient d'appeler.
+///
+/// Les noms sont ceux de `portcls::packet`, pas ceux de `portcls.h` : c'est la méthode Rust
+/// qui a été atteinte, et c'est elle qu'on retrouve dans le code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketMethod {
+    /// `IMiniportWaveRTOutputStream::SetWritePacket`.
+    SetWritePacket,
+    /// `IMiniportWaveRTInputStream::GetReadPacket`.
+    GetReadPacket,
+    /// `IMiniportWaveRTOutputStream::GetPacketCount`.
+    PacketCount,
+    /// `IMiniportWaveRTOutputStream::GetOutputStreamPresentationPosition`.
+    PresentationPosition,
+}
+
+/// Ce que le mode paquets a produit dans **un sens**, hors verrou : les appels reçus, les
+/// `QueryInterface` de paquets, l'IRQL et les horodatages.
+///
+/// # Sur le câble, pas sur le flux, et pour la raison d'[`AllocRefusals`]
+///
+/// Les quatre méthodes **refusent** (`STATUS_NOT_SUPPORTED`, voir `stream::WaveStream`), et
+/// rien n'oblige le moteur audio à garder sa broche ouverte après un refus. Un compteur logé
+/// dans le [`StreamState`] mourrait donc avec le flux qu'on cherche à comprendre, et le relevé
+/// fait une seconde plus tard montrerait un câble au repos sans la moindre trace de l'appel.
+/// Seule l'**exposition** vit dans le flux, parce qu'elle décrit le flux courant et rien
+/// d'autre.
+///
+/// Remis à zéro par [`Cable::start`], comme les [`Counters`] de la boucle locale et les
+/// [`AllocRefusals`], et pour la même raison : un compteur qui cumulerait les cycles de
+/// périphérique ferait lire une trace de cycle neuf comme une trace de cycle ancien.
+///
+/// # Atomiques, `Relaxed`, et ce que ça coûte au relevé
+///
+/// Les huit champs d'un sens sont lus et écrits **indépendamment** : un relevé pris pendant
+/// une rafale d'appels peut mélanger deux instants — un compte d'appels d'avant le dernier, un
+/// IRQL d'après. C'est le choix de tout ce module (voir [`Cable::counters_snapshot`]) et il
+/// est sans effet sur ce qu'on cherche : on regarde quels compteurs **bougent**, pas si leur
+/// somme est exacte.
+///
+/// Les deux horodatages demandent un mot de plus : [`Self::first_qpc`] n'est écrit **que s'il
+/// est encore nul**, par un `compare_exchange` — sans quoi deux appels concurrents en feraient
+/// tous les deux le premier. `last_qpc` et les deux IRQL sont de simples `store` : le dernier
+/// écrivain gagne, ce qui est exactement leur définition, et [`Self::irql_max`] monte par une
+/// boucle de `compare_exchange` pour ne jamais redescendre.
+#[derive(Debug)]
+struct SidePackets {
+    /// Appels de `SetWritePacket` reçus.
+    set_write_packet: AtomicU64,
+    /// Appels de `GetReadPacket` reçus.
+    get_read_packet: AtomicU64,
+    /// Appels de `GetPacketCount` reçus.
+    packet_count: AtomicU64,
+    /// Appels de `GetOutputStreamPresentationPosition` reçus.
+    presentation_position: AtomicU64,
+    /// `QueryInterface` reçus sur un des deux IID de paquets, exposé ou non.
+    queries: AtomicU64,
+    /// Ceux auxquels le pilote a répondu en rendant une tête satellite.
+    queries_granted: AtomicU64,
+    /// QPC du premier appel de méthode, 0 tant qu'il n'y en a pas eu.
+    first_qpc: AtomicU64,
+    /// QPC du dernier appel de méthode, 0 tant qu'il n'y en a pas eu.
+    last_qpc: AtomicU64,
+    /// IRQL du dernier appel de méthode.
+    irql_last: AtomicU32,
+    /// IRQL maximal vu, qui ne redescend jamais.
+    irql_max: AtomicU32,
+}
+
+impl SidePackets {
+    const fn new() -> Self {
+        Self {
+            set_write_packet: AtomicU64::new(0),
+            get_read_packet: AtomicU64::new(0),
+            packet_count: AtomicU64::new(0),
+            presentation_position: AtomicU64::new(0),
+            queries: AtomicU64::new(0),
+            queries_granted: AtomicU64::new(0),
+            first_qpc: AtomicU64::new(0),
+            last_qpc: AtomicU64::new(0),
+            irql_last: AtomicU32::new(0),
+            irql_max: AtomicU32::new(0),
+        }
+    }
+
+    /// Remet les dix compteurs à zéro (nouveau cycle de périphérique).
+    ///
+    /// IRQL : `PASSIVE_LEVEL`, aucune broche ouverte : `Relaxed` suffit.
+    fn reset(&self) {
+        self.set_write_packet.store(0, Ordering::Relaxed);
+        self.get_read_packet.store(0, Ordering::Relaxed);
+        self.packet_count.store(0, Ordering::Relaxed);
+        self.presentation_position.store(0, Ordering::Relaxed);
+        self.queries.store(0, Ordering::Relaxed);
+        self.queries_granted.store(0, Ordering::Relaxed);
+        self.first_qpc.store(0, Ordering::Relaxed);
+        self.last_qpc.store(0, Ordering::Relaxed);
+        self.irql_last.store(0, Ordering::Relaxed);
+        self.irql_max.store(0, Ordering::Relaxed);
+    }
+
+    /// Le compteur de la méthode `methode`.
+    const fn slot(&self, methode: PacketMethod) -> &AtomicU64 {
+        match methode {
+            PacketMethod::SetWritePacket => &self.set_write_packet,
+            PacketMethod::GetReadPacket => &self.get_read_packet,
+            PacketMethod::PacketCount => &self.packet_count,
+            PacketMethod::PresentationPosition => &self.presentation_position,
+        }
+    }
+
+    /// Compte un appel de `methode`, à l'IRQL `irql` et à l'instant `qpc`.
+    ///
+    /// IRQL : quelconque — que des atomiques, aucun verrou pris, rien de paginé. Le contrat
+    /// annonce `PASSIVE_LEVEL` pour les quatre méthodes ; c'est justement ce que `irql`
+    /// vérifie, et il ne servirait à rien si cette fonction l'exigeait.
+    fn note_call(&self, methode: PacketMethod, irql: u32, qpc: u64) {
+        self.slot(methode).fetch_add(1, Ordering::Relaxed);
+        self.irql_last.store(irql, Ordering::Relaxed);
+        // Un maximum qui ne redescend jamais : la boucle relit ce qu'un autre fil aurait
+        // posé entre-temps plutôt que d'écraser une valeur plus haute.
+        let mut vu = self.irql_max.load(Ordering::Relaxed);
+        while irql > vu {
+            match self.irql_max.compare_exchange_weak(
+                vu,
+                irql,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(courant) => vu = courant,
+            }
+        }
+        // Le premier appel ne s'écrit qu'une fois : sans le `compare_exchange`, deux appels
+        // concurrents se déclareraient tous les deux premiers et l'écart avec le dernier ne
+        // voudrait plus rien dire. Un `qpc` nul — que `clock::now` ne rend qu'en cas
+        // d'échec du noyau — laisse simplement le champ à sa valeur « aucun appel ».
+        let _ = self
+            .first_qpc
+            .compare_exchange(0, qpc, Ordering::Relaxed, Ordering::Relaxed);
+        self.last_qpc.store(qpc, Ordering::Relaxed);
+    }
+
+    /// Compte un `QueryInterface` sur un IID de paquets, `rendu` disant si la tête satellite
+    /// a été rendue.
+    ///
+    /// IRQL : `<= DISPATCH_LEVEL` (celui de `QueryInterface`) — deux `fetch_add`.
+    fn note_query(&self, rendu: bool) {
+        self.queries.fetch_add(1, Ordering::Relaxed);
+        if rendu {
+            self.queries_granted.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Un instantané du bloc, **sans l'exposition** : c'est [`Cable::packets_snapshot`] qui
+    /// la pose, en la lisant sous le verrou du flux courant.
+    ///
+    /// IRQL : quelconque — dix chargements atomiques, aucun verrou pris.
+    fn snapshot(&self) -> StreamPackets {
+        StreamPackets {
+            exposure: PacketExposure::NoStream.code(),
+            irql_last: self.irql_last.load(Ordering::Relaxed),
+            irql_max: self.irql_max.load(Ordering::Relaxed),
+            reserved: 0,
+            set_write_packet: self.set_write_packet.load(Ordering::Relaxed),
+            get_read_packet: self.get_read_packet.load(Ordering::Relaxed),
+            packet_count: self.packet_count.load(Ordering::Relaxed),
+            presentation_position: self.presentation_position.load(Ordering::Relaxed),
+            queries: self.queries.load(Ordering::Relaxed),
+            queries_granted: self.queries_granted.load(Ordering::Relaxed),
+            first_qpc: self.first_qpc.load(Ordering::Relaxed),
+            last_qpc: self.last_qpc.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Les compteurs du mode paquets des deux sens d'un câble (voir [`SidePackets`]).
+#[derive(Debug)]
+struct PacketCounters {
+    /// Côté rendu, où le moteur audio écrit.
+    render: SidePackets,
+    /// Côté capture, où le moteur audio lit.
+    capture: SidePackets,
+}
+
+impl PacketCounters {
+    const fn new() -> Self {
+        Self {
+            render: SidePackets::new(),
+            capture: SidePackets::new(),
+        }
+    }
+
+    /// Le bloc du sens `direction`.
+    const fn slot(&self, direction: Direction) -> &SidePackets {
+        match direction {
+            Direction::Render => &self.render,
+            Direction::Capture => &self.capture,
+        }
+    }
+
+    /// Remet les deux blocs à zéro (nouveau cycle de périphérique).
+    fn reset(&self) {
+        self.render.reset();
+        self.capture.reset();
+    }
+}
+
 /// Erreur de [`Cable::attach`] : un flux est déjà ouvert dans ce sens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotOccupied;
@@ -703,6 +926,8 @@ pub struct Cable {
     counters: Counters,
     /// Allocations de tampon refusées, par sens (hors verrou, [`AllocRefusals`]).
     alloc_refusals: AllocRefusals,
+    /// Ce que le mode paquets a produit, par sens (hors verrou, [`PacketCounters`]).
+    packets: PacketCounters,
     /// Nœuds volume et sourdine du filtre `TopoRender<n>` (hors verrou, [`NodeState`]).
     render_nodes: NodeState,
     /// Nœuds volume et sourdine du filtre `TopoCapture<n>`.
@@ -787,6 +1012,7 @@ impl Cable {
             timer: ExTimer::new(),
             counters: Counters::new(),
             alloc_refusals: AllocRefusals::new(),
+            packets: PacketCounters::new(),
             render_nodes: NodeState::new(),
             capture_nodes: NodeState::new(),
             jack_events: SpinLock::new(ManuallyDrop::new(JackTargets::new())),
@@ -1041,9 +1267,13 @@ impl Cable {
             // Les compteurs aussi : le pilote reste chargé d'un cycle à l'autre, et une
             // trace qui cumulerait les ticks des cycles précédents ferait croire à une
             // image obsolète du pilote. Les refus d'allocation partent avec eux, et pour
-            // exactement la même raison.
+            // exactement la même raison ; ceux du mode paquets aussi, et la raison compte
+            // doublement là : `PacketMode` se règle d'un redémarrage de périphérique à
+            // l'autre, et un relevé qui cumulerait les deux cycles attribuerait au mode
+            // courant des appels reçus sous le précédent.
             self.counters.reset();
             self.alloc_refusals.reset();
+            self.packets.reset();
         }
         // Les cibles d'événement ne sont **pas** effacées : elles sont posées par les
         // `Init` des miniports de topologie, qui suivent ce `start`, et retirées par leur
@@ -1486,6 +1716,87 @@ impl Cable {
         CableTransport {
             cable: self.index,
             reserved: 0,
+            render,
+            capture,
+        }
+    }
+
+    /// Compte un appel d'une méthode du **mode paquets** dans le sens `direction`, avec son
+    /// IRQL et son horodatage QPC.
+    ///
+    /// Appelée par les quatre méthodes de `stream::WaveStream`, **qui refusent toutes** : ce
+    /// compteur mesure donc des refus rendus depuis une interface que le moteur audio avait
+    /// légitimement obtenue, c'est-à-dire exactement le risque que `portcls::packet` décrit et
+    /// que l'expérience du lot 2 sert à quantifier.
+    ///
+    /// Le compteur vit sur le câble et non sur le flux : voir [`SidePackets`].
+    ///
+    /// IRQL : quelconque — que des atomiques. Les quatre méthodes sont à `PASSIVE_LEVEL` par
+    /// contrat, et `irql` est là pour le **vérifier**, pas pour être supposé.
+    pub fn note_packet_call(&self, direction: Direction, methode: PacketMethod, irql: u32) {
+        self.packets
+            .slot(direction)
+            .note_call(methode, irql, clock::now());
+    }
+
+    /// Compte un `QueryInterface` reçu sur un IID du mode paquets par le flux du sens
+    /// `direction`, `rendu` disant si la tête satellite a été rendue.
+    ///
+    /// Compté **que l'IID soit exposé ou non**, et c'est là tout son intérêt : à
+    /// `PacketMode = 0`, des demandes non rendues prouvent que le moteur audio cherche le mode
+    /// paquets sans qu'on ait rien exposé — une mesure qui ne promet rien.
+    ///
+    /// IRQL : `<= DISPATCH_LEVEL` (celui de `QueryInterface`, plus permissif que celui des
+    /// quatre méthodes) — deux `fetch_add`, aucun verrou pris.
+    pub fn note_packet_query(&self, direction: Direction, rendu: bool) {
+        self.packets.slot(direction).note_query(rendu);
+    }
+
+    /// Un **instantané** de ce que le mode paquets a produit sur les deux sens, pour
+    /// `KSPROPERTY_CONDUIT_PACKETS` (lot 2).
+    ///
+    /// # Le verrou, et pourquoi si peu
+    ///
+    /// Tous les compteurs sont des atomiques du câble : ils se lisent **hors de tout verrou**,
+    /// comme ceux de [`Cable::counters_snapshot`]. Seule l'**exposition** vit dans le
+    /// [`StreamState`], sous le verrou du flux, parce qu'elle décrit le flux courant — d'où le
+    /// même geste que [`Cable::transport_snapshot`], et le même ordre de verrouillage (câble
+    /// puis flux), mais pour recopier un seul champ immuable au lieu de sept.
+    ///
+    /// # Non atomique entre les champs
+    ///
+    /// Les compteurs sont lus avant les expositions, et les deux sens l'un après l'autre : un
+    /// appel peut tomber entre deux lectures et l'instantané mélanger deux instants. C'est le
+    /// choix de tout ce module, pour la raison écrite sur [`Cable::counters_snapshot`], et il
+    /// est sans effet sur ce qu'on cherche : quels compteurs bougent, et pas leur somme exacte.
+    ///
+    /// Le champ `packet_mode` n'est **pas** rempli ici : il vient du registre, pas du câble,
+    /// et c'est `topo` qui le pose (`registry::packet_mode`). Le laisser à zéro ici évite que
+    /// ce module ait à connaître un paramètre global pour rendre un état de câble.
+    ///
+    /// IRQL : `<= DISPATCH_LEVEL` (le spin lock du câble est pris).
+    pub fn packets_snapshot(&self) -> CablePackets {
+        // Hors verrou, et avant : un `fetch_add` du chemin de refus ne doit pas attendre que
+        // ce relevé ait fini.
+        let mut render = self.packets.slot(Direction::Render).snapshot();
+        let mut capture = self.packets.slot(Direction::Capture).snapshot();
+
+        let cable = self.state();
+        // Un emplacement vide reste `PacketExposure::NoStream` : le relevé dit « aucun flux
+        // ouvert » plutôt que « rien d'exposé », deux choses qu'un zéro unique confondrait.
+        let exposition = |direction: Direction| match cable.get(direction) {
+            None => PacketExposure::NoStream,
+            // SAFETY: le pointeur de l'emplacement désigne le `SpinLock<StreamState>` d'un
+            // flux vivant tant que la garde du câble est détenue (contrat du module) ;
+            // l'ordre câble puis flux est respecté, et la garde du flux meurt à la fin de
+            // cette expression.
+            Some(shared) => unsafe { shared.as_ref() }.lock().packet_exposure,
+        };
+        render.exposure = exposition(Direction::Render).code();
+        capture.exposure = exposition(Direction::Capture).code();
+        CablePackets {
+            cable: self.index,
+            packet_mode: 0,
             render,
             capture,
         }

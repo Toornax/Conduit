@@ -65,14 +65,14 @@ use conduit_backend::CableId;
 /// aujourd'hui, `CableControl` demain) lisent la structure d'échange et le nombre de
 /// câbles **ici**, sans dépendre du crate du pilote ni en recopier quoi que ce soit.
 pub use conduit_kmd_core::config::{
-    AllocationMode, CableCounters, CableState, CableTransport, KsRunState, StreamSide,
-    StreamTransport, CABLE_MAX,
+    AllocationMode, CableCounters, CablePackets, CableState, CableTransport, KsRunState,
+    PacketExposure, StreamPackets, StreamSide, StreamTransport, CABLE_MAX,
 };
 use conduit_kmd_core::config::{
-    ConfigError, ConfigGuid, CountersError, TransportError, CABLE_COUNTERS_BYTES,
-    CABLE_STATE_BYTES, CABLE_TRANSPORT_BYTES, CONFIG_VERSION, KSPROPERTY_CONDUIT_CABLE_STATE,
-    KSPROPERTY_CONDUIT_COUNTERS, KSPROPERTY_CONDUIT_TRANSPORT, KSPROPERTY_CONDUIT_VERSION,
-    KSPROPSETID_CONDUIT,
+    ConfigError, ConfigGuid, CountersError, PacketsError, TransportError, CABLE_COUNTERS_BYTES,
+    CABLE_PACKETS_BYTES, CABLE_STATE_BYTES, CABLE_TRANSPORT_BYTES, CONFIG_VERSION,
+    KSPROPERTY_CONDUIT_CABLE_STATE, KSPROPERTY_CONDUIT_COUNTERS, KSPROPERTY_CONDUIT_PACKETS,
+    KSPROPERTY_CONDUIT_TRANSPORT, KSPROPERTY_CONDUIT_VERSION, KSPROPSETID_CONDUIT,
 };
 use windows::core::PCWSTR;
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
@@ -618,6 +618,40 @@ pub fn parse_transport(buffer: &[u8], returned: usize) -> Result<CableTransport,
         });
     }
     CableTransport::from_bytes(utiles).map_err(|e: TransportError| CableConfigError::Reponse {
+        cause: e.to_string(),
+    })
+}
+
+/// Analyse la réponse d'un `GET` de [`KSPROPERTY_CONDUIT_PACKETS`] :
+/// `returned` octets utiles dans `buffer`.
+///
+/// Même forme que [`parse_transport`], et pour la même raison : la longueur **rendue** est
+/// vérifiée avant le contenu, puis le jugement sur les octets est délégué au parseur du
+/// contrat, celui-là même que le pilote partage.
+///
+/// # Erreurs
+///
+/// [`CableConfigError::Reponse`] si le pilote a écrit un nombre d'octets inattendu ou une
+/// valeur que le contrat refuse — une exposition, un mode ou un IRQL hors domaine, ce qui
+/// dirait que le pilote et cet outil ne parlent pas de la même chose.
+pub fn parse_packets(buffer: &[u8], returned: usize) -> Result<CablePackets, CableConfigError> {
+    let utiles = buffer
+        .get(..returned)
+        .ok_or_else(|| CableConfigError::Reponse {
+            cause: format!(
+                "{returned} octets annoncés pour un tampon de {} : le pilote a débordé",
+                buffer.len()
+            ),
+        })?;
+    if utiles.len() != CABLE_PACKETS_BYTES {
+        return Err(CableConfigError::Reponse {
+            cause: format!(
+                "{} octets rendus, {CABLE_PACKETS_BYTES} attendus pour un CablePackets",
+                utiles.len()
+            ),
+        });
+    }
+    CablePackets::from_bytes(utiles).map_err(|e: PacketsError| CableConfigError::Reponse {
         cause: e.to_string(),
     })
 }
@@ -1461,6 +1495,53 @@ impl TopologyFilter {
         parse_transport(&valeur, rendus)
     }
 
+    /// Lit [`KSPROPERTY_CONDUIT_PACKETS`], ce que le moteur audio a fait des interfaces du
+    /// **mode paquets** sur les deux sens du câble (lot 2).
+    ///
+    /// # Ce que la lecture répond
+    ///
+    /// Le paramètre `PacketMode` **effectif** (0 : rien n'est exposé, le pilote livré ; 1 :
+    /// les interfaces sont exposées **sans être servies**, une expérience de mesure), ce que
+    /// le flux courant de chaque sens expose, puis, cumulés depuis le dernier `StartDevice` :
+    /// les `QueryInterface` reçus sur les deux IID de paquets et ceux auxquels le pilote a
+    /// répondu, les appels des quatre méthodes — toutes refusées par `STATUS_NOT_SUPPORTED` —
+    /// par sens et par méthode, l'IRQL du dernier appel et le maximum vu, et les horodatages
+    /// QPC du premier et du dernier appel.
+    ///
+    /// C'est ce qui tranche la question laissée ouverte par le lot 0 : le moteur audio scrute
+    /// **par politique**, ou parce qu'il ne trouve pas les interfaces de paquets ? Le relevé
+    /// est utile même à `PacketMode = 0`, les `QueryInterface` étant comptés que l'IID soit
+    /// rendu ou non.
+    ///
+    /// Les deux sens viennent ensemble quel que soit le côté ouvert, comme pour
+    /// [`Self::read_transport`] : la question porte sur le câble.
+    ///
+    /// # Ce que l'instantané vaut, et ce qu'il ne vaut pas
+    ///
+    /// Les compteurs sont des atomiques lus hors verrou, les deux expositions sous le verrou
+    /// de leur flux : l'instantané peut mélanger deux instants, et aucune cohérence entre
+    /// champs n'est garantie. C'est un choix, écrit sur
+    /// `conduit_kmd::cable::Cable::packets_snapshot`.
+    ///
+    /// Aucun privilège n'est exigé, comme pour [`Self::read_counters`].
+    ///
+    /// # Erreurs
+    ///
+    /// Voir [`Self::read_state`]. Sur un pilote antérieur au lot 2, la propriété n'existe
+    /// pas : le refus arrive en [`CableConfigError::Requete`], et c'est
+    /// [`Self::read_version`] qui dit pourquoi.
+    pub fn read_packets(&self) -> Result<CablePackets, CableConfigError> {
+        let mut valeur = [0u8; CABLE_PACKETS_BYTES];
+        let rendus = self.property(
+            KSPROPERTY_CONDUIT_PACKETS,
+            KSPROPERTY_TYPE_GET,
+            &mut valeur,
+            "KSPROPERTY_CONDUIT_PACKETS",
+            "GET",
+        )?;
+        parse_packets(&valeur, rendus)
+    }
+
     /// Écrit [`KSPROPERTY_CONDUIT_CABLE_STATE`] : connecte ou déconnecte le câble.
     ///
     /// # Une lecture, puis l'écriture — et c'est le contrat, pas une précaution
@@ -1862,6 +1943,78 @@ mod tests {
         .to_bytes();
         let erreur =
             parse_transport(&mode_inconnu, CABLE_TRANSPORT_BYTES).expect_err("mode inconnu");
+        let rendu = erreur.to_string();
+        assert!(rendu.contains("capture"), "{rendu}");
+        assert!(rendu.contains("99"), "{rendu}");
+    }
+
+    /// La réponse du relevé de paquets doit faire exactement cent soixante-huit octets, et le
+    /// message d'erreur doit dire **cette** longueur-là.
+    ///
+    /// Les paliers 16, 56 et 72 comptent : ce sont les tailles des trois autres structures du
+    /// même jeu, donc les erreurs qu'un client fait en confondant les propriétés.
+    #[test]
+    fn la_reponse_des_paquets_doit_faire_exactement_cent_soixante_huit_octets() {
+        let valide = CablePackets {
+            packet_mode: 1,
+            render: StreamPackets {
+                exposure: PacketExposure::Output.code(),
+                set_write_packet: 5,
+                queries: 7,
+                queries_granted: 7,
+                irql_max: 0,
+                ..StreamPackets::new()
+            },
+            ..CablePackets::new(2)
+        }
+        .to_bytes();
+        let paquets = parse_packets(&valide, CABLE_PACKETS_BYTES).expect("paquets valides");
+        assert_eq!(paquets.cable, 2);
+        assert!(
+            paquets.mode_actif(),
+            "le mode effectif est celui du dernier StartDevice, pas ce que regedit contient"
+        );
+        assert!(
+            paquets.emprunte(),
+            "cinq SetWritePacket refusés : le moteur a bien emprunté le mode paquets"
+        );
+        assert_eq!(paquets.queries_total(), 7);
+        assert_eq!(paquets.queries_granted_total(), 7);
+        assert_eq!(
+            paquets.irql_max(),
+            0,
+            "PASSIVE_LEVEL, comme le contrat promet"
+        );
+        assert_eq!(
+            paquets.capture.exposure(),
+            Some(PacketExposure::NoStream),
+            "l'autre sens n'a pas de flux, et se lit comme tel"
+        );
+
+        for rendus in [0, 4, 16, 56, 72, 167] {
+            let erreur = parse_packets(&valide, rendus).expect_err("longueur");
+            assert!(
+                matches!(erreur, CableConfigError::Reponse { .. }),
+                "{rendus} octets rendus"
+            );
+        }
+        // Plus d'octets que le tampon n'en contient : le pilote a débordé.
+        assert!(matches!(
+            parse_packets(&valide, CABLE_PACKETS_BYTES + 1),
+            Err(CableConfigError::Reponse { .. })
+        ));
+        // Contenu refusé par le contrat : le message vient de `PacketsError`, et il nomme le
+        // sens fautif.
+        let exposition_inconnue = CablePackets {
+            capture: StreamPackets {
+                exposure: 99,
+                ..StreamPackets::new()
+            },
+            ..CablePackets::new(0)
+        }
+        .to_bytes();
+        let erreur =
+            parse_packets(&exposition_inconnue, CABLE_PACKETS_BYTES).expect_err("exposition");
         let rendu = erreur.to_string();
         assert!(rendu.contains("capture"), "{rendu}");
         assert!(rendu.contains("99"), "{rendu}");

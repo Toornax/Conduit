@@ -143,22 +143,34 @@ HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GRGWGX;;;BA)(A;;GRGWGX;;;WD)(A;;GRGWGX;;;RC)"
 ; IoOpenDeviceRegistryKey(PLUGPLAY_REGKEY_DEVICE), qui ouvre exactement la clé matérielle
 ; que cette section alimente. 0x10001 = FLG_ADDREG_TYPE_DWORD.
 ;
-; Les trois défauts sont ENGENDRÉS depuis conduit_kmd_core::params, par
-; Param::default_value. Les modifier ici ne servirait à rien : le pilote garde les siens,
-; et le test defauts_de_parametres_identiques_au_pilote signale la divergence.
+; Les défauts sont ENGENDRÉS depuis conduit_kmd_core::params, par Param::default_value. Les
+; modifier ici ne servirait à rien : le pilote garde les siens, et le test
+; defauts_de_parametres_identiques_au_pilote signale la divergence.
 ;
 ; Aucune de ces valeurs n'est nécessaire au chargement : absente, d'un autre type ou hors
 ; bornes, elle est remplacée par le défaut et consignée au journal d'événements. Elles
 ; sont écrites pour que `regedit` montre à l'administrateur ce qu'il peut régler.
+;
+; PacketMode (lot 2 du mode paquets WaveRT) est une EXPÉRIENCE DE MESURE, pas un réglage, et
+; c'est le seul paramètre de cette section dont la valeur ne doit jamais être changée sur un
+; poste en service. À 1, le pilote EXPOSE les interfaces IMiniportWaveRTInputStream /
+; IMiniportWaveRTOutputStream sur ses flux SANS LES SERVIR : les quatre méthodes rendent
+; STATUS_NOT_SUPPORTED et se contentent de compter, ce que la propriété KS
+; KSPROPERTY_CONDUIT_PACKETS rend lisible. Exposer une interface qu'on ne sert pas est plus
+; dangereux que ne rien exposer — le moteur audio peut basculer sur le chemin des paquets et
+; casser un transport qui marchait. À n'utiliser que sur une machine d'essai, et à remettre
+; à 0 (puis redémarrer le périphérique) ensuite. Le paramètre est lu au StartDevice : une
+; modification ne prend effet qu'au démarrage suivant du périphérique.
 HKR,,ReserveSize,0x10001,16
 HKR,,Channels,0x10001,2
 HKR,,BufferMs,0x10001,10
+HKR,,PacketMode,0x10001,0
 
 ; État actif des câbles (M1b-04, F-05). Masque de bits : le bit n vaut « câble n+1
 ; connecté ». 0x00000003 = « Conduit 1 » et « Conduit 2 » actifs, les quatorze autres
 ; rangés sous « Périphériques déconnectés ».
 ;
-; À la DIFFÉRENCE des trois valeurs ci-dessus, celle-ci n'est pas un réglage
+; À la DIFFÉRENCE des valeurs ci-dessus, celle-ci n'est pas un réglage
 ; d'administrateur : c'est de l'ÉTAT, que le pilote RÉÉCRIT lui-même à chaque changement
 ; demandé par la propriété KS privée KSPROPSETID_Conduit. La modifier à la main marche (le
 ; pilote la relit au démarrage suivant) mais elle sera écrasée à la première demande du

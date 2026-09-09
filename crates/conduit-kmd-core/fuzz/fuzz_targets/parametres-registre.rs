@@ -1,6 +1,6 @@
 //! Cible cargo-fuzz : le chemin de lecture des paramètres de registre (M1b-08).
 //!
-//! Le pilote lit trois valeurs sous `Device Parameters` au `StartDevice`, les décode
+//! Le pilote lit quatre valeurs sous `Device Parameters` au `StartDevice`, les décode
 //! (`decode_dword`) puis les écrête (`sanitize`). Le critère de M1b-01 est que **rien**
 //! de ce que l'administrateur peut écrire dans `regedit` ne fasse échouer le chargement :
 //! `sanitize` est donc une fonction **totale**, et cette cible le vérifie sur des types
@@ -8,8 +8,8 @@
 //!
 //! # Disposition de l'entrée
 //!
-//! Trois enregistrements de 13 octets, un par paramètre, dans l'ordre de `Param::ALL`
-//! (`ReserveSize`, `Channels`, `BufferMs`) :
+//! Quatre enregistrements de 13 octets, un par paramètre, dans l'ordre de `Param::ALL`
+//! (`ReserveSize`, `Channels`, `BufferMs`, `PacketMode`) :
 //!
 //! | Décalage | Champ |
 //! |---|---|
@@ -18,7 +18,7 @@
 //! | `5..13` | les données, dont seuls les `longueur` premiers octets sont décodés |
 //!
 //! Un enregistrement absent (entrée trop courte) vaut « valeur absente du registre »,
-//! ce qui est le cas d'une clé `Parameters` vide. Les octets au-delà du 39ᵉ sont ignorés.
+//! ce qui est le cas d'une clé `Parameters` vide. Les octets au-delà du 52ᵉ sont ignorés.
 //!
 //! # Ce qui est vérifié
 //!
@@ -32,7 +32,7 @@
 //!
 //! `cargo +nightly fuzz run parametres-registre` depuis `crates/conduit-kmd-core`.
 #![no_main]
-// `..RawParams::MISSING` est redondant tant que les trois champs sont énumérés ; il est
+// `..RawParams::MISSING` est redondant tant que les quatre champs sont énumérés ; il est
 // là exprès, pour que la cible continue de compiler si M1b-05 ajoute un paramètre.
 #![allow(clippy::needless_update)]
 
@@ -59,6 +59,7 @@ fuzz_target!(|data: &[u8]| {
         reserve: lire(data, 0),
         channels: lire(data, 1),
         buffer_ms: lire(data, 2),
+        packet_mode: lire(data, 3),
         ..RawParams::MISSING
     };
 
@@ -69,6 +70,11 @@ fuzz_target!(|data: &[u8]| {
         (Param::Reserve, brut.reserve, u32::from(params.reserve)),
         (Param::Channels, brut.channels, u32::from(params.channels)),
         (Param::BufferMs, brut.buffer_ms, params.buffer_ms),
+        (
+            Param::PacketMode,
+            brut.packet_mode,
+            u32::from(params.packet_mode),
+        ),
     ];
 
     for (param, trouve, retenu) in table {
@@ -122,6 +128,7 @@ fuzz_target!(|data: &[u8]| {
         reserve: Some(u32::from(params.reserve)),
         channels: Some(u32::from(params.channels)),
         buffer_ms: Some(params.buffer_ms),
+        packet_mode: Some(u32::from(params.packet_mode)),
         ..RawParams::MISSING
     });
     assert_eq!(encore, params, "sanitize n'est pas idempotente");

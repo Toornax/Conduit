@@ -1090,3 +1090,186 @@ fn un_flux_composite_n_est_ni_une_cible_de_propriete_ni_une_cible_d_evenement() 
         assert_eq!(dropped.load(Ordering::SeqCst), 1, "{interfaces:?}");
     }
 }
+
+// ---------------------------------------------------------------------------------
+// Les deux points d'observation du `QueryInterface` composite (lot 2).
+// ---------------------------------------------------------------------------------
+
+/// Flux qui ne sert rien du mode paquets mais **observe** les demandes d'IID.
+///
+/// Il est distinct de [`Flux`] et de [`FluxMuet`] à dessein : ce qui se vérifie ici est le
+/// chemin d'observation, pas le service, et un flux qui ferait les deux ne dirait pas lequel
+/// des deux a été emprunté.
+struct FluxObservateur {
+    /// `(demandes, rendues)` sur `IID_IMiniportWaveRTInputStream`.
+    entree: AtomicU64,
+    /// `(demandes, rendues)` sur `IID_IMiniportWaveRTOutputStream`.
+    sortie: AtomicU64,
+}
+
+impl FluxObservateur {
+    const fn nouveau() -> Self {
+        Self {
+            entree: AtomicU64::new(0),
+            sortie: AtomicU64::new(0),
+        }
+    }
+
+    /// Un compteur par mot de 32 bits : les demandes en poids faible, les réponses en poids
+    /// fort. Un seul atomique par sens suffit et évite d'en désynchroniser deux.
+    fn noter(compteur: &AtomicU64, rendu: bool) {
+        let pas = if rendu { 1 | (1 << 32) } else { 1 };
+        compteur.fetch_add(pas, Ordering::SeqCst);
+    }
+
+    fn lire(compteur: &AtomicU64) -> (u64, u64) {
+        let brut = compteur.load(Ordering::SeqCst);
+        (brut & 0xFFFF_FFFF, brut >> 32)
+    }
+}
+
+impl MiniportWaveRTStream for FluxObservateur {
+    fn set_state(&self, _: KSSTATE::Type) -> NtStatus {
+        STATUS_SUCCESS
+    }
+
+    fn position(&self) -> Result<u32, NtStatus> {
+        Ok(0)
+    }
+
+    fn allocate_audio_buffer(&self, _: u32) -> Result<AudioBuffer, NtStatus> {
+        Err(STATUS_INVALID_PARAMETER)
+    }
+
+    fn free_audio_buffer(&self, _: PMDL, _: u32) {}
+}
+
+impl MiniportWaveRTStreamNotification for FluxObservateur {
+    fn allocate_buffer_with_notification(&self, _: u32, _: u32) -> Result<AudioBuffer, NtStatus> {
+        Err(STATUS_INVALID_PARAMETER)
+    }
+
+    fn free_buffer_with_notification(&self, _: PMDL, _: u32) {}
+
+    fn register_notification_event(&self, _: PKEVENT) -> NtStatus {
+        STATUS_SUCCESS
+    }
+
+    fn unregister_notification_event(&self, _: PKEVENT) -> NtStatus {
+        STATUS_SUCCESS
+    }
+}
+
+impl MiniportWaveRTInputStream for FluxObservateur {
+    fn note_input_query(&self, rendu: bool) {
+        Self::noter(&self.entree, rendu);
+    }
+}
+
+impl MiniportWaveRTOutputStream for FluxObservateur {
+    fn note_output_query(&self, rendu: bool) {
+        Self::noter(&self.sortie, rendu);
+    }
+}
+
+/// Les deux points d'observation voient **toutes** les demandes d'IID de paquets, exposées
+/// ou non, et rien d'autre.
+///
+/// C'est ce qui rend mesurable, sans rien exposer, la question du lot 2 : le moteur audio
+/// demande-t-il le mode paquets ? Un compteur qui ne verrait que les demandes **satisfaites**
+/// répondrait toujours « non » sur le pilote livré, c'est-à-dire ne répondrait rien.
+#[test]
+fn les_points_d_observation_voient_les_demandes_exposees_ou_non() {
+    for interfaces in [
+        PacketInterfaces::None,
+        PacketInterfaces::Input,
+        PacketInterfaces::Output,
+        PacketInterfaces::Both,
+    ] {
+        let this = new_packet_stream_object(FluxObservateur::nouveau(), interfaces).into_raw();
+        let flux = |this: This| unsafe {
+            conduit_com::ComObject::<
+                IMiniportWaveRTStreamNotificationVtbl,
+                portcls::PacketStream<FluxObservateur>,
+            >::inner(this)
+        };
+
+        // Les deux IID de paquets, demandés une fois chacun. Ceux qui sont exposés rendent
+        // une tête satellite (référence à rendre), les autres sont refusés comme n'importe
+        // quel IID inconnu — et les deux cas sont notifiés.
+        for (iid, expose) in [
+            (iid_entree(), interfaces.has_input()),
+            (iid_sortie(), interfaces.has_output()),
+        ] {
+            let (status, out) = query_interface(this, &iid);
+            if expose {
+                assert_eq!(status, STATUS_SUCCESS, "{interfaces:?} {iid}");
+                release(out);
+            } else {
+                assert_eq!(status, STATUS_INVALID_PARAMETER, "{interfaces:?} {iid}");
+                assert!(out.is_null(), "{interfaces:?} {iid}");
+            }
+        }
+
+        let (demandes_e, rendues_e) = FluxObservateur::lire(&flux(this).entree);
+        let (demandes_s, rendues_s) = FluxObservateur::lire(&flux(this).sortie);
+        assert_eq!(
+            demandes_e, 1,
+            "{interfaces:?} : l'IID d'entrée a été demandé"
+        );
+        assert_eq!(
+            demandes_s, 1,
+            "{interfaces:?} : l'IID de sortie a été demandé"
+        );
+        assert_eq!(
+            rendues_e,
+            u64::from(interfaces.has_input()),
+            "{interfaces:?}"
+        );
+        assert_eq!(
+            rendues_s,
+            u64::from(interfaces.has_output()),
+            "{interfaces:?}"
+        );
+
+        // Un IID qui n'est pas du mode paquets ne notifie rien : l'observation ne déforme
+        // pas le `QueryInterface` générique.
+        let base = qi_ok(this, &guid(&IID_IMiniportWaveRTStream));
+        release(base);
+        assert_eq!(FluxObservateur::lire(&flux(this).entree), (1, rendues_e));
+        assert_eq!(FluxObservateur::lire(&flux(this).sortie), (1, rendues_s));
+
+        assert_eq!(release(this), 0, "{interfaces:?}");
+    }
+}
+
+/// Une demande relayée par une **tête satellite** est notifiée elle aussi.
+///
+/// Le `QueryInterface` d'un satellite délègue au principal (transitivité COM) : sans ce
+/// test, un chemin de demande sur deux resterait invisible, et le relevé sous-compterait
+/// exactement là où le moteur audio est déjà passé en mode paquets.
+#[test]
+fn une_demande_relayee_par_un_satellite_est_notifiee() {
+    let this =
+        new_packet_stream_object(FluxObservateur::nouveau(), PacketInterfaces::Both).into_raw();
+    let flux = unsafe {
+        conduit_com::ComObject::<
+            IMiniportWaveRTStreamNotificationVtbl,
+            portcls::PacketStream<FluxObservateur>,
+        >::inner(this)
+    };
+
+    // Une première demande sur le principal, puis la même depuis la tête d'entrée.
+    let tete = qi_ok(this, &iid_entree());
+    assert_eq!(FluxObservateur::lire(&flux.entree), (1, 1));
+    let depuis_satellite = qi_ok(tete, &iid_sortie());
+    assert_eq!(
+        FluxObservateur::lire(&flux.sortie),
+        (1, 1),
+        "le QueryInterface d'un satellite délègue au principal : la demande compte"
+    );
+
+    release(depuis_satellite);
+    release(tete);
+    assert_eq!(release(this), 0);
+}

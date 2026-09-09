@@ -13,7 +13,7 @@
 //! mode utilisateur, et il ne peut l'être que s'il ne dépend d'aucun type du WDK. Toute
 //! validation écrite **ici** échapperait au fuzzer.
 //!
-//! # Quatre propriétés, un jeu
+//! # Cinq propriétés, un jeu
 //!
 //! | Propriété | Verbes | Valeur |
 //! |---|---|---|
@@ -21,14 +21,15 @@
 //! | [`KSPROPERTY_CONDUIT_VERSION`] | GET, BASICSUPPORT | un `ULONG` |
 //! | [`KSPROPERTY_CONDUIT_COUNTERS`] | GET, BASICSUPPORT | [`CableCounters`], 56 octets |
 //! | [`KSPROPERTY_CONDUIT_TRANSPORT`] | GET, BASICSUPPORT | [`CableTransport`], 72 octets |
+//! | [`KSPROPERTY_CONDUIT_PACKETS`] | GET, BASICSUPPORT | [`CablePackets`], 168 octets |
 //!
 //! Une seule est modifiable, et c'est la première : la version est celle du binaire chargé,
 //! les compteurs sont ce que la boucle locale a fait, le transport est ce que le moteur audio
-//! a demandé. **Ni un compteur ni une observation n'est un réglage**, d'où l'absence de `SET`
-//! — et, faute d'écriture, aucun contrôle de privilège à faire : seule l'écriture en
-//! demandait un.
+//! a demandé, le relevé de paquets ce qu'il a fait des interfaces du mode paquets. **Ni un
+//! compteur ni une observation n'est un réglage**, d'où l'absence de `SET` — et, faute
+//! d'écriture, aucun contrôle de privilège à faire : seule l'écriture en demandait un.
 //!
-//! Les quatre se posent dans la `PCAUTOMATION_TABLE` du **filtre** de topologie
+//! Les cinq se posent dans la `PCAUTOMATION_TABLE` du **filtre** de topologie
 //! (`PCFILTER_DESCRIPTOR::AutomationTable`), à côté de `KSPROPERTY_JACK_DESCRIPTION`, et
 //! non sur une broche ni sur un nœud : elles décrivent le câble entier, pas un point de
 //! son graphe. Le service d'assistance (M1b-20) ouvre l'interface `KSCATEGORY_TOPOLOGY` du
@@ -141,14 +142,18 @@
 
 use conduit_com::{NtStatus, STATUS_INVALID_PARAMETER};
 use conduit_kmd_core::config::{
-    CABLE_COUNTERS_BYTES, CABLE_STATE_BYTES, CABLE_TRANSPORT_BYTES, CONFIG_VERSION, CableCounters,
-    CableState, CableTransport, ConfigError, ConfigGuid, KSPROPERTY_CONDUIT_CABLE_STATE,
-    KSPROPERTY_CONDUIT_COUNTERS, KSPROPERTY_CONDUIT_TRANSPORT, KSPROPERTY_CONDUIT_VERSION,
+    CABLE_COUNTERS_BYTES, CABLE_PACKETS_BYTES, CABLE_STATE_BYTES, CABLE_TRANSPORT_BYTES,
+    CONFIG_VERSION, CableCounters, CablePackets, CableState, CableTransport, ConfigError,
+    ConfigGuid, KSPROPERTY_CONDUIT_CABLE_STATE, KSPROPERTY_CONDUIT_COUNTERS,
+    KSPROPERTY_CONDUIT_PACKETS, KSPROPERTY_CONDUIT_TRANSPORT, KSPROPERTY_CONDUIT_VERSION,
     KSPROPSETID_CONDUIT, O_CABLE, O_CHANNELS, O_CONNECTED, O_RESERVED, OC_CABLE, OC_COPIED,
     OC_DISCARDED_TICKS, OC_OVERRUNS, OC_RESERVED, OC_SILENCED_BEFORE_RENDER, OC_SILENCED_NO_RENDER,
-    OC_TICKS, OS_BUFFER_BYTES, OS_BUFFER_FRAMES, OS_KS_STATE, OS_MODE, OS_NOTIFICATION_COUNT,
-    OS_NOTIFICATION_EVENTS, OS_REFUSED_ALLOCATIONS, OT_CABLE, OT_CAPTURE, OT_RENDER, OT_RESERVED,
-    STREAM_TRANSPORT_BYTES, StreamTransport,
+    OC_TICKS, OCP_CABLE, OCP_CAPTURE, OCP_MODE, OCP_RENDER, OS_BUFFER_BYTES, OS_BUFFER_FRAMES,
+    OS_KS_STATE, OS_MODE, OS_NOTIFICATION_COUNT, OS_NOTIFICATION_EVENTS, OS_REFUSED_ALLOCATIONS,
+    OSP_EXPOSURE, OSP_FIRST_QPC, OSP_GET_READ_PACKET, OSP_IRQL_LAST, OSP_IRQL_MAX, OSP_LAST_QPC,
+    OSP_PACKET_COUNT, OSP_PRESENTATION_POSITION, OSP_QUERIES, OSP_QUERIES_GRANTED, OSP_RESERVED,
+    OSP_SET_WRITE_PACKET, OT_CABLE, OT_CAPTURE, OT_RENDER, OT_RESERVED, STREAM_PACKETS_BYTES,
+    STREAM_TRANSPORT_BYTES, StreamPackets, StreamTransport,
 };
 use portcls_sys::{
     GUID, GUID_NULL, KSPROPERTY_TYPE_BASICSUPPORT, KSPROPERTY_TYPE_GET, KSPROPERTY_TYPE_SET,
@@ -232,6 +237,17 @@ pub const COUNTERS_ACCESS_FLAGS: u32 = KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_BAS
 /// observation ne se règle pas plus qu'un compteur.
 pub const TRANSPORT_ACCESS_FLAGS: u32 = KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_BASICSUPPORT;
 
+/// `Flags` du `PCPROPERTY_ITEM` du relevé de paquets : `GET | BASICSUPPORT` (513), **sans
+/// `SET`**.
+///
+/// Quatrième constante de même valeur, et pour la même raison que la troisième. Ce que le
+/// relevé de paquets décrit est une **observation** — ce que le moteur audio a fait
+/// d'interfaces exposées — et le seul réglage du mode paquets est le paramètre de registre
+/// `PacketMode`, lu au `StartDevice` : rendre modifiable par KS ce qui exige un redémarrage du
+/// périphérique serait promettre un effet qui n'aurait pas lieu, exactement l'erreur que
+/// [`CableState::channels`] écarte de son côté.
+pub const PACKETS_ACCESS_FLAGS: u32 = KSPROPERTY_TYPE_GET | KSPROPERTY_TYPE_BASICSUPPORT;
+
 /// Taille de la valeur de [`KSPROPERTY_CONDUIT_VERSION`] : un `ULONG`.
 const TAILLE_VERSION: usize = 4;
 
@@ -263,6 +279,20 @@ const _: () = assert!(OS_MODE == 0 && OS_NOTIFICATION_COUNT == 4 && OS_BUFFER_BY
 const _: () = assert!(OS_BUFFER_FRAMES == 12 && OS_NOTIFICATION_EVENTS == 16);
 const _: () = assert!(OS_KS_STATE == 20 && OS_REFUSED_ALLOCATIONS == 24);
 const _: () = assert!(OS_REFUSED_ALLOCATIONS + 8 == STREAM_TRANSPORT_BYTES);
+const _: () = assert!(PACKETS_ACCESS_FLAGS == 513);
+const _: () = assert!(PACKETS_ACCESS_FLAGS & KSPROPERTY_TYPE_SET == 0);
+// Idem pour le relevé de paquets : deux `ULONG` puis deux blocs de sens de 80 octets, chacun
+// aligné sur huit ; dans un bloc, quatre `ULONG` puis huit `ULONGLONG`.
+const _: () = assert!(CABLE_PACKETS_BYTES == 168 && STREAM_PACKETS_BYTES == 80);
+const _: () = assert!(OCP_CABLE == 0 && OCP_MODE == 4);
+const _: () = assert!(OCP_RENDER == 8 && OCP_CAPTURE == 88);
+const _: () = assert!(OCP_CAPTURE + STREAM_PACKETS_BYTES == CABLE_PACKETS_BYTES);
+const _: () = assert!(OSP_EXPOSURE == 0 && OSP_IRQL_LAST == 4 && OSP_IRQL_MAX == 8);
+const _: () = assert!(OSP_RESERVED == 12 && OSP_SET_WRITE_PACKET == 16);
+const _: () = assert!(OSP_GET_READ_PACKET == 24 && OSP_PACKET_COUNT == 32);
+const _: () = assert!(OSP_PRESENTATION_POSITION == 40 && OSP_QUERIES == 48);
+const _: () = assert!(OSP_QUERIES_GRANTED == 56 && OSP_FIRST_QPC == 64 && OSP_LAST_QPC == 72);
+const _: () = assert!(OSP_LAST_QPC + 8 == STREAM_PACKETS_BYTES);
 
 // ---------------------------------------------------------------------------------
 // Trace.
@@ -305,6 +335,8 @@ const PROP_VERSION: &str = "version";
 const PROP_COMPTEURS: &str = "compteurs";
 /// Nom de propriété des traces du transport.
 const PROP_TRANSPORT: &str = "transport";
+/// Nom de propriété des traces du relevé de paquets.
+const PROP_PAQUETS: &str = "paquets";
 /// Nom de verbe des traces de lecture.
 const VERBE_GET: &str = "GET";
 /// Nom de verbe des traces d'écriture.
@@ -407,6 +439,25 @@ pub trait CableConfig: Send + Sync + 'static {
     ///
     /// IRQL : `PASSIVE_LEVEL` (les propriétés KS sont traitées en ligne par PortCls).
     fn transport(&self) -> CableTransport;
+
+    /// Ce que le moteur audio a fait des interfaces du **mode paquets**, sur les deux sens du
+    /// câble, pour [`KSPROPERTY_CONDUIT_PACKETS`] (lot 2).
+    ///
+    /// Les deux sens, comme [`Self::transport`] et pour la même raison. L'implémentation doit
+    /// aussi remplir [`CablePackets::packet_mode`] — le paramètre `PacketMode` **effectif**,
+    /// celui que le pilote a retenu au dernier `StartDevice` — parce qu'un relevé qui
+    /// montrerait des compteurs sans dire dans quel mode ils ont été pris n'apprendrait rien :
+    /// zéro appel est une conclusion sous `PacketMode = 1` et une évidence sous 0.
+    ///
+    /// **Un instantané, pas une transaction** : les compteurs sont des atomiques lus hors de
+    /// tout verrou, l'exposition de chaque sens sous le verrou de son flux. Voir
+    /// `conduit_kmd::cable::Cable::packets_snapshot`.
+    ///
+    /// Le champ [`CablePackets::cable`] doit valoir [`Self::cable_index`] : c'est un écho, et
+    /// il n'y a rien à comparer puisque cette propriété n'a pas de `SET`.
+    ///
+    /// IRQL : `PASSIVE_LEVEL` (les propriétés KS sont traitées en ligne par PortCls).
+    fn packets(&self) -> CablePackets;
 
     /// Point de trace, appelé une fois par requête, après coup.
     ///
@@ -516,6 +567,70 @@ fn ecrire_transport(value: &mut [u8], transport: &CableTransport) {
     champs.u32(OT_RESERVED, transport.reserved);
     ecrire_sens(&mut champs, OT_RENDER, &transport.render);
     ecrire_sens(&mut champs, OT_CAPTURE, &transport.capture);
+}
+
+/// Écrit le bloc de paquets d'un sens dans `champs`, au décalage **absolu** `base`.
+///
+/// Même forme que [`ecrire_sens`] : l'appelant a déjà vérifié que la place y est
+/// ([`ecrire_paquets`]), et les additions sont `checked_add` par principe — les décalages sont
+/// des constantes, mais un débordement silencieux écrirait le champ ailleurs.
+fn ecrire_sens_paquets(champs: &mut Champs<'_>, base: usize, sens: &StreamPackets) {
+    let a = |offset: usize| base.checked_add(offset);
+    if let Some(o) = a(OSP_EXPOSURE) {
+        champs.u32(o, sens.exposure);
+    }
+    if let Some(o) = a(OSP_IRQL_LAST) {
+        champs.u32(o, sens.irql_last);
+    }
+    if let Some(o) = a(OSP_IRQL_MAX) {
+        champs.u32(o, sens.irql_max);
+    }
+    if let Some(o) = a(OSP_RESERVED) {
+        // Toujours zéro : rien de la mémoire du noyau ne transite par le champ réservé.
+        champs.u32(o, sens.reserved);
+    }
+    if let Some(o) = a(OSP_SET_WRITE_PACKET) {
+        champs.u64(o, sens.set_write_packet);
+    }
+    if let Some(o) = a(OSP_GET_READ_PACKET) {
+        champs.u64(o, sens.get_read_packet);
+    }
+    if let Some(o) = a(OSP_PACKET_COUNT) {
+        champs.u64(o, sens.packet_count);
+    }
+    if let Some(o) = a(OSP_PRESENTATION_POSITION) {
+        champs.u64(o, sens.presentation_position);
+    }
+    if let Some(o) = a(OSP_QUERIES) {
+        champs.u64(o, sens.queries);
+    }
+    if let Some(o) = a(OSP_QUERIES_GRANTED) {
+        champs.u64(o, sens.queries_granted);
+    }
+    if let Some(o) = a(OSP_FIRST_QPC) {
+        champs.u64(o, sens.first_qpc);
+    }
+    if let Some(o) = a(OSP_LAST_QPC) {
+        champs.u64(o, sens.last_qpc);
+    }
+}
+
+/// Écrit une [`CablePackets`] dans `value`, champ par champ, aux décalages du contrat
+/// portable.
+///
+/// **Tout ou rien**, comme les trois autres sérialiseurs et pour la même raison : un relevé à
+/// demi écrit ferait lire au client des compteurs d'un sens et une exposition de l'autre —
+/// exactement le genre de relevé qui fait conclure de travers. Aucun transtypage vers un
+/// `*mut CablePackets` : `value` n'est aligné sur rien.
+fn ecrire_paquets(value: &mut [u8], paquets: &CablePackets) {
+    if value.len() < CABLE_PACKETS_BYTES {
+        return;
+    }
+    let mut champs = Champs { dest: value };
+    champs.u32(OCP_CABLE, paquets.cable);
+    champs.u32(OCP_MODE, paquets.packet_mode);
+    ecrire_sens_paquets(&mut champs, OCP_RENDER, &paquets.render);
+    ecrire_sens_paquets(&mut champs, OCP_CAPTURE, &paquets.capture);
 }
 
 /// Écrit un `ULONG` en tête de `value` s'il y tient (sinon rien : le thunk rendra la taille
@@ -863,6 +978,69 @@ impl<T: CableConfig> PropertyHandler<T> for ConduitTransport {
 }
 
 // ---------------------------------------------------------------------------------
+// Le gestionnaire du relevé de paquets.
+// ---------------------------------------------------------------------------------
+
+/// [`KSPROPERTY_CONDUIT_PACKETS`] : ce que le moteur audio a fait des interfaces du **mode
+/// paquets** (lot 2).
+///
+/// Une [`CablePackets`] de 168 octets, en **lecture seule** et **sans contrôle de privilège**,
+/// comme les compteurs et le transport, pour les mêmes raisons. Elle répond à la question que
+/// le lot 0 a laissée ouverte : le moteur audio scrute-t-il par politique, ou parce qu'il ne
+/// trouve pas les interfaces de paquets ? Le paramètre de registre `PacketMode` les expose sur
+/// une machine d'essai — **sans les servir** —, et ce relevé dit ce qui s'est passé ensuite :
+/// les `QueryInterface` reçus sur les deux IID, ceux auxquels on a répondu, les appels de
+/// méthode par sens et par méthode, leur IRQL et leurs horodatages.
+///
+/// Le relevé est utile **même à `PacketMode = 0`**, où rien n'est exposé : les
+/// `QueryInterface` sont comptés que l'IID soit rendu ou non, si bien qu'un compteur de
+/// demandes non nul prouve que le moteur cherche le mode paquets sans qu'on ait rien promis.
+///
+/// L'écho de câble n'est pas comparé — il n'y a rien à comparer sans `SET` — mais il est
+/// **rempli par le miniport**, donc par le câble du filtre visé.
+#[derive(Debug)]
+pub struct ConduitPackets;
+
+impl<T: CableConfig> PropertyHandler<T> for ConduitPackets {
+    fn get(req: &Request<'_, T>, value: &mut [u8]) -> Result<u32, NtStatus> {
+        // Lecture libre : voir `ConduitCableState::get`. Un diagnostic qui exigerait
+        // l'élévation ne servirait pas là où il sert.
+        let paquets = req.target.packets();
+        ecrire_paquets(value, &paquets);
+        req.target.trace(&ConfigTrace {
+            property: PROP_PAQUETS,
+            verb: VERBE_GET,
+            instance: req.instance,
+            cable: paquets.cable,
+            // `ConfigTrace::state` porte une `CableState` ; le relevé de paquets n'en est pas
+            // une, et le recopier dans la trace n'apprendrait rien que le tampon rendu ne dise
+            // déjà.
+            state: None,
+            status: conduit_com::STATUS_SUCCESS,
+            persisted: None,
+        });
+        // Taille **requise**, écrite ou non : contrat de `get`.
+        Ok(CABLE_PACKETS_BYTES as u32)
+    }
+
+    fn basic_support(req: &Request<'_, T>, value: &mut [u8]) -> Result<u32, NtStatus> {
+        // Structure de cent soixante-huit octets : aucune `VARENUM` ne la nomme, d'où un
+        // `PropTypeSet` nul, exactement comme pour l'état, les compteurs et le transport.
+        let ecrits = basic_support_ks(value, PACKETS_ACCESS_FLAGS, &GUID_NULL, 0);
+        req.target.trace(&ConfigTrace {
+            property: PROP_PAQUETS,
+            verb: VERBE_BASICSUPPORT,
+            instance: req.instance,
+            cable: req.target.cable_index(),
+            state: None,
+            status: ecrits.map_or_else(|status| status, |_| conduit_com::STATUS_SUCCESS),
+            persisted: None,
+        });
+        ecrits
+    }
+}
+
+// ---------------------------------------------------------------------------------
 // Entrées de table prêtes à poser.
 // ---------------------------------------------------------------------------------
 
@@ -929,6 +1107,21 @@ where
     )
 }
 
+/// Entrée de `PCAUTOMATION_TABLE` du **filtre** de topologie :
+/// `KSPROPSETID_Conduit`, [`KSPROPERTY_CONDUIT_PACKETS`], `GET | BASICSUPPORT` (lot 2 du mode
+/// paquets WaveRT).
+pub const fn packets_item<V, T>() -> PCPROPERTY_ITEM
+where
+    V: TargetVtbl<T>,
+    T: CableConfig,
+{
+    property::item::<V, T, ConduitPackets>(
+        &SET_CONDUIT,
+        KSPROPERTY_CONDUIT_PACKETS,
+        PACKETS_ACCESS_FLAGS,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     // Tests en mode utilisateur : les lints anti-panique du noyau y sont sans objet, une
@@ -954,13 +1147,15 @@ mod tests {
         assert_ne!(SET_CONDUIT.Data1, GUID_NULL.Data1);
     }
 
-    /// Les drapeaux d'accès : l'état s'écrit, la version, les compteurs et le transport non.
+    /// Les drapeaux d'accès : l'état s'écrit, la version, les compteurs, le transport et le
+    /// relevé de paquets non.
     #[test]
     fn les_drapeaux_disent_qui_s_ecrit() {
         assert_eq!(CABLE_STATE_ACCESS_FLAGS, 515);
         assert_eq!(VERSION_ACCESS_FLAGS, 513);
         assert_eq!(COUNTERS_ACCESS_FLAGS, 513);
         assert_eq!(TRANSPORT_ACCESS_FLAGS, 513);
+        assert_eq!(PACKETS_ACCESS_FLAGS, 513);
         assert_ne!(CABLE_STATE_ACCESS_FLAGS & KSPROPERTY_TYPE_SET, 0);
         assert_eq!(VERSION_ACCESS_FLAGS & KSPROPERTY_TYPE_SET, 0);
         assert_eq!(
@@ -973,15 +1168,22 @@ mod tests {
             0,
             "une observation n'est pas un réglage : le bit SET ne doit pas être déclaré"
         );
-        // Les quatre répondent à BASICSUPPORT : dès ce bit posé, PortCls ne répond plus à
+        assert_eq!(
+            PACKETS_ACCESS_FLAGS & KSPROPERTY_TYPE_SET,
+            0,
+            "le mode paquets se règle par le registre et un redémarrage du périphérique, \
+             pas par cette propriété : le bit SET ne doit pas être déclaré"
+        );
+        // Les cinq répondent à BASICSUPPORT : dès ce bit posé, PortCls ne répond plus à
         // notre place.
         assert_ne!(CABLE_STATE_ACCESS_FLAGS & KSPROPERTY_TYPE_BASICSUPPORT, 0);
         assert_ne!(VERSION_ACCESS_FLAGS & KSPROPERTY_TYPE_BASICSUPPORT, 0);
         assert_ne!(COUNTERS_ACCESS_FLAGS & KSPROPERTY_TYPE_BASICSUPPORT, 0);
         assert_ne!(TRANSPORT_ACCESS_FLAGS & KSPROPERTY_TYPE_BASICSUPPORT, 0);
+        assert_ne!(PACKETS_ACCESS_FLAGS & KSPROPERTY_TYPE_BASICSUPPORT, 0);
     }
 
-    /// Les quatre entrées de table portent le même jeu et quatre identifiants distincts.
+    /// Les cinq entrées de table portent le même jeu et cinq identifiants distincts.
     #[test]
     fn les_quatre_entrees_partagent_le_jeu_et_pas_l_identifiant() {
         let ids = [
@@ -989,6 +1191,7 @@ mod tests {
             KSPROPERTY_CONDUIT_VERSION,
             KSPROPERTY_CONDUIT_COUNTERS,
             KSPROPERTY_CONDUIT_TRANSPORT,
+            KSPROPERTY_CONDUIT_PACKETS,
         ];
         for (i, gauche) in ids.iter().enumerate() {
             for droite in ids.iter().skip(i + 1) {
@@ -1003,18 +1206,75 @@ mod tests {
         assert_eq!(TAILLE_VERSION, 4);
         assert_eq!(CABLE_COUNTERS_BYTES, 56);
         assert_eq!(CABLE_TRANSPORT_BYTES, 72);
-        // Les quatre longueurs sont distinctes : un client qui allouerait la mauvaise se
+        assert_eq!(CABLE_PACKETS_BYTES, 168);
+        // Les cinq longueurs sont distinctes : un client qui allouerait la mauvaise se
         // fait refuser au lieu de lire une structure pour une autre.
         let tailles = [
             CABLE_STATE_BYTES,
             TAILLE_VERSION,
             CABLE_COUNTERS_BYTES,
             CABLE_TRANSPORT_BYTES,
+            CABLE_PACKETS_BYTES,
         ];
         for (i, gauche) in tailles.iter().enumerate() {
             for droite in tailles.iter().skip(i + 1) {
                 assert_ne!(gauche, droite);
             }
+        }
+    }
+
+    /// La sérialisation du relevé de paquets écrit chaque champ à son décalage, ou rien du
+    /// tout.
+    ///
+    /// Les vingt-six valeurs diffèrent d'un sens à l'autre, pour la raison de
+    /// [`la_serialisation_du_transport_est_tout_ou_rien`].
+    #[test]
+    fn la_serialisation_des_paquets_est_tout_ou_rien() {
+        let paquets = paquets_temoin();
+
+        // Place suffisante : les vingt-six champs, à leurs décalages.
+        let mut tampon = [0xAAu8; CABLE_PACKETS_BYTES];
+        ecrire_paquets(&mut tampon, &paquets);
+        assert_eq!(tampon, paquets.to_bytes());
+        assert_eq!(CablePackets::from_bytes(&tampon), Ok(paquets));
+
+        // Un octet de trop peu : rien n'est écrit, le tampon reste tel quel.
+        let mut court = [0xAAu8; CABLE_PACKETS_BYTES - 1];
+        ecrire_paquets(&mut court, &paquets);
+        assert_eq!(court, [0xAAu8; CABLE_PACKETS_BYTES - 1]);
+
+        // Tampon vide (interrogation de taille) : rien non plus, et aucune panique.
+        ecrire_paquets(&mut [], &paquets);
+
+        // Plus grand que nécessaire : les cent soixante-huit premiers octets, et rien au-delà.
+        let mut grand = [0xAAu8; CABLE_PACKETS_BYTES + 8];
+        ecrire_paquets(&mut grand, &paquets);
+        assert_eq!(&grand[..CABLE_PACKETS_BYTES], &paquets.to_bytes()[..]);
+        assert_eq!(&grand[CABLE_PACKETS_BYTES..], &[0xAAu8; 8]);
+    }
+
+    /// Les deux champs réservés du relevé de paquets partent à zéro, comme ceux des trois
+    /// autres structures : rien de la mémoire du noyau ne transite par eux.
+    #[test]
+    fn les_reserves_des_paquets_partent_a_zero() {
+        let cible = Faux {
+            cable: 3,
+            connected: true,
+            channels: 2,
+        };
+        let paquets = cible.packets();
+        assert_eq!(paquets.render.reserved, 0);
+        assert_eq!(paquets.capture.reserved, 0);
+        assert_eq!(
+            paquets.cable,
+            cible.cable_index(),
+            "l'écho de câble doit être celui du miniport"
+        );
+        let mut tampon = [0xFFu8; CABLE_PACKETS_BYTES];
+        ecrire_paquets(&mut tampon, &paquets);
+        for base in [OCP_RENDER, OCP_CAPTURE] {
+            let debut = base + OSP_RESERVED;
+            assert_eq!(&tampon[debut..debut + 4], &[0, 0, 0, 0], "bloc {base}");
         }
     }
 
@@ -1266,6 +1526,56 @@ mod tests {
                 cable: self.cable,
                 ..transport_temoin()
             }
+        }
+
+        fn packets(&self) -> CablePackets {
+            CablePackets {
+                cable: self.cable,
+                ..paquets_temoin()
+            }
+        }
+    }
+
+    /// Le relevé de paquets de référence des tests : le mode exposé, un rendu qui a été
+    /// demandé et emprunté, une capture demandée et refusée.
+    ///
+    /// Les deux sens portent des valeurs toutes distinctes, pour la raison de
+    /// [`transport_temoin`] : deux blocs de quatre-vingts octets écrits l'un à la place de
+    /// l'autre feraient lire « c'est la capture qui emprunte » d'un câble où c'est le rendu.
+    fn paquets_temoin() -> CablePackets {
+        use conduit_kmd_core::config::PacketExposure;
+
+        CablePackets {
+            cable: 3,
+            packet_mode: 1,
+            render: StreamPackets {
+                exposure: PacketExposure::Output.code(),
+                irql_last: 0,
+                irql_max: 2,
+                reserved: 0,
+                set_write_packet: 13,
+                get_read_packet: 17,
+                packet_count: 19,
+                presentation_position: 23,
+                queries: 29,
+                queries_granted: 31,
+                first_qpc: 37,
+                last_qpc: 41,
+            },
+            capture: StreamPackets {
+                exposure: PacketExposure::Input.code(),
+                irql_last: 1,
+                irql_max: 3,
+                reserved: 0,
+                set_write_packet: 43,
+                get_read_packet: 47,
+                packet_count: 53,
+                presentation_position: 59,
+                queries: 61,
+                queries_granted: 67,
+                first_qpc: 71,
+                last_qpc: 73,
+            },
         }
     }
 
