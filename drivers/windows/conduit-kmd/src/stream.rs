@@ -2,18 +2,17 @@
 //! `WaveRender::NewStream` ou `WaveCapture::NewStream` crée pour la broche système, avec
 //! son tampon cyclique (§5.2), sa position calculée par l'horloge (§5.1) et ses
 //! notifications (§5.3, étape 5). Implémente `portcls::MiniportWaveRTStreamNotification`,
-//! donc aussi `MiniportWaveRTStream`, ainsi que les deux interfaces du **mode paquets**
-//! (`MiniportWaveRTInputStream` pour la capture, `MiniportWaveRTOutputStream` pour le
-//! rendu ; `portcls::packet`).
+//! donc aussi `MiniportWaveRTStream`.
 //!
-//! # Mode paquets
+//! # Mode paquets : pas servi, pas exposé
 //!
-//! Toutes les méthodes du mode paquets refusent (`STATUS_NOT_SUPPORTED`) et journalisent
-//! leurs paramètres : la notion de paquet n'a de sens que sur un tampon alloué **avec**
-//! notifications, or le moteur audio n'appelle jamais `AllocateBufferWithNotification`.
-//! Exposer les interfaces fait apparaître les propriétés `KSPROPERTY_RTAUDIO_GETREADPACKET`
-//! / `SETWRITEPACKET` / `PACKETCOUNT` / `PRESENTATIONPOSITION` côté PortCls ; les traces
-//! diront si le moteur les emprunte, ce qui décidera de l'implémentation réelle.
+//! Le flux satisfait aussi les bornes `MiniportWaveRTInputStream` et
+//! `MiniportWaveRTOutputStream` (`portcls::packet`), mais **uniquement par leurs
+//! défauts**, qui refusent : aucune des quatre méthodes n'est écrite ici. `wave.rs`
+//! construit donc tous les flux avec `PacketInterfaces::None`, si bien que ces méthodes
+//! sont **inatteignables** — PortCls n'obtient jamais l'adresse des têtes satellites. Un
+//! IID rendu serait une promesse de service ; les servir viendra avec sa mesure, ou ne
+//! viendra pas.
 //!
 //! Un seul type pour les deux sens : rendu et capture ne diffèrent que par leur
 //! [`Direction`] — l'emplacement du câble qu'ils occupent, et le rôle que la boucle
@@ -76,13 +75,9 @@ use portcls::conduit_com::{
 };
 use portcls::{
     AudioBuffer, MiniportWaveRTInputStream, MiniportWaveRTOutputStream, MiniportWaveRTStream,
-    MiniportWaveRTStreamNotification, PortWaveRTStream, ReadPacket, STATUS_NOT_SUPPORTED,
-    physical_address,
+    MiniportWaveRTStreamNotification, PortWaveRTStream, physical_address,
 };
-use portcls_sys::{
-    _MEMORY_CACHING_TYPE, KSAUDIO_PRESENTATION_POSITION, KSRTAUDIO_HWLATENCY, KSSTATE, PKEVENT,
-    PMDL,
-};
+use portcls_sys::{_MEMORY_CACHING_TYPE, KSRTAUDIO_HWLATENCY, KSSTATE, PKEVENT, PMDL};
 use wdk_sys::{
     KEVENT, PAGE_SIZE, STATUS_DEVICE_BUSY, STATUS_INVALID_DEVICE_REQUEST, STATUS_NOT_FOUND,
 };
@@ -148,20 +143,6 @@ impl WaveStream {
     /// Nom du flux pour la journalisation (`RenderStream` ou `CaptureStream`).
     fn name(&self) -> &'static str {
         self.direction.stream_name()
-    }
-
-    /// État du mode paquets, pour la journalisation : la notion de paquet n'existe que
-    /// sur un tampon alloué **avec** notifications (`AllocateBufferWithNotification`),
-    /// puisque c'est le compte de notifications qui découpe le tampon en paquets.
-    ///
-    /// IRQL : `<= DISPATCH_LEVEL` (prend brièvement le verrou du flux).
-    fn packet_mode(&self) -> &'static str {
-        let state = self.shared.lock();
-        match (state.buffer.is_some(), state.notifier.is_some()) {
-            (false, _) => "aucun tampon alloué",
-            (true, false) => "tampon sans notifications",
-            (true, true) => "tampon avec notifications",
-        }
     }
 
     /// Inscrit le flux dans l'emplacement `direction` du câble. `STATUS_DEVICE_BUSY` si
@@ -599,55 +580,12 @@ impl MiniportWaveRTStreamNotification for WaveStream {
 }
 
 // ---------------------------------------------------------------------------------
-// Mode paquets (étape 1.4). Premier jet : tout refuse proprement, mais tout est
-// journalisé avec ses paramètres — le but est de savoir si le moteur audio emprunte ces
-// chemins, puisqu'il n'appelle jamais `AllocateBufferWithNotification`.
+// Mode paquets : les deux bornes du composite, satisfaites par leurs seuls défauts (qui
+// refusent). Rien n'est écrit ici, et rien n'est exposé — `wave.rs` construit les flux
+// avec `PacketInterfaces::None`, donc aucune de ces méthodes n'est atteignable. Les
+// servir, c'est le jour où on saura, par la mesure, que le moteur les emprunte.
 // ---------------------------------------------------------------------------------
 
-impl MiniportWaveRTInputStream for WaveStream {
-    // IRQL: PASSIVE_LEVEL
-    fn read_packet(&self) -> Result<ReadPacket, NtStatus> {
-        kmd_log!(
-            "{}{}::GetReadPacket ({}) : {STATUS_NOT_SUPPORTED:#010x}",
-            self.name(),
-            self.n,
-            self.packet_mode()
-        );
-        Err(STATUS_NOT_SUPPORTED)
-    }
-}
+impl MiniportWaveRTInputStream for WaveStream {}
 
-impl MiniportWaveRTOutputStream for WaveStream {
-    // IRQL: PASSIVE_LEVEL
-    fn set_write_packet(&self, packet_number: u32, flags: u32, eos_packet_length: u32) -> NtStatus {
-        kmd_log!(
-            "{}{}::SetWritePacket paquet {packet_number} drapeaux {flags:#x} fin de flux {eos_packet_length} ({}) : {STATUS_NOT_SUPPORTED:#010x}",
-            self.name(),
-            self.n,
-            self.packet_mode()
-        );
-        STATUS_NOT_SUPPORTED
-    }
-
-    // IRQL: PASSIVE_LEVEL
-    fn presentation_position(&self) -> Result<KSAUDIO_PRESENTATION_POSITION, NtStatus> {
-        kmd_log!(
-            "{}{}::GetOutputStreamPresentationPosition ({}) : {STATUS_NOT_SUPPORTED:#010x}",
-            self.name(),
-            self.n,
-            self.packet_mode()
-        );
-        Err(STATUS_NOT_SUPPORTED)
-    }
-
-    // IRQL: PASSIVE_LEVEL
-    fn packet_count(&self) -> Result<u32, NtStatus> {
-        kmd_log!(
-            "{}{}::GetPacketCount ({}) : {STATUS_NOT_SUPPORTED:#010x}",
-            self.name(),
-            self.n,
-            self.packet_mode()
-        );
-        Err(STATUS_NOT_SUPPORTED)
-    }
-}
+impl MiniportWaveRTOutputStream for WaveStream {}

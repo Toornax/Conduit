@@ -8,6 +8,18 @@
 //! principal, d'où qu'on l'interroge ; les slots métier atteignent bien le flux du
 //! pilote avec leurs paramètres ; les onze slots de `IMiniportWaveRTStream` continuent de
 //! fonctionner à travers la délégation de `PacketStream`.
+//!
+//! # Le cycle de vie, et pourquoi il a son propre test
+//!
+//! Un objet composite, c'est **trois pointeurs pour un compteur**. Une référence prise en
+//! trop et l'objet ne meurt jamais : son `Drop` ne s'exécute pas, le flux ne se retire
+//! pas de l'emplacement du câble, et la **deuxième** ouverture rend
+//! `STATUS_DEVICE_BUSY` — pas la vingtième. Une référence oubliée et l'objet meurt sous
+//! les pieds de PortCls. `cycle_de_vie_du_composite_revient_a_zero` rejoue donc une
+//! séquence complète — ouverture, `QueryInterface` de chaque IID, fermeture — pour les
+//! **quatre** configurations d'interfaces, en tenant le compte des `AddRef` et des
+//! `Release` demandés, et vérifie l'invariant du cycle : `Release` = `AddRef` + 1 (la
+//! référence de la construction), compteur à zéro, `Drop` exactement une fois.
 
 #![allow(
     clippy::undocumented_unsafe_blocks,
@@ -27,21 +39,25 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use common::{FAUX_MDL, This, add_ref, query_interface, refcount, release, vtbl_de};
-use conduit_com::{Guid, NtStatus, STATUS_INVALID_PARAMETER, STATUS_SUCCESS};
+use conduit_com::{ComRef, Guid, NtStatus, STATUS_INVALID_PARAMETER, STATUS_SUCCESS};
 use portcls::conduit_com::IID_IUNKNOWN;
 use portcls::portcls_sys::com::guid;
 use portcls::portcls_sys::{
-    _MEMORY_CACHING_TYPE, BOOL, DWORD, IID_IMiniportWaveRT, IID_IMiniportWaveRTInputStream,
+    _MEMORY_CACHING_TYPE, BOOL, DWORD, GUID, IID_IMiniportWaveRT, IID_IMiniportWaveRTInputStream,
     IID_IMiniportWaveRTOutputStream, IID_IMiniportWaveRTStream,
-    IID_IMiniportWaveRTStreamNotification, IMiniportWaveRTInputStreamVtbl,
+    IID_IMiniportWaveRTStreamNotification, IMiniportTopologyVtbl, IMiniportWaveRTInputStreamVtbl,
     IMiniportWaveRTOutputStreamVtbl, IMiniportWaveRTStreamNotificationVtbl,
-    IMiniportWaveRTStreamVtbl, KSAUDIO_POSITION, KSAUDIO_PRESENTATION_POSITION, KSSTATE, PKEVENT,
-    PMDL, ULONG, ULONG64,
+    IMiniportWaveRTStreamVtbl, IUnknown, KSAUDIO_POSITION, KSAUDIO_PRESENTATION_POSITION,
+    KSEVENT_TYPE_ENABLE, KSPROPERTY_TYPE_GET, KSPROPSETID_Jack, KSSTATE, NTSTATUS, PCEVENT_ITEM,
+    PCEVENT_REQUEST, PCEVENT_VERB_SUPPORT, PCFILTER_DESCRIPTOR, PCPROPERTY_ITEM,
+    PCPROPERTY_REQUEST, PKEVENT, PKSEVENT_ENTRY, PMDL, ULONG, ULONG64,
 };
 use portcls::{
-    AudioBuffer, MiniportWaveRTInputStream, MiniportWaveRTOutputStream, MiniportWaveRTStream,
-    MiniportWaveRTStreamNotification, PacketInterfaces, PacketStreamVtbl, ReadPacket,
-    STATUS_NOT_SUPPORTED, new_packet_stream_object, try_new_packet_stream_object,
+    AudioBuffer, EventHandler, MiniportTopology, MiniportWaveRTInputStream,
+    MiniportWaveRTOutputStream, MiniportWaveRTStream, MiniportWaveRTStreamNotification,
+    PacketInterfaces, PacketStreamVtbl, PortTopology, PropertyHandler, ReadPacket, ResourceList,
+    STATUS_INVALID_DEVICE_REQUEST, STATUS_NOT_SUPPORTED, StreamObject, event,
+    new_packet_stream_object, new_topology_object, property, try_new_packet_stream_object,
 };
 
 const SLOT: usize = 8;
@@ -668,4 +684,409 @@ fn query_interface_arguments_degeneres() {
 
     release(entree);
     assert_eq!(release(this), 0);
+}
+
+// ---------------------------------------------------------------------------------
+// Cycle de vie : trois pointeurs, un compteur.
+// ---------------------------------------------------------------------------------
+
+/// Comptabilité des `AddRef` et des `Release` **demandés par le test** à travers les
+/// vtables — y compris celui qu'un `QueryInterface` réussi prend pour l'appelant.
+///
+/// L'invariant du cycle de vie en découle : sur un objet qui naît avec une référence et
+/// meurt à zéro, `releases == add_refs + 1`.
+#[derive(Default)]
+struct Comptes {
+    add_refs: u32,
+    releases: u32,
+}
+
+impl Comptes {
+    fn add_ref(&mut self, this: This) -> ULONG {
+        self.add_refs += 1;
+        add_ref(this)
+    }
+
+    fn release(&mut self, this: This) -> ULONG {
+        self.releases += 1;
+        release(this)
+    }
+
+    /// Compte courant, observé par un `AddRef`/`Release` équilibré.
+    fn refcount(&mut self, this: This) -> ULONG {
+        self.add_refs += 1;
+        self.releases += 1;
+        refcount(this)
+    }
+
+    /// `QueryInterface` : un succès rend un pointeur **déjà compté**, c'est donc un
+    /// `AddRef` de plus au passif du test.
+    fn qi(&mut self, this: This, iid: &Guid) -> (NtStatus, This) {
+        let (status, out) = query_interface(this, iid);
+        if status == STATUS_SUCCESS {
+            self.add_refs += 1;
+        }
+        (status, out)
+    }
+}
+
+/// Les six IID qu'un flux composite peut se voir demander : les trois qu'il porte
+/// toujours, les deux du mode paquets, et un sixième qui n'est pas le sien.
+fn iids_interrogeables(interfaces: PacketInterfaces) -> [(&'static str, Guid, bool); 6] {
+    [
+        ("IUnknown", IID_IUNKNOWN, true),
+        (
+            "IMiniportWaveRTStream",
+            guid(&IID_IMiniportWaveRTStream),
+            true,
+        ),
+        (
+            "IMiniportWaveRTStreamNotification",
+            guid(&IID_IMiniportWaveRTStreamNotification),
+            true,
+        ),
+        (
+            "IMiniportWaveRTInputStream",
+            guid(&IID_IMiniportWaveRTInputStream),
+            interfaces.has_input(),
+        ),
+        (
+            "IMiniportWaveRTOutputStream",
+            guid(&IID_IMiniportWaveRTOutputStream),
+            interfaces.has_output(),
+        ),
+        ("IMiniportWaveRT", guid(&IID_IMiniportWaveRT), false),
+    ]
+}
+
+/// Ouverture, `QueryInterface` de chaque IID, puis fermeture, pour les quatre
+/// configurations d'interfaces : le compteur revient à **zéro**, `Drop` est appelé
+/// **exactement une fois**, et le nombre de `Release` vaut celui des `AddRef` plus la
+/// référence de construction.
+///
+/// C'est le test de non-régression du lot : une référence en trop laisserait le flux
+/// vivant, donc l'emplacement du câble occupé, donc la **deuxième** ouverture en
+/// `STATUS_DEVICE_BUSY` ; une référence en moins détruirait l'objet sous PortCls.
+#[test]
+fn cycle_de_vie_du_composite_revient_a_zero() {
+    for interfaces in [
+        PacketInterfaces::None,
+        PacketInterfaces::Input,
+        PacketInterfaces::Output,
+        PacketInterfaces::Both,
+    ] {
+        let mut c = Comptes::default();
+        let (flux, dropped) = Flux::nouveau();
+        let this = new_packet_stream_object(flux, interfaces).into_raw();
+
+        // Ouverture : une seule référence, celle de la construction. Elle ne vient
+        // d'aucun `AddRef`, d'où le « + 1 » de l'invariant final.
+        let mut attendu: ULONG = 1;
+        assert_eq!(c.refcount(this), attendu, "{interfaces:?} à la création");
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+
+        // PortCls interroge les IID un par un. Un succès prend exactement une référence,
+        // un refus n'en prend aucune et laisse `*out` nul.
+        let mut prises: Vec<(&'static str, This)> = Vec::new();
+        for (nom, iid, expose) in iids_interrogeables(interfaces) {
+            let (status, out) = c.qi(this, &iid);
+            if expose {
+                assert_eq!(status, STATUS_SUCCESS, "{nom} sur {interfaces:?}");
+                assert!(!out.is_null(), "{nom} sur {interfaces:?}");
+                attendu += 1;
+                prises.push((nom, out));
+            } else {
+                assert_eq!(
+                    status, STATUS_INVALID_PARAMETER,
+                    "{nom} n'est pas exposée par {interfaces:?}"
+                );
+                assert!(out.is_null(), "{nom} sur {interfaces:?}");
+            }
+            assert_eq!(c.refcount(this), attendu, "après {nom} sur {interfaces:?}");
+        }
+
+        // Trois interfaces toujours, plus celles du mode paquets exposées : avec
+        // `None`, l'objet répond exactement comme un flux ordinaire.
+        let attendues =
+            3 + usize::from(interfaces.has_input()) + usize::from(interfaces.has_output());
+        assert_eq!(prises.len(), attendues, "{interfaces:?}");
+        assert_eq!(interfaces.is_none(), attendues == 3, "{interfaces:?}");
+
+        // Chaque pointeur obtenu est un `IUnknown` complet : `AddRef` puis `Release` s'y
+        // équilibrent, quelle que soit la tête d'où l'appel part.
+        for (nom, prise) in &prises {
+            assert_eq!(c.add_ref(*prise), attendu + 1, "AddRef par {nom}");
+            assert_eq!(c.release(*prise), attendu, "Release par {nom}");
+        }
+
+        // Fermeture : les références rendues dans l'ordre inverse de leur prise. Rien
+        // n'est détruit tant qu'il en reste une.
+        while let Some((nom, prise)) = prises.pop() {
+            attendu -= 1;
+            assert_eq!(c.release(prise), attendu, "Release de {nom}");
+            assert_eq!(dropped.load(Ordering::SeqCst), 0, "vivant après {nom}");
+        }
+
+        // La dernière : le compteur tombe à zéro et le flux du pilote est détruit une
+        // fois — c'est ce `Drop` qui libère l'emplacement du câble.
+        assert_eq!(c.release(this), 0, "{interfaces:?}");
+        assert_eq!(dropped.load(Ordering::SeqCst), 1, "{interfaces:?}");
+        assert_eq!(
+            c.releases,
+            c.add_refs + 1,
+            "{interfaces:?} : {} Release pour {} AddRef et la référence de construction",
+            c.releases,
+            c.add_refs
+        );
+    }
+}
+
+/// Le dernier `Release` venu d'une tête satellite détruit l'objet une seule fois, et
+/// l'ordre de rendu des références n'y change rien.
+#[test]
+fn le_drop_n_a_lieu_qu_une_fois_quel_que_soit_l_ordre() {
+    // Ordres de fermeture : le principal en dernier, un satellite en dernier, l'autre.
+    for ordre in [[0_usize, 1, 2], [2, 0, 1], [1, 2, 0]] {
+        let mut c = Comptes::default();
+        let (flux, dropped) = Flux::nouveau();
+        let this = new_packet_stream_object(flux, PacketInterfaces::Both).into_raw();
+        let (_, entree) = c.qi(this, &iid_entree());
+        let (_, sortie) = c.qi(this, &iid_sortie());
+        let pointeurs = [this, entree, sortie];
+
+        assert_eq!(c.refcount(this), 3, "ordre {ordre:?}");
+        for (rang, i) in ordre.into_iter().enumerate() {
+            let reste = 2 - rang as ULONG;
+            assert_eq!(
+                c.release(pointeurs[i]),
+                reste,
+                "ordre {ordre:?}, rang {rang}"
+            );
+            assert_eq!(
+                dropped.load(Ordering::SeqCst),
+                usize::from(reste == 0),
+                "ordre {ordre:?}, rang {rang}"
+            );
+        }
+        assert_eq!(c.releases, c.add_refs + 1, "ordre {ordre:?}");
+    }
+}
+
+/// Avec [`PacketInterfaces::None`], le `QueryInterface` du composite répond **exactement**
+/// comme celui d'un flux non composite : les deux IID du mode paquets sont refusés au même
+/// titre qu'un IID étranger, et les têtes satellites — bien présentes dans l'allocation —
+/// ne sont rendues à personne.
+///
+/// C'est la configuration que `conduit-kmd::wave::open_stream` construit : le composite y
+/// doit être **indiscernable** de l'ancien objet de flux, faute de quoi le moteur audio
+/// pourrait basculer sur un chemin que le pilote ne sert pas.
+#[test]
+fn sans_interface_exposee_le_composite_est_indiscernable_d_un_flux_ordinaire() {
+    let (flux, dropped) = Flux::nouveau();
+    let objet = new_packet_stream_object(flux, PacketInterfaces::None);
+    assert!(objet.interfaces().is_none());
+    assert!(!objet.interfaces().has_input() && !objet.interfaces().has_output());
+    let this = objet.into_raw();
+
+    // Les deux IID du mode paquets sont refusés comme n'importe quel IID inconnu, et le
+    // flux du pilote — qui les sert pourtant — n'est jamais atteint.
+    for (nom, iid) in [
+        ("IMiniportWaveRTInputStream", iid_entree()),
+        ("IMiniportWaveRTOutputStream", iid_sortie()),
+        ("IMiniportWaveRT", guid(&IID_IMiniportWaveRT)),
+    ] {
+        let (status, out) = query_interface(this, &iid);
+        assert_eq!(status, STATUS_INVALID_PARAMETER, "{nom}");
+        assert!(out.is_null(), "{nom}");
+        assert_eq!(refcount(this), 1, "un refus ne compte rien ({nom})");
+    }
+
+    // Les trois interfaces d'un flux ordinaire répondent, elles, et rendent le principal.
+    for iid in [
+        IID_IUNKNOWN,
+        guid(&IID_IMiniportWaveRTStream),
+        guid(&IID_IMiniportWaveRTStreamNotification),
+    ] {
+        let out = qi_ok(this, &iid);
+        assert_eq!(out, this, "{iid}");
+        release(out);
+    }
+
+    assert_eq!(release(this), 0);
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+}
+
+/// Le composite se transfère à PortCls par [`StreamObject`] — le chemin exact de
+/// `NewStream` — sans une référence perdue ni une de trop.
+#[test]
+fn le_composite_se_transfere_par_stream_object() {
+    let (flux, dropped) = Flux::nouveau();
+    let objet = new_packet_stream_object(flux, PacketInterfaces::None);
+    // `StreamObject::from` accepte la vtable du flux à notifications, dont la vtable
+    // composite est une variante (seul le slot 0 change) : rien à changer dans `wavert`.
+    let stream = StreamObject::from(objet);
+    let this: This = stream.into_raw().cast();
+
+    // L'objet cédé est un `IMiniportWaveRTStream` en règle, avec sa référence unique.
+    assert_eq!(refcount(this), 1);
+    let out = qi_ok(this, &guid(&IID_IMiniportWaveRTStream));
+    assert_eq!(out, this);
+    assert_eq!(release(out), 1);
+
+    assert_eq!(release(this), 0);
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+}
+
+// ---------------------------------------------------------------------------------
+// Le composite face aux gardes de vtable de `property` et d'`event`.
+// ---------------------------------------------------------------------------------
+
+/// `PCFILTER_DESCRIPTOR` n'est fait que de pointeurs, tous nuls ici et jamais
+/// déréférencés : `Sync` déclaré à la main pour la `static`.
+struct SyncDesc(PCFILTER_DESCRIPTOR);
+// SAFETY: la valeur est entièrement nulle et personne ne la lit.
+unsafe impl Sync for SyncDesc {}
+static DESCRIPTION: SyncDesc = SyncDesc(unsafe { core::mem::zeroed() });
+
+/// Un miniport topologie quelconque : ce qui compte est que sa vtable soit celle
+/// qu'attendent les deux gardes, et que ce ne soit **pas** celle d'un flux.
+struct CibleTopo;
+
+impl MiniportTopology for CibleTopo {
+    fn init(&self, _: Option<ComRef<IUnknown>>, _: ResourceList, _: PortTopology) -> NtStatus {
+        STATUS_SUCCESS
+    }
+
+    fn description(&self) -> &'static PCFILTER_DESCRIPTOR {
+        &DESCRIPTION.0
+    }
+}
+
+/// Gestionnaire tout en défauts : il rend `STATUS_NOT_SUPPORTED`, ce qui suffit à
+/// distinguer « la garde a laissé passer » de « la garde a refusé ».
+struct Muet;
+
+impl PropertyHandler<CibleTopo> for Muet {}
+impl EventHandler<CibleTopo> for Muet {}
+
+struct SyncPropItem(PCPROPERTY_ITEM);
+// SAFETY: un `&'static GUID` et un pointeur de fonction, tous deux `'static`.
+unsafe impl Sync for SyncPropItem {}
+
+struct SyncEventItem(PCEVENT_ITEM);
+// SAFETY: idem `SyncPropItem`.
+unsafe impl Sync for SyncEventItem {}
+
+/// Un jeu quelconque : les deux thunks refusent sur la vtable bien avant de le lire.
+static SET_TEST: GUID = KSPROPSETID_Jack;
+
+static ITEM_PROP: SyncPropItem = SyncPropItem(property::item::<
+    IMiniportTopologyVtbl,
+    CibleTopo,
+    Muet,
+>(&SET_TEST, 0, KSPROPERTY_TYPE_GET));
+
+static ITEM_EVENT: SyncEventItem = SyncEventItem(event::item::<
+    IMiniportTopologyVtbl,
+    CibleTopo,
+    Muet,
+>(&SET_TEST, 0, KSEVENT_TYPE_ENABLE));
+
+/// Le `Handler` de l'entrée de propriété, appelé comme PortCls le fait, avec `this` pour
+/// `MajorTarget`.
+fn appeler_propriete(this: This) -> NTSTATUS {
+    let mut req = PCPROPERTY_REQUEST {
+        MajorTarget: this.cast(),
+        MinorTarget: ptr::null_mut(),
+        Node: ULONG::MAX,
+        PropertyItem: &ITEM_PROP.0,
+        Verb: KSPROPERTY_TYPE_GET,
+        InstanceSize: 0,
+        Instance: ptr::null_mut(),
+        ValueSize: 0,
+        Value: ptr::null_mut(),
+        Irp: ptr::null_mut(),
+    };
+    let slot = ITEM_PROP.0.Handler.expect("Handler de property::item");
+    unsafe { slot(&mut req) }
+}
+
+/// Idem pour l'entrée d'événement.
+fn appeler_evenement(this: This) -> NTSTATUS {
+    let mut req = PCEVENT_REQUEST {
+        MajorTarget: this.cast(),
+        MinorTarget: ptr::null_mut(),
+        Node: ULONG::MAX,
+        EventItem: &ITEM_EVENT.0,
+        EventEntry: ptr::null_mut::<PKSEVENT_ENTRY>().cast(),
+        Verb: PCEVENT_VERB_SUPPORT,
+        Irp: ptr::null_mut(),
+    };
+    let slot = ITEM_EVENT.0.Handler.expect("Handler de event::item");
+    unsafe { slot(&mut req) }
+}
+
+/// Les gardes de vtable de `property` et d'`event` comparent `MajorTarget`, qui est
+/// toujours un **miniport** — jamais un flux. Un objet composite, principal comme
+/// satellite, y est donc refusé (`STATUS_INVALID_DEVICE_REQUEST`) : le rapport de
+/// conception s'en trouve vérifié plutôt que supposé.
+///
+/// Le repère importe autant que le refus : sur un vrai miniport topologie, les deux
+/// thunks passent la garde et atteignent le gestionnaire (`STATUS_NOT_SUPPORTED`). Sans
+/// lui, le test réussirait tout aussi bien si les gardes refusaient tout.
+#[test]
+fn un_flux_composite_n_est_ni_une_cible_de_propriete_ni_une_cible_d_evenement() {
+    let topo = new_topology_object(CibleTopo).into_raw();
+    assert_eq!(
+        appeler_propriete(topo),
+        STATUS_NOT_SUPPORTED,
+        "repère : un vrai miniport passe la garde de property"
+    );
+    assert_eq!(
+        appeler_evenement(topo),
+        STATUS_NOT_SUPPORTED,
+        "repère : un vrai miniport passe la garde d'event"
+    );
+    assert_eq!(release(topo), 0);
+
+    for interfaces in [
+        PacketInterfaces::None,
+        PacketInterfaces::Input,
+        PacketInterfaces::Output,
+        PacketInterfaces::Both,
+    ] {
+        let (flux, dropped) = Flux::nouveau();
+        let this = new_packet_stream_object(flux, interfaces).into_raw();
+
+        // Le principal, puis chaque tête satellite exposée : aucune n'est prise pour un
+        // miniport, et aucune ne fait fuir de référence au passage.
+        let mut cibles = vec![("principal", this)];
+        if interfaces.has_input() {
+            cibles.push(("tête entrée", qi_ok(this, &iid_entree())));
+        }
+        if interfaces.has_output() {
+            cibles.push(("tête sortie", qi_ok(this, &iid_sortie())));
+        }
+        let attendu = cibles.len() as ULONG;
+
+        for (nom, cible) in &cibles {
+            assert_eq!(
+                appeler_propriete(*cible),
+                STATUS_INVALID_DEVICE_REQUEST,
+                "{nom} de {interfaces:?} n'est pas une cible de propriété"
+            );
+            assert_eq!(
+                appeler_evenement(*cible),
+                STATUS_INVALID_DEVICE_REQUEST,
+                "{nom} de {interfaces:?} n'est pas une cible d'événement"
+            );
+        }
+        assert_eq!(refcount(this), attendu, "{interfaces:?}");
+
+        for (_, cible) in cibles.iter().skip(1) {
+            release(*cible);
+        }
+        assert_eq!(release(this), 0, "{interfaces:?}");
+        assert_eq!(dropped.load(Ordering::SeqCst), 1, "{interfaces:?}");
+    }
 }

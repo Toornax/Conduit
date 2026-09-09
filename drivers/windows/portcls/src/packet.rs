@@ -1,15 +1,49 @@
 //! Mode **paquets** de WaveRT : `IMiniportWaveRTInputStream` et
-//! `IMiniportWaveRTOutputStream` (`portcls.h`, `NTDDI_WINTHRESHOLD`), le chemin nominal
-//! du transport WaveRT sur Windows 10/11.
+//! `IMiniportWaveRTOutputStream` (`portcls.h`, compilées sous `NTDDI_THRESHOLD`, soit
+//! Windows 10 1507), et l'objet composite qui permettrait de les servir.
 //!
-//! Dans ce mode, le moteur audio ne se contente plus de suivre la position du tampon
-//! cyclique : il **signale** chaque paquet écrit (`SetWritePacket`, propriété
-//! `KSPROPERTY_RTAUDIO_SETWRITEPACKET`) et **demande** chaque paquet à lire
-//! (`GetReadPacket`, `KSPROPERTY_RTAUDIO_GETREADPACKET`), avec
-//! `KSPROPERTY_RTAUDIO_PACKETCOUNT` et `KSPROPERTY_RTAUDIO_PRESENTATIONPOSITION`. PortCls
-//! n'expose ces propriétés que si le flux répond à `QueryInterface` pour l'interface
-//! correspondante ; sans elles, le moteur n'a aucun moyen d'annoncer ses écritures, ce
-//! qui est exactement le symptôme observé (le pilote copie, le moteur n'écrit jamais).
+//! # Le contrat, et ce qu'il n'est pas
+//!
+//! Le mode paquets remplace une **supposition** — « où en est le moteur dans le tampon
+//! cyclique ? », extrapolée d'une position — par une **frontière certaine**. Il
+//! n'apporte ni réveil, ni gain de latence, et ne dispense de rien. Cinq points, tous
+//! sur source, contre lesquels toute implémentation de ce module se juge :
+//!
+//! 1. **Un paquet *est* une période.** `GetReadPacket`, Remarks : « The packet size is
+//!    the WaveRT buffer size divided by the `NotificationCount` passed to
+//!    `IMiniportWaveRTStreamNotification::AllocateBufferWithNotification`. » Un paquet
+//!    n'existe donc que sur un tampon alloué **avec** notifications, et
+//!    `offset = (numéro % NotificationCount) * taille_de_paquet`. Chez nous,
+//!    `conduit_kmd_core::notify::Notifier::period_of(trames)` **est** déjà le numéro de
+//!    paquet : le mode paquets nomme ce que la boucle calcule, il n'ajoute aucune
+//!    arithmétique.
+//! 2. **`SetWritePacket` est un *hint*, pas un déclencheur, et n'exempte pas du
+//!    minuteur.** Remarks, verbatim : *« The driver however is still obligated to
+//!    increase its internal packet counter and signal notification events at a nominal
+//!    real time rate. »* Le minuteur périodique du pilote reste donc une **obligation
+//!    contractuelle**, pas un vestige à retirer.
+//! 3. **`GetReadPacket` est un *pull*.** C'est l'OS qui vient chercher le paquet de
+//!    capture ; ce qui le réveille reste l'événement de `RegisterNotificationEvent`.
+//!    « When the OS calls this routine, the driver may assume that the OS has finished
+//!    reading all previous packets. »
+//! 4. **Les quatre méthodes sont à `PASSIVE_LEVEL`** (`_IRQL_requires_max_(PASSIVE_LEVEL)`,
+//!    `portcls.h` 2604-2661, et les quatre pages Learn), donc appelées depuis un fil du
+//!    moteur audio — mais **en code non pagé** : SYSVAD les marque `#pragma code_seg()`
+//!    avec « Although called at passive level, this routine is non-paged code because it
+//!    is called in the streaming path where page faults should be avoided. » Rien n'est
+//!    pagé dans ce workspace ; c'est à ne pas casser, pas à faire.
+//! 5. **Le mode paquets ne s'« annonce » pas.** Ni propriété KS à déclarer, ni drapeau
+//!    d'INF, ni `DEVPKEY` : PortCls interroge l'objet de **flux** par `QueryInterface` à
+//!    sa création, et le refus se fait par sens et par broche (SYSVAD,
+//!    `CMiniportWaveRTStream::NonDelegatingQueryInterface`). Répondre à un IID, c'est
+//!    promettre de servir les méthodes derrière.
+//!
+//! Corollaire, et raison d'être de [`PacketInterfaces::None`] : **exposer une interface
+//! qu'on ne sert pas est plus dangereux que ne rien exposer**. Un moteur qui bascule en
+//! mode paquets et se fait répondre `STATUS_NOT_SUPPORTED` peut casser un transport qui
+//! marchait. La coexistence des deux modes est en revanche acquise : SYSVAD sert
+//! `GetPosition` **et** les quatre méthodes sur le même objet (`minwavertstream.h`), ce
+//! qui est exactement ce que l'objet composite ci-dessous permet en Rust.
 //!
 //! # Quatre interfaces, un seul objet
 //!
@@ -72,18 +106,37 @@
 //! satellites traitent tout de même un `principal` nul comme une erreur plutôt que de
 //! déréférencer.
 //!
-//! # Sens du flux
+//! # Sens du flux, et le cas `None`
 //!
 //! [`PacketInterfaces`] dit à quelle famille l'objet répond : un flux de **rendu**
 //! (le moteur écrit) expose `IMiniportWaveRTOutputStream`, un flux de **capture** (le
-//! moteur lit) expose `IMiniportWaveRTInputStream`. Les IID non exposés sont refusés
-//! comme n'importe quel IID inconnu (`STATUS_INVALID_PARAMETER`, `*out` nul).
+//! moteur lit) expose `IMiniportWaveRTInputStream`, [`PacketInterfaces::None`] n'expose
+//! **rien**. Les IID non exposés sont refusés comme n'importe quel IID inconnu
+//! (`STATUS_INVALID_PARAMETER`, `*out` nul) — c'est-à-dire exactement comme le ferait un
+//! flux non composite.
+//!
+//! # Garde de vtable : ce module n'est pas concerné, et pourquoi
+//!
+//! La garde de [`property::handler`](crate::property::handler) et celle de
+//! [`event::handler`](crate::event::handler) comparent l'adresse de vtable de
+//! `req.MajorTarget` à l'occurrence canonique de `TargetVtbl::vtbl()`. `MajorTarget` est
+//! toujours un **miniport** (topologie ou WaveRT), jamais un flux, et seules
+//! `IMiniportTopologyVtbl` et `IMiniportWaveRTVtbl` implémentent `TargetVtbl` : un objet
+//! de ce module, principal comme satellite, est donc refusé par les deux gardes
+//! (vérifié, `tests/packet.rs`). Si un flux devait un jour porter une propriété, il lui
+//! faudrait sa propre implémentation de `TargetVtbl` avec la même précaution
+//! d'occurrence unique et de `#[inline(never)]` que
+//! [`topology::vtbl_of`](crate::topology::vtbl_of) et
+//! [`wavert::vtbl_of`](crate::wavert::vtbl_of) : la vtable du principal est ici une
+//! constante **distincte** (`<T as PacketStreamVtbl>::VTBL`, dont seul le slot 0 change)
+//! de `<PacketStream<T> as StreamNotificationVtbl>::VTBL`.
 //!
 //! # IRQL
 //!
 //! Toutes les méthodes des deux interfaces sont à `PASSIVE_LEVEL`
-//! (`_IRQL_requires_max_(PASSIVE_LEVEL)` dans `portcls.h`) ; `QueryInterface`, `AddRef` et
-//! `Release` des satellites restent à `<= DISPATCH_LEVEL`, comme ceux du principal.
+//! (`_IRQL_requires_max_(PASSIVE_LEVEL)` dans `portcls.h`), en code **non pagé** ;
+//! `QueryInterface`, `AddRef` et `Release` des satellites restent à
+//! `<= DISPATCH_LEVEL`, comme ceux du principal.
 
 use core::ffi::c_void;
 use core::fmt;
@@ -105,7 +158,6 @@ use crate::status::STATUS_NOT_SUPPORTED;
 use crate::stream::{
     AudioBuffer, MiniportWaveRTStream, MiniportWaveRTStreamNotification, StreamNotificationVtbl,
 };
-use crate::unknown;
 
 /// `IID_IMiniportWaveRTInputStream` sous forme [`Guid`], pour la comparaison.
 const IID_INPUT_STREAM: Guid = guid(&IID_IMiniportWaveRTInputStream);
@@ -137,14 +189,20 @@ pub struct ReadPacket {
 /// Contrat de `IMiniportWaveRTInputStream` (`portcls.h`), vu du pilote : le mode paquets
 /// d'un flux de **capture**, que le moteur audio lit.
 ///
-/// Toutes les méthodes ont un défaut qui refuse (`STATUS_NOT_SUPPORTED`) : un flux peut
-/// exposer l'interface sans encore la servir, ce qui suffit à faire apparaître les
-/// propriétés `KSPROPERTY_RTAUDIO_*` côté PortCls et à observer si le moteur les emprunte.
+/// La méthode a un défaut qui refuse (`STATUS_NOT_SUPPORTED`), pour qu'un flux qui ne
+/// sert pas le mode paquets satisfasse tout de même la borne du composite. Ce défaut
+/// n'autorise pas à **exposer** l'interface : un IID rendu est une promesse de service
+/// (voir l'en-tête du module, point 5, et [`PacketInterfaces::None`]).
 pub trait MiniportWaveRTInputStream: MiniportWaveRTStream {
     /// `GetReadPacket` : numéro, drapeaux, horodatage QPC et présence de données
     /// supplémentaires du dernier paquet complet.
     ///
-    /// IRQL : `PASSIVE_LEVEL`.
+    /// C'est un *pull* : l'OS vient chercher, rien n'est déclenché ici. En rendant `Ok`,
+    /// le pilote peut supposer que l'OS a fini de lire tous les paquets précédents. Sans
+    /// paquet neuf, rendre `STATUS_DEVICE_NOT_READY` — jamais `Ok` sur un paquet déjà
+    /// rendu. Le numéro repart de zéro en `KSSTATE_STOP`.
+    ///
+    /// IRQL : `PASSIVE_LEVEL`, en code non pagé.
     fn read_packet(&self) -> Result<ReadPacket, NtStatus> {
         Err(STATUS_NOT_SUPPORTED)
     }
@@ -153,32 +211,54 @@ pub trait MiniportWaveRTInputStream: MiniportWaveRTStream {
 /// Contrat de `IMiniportWaveRTOutputStream` (`portcls.h`), vu du pilote : le mode paquets
 /// d'un flux de **rendu**, dans lequel le moteur audio écrit.
 ///
-/// Mêmes défauts que [`MiniportWaveRTInputStream`] : tout refuse tant que le pilote ne
-/// sert pas le mode paquets.
+/// Mêmes défauts que [`MiniportWaveRTInputStream`], et la même réserve : refuser depuis
+/// une interface exposée est plus dangereux que ne pas l'exposer.
 pub trait MiniportWaveRTOutputStream: MiniportWaveRTStream {
     /// `SetWritePacket` : le moteur vient d'écrire le paquet `packet_number` (position
     /// `packet_number % nombre_de_paquets` dans le tampon). `flags` porte
     /// `KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM` en fin de flux, auquel cas
-    /// `eos_packet_length` donne le nombre d'octets **utiles** du dernier paquet.
+    /// `eos_packet_length` donne le nombre d'octets **utiles** du dernier paquet (zéro
+    /// est une valeur valide ; le champ est ignoré sans le drapeau).
     ///
-    /// IRQL : `PASSIVE_LEVEL`.
+    /// C'est un **hint** : il n'exempte pas le pilote d'avancer son compteur de paquets
+    /// et de signaler ses notifications à la cadence temps réel (voir l'en-tête du
+    /// module, point 2). `KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM` (`ks.h`, `0x200`) est le
+    /// **seul** drapeau défini : tout autre bit doit être refusé par
+    /// `STATUS_INVALID_PARAMETER`. Un numéro déjà transféré ou en cours de transfert vaut
+    /// `STATUS_DATA_LATE_ERROR`, un numéro trop en avance pour tenir dans le tampon vaut
+    /// `STATUS_DATA_OVERRUN` ; la comparaison est **modulaire** (`ULONG` 32 bits).
+    ///
+    /// IRQL : `PASSIVE_LEVEL`, en code non pagé.
     fn set_write_packet(&self, packet_number: u32, flags: u32, eos_packet_length: u32) -> NtStatus {
         let _ = (packet_number, flags, eos_packet_length);
         STATUS_NOT_SUPPORTED
     }
 
-    /// `GetOutputStreamPresentationPosition` : position de présentation (octets rendus
-    /// depuis le début du flux) et valeur du compteur de performance associée.
+    /// `GetOutputStreamPresentationPosition` : position de présentation et horodatage.
     ///
-    /// IRQL : `PASSIVE_LEVEL`.
+    /// Ni octets ni unités de 100 ns : `u64PositionInBlocks` est un nombre de **blocs**
+    /// — pour du PCM, de **trames** — **absolu depuis le début du flux**, et
+    /// `u64QPCPosition` la valeur brute de `KeQueryPerformanceCounter`
+    /// (`ksmedia.h`, `KSAUDIO_PRESENTATION_POSITION`). Elle ne coïncide pas en général
+    /// avec [`packet_count`](Self::packet_count) : l'écart entre les deux est la latence
+    /// matérielle, nulle par construction pour un pont logiciel.
+    ///
+    /// IRQL : `PASSIVE_LEVEL`, en code non pagé.
     fn presentation_position(&self) -> Result<KSAUDIO_PRESENTATION_POSITION, NtStatus> {
         Err(STATUS_NOT_SUPPORTED)
     }
 
-    /// `GetPacketCount` : nombre de paquets **écrits par le moteur et déjà consommés** par
-    /// le pilote depuis le passage en `KSSTATE_RUN`.
+    /// `GetPacketCount` : compte **base 1** des paquets entièrement transférés du tampon
+    /// WaveRT vers le matériel, remis à zéro en `KSSTATE_STOP`.
     ///
-    /// IRQL : `PASSIVE_LEVEL`.
+    /// « If the packet count is 5, then 5 packets have completely transferred. That is,
+    /// packets 0-4 have completely transferred. » C'est le mécanisme de
+    /// **resynchronisation** : l'OS l'interroge périodiquement, et surtout après un
+    /// `STATUS_DATA_LATE_ERROR` ou un `STATUS_DATA_OVERRUN` rendu par
+    /// [`set_write_packet`](Self::set_write_packet) — un événement de notification, lui,
+    /// ne dit pas quel paquet il concerne.
+    ///
+    /// IRQL : `PASSIVE_LEVEL`, en code non pagé.
     fn packet_count(&self) -> Result<u32, NtStatus> {
         Err(STATUS_NOT_SUPPORTED)
     }
@@ -201,6 +281,23 @@ impl<T> PacketWaveRTStream for T where
 /// Interfaces du mode paquets auxquelles un objet répond, selon le sens du flux.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketInterfaces {
+    /// **Aucune** : l'objet est composite (une allocation, un compteur, trois têtes de
+    /// vtable), mais son `QueryInterface` ne répond à **aucun IID de plus** qu'un flux
+    /// ordinaire. Les deux têtes satellites existent dans l'allocation et ne sont
+    /// jamais rendues : personne n'en obtient l'adresse.
+    ///
+    /// C'est le choix **délibéré** du pilote aujourd'hui, et c'est la variante à garder
+    /// tant que les quatre méthodes ne sont pas réellement servies. Exposer une
+    /// interface qu'on ne sert pas est plus dangereux que ne rien exposer : rien
+    /// n'oblige le moteur audio à rester sur le chemin cyclique s'il voit le mode
+    /// paquets, et un `STATUS_NOT_SUPPORTED` rendu depuis une interface qu'il a
+    /// légitimement obtenue casse un transport qui fonctionnait. Un IID rendu est une
+    /// promesse de service (en-tête du module, point 5).
+    ///
+    /// Passer à [`Input`](Self::Input) ou [`Output`](Self::Output) est donc un
+    /// changement de contrat observable en machine, pas un réglage : il ne se fait
+    /// qu'avec les méthodes derrière.
+    None,
     /// Flux de **capture** : `IMiniportWaveRTInputStream` seule (le moteur lit).
     Input,
     /// Flux de **rendu** : `IMiniportWaveRTOutputStream` seule (le moteur écrit).
@@ -218,6 +315,12 @@ impl PacketInterfaces {
     /// Faut-il répondre à `IID_IMiniportWaveRTOutputStream` ?
     pub const fn has_output(self) -> bool {
         matches!(self, Self::Output | Self::Both)
+    }
+
+    /// Aucune interface du mode paquets exposée : le `QueryInterface` de l'objet répond
+    /// exactement comme celui d'un flux non composite.
+    pub const fn is_none(self) -> bool {
+        matches!(self, Self::None)
     }
 }
 
@@ -476,8 +579,6 @@ unsafe extern "C" fn query_interface_composite<T: PacketWaveRTStream>(
     if iid.is_null() {
         // SAFETY: `out` est non nul et inscriptible (contrat).
         unsafe { *out = ptr::null_mut() };
-        // SAFETY: `iid` est nul, la trace ne le déréférence pas.
-        unsafe { unknown::trace_query_interface(this, iid, STATUS_INVALID_PARAMETER) };
         return STATUS_INVALID_PARAMETER;
     }
     // SAFETY: `iid` est non nul et pointe un `IID` lisible (contrat) ; `IID` et `Guid` ont
@@ -494,7 +595,7 @@ unsafe extern "C" fn query_interface_composite<T: PacketWaveRTStream>(
         None
     };
 
-    let status = match satellite {
+    match satellite {
         Some(tete) => {
             // SAFETY: `this` est vivant et l'appelant en détient une référence : le
             // pointeur rendu doit être compté, comme l'exige COM.
@@ -511,10 +612,7 @@ unsafe extern "C" fn query_interface_composite<T: PacketWaveRTStream>(
                 out,
             )
         },
-    };
-    // SAFETY: `iid` est non nul et lisible (vérifié plus haut).
-    unsafe { unknown::trace_query_interface(this, iid, status) };
-    status
+    }
 }
 
 // ---------------------------------------------------------------------------------

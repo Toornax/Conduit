@@ -28,9 +28,10 @@
 //! défaut décrit, et qui laisse le moteur audio parcourir une liste jusqu'à épuisement.
 //!
 //! L'objet rendu par `NewStream` est un **flux composite** (`portcls::packet`) : une seule
-//! allocation, un seul compteur de références, plusieurs têtes de vtable. Quelles
-//! interfaces du mode paquets il expose est décidé par `PacketInterfaces` au moment de sa
-//! création — voir `open_stream`.
+//! allocation, un seul compteur de références, plusieurs têtes de vtable. Il est construit
+//! avec `PacketInterfaces::None`, donc **sans exposer une interface de plus** qu'un flux
+//! ordinaire : le mode paquets n'est pas servi, et un pilote n'annonce pas ce qu'il ne
+//! sert pas. Voir `open_stream` et la documentation de `PacketInterfaces::None`.
 //!
 //! # Lecture du format
 //!
@@ -203,13 +204,14 @@ fn open_stream(
     supported: SupportedFormat,
 ) -> Result<StreamObject, NtStatus> {
     let name = direction.stream_name();
-    // Mode paquets (étape 1.4) : un flux de rendu est une *sortie* du point de vue du
-    // moteur, qui y écrit ses paquets (`IMiniportWaveRTOutputStream`) ; un flux de capture
-    // est une *entrée*, dont il lit les paquets (`IMiniportWaveRTInputStream`).
-    let interfaces = match direction {
-        Direction::Render => PacketInterfaces::Output,
-        Direction::Capture => PacketInterfaces::Input,
-    };
+    // Mode paquets : l'objet est composite, mais n'expose RIEN. `PacketInterfaces::None`
+    // fait répondre son `QueryInterface` exactement comme celui d'un flux ordinaire —
+    // aucun IID de plus. C'est délibéré : le pilote ne sert pas encore les quatre
+    // méthodes, et exposer une interface qu'on ne sert pas laisserait le moteur audio
+    // basculer sur un chemin qui lui répondrait `STATUS_NOT_SUPPORTED`, au risque de
+    // casser un transport qui fonctionne. Le sens du flux dira `Output` pour le rendu et
+    // `Input` pour la capture le jour où les méthodes existeront, pas avant.
+    let interfaces = PacketInterfaces::None;
     let stream = WaveStream::new(n, direction, cable, port_stream, supported)?;
     let object = try_new_packet_stream_object(stream, interfaces).ok_or_else(|| {
         kmd_log!("{name}{n}::NewStream : allocation du flux impossible");
