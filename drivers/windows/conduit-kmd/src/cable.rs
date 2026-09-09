@@ -19,6 +19,20 @@
 //! les réutilisent ([`Cable::start`]) ; seuls leurs timers sont alloués par le noyau, une
 //! fois au premier `StartDevice` et supprimés au déchargement ([`shutdown`]).
 //!
+//! # Les trois verbes du cycle de vie (M1b-06)
+//!
+//! | Verbe | Quand | Timer | `device` |
+//! |---|---|---|---|
+//! | [`Cable::start`] | `StartDevice` | **créé** s'il ne l'est pas | posé |
+//! | [`Cable::suspend`] | `PowerChangeState` hors `D0` | **désarmé** (`ExCancelTimer`) | intact |
+//! | [`Cable::stop`] | `DriverUnload`, par [`shutdown`] | **supprimé** (`ExDeleteTimer`, attente) | remis à nul |
+//!
+//! La distinction entre les deux derniers est le cœur de M1b-06 : une veille n'est pas un
+//! arrêt. En `D3` l'objet de périphérique reste valide et l'utilisateur doit retrouver ses
+//! câbles au réveil, alors `suspend` ne touche ni au `device` ni à l'existence du timer ;
+//! seul `stop` défait ce que `start` a fait, et c'est le seul des trois à exiger
+//! `PASSIVE_LEVEL`. Voir `crate::power` pour le pourquoi de chaque colonne.
+//!
 //! # Synchronisation et contrat des emplacements
 //!
 //! Les emplacements sont protégés par le **spin lock du câble** ([`Cable::state`]) :
@@ -897,6 +911,87 @@ impl Cable {
         Err(STATUS_INSUFFICIENT_RESOURCES)
     }
 
+    /// Arrête le câble : **supprime** le minuteur (en attendant la fin du tick en cours)
+    /// et **remet l'objet de périphérique à nul**. Symétrique de [`Cable::start`].
+    ///
+    /// # Ce que cette fonction corrige
+    ///
+    /// Le champ `device` borne explicitement sa validité « jusqu'au retrait du
+    /// périphérique » (voir sa documentation) — et jusqu'à M1b-06, **rien ne l'annulait**
+    /// à ce moment-là. Un pointeur périmé y aurait survécu à l'objet de périphérique, et
+    /// [`Cable::persist_active_mask`] ne traite que le cas **nul** (par
+    /// `STATUS_DEVICE_NOT_READY`), pas le cas périmé : il l'aurait passé à
+    /// `IoOpenDeviceRegistryKey`. Il existe désormais **une** opération qui rend le câble
+    /// à l'état d'avant son premier démarrage, et c'est elle qui doit être appelée partout
+    /// où le périphérique s'en va.
+    ///
+    /// # Ce qu'elle ne fait pas
+    ///
+    /// Elle ne vide pas les emplacements de flux : c'est le `Drop` de chaque
+    /// `stream::WaveStream` qui les retire, et il court avant, PortCls fermant les broches
+    /// avant tout arrêt du périphérique. Elle n'efface ni les [`NodeState`], ni l'état de
+    /// connexion — pour les mêmes raisons que [`Cable::start`] ne les remet pas à zéro.
+    ///
+    /// # Ce n'est **pas** le chemin de la veille
+    ///
+    /// Une transition `D3` n'est pas un arrêt : l'objet de périphérique reste valide, le
+    /// pilote reste chargé, et l'utilisateur s'attend à retrouver ses câbles au réveil.
+    /// La veille passe par [`Cable::suspend`], qui se contente de **désarmer** le
+    /// minuteur. Appeler `stop` en `D3` annulerait la persistance de l'état actif pour
+    /// tout le reste de la vie du périphérique — `start` est le seul à reposer `device`,
+    /// et il ne court pas au réveil.
+    ///
+    /// # IRQL
+    ///
+    /// **`PASSIVE_LEVEL`**, hors de tout spin lock : `ExDeleteTimer(…, Wait = TRUE, …)`
+    /// **attend** la fin du rappel en cours, ce qui exige `<= APC_LEVEL`
+    /// ([`crate::timer::ExTimer::delete`]).
+    pub fn stop(&self) {
+        self.timer.delete();
+        {
+            // `armed` repart à faux avec le reste de l'état : le câble arrêté doit être
+            // indiscernable d'un câble qui n'a jamais démarré, sans quoi le prochain
+            // `refresh_timer` croirait le minuteur déjà armé.
+            let mut state = self.state();
+            state.armed = false;
+        }
+        // Après le minuteur, jamais avant : un tick qui s'achèverait entre les deux ne
+        // toucherait de toute façon pas à `device`, mais l'ordre « plus rien ne tourne,
+        // puis plus rien n'est joignable » est celui qu'on peut relire.
+        self.device.store(ptr::null_mut(), Ordering::Relaxed);
+    }
+
+    /// Le câble entre en veille (`PowerDeviceD3` et tout état qui n'est pas `D0`) :
+    /// **désarme** le minuteur sans le supprimer, et oublie qu'il était armé.
+    ///
+    /// # Pourquoi désarmer et non supprimer
+    ///
+    /// Deux raisons, et la première suffit. `ExCancelTimer` est autorisé jusqu'à
+    /// `DISPATCH_LEVEL` et **n'attend rien** ; `ExDeleteTimer(…, Wait = TRUE, …)` attend
+    /// la fin du tick en cours et exige `<= APC_LEVEL`. Or l'IRQL exact des rappels
+    /// `IAdapterPowerManagement` n'est pas écrit dans la documentation de PortCls (voir
+    /// `crate::power`) : un désarmement reste correct même si la supposition
+    /// `PASSIVE_LEVEL` était fausse, une suppression bloquante non. La seconde raison est
+    /// le choix déjà pris en tête de module : l'objet minuteur est alloué une fois et
+    /// vit jusqu'au déchargement, pour qu'aucun réveil ne dépende d'une allocation de
+    /// pool qui pourrait échouer.
+    ///
+    /// # Pourquoi remettre `armed` à faux
+    ///
+    /// [`Cable::refresh_timer`] est un différentiel : il ne fait rien quand l'état voulu
+    /// est celui qu'il croit avoir. Désarmer sans le lui dire laisserait `armed` à vrai,
+    /// et le `refresh_timer` du réveil ne réarmerait **jamais** un flux resté en `RUN` —
+    /// le câble se réveillerait muet. C'est le seul piège de cette paire.
+    ///
+    /// # IRQL
+    ///
+    /// `<= DISPATCH_LEVEL` (le spin lock du câble est pris ; `ExCancelTimer` l'admet).
+    pub fn suspend(&self) {
+        let mut state = self.state();
+        state.armed = false;
+        self.timer.stop();
+    }
+
     /// Inscrit `state` comme flux du sens `direction`. [`SlotOccupied`] si l'emplacement
     /// est déjà pris (un seul flux par sens : la broche déclare une instance).
     ///
@@ -1096,12 +1191,15 @@ impl Cable {
     #[cfg(not(debug_assertions))]
     fn log_counters(&self, _ticks: u64) {}
 
-    /// Supprime le timer du câble et attend la fin du tick en cours (déchargement du
-    /// pilote). Les broches sont fermées et les emplacements vides à ce stade.
+    /// Arrête le câble ([`Cable::stop`] : timer supprimé, objet de périphérique oublié)
+    /// puis relâche ce qui pourrait survivre au déchargement du pilote. Les broches sont
+    /// fermées et les emplacements vides à ce stade.
     ///
     /// IRQL : `PASSIVE_LEVEL`, hors de tout spin lock.
     fn shutdown(&self) {
-        self.timer.delete();
+        // Le timer et l'objet de périphérique partent ensemble, par l'opération
+        // symétrique de `start` : c'est elle qui porte le pourquoi.
+        self.stop();
         // Les cibles d'événement devraient déjà avoir été retirées par le `Drop` de leur
         // miniport ; les relâcher ici garantit qu'aucune référence sur un objet port ne
         // survit au déchargement. Hors du verrou, comme partout ailleurs : le `Drop` d'une
@@ -1111,10 +1209,6 @@ impl Cable {
             cibles.take_all()
         };
         drop(restantes);
-        // L'objet de périphérique ne survit pas au déchargement : le pointeur repart à nul
-        // pour qu'aucun chemin résiduel ne s'en serve. `persist_active_mask` traite ce cas
-        // par un statut nommé, jamais par un déréférencement.
-        self.device.store(ptr::null_mut(), Ordering::Relaxed);
         kmd_log!(
             "câble {} : timer supprimé après {} ticks depuis le dernier StartDevice ({} trames copiées, {} silences, {} débordements)",
             self.index,

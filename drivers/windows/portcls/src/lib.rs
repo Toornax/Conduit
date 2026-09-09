@@ -29,10 +29,12 @@
 //! # Feature `kernel`
 //!
 //! Les enveloppes des fonctions `Pc*` ([`adapter::new_port`],
-//! [`adapter::register_subdevice`], [`adapter::register_physical_connection`]) appellent
-//! des symboles de `portcls.sys` que seul `conduit-kmd` lie : elles n'existent que sous
-//! la feature `kernel`, que `conduit-kmd` active. Tout le reste (thunks, enveloppes
-//! reçues, `port_init`) est indépendant de la feature et testé en mode utilisateur.
+//! [`adapter::register_subdevice`], [`adapter::register_physical_connection`],
+//! [`adapter::register_adapter_power_management`]) appellent des symboles de
+//! `portcls.sys` que seul `conduit-kmd` lie : elles n'existent que sous la feature
+//! `kernel`, que `conduit-kmd` active. Tout le reste (thunks, enveloppes reçues,
+//! `port_init`, [`power::is_powered`]) est indépendant de la feature et testé en mode
+//! utilisateur.
 //!
 //! # Vtable par type : constante associée
 //!
@@ -61,11 +63,15 @@
 //!
 //! # IRQL
 //!
-//! `Init`, `GetDescription`, `DataRangeIntersection`, `NewStream`, `GetDeviceDescription`,
-//! les méthodes de flux hors `GetPosition` et les trois méthodes d'alimentation sont
-//! appelées à `PASSIVE_LEVEL` (contexte des IRP PnP/Power et des propriétés KS traitées
-//! par PortCls) ; `GetPosition` et `QueryInterface`/`AddRef`/`Release` à
-//! `<= DISPATCH_LEVEL`. Les méthodes des enveloppes reçues sont documentées une à une.
+//! `Init`, `GetDescription`, `DataRangeIntersection`, `NewStream`, `GetDeviceDescription`
+//! et les méthodes de flux hors `GetPosition` sont appelées à `PASSIVE_LEVEL` (contexte
+//! des IRP PnP et des propriétés KS traitées par PortCls) ; `GetPosition` et
+//! `QueryInterface`/`AddRef`/`Release` à `<= DISPATCH_LEVEL`. Les méthodes des enveloppes
+//! reçues sont documentées une à une.
+//!
+//! Les **trois méthodes d'alimentation** font exception : leur IRQL n'est pas documenté
+//! par PortCls — seul « must reside in paged memory » l'est. Voir l'en-tête de [`power`],
+//! qui dit ce qu'on en sait et ce qu'on n'en sait pas.
 
 #![no_std]
 #![warn(missing_docs)]
@@ -104,7 +110,9 @@ pub use adapter::{
     ref_as_unknown, subdevice_names, utf16z, utf16z_numbered,
 };
 #[cfg(feature = "kernel")]
-pub use adapter::{new_port, register_physical_connection, register_subdevice};
+pub use adapter::{
+    new_port, register_adapter_power_management, register_physical_connection, register_subdevice,
+};
 pub use audio::{
     ACCESS_FLAGS, AudioNodes, Channel, Mute, Trace, VOLUME_DELTA, VOLUME_MAX, VOLUME_MIN, Volume,
     mute_item, volume_item,
@@ -124,7 +132,8 @@ pub use jack::{
     JACK_PORT_CONNECTION, JackDescription, JackInfo, JackTrace, Pin, jack_description_item,
 };
 pub use power::{
-    AdapterPowerManagement, PowerObject, PowerVtbl, new_power_object, try_new_power_object,
+    AdapterPowerManagement, PowerObject, PowerVtbl, is_powered, new_power_object,
+    try_new_power_object,
 };
 pub use property::{PropertyHandler, Request, TargetVtbl};
 pub use received::{
