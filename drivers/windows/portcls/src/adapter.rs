@@ -6,10 +6,10 @@
 //!
 //! Les fonctions `Pc*` sont des symboles de `portcls.sys` que seul le pilote lie
 //! (`conduit-kmd/build.rs`) : leurs enveloppes ([`new_port`], [`register_subdevice`],
-//! [`register_physical_connection`]) n'existent que sous la feature **`kernel`** du
-//! crate, activée par `conduit-kmd`. Le reste du module ([`port_init`], [`as_unknown`],
-//! les noms) est un appel de vtable ou une conversion, disponible et testé en mode
-//! utilisateur.
+//! [`register_physical_connection`], [`register_adapter_power_management`]) n'existent
+//! que sous la feature **`kernel`** du crate, activée par `conduit-kmd`. Le reste du
+//! module ([`port_init`], [`as_unknown`], les noms) est un appel de vtable ou une
+//! conversion, disponible et testé en mode utilisateur.
 //!
 //! Ordre d'appel par sous-périphérique (SYSVAD `InstallSubdevice`, structure) :
 //! `new_port(&CLSID_PortWaveRT)` → `new_wavert_object(miniport)` → `port_init(…)` →
@@ -27,7 +27,10 @@ use crate::received::ResourceList;
 #[cfg(feature = "kernel")]
 use conduit_com::{STATUS_INVALID_PARAMETER, nt_success};
 #[cfg(feature = "kernel")]
-use portcls_sys::{PPORT, PcNewPort, PcRegisterPhysicalConnection, PcRegisterSubdevice};
+use portcls_sys::{
+    PPORT, PcNewPort, PcRegisterAdapterPowerManagement, PcRegisterPhysicalConnection,
+    PcRegisterSubdevice,
+};
 
 /// Référence `IUnknown` sur un objet COM du pilote (`AddRef`) : la forme sous laquelle
 /// `IPort::Init` reçoit le miniport et `PcRegisterSubdevice` le port.
@@ -159,6 +162,53 @@ pub unsafe fn register_physical_connection(
     // SAFETY: `from` et `to` sont vivants le temps de l'appel ; `device` est celui de
     // `StartDevice`.
     unsafe { PcRegisterPhysicalConnection(device, from.as_ptr(), from_pin, to.as_ptr(), to_pin) }
+}
+
+/// `PcRegisterAdapterPowerManagement` : inscrit `unknown` — l'`IUnknown` d'un objet
+/// [`crate::power::AdapterPowerManagement`], par [`as_unknown`] — comme destinataire des
+/// messages d'alimentation de l'adaptateur `device`. Sans cet appel, l'objet construit
+/// par [`crate::new_power_object`] n'est jamais appelé : c'est le seul chemin.
+///
+/// Prototype du WDK (`km/portcls.h` 10.0.26100, l. 4262-4273) :
+/// `NTSTATUS PcRegisterAdapterPowerManagement(_In_ PUNKNOWN Unknown, _In_ PVOID
+/// pvContext1)`. Le second paramètre est l'**objet de périphérique** de l'adaptateur :
+/// c'est sur lui que la fonction inverse `PcUnregisterAdapterPowerManagement(_In_
+/// PDEVICE_OBJECT)` (l. 4275-4287) est clavetée. L'enveloppe prend donc les deux
+/// arguments dans l'ordre du reste du module — `device` d'abord — plutôt que dans celui
+/// du prototype C.
+///
+/// # Propriété
+///
+/// Même contrat que [`register_subdevice`] : PortCls prend **sa propre référence** sur
+/// l'objet, qu'il appellera longtemps après le retour ; l'appelant relâche la sienne.
+/// C'est ce que fait SYSVAD de son `CAdapterCommon`.
+///
+/// # Quand appeler
+///
+/// L'en-tête est explicite et contre-intuitif (l. 2777-2785) : « If you want to fill in
+/// the caps struct for your device, register the interface with PortCls **in or before
+/// your AddDevice() function**. The OS queries devices before StartDevice() gets
+/// called. » Autrement dit, un enregistrement fait dans `StartDevice` arrive **après**
+/// l'interrogation des capacités : `QueryDeviceCapabilities` ne sera pas appelé, et le
+/// défaut du trait (ne rien amender) est le seul comportement observable. Les deux
+/// autres méthodes, elles, sont appelées normalement — ce sont les transitions
+/// d'alimentation qui suivent le démarrage.
+///
+/// IRQL : `PASSIVE_LEVEL`.
+///
+/// # Safety
+///
+/// `device` est l'objet de périphérique fonctionnel remis à `StartDevice` (PortCls le
+/// déréférence pour retrouver son extension).
+#[cfg(feature = "kernel")]
+pub unsafe fn register_adapter_power_management(
+    device: PDEVICE_OBJECT,
+    unknown: &ComRef<IUnknown>,
+) -> NtStatus {
+    // SAFETY: `unknown` est vivant le temps de l'appel et PortCls prend sa propre
+    // référence ; `device` est celui de `StartDevice` (contrat), passé en `PVOID` comme
+    // le veut le prototype.
+    unsafe { PcRegisterAdapterPowerManagement(unknown.as_ptr(), device.cast()) }
 }
 
 /// Nombre de câbles servis par le pilote (M1b-02, driver-design.md §2.1).

@@ -20,7 +20,16 @@
 //! (`ComRef`, `ComPtr`) sont relâchées à la sortie de chaque fonction (`Drop`). Seul
 //! l'état partagé des câbles ([`crate::cable`]) survit, et il est `static`.
 //!
-//! `PcRegisterAdapterPowerManagement` n'est pas appelé avant M1b-06.
+//! # Alimentation (M1b-06)
+//!
+//! `StartDevice` enregistre en outre l'objet `IAdapterPowerManagement` du pilote auprès de
+//! PortCls ([`crate::power::register`]), **avant** la boucle d'enregistrement des câbles :
+//! c'est un objet d'adaptateur, pas de câble, et il vaut mieux qu'il soit en place avant
+//! qu'un endpoint n'existe. Son échec est **journalisé sans être propagé** : l'interface
+//! est documentée comme optionnelle, et un pilote qui n'apprend pas les transitions
+//! d'alimentation reste parfaitement fonctionnel (PortCls met les flux en pause de
+//! lui-même). Refuser de démarrer pour cela échangerait un service dégradé contre aucun
+//! service.
 //!
 //! IRQL : `PASSIVE_LEVEL` partout (contexte de `IRP_MN_START_DEVICE`).
 
@@ -43,6 +52,7 @@ use crate::descriptors::{
     WAVE_RENDER_PIN_BRIDGE,
 };
 use crate::eventlog::EventLog;
+use crate::power;
 use crate::registry;
 use crate::topo::{TopoCapture, TopoRender};
 use crate::wave::{WaveCapture, WaveRender};
@@ -286,6 +296,14 @@ pub unsafe fn start_device(
     // SAFETY: idem.
     let masque = unsafe { registry::read_active_cables(device, log) };
     cable::apply_active_mask(masque);
+
+    // Alimentation (M1b-06) : l'objet d'alimentation de l'adaptateur, avant tout câble.
+    // L'échec ne fait pas échouer `StartDevice` — voir « Alimentation » en tête de module.
+    // SAFETY: `device` est celui de `StartDevice` (contrat) ; `PcRegisterAdapterPowerManagement`
+    // exige `PASSIVE_LEVEL`, ce qu'est le contexte de `IRP_MN_START_DEVICE`.
+    if let Err(status) = unsafe { power::register(device) } {
+        kmd_log!("StartDevice : enregistrement de l'alimentation a échoué : {status:#010x}");
+    }
 
     // `sanitize` a déjà écrêté la réserve dans `1..=MAX_RESERVE`, et une assertion à la
     // compilation aligne ce plafond sur le nombre de câbles statiques : le `min` est une

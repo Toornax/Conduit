@@ -412,8 +412,22 @@ l'adaptateur ne conserve que l'état partagé des câbles (`cable::Cable`, §5.3
 déchargement : ni allocation, ni fuite de pool, ni `Drop` ; les cycles start/stop la
 réutilisent). Ses deux `Slot` (flux rendu et capture courants) sont des `AtomicPtr` ;
 M1a-08 fixera comment le tick garantit la survie de l'état pointé.
-`PcRegisterAdapterPowerManagement` n'est pas appelé avant M1b-06. `NewStream` valide le
-format (`kmd-core::format::validate`) puis crée le flux, dans les deux sens (§5).
+`NewStream` valide le format (`kmd-core::format::validate`) puis crée le flux, dans les
+deux sens (§5).
+
+Réalité M1b-06 : `StartDevice` appelle `PcRegisterAdapterPowerManagement`, **une seule fois
+par chargement** (`conduit_kmd::power::register`) — la règle Driver Verifier
+`PcRegisterAdapterPower` du domaine `audio` fait d'un second enregistrement sans
+désenregistrement intercalaire un bug check `0xC4` (`0x00071006`), et le pilote n'a aucun
+rappel d'arrêt d'où appeler `PcUnregisterAdapterPowerManagement`. L'objet reçoit
+`PowerChangeState` : hors `D0`, chaque câble **désarme** son timer (`Cable::suspend`,
+`ExCancelTimer`, valide jusqu'à `DISPATCH_LEVEL` — l'IRQL des rappels d'alimentation de
+PortCls n'est pas documenté) ; en `D0`, `Cable::refresh_timer` réarme ce qui doit l'être.
+C'est une ceinture : PortCls met lui-même les flux en pause avant l'appel de descente et
+les relance après celui de montée, donc `SetState` fait déjà l'essentiel.
+`QueryPowerChangeState` accepte tout (le refus n'est ni fiable ni utile à un câble
+virtuel) et `QueryDeviceCapabilities` n'est jamais appelé, l'OS interrogeant les capacités
+avant `StartDevice`.
 
 Réalité M1a-08 : les emplacements du câble ne sont plus des `AtomicPtr` mais deux pointeurs
 sous un **spin lock du câble** (`Cable::attach`/`detach`/`state`), car l'atomique seul ne
