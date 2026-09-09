@@ -720,7 +720,7 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   *Suite décrite et non faite* : `IAdapterPnpManagement` est le vrai rappel d'arrêt, et
   c'est là que `Cable::stop` et `PcUnregisterAdapterPowerManagement` trouveraient leur
   appelant.
-- [ ] **M1b-07** `feat(driver): comportement à un seul côté ouvert`
+- [x] **M1b-07** `feat(driver): comportement à un seul côté ouvert`
   *Fait quand* : capture seule → silence ; rendu seul → pas d'accumulation.
   Le comportement était **déjà correct et testé** depuis M1a ; le travail a consisté à le
   rendre **mesurable**. Le plan dit désormais *pourquoi* il demande un silence
@@ -735,10 +735,22 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   ```
   Vingt secondes de rendu sans capture : le compteur de rejets suit les ticks, tout le
   reste reste à zéro. Puis la passe normale démarre et il se fige net.
-  *Reste à mesurer* : la moitié « capture seule ». Sa fenêtre naturelle (la queue après
-  l'arrêt du rendu) fait ~100 ms, sous la cadence de journalisation de 1000 ticks. Elle
-  deviendra mesurable **sans débogueur** quand les compteurs seront exposés par le jeu de
-  propriétés privé — forme proposée, à fusionner avec M1b-05 qui touche les mêmes fichiers.
+  *Les deux moitiés mesurées le 2026-09-09*, **sans débogueur**, session console intacte,
+  par `conduit-looptest --cable-compteurs` — les compteurs sont désormais exposés par le jeu
+  de propriétés privé (`KSPROPERTY_CONDUIT_COUNTERS`, GET seul, sans privilège), ce qui les
+  rend lisibles **en release** et sans l'outil qui fausse les mesures de transport :
+
+  | | ticks | copiées | silences sans rendu | ticks jetés |
+  |---|---|---|---|---|
+  | après une passe normale de 5 s | 3 440 | 242 676 | **192** | 0 |
+  | après 10 s de **rendu seul** | 10 058 | 242 676 *(inchangé)* | 192 *(inchangé)* | **6 618** |
+
+  La première ligne prouve la moitié « capture seule » : les 192 silences viennent de la
+  fenêtre où la capture tourne encore alors que le rendu s'est arrêté. La seconde prouve
+  « rendu seul » : rien copié, aucun silence écrit, seuls les rejets montent.
+  *Défaut mineur du relevé, à corriger* : la ligne de régime (« les deux côtés tournent »)
+  est déduite des compteurs **cumulés**, donc elle décrit le passé et non l'instant — elle
+  annonçait « le câble transporte » alors que plus rien ne tournait.
 - [x] **M1b-08** `test(driver): harnais utilisateur et fuzzing du parseur de la propriété KS`
   Le code de validation compile aussi en mode utilisateur pour être fuzzé.
   *Fait quand* : 1 h de fuzzing sans panique.
