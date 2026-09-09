@@ -83,12 +83,14 @@ pub mod ring;
 pub mod wavefmt;
 
 pub use config::{
-    cable_bit, is_active, sanitize_mask, with_active, CableCounters, CableFormat, CableFormatFix,
-    CableState, ConfigError, ConfigGuid, CountersError, FormatCodeError, MaskFix,
+    cable_bit, is_active, sanitize_mask, with_active, AllocationMode, CableCounters, CableFormat,
+    CableFormatFix, CableState, CableTransport, ConfigError, ConfigGuid, CountersError,
+    FormatCodeError, KsRunState, MaskFix, StreamSide, StreamTransport, TransportError,
     ACTIVE_CABLES_DEFAULT, ACTIVE_CABLES_LABEL, ACTIVE_CABLES_MASK, ACTIVE_CABLES_VALUE_NAME,
-    CABLE_COUNTERS_BYTES, CABLE_FORMAT_DEFAULT, CABLE_FORMAT_LABEL, CABLE_FORMAT_VALUE_NAMES,
-    CABLE_MAX, CABLE_STATE_BYTES, CONFIG_VERSION, KSPROPERTY_CONDUIT_CABLE_STATE,
-    KSPROPERTY_CONDUIT_COUNTERS, KSPROPERTY_CONDUIT_VERSION, KSPROPSETID_CONDUIT,
+    ALLOCATION_MODE_MAX, CABLE_COUNTERS_BYTES, CABLE_FORMAT_DEFAULT, CABLE_FORMAT_LABEL,
+    CABLE_FORMAT_VALUE_NAMES, CABLE_MAX, CABLE_STATE_BYTES, CABLE_TRANSPORT_BYTES, CONFIG_VERSION,
+    KSPROPERTY_CONDUIT_CABLE_STATE, KSPROPERTY_CONDUIT_COUNTERS, KSPROPERTY_CONDUIT_TRANSPORT,
+    KSPROPERTY_CONDUIT_VERSION, KSPROPSETID_CONDUIT, KS_RUN_STATE_MAX, STREAM_TRANSPORT_BYTES,
 };
 pub use format::{
     buffer_bytes, buffer_bytes_for_notifications, buffer_bytes_for_notifications_with_floor,

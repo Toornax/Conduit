@@ -1,7 +1,8 @@
 //! Contrat du jeu de propriétés KS **privé** de configuration (M1b-04,
-//! `docs/driver-design.md` §6) : le GUID du jeu, les identifiants de propriété, les deux
-//! structures d'échange ([`CableState`] et, depuis M1b-21, [`CableCounters`]), leurs
-//! parseurs, et le masque de bits qui persiste l'état des câbles.
+//! `docs/driver-design.md` §6) : le GUID du jeu, les identifiants de propriété, les trois
+//! structures d'échange ([`CableState`], [`CableCounters`] depuis M1b-21 et
+//! [`CableTransport`] depuis le lot 0 du mode paquets), leurs parseurs, et le masque de bits
+//! qui persiste l'état des câbles.
 //!
 //! Tout est ici et **rien n'appelle le noyau** : ce module est le contrat que le service
 //! d'assistance (M1b-20) et le pilote se partagent, celui que M1b-08 fuzzera en mode
@@ -16,7 +17,7 @@
 //! (`…(A;;GRGWGX;;;WD)`, « Tout le monde ») le laisse ouvrir nos filtres KS, comme tout
 //! adaptateur audio. Le contenu et la **longueur** du tampon sont donc hostiles. D'où la
 //! règle qui gouverne [`CableState::from_bytes`] — et, à l'identique,
-//! [`CableCounters::from_bytes`] :
+//! [`CableCounters::from_bytes`] et [`CableTransport::from_bytes`] :
 //!
 //! **toute longueur inattendue est refusée, y compris un préfixe valide suivi d'octets en
 //! trop.** Accepter un préfixe est le défaut classique de ce genre de parseur : il rend le
@@ -169,6 +170,41 @@ pub const KSPROPERTY_CONDUIT_VERSION: u32 = 1;
 /// servirait pas là où il sert — sur la machine où plus rien ne marche.
 pub const KSPROPERTY_CONDUIT_COUNTERS: u32 = 2;
 
+/// `KSPROPERTY_CONDUIT_TRANSPORT` : l'état du transport des deux sens du câble
+/// (`GET` seulement).
+///
+/// La valeur échangée est une [`CableTransport`]. Comme pour les deux propriétés
+/// précédentes, le câble n'est pas désigné par un paramètre de la requête mais par le filtre
+/// auquel elle s'adresse ; [`CableTransport::cable`] n'est qu'un **écho**, et il n'y a rien à
+/// comparer puisqu'il n'y a pas de `SET`.
+///
+/// # Un sélecteur voisin, et non des champs de plus dans [`CableCounters`]
+///
+/// Les deux valeurs ne sont pas du même genre : les compteurs sont **cumulés depuis le
+/// dernier `StartDevice`** et décrivent le câble entier, tandis que l'état du transport
+/// décrit le **flux courant**, sens par sens, et disparaît avec la broche qui se ferme.
+/// Les fondre dans une seule structure obligerait à relire cinquante-six octets d'histoire
+/// pour connaître un mode d'allocation, et surtout ferait grandir une valeur dont la
+/// **longueur est refusée dès qu'elle change** — c'est-à-dire casserait tout client des
+/// compteurs pour une information qui ne les concerne pas.
+///
+/// # Ce qu'elle rend lisible, et pourquoi maintenant
+///
+/// Un paquet WaveRT n'existe que sur un tampon alloué par `AllocateBufferWithNotification`.
+/// Tous les journaux du dépôt montrent le moteur audio allouant **sans** notifications, et
+/// l'audio passant quand même : il scrute. Mais ces journaux sont anciens, pris débogueur
+/// attaché, peut-être en session 0 — et le débogueur fausse précisément ce qu'on mesure
+/// (17 passes sur 20 attaché contre 20 sur 20 détaché, le 2026-09-08). Cette propriété
+/// répond en session console, sans rien attacher, par le chemin `IOCTL_KS_PROPERTY` déjà en
+/// place : `conduit-looptest --cable-transport`.
+///
+/// # Pas de `SET`, et pas de contrôle de privilège
+///
+/// Même raison que pour [`KSPROPERTY_CONDUIT_COUNTERS`] : une observation n'est pas un
+/// réglage, il n'y a rien à écrire, et un diagnostic qui exigerait l'élévation ne servirait
+/// pas là où il sert.
+pub const KSPROPERTY_CONDUIT_TRANSPORT: u32 = 3;
+
 /// Le `pid` de la **marque de câble** dans le magasin de propriétés d'un endpoint
 /// MMDevices : la valeur `{3f1b27a4-8c6e-4d02-9b75-e4a0d61c8f3b},1`.
 ///
@@ -237,7 +273,24 @@ pub const PID_MARQUE_CABLE: u32 = 1;
 /// seulement que le pilote et l'outil ne sont pas du même millésime. C'est ainsi que
 /// `conduit-looptest` le formule depuis M1b-21 ; le service d'assistance, lui, se contente
 /// de rapporter les deux numéros et ne refuse rien sur ce seul critère.
-pub const CONFIG_VERSION: u32 = 3;
+///
+/// # Pourquoi 4 : la même règle, appliquée une deuxième fois
+///
+/// [`KSPROPERTY_CONDUIT_TRANSPORT`] apparaît (lot 0 du mode paquets WaveRT), sans toucher à
+/// un octet de [`CableState`] ni de [`CableCounters`], ni à leur sémantique. Le numéro monte
+/// quand même, et la raison est celle du paragraphe précédent, mot pour mot : le GUID du jeu
+/// est gravé et la longueur des tampons est refusée dès qu'elle change, donc ce numéro est
+/// la **seule** voie de versionnement qui reste. Ne pas le monter ferait désigner par
+/// « version 3 » deux jeux différents — celui à trois propriétés et celui à quatre — sans
+/// qu'aucun canal du contrat ne puisse les distinguer, et un client n'aurait pour recours
+/// que d'envoyer la requête et d'interpréter le refus, c'est-à-dire de deviner la version au
+/// lieu de la lire.
+///
+/// Le passage de 3 à 4 est **additif**, comme 2 → 3 : un client v3 devant un pilote v4 lit
+/// exactement les mêmes états et les mêmes compteurs. La règle sur les messages ne change
+/// donc pas — un outil qui constate une inadéquation dit que les millésimes diffèrent,
+/// jamais **ce qui** diffère.
+pub const CONFIG_VERSION: u32 = 4;
 
 /// Nombre de câbles que le contrat sait adresser : le plafond de la réserve
 /// ([`crate::params::MAX_RESERVE`], SPEC F-06).
@@ -932,6 +985,744 @@ impl CableCounters {
 }
 
 // ---------------------------------------------------------------------------------
+// L'état du transport, sens par sens (lot 0 du mode paquets WaveRT).
+// ---------------------------------------------------------------------------------
+
+/// Le sens d'un flux dans une [`CableTransport`].
+///
+/// Un câble a deux emplacements, et rien ne dit que le moteur audio les alloue de la même
+/// façon : c'est précisément la question que cette propriété pose. Le type existe pour que
+/// personne n'ait à se souvenir que « le premier bloc est le rendu ».
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StreamSide {
+    /// Broche système de `WaveRender<n>` : le lecteur écrit.
+    Render,
+    /// Broche système de `WaveCapture<n>` : l'enregistreur lit.
+    Capture,
+}
+
+impl StreamSide {
+    /// Les deux sens, dans l'ordre où ils sont sérialisés.
+    pub const ALL: [Self; 2] = [Self::Render, Self::Capture];
+
+    /// Nom du sens en français, pour un relevé (« rendu », « capture »).
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Render => "rendu",
+            Self::Capture => "capture",
+        }
+    }
+}
+
+/// Comment le tampon du flux courant a été alloué — **la** question du lot 0.
+///
+/// # Ce que chaque cas démontre
+///
+/// Un paquet WaveRT n'existe que sur un tampon alloué avec notifications. Tous les
+/// journaux du dépôt montrent le moteur audio allouant **sans** (`Allocate(notifications
+/// None)`, quarante-cinq fois, aucun `RegisterNotificationEvent`), et l'audio passait quand
+/// même : le moteur **scrute** notre endpoint. Ces journaux sont anciens, pris débogueur
+/// attaché, peut-être en session 0 — d'où cette propriété, qui répond en session console et
+/// sans rien attacher.
+///
+/// Les quatre cas ne se confondent pas, et c'est tout leur intérêt :
+///
+/// - [`Self::NoStream`] : personne n'a ouvert ce sens. Un relevé fait au mauvais moment
+///   ressemble à cela, et ne prouve **rien** ;
+/// - [`Self::NoBuffer`] : la broche est ouverte, le tampon pas encore alloué (ou déjà
+///   rendu). C'est une fenêtre étroite, mais la confondre avec le cas précédent ferait
+///   conclure « aucun flux » alors que le flux est là ;
+/// - [`Self::Polling`] : `AllocateAudioBuffer`, sans notification — le moteur scrute ;
+/// - [`Self::Notifications`] : `AllocateBufferWithNotification`, la seule allocation sur
+///   laquelle un paquet puisse exister.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum AllocationMode {
+    /// Aucun flux ouvert dans ce sens : l'emplacement du câble est vide.
+    #[default]
+    NoStream,
+    /// Flux ouvert, aucun tampon alloué.
+    NoBuffer,
+    /// Tampon alloué par `AllocateAudioBuffer` : **scrutation**, pas de paquets possibles.
+    Polling,
+    /// Tampon alloué par `AllocateBufferWithNotification`.
+    Notifications,
+}
+
+/// Le plus grand code de [`AllocationMode`] : tout ce qui dépasse est refusé par
+/// [`CableTransport::from_bytes`].
+pub const ALLOCATION_MODE_MAX: u32 = 3;
+
+impl AllocationMode {
+    /// Le code qui voyage dans [`StreamTransport::mode`].
+    #[must_use]
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::NoStream => 0,
+            Self::NoBuffer => 1,
+            Self::Polling => 2,
+            Self::Notifications => 3,
+        }
+    }
+
+    /// Le mode d'un code reçu, `None` au-delà de [`ALLOCATION_MODE_MAX`].
+    #[must_use]
+    pub const fn from_code(code: u32) -> Option<Self> {
+        match code {
+            0 => Some(Self::NoStream),
+            1 => Some(Self::NoBuffer),
+            2 => Some(Self::Polling),
+            3 => Some(Self::Notifications),
+            _ => None,
+        }
+    }
+
+    /// Le mode **en toutes lettres**, pour un relevé lisible d'un coup d'œil.
+    ///
+    /// Le nom de la routine PortCls y figure : c'est elle qu'on cherche dans une trace, et
+    /// « avec notifications » sans le nom obligerait à retraduire.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NoStream => "aucun flux ouvert",
+            Self::NoBuffer => "flux ouvert, aucun tampon",
+            Self::Polling => "AllocateAudioBuffer (scrutation)",
+            Self::Notifications => "AllocateBufferWithNotification",
+        }
+    }
+
+    /// Vrai pour le seul mode sur lequel un paquet WaveRT puisse exister.
+    #[must_use]
+    pub const fn notifie(self) -> bool {
+        matches!(self, Self::Notifications)
+    }
+}
+
+/// L'état KS d'un flux (`KSSTATE` de `ks.h`), tel qu'il traverse la propriété.
+///
+/// Recopié plutôt qu'importé, comme [`ConfigGuid`] : ce crate est portable et se teste
+/// depuis Linux. Les quatre codes sont ceux de `ks.h` et n'en bougeront pas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum KsRunState {
+    /// `KSSTATE_STOP` : arrêté, position remise à zéro.
+    #[default]
+    Stop,
+    /// `KSSTATE_ACQUIRE` : ressources acquises.
+    Acquire,
+    /// `KSSTATE_PAUSE` : en pause, position accumulée.
+    Pause,
+    /// `KSSTATE_RUN` : en marche — le seul état où le tick a quelque chose à faire.
+    Run,
+}
+
+/// Le plus grand code de [`KsRunState`] (`KSSTATE_RUN`).
+pub const KS_RUN_STATE_MAX: u32 = 3;
+
+impl KsRunState {
+    /// Le code `KSSTATE` qui voyage dans [`StreamTransport::ks_state`].
+    #[must_use]
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::Stop => 0,
+            Self::Acquire => 1,
+            Self::Pause => 2,
+            Self::Run => 3,
+        }
+    }
+
+    /// L'état d'un code reçu, `None` au-delà de [`KS_RUN_STATE_MAX`].
+    #[must_use]
+    pub const fn from_code(code: u32) -> Option<Self> {
+        match code {
+            0 => Some(Self::Stop),
+            1 => Some(Self::Acquire),
+            2 => Some(Self::Pause),
+            3 => Some(Self::Run),
+            _ => None,
+        }
+    }
+
+    /// Le nom KS de l'état, celui des traces du pilote.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Stop => "STOP",
+            Self::Acquire => "ACQUIRE",
+            Self::Pause => "PAUSE",
+            Self::Run => "RUN",
+        }
+    }
+}
+
+/// `StreamTransport::mode` (`ULONG`) : décalage 0 dans le bloc d'un sens.
+pub const OS_MODE: usize = 0;
+/// `StreamTransport::notification_count` (`ULONG`) : décalage 4.
+pub const OS_NOTIFICATION_COUNT: usize = 4;
+/// `StreamTransport::buffer_bytes` (`ULONG`) : décalage 8.
+pub const OS_BUFFER_BYTES: usize = 8;
+/// `StreamTransport::buffer_frames` (`ULONG`) : décalage 12.
+pub const OS_BUFFER_FRAMES: usize = 12;
+/// `StreamTransport::notification_events` (`ULONG`) : décalage 16.
+pub const OS_NOTIFICATION_EVENTS: usize = 16;
+/// `StreamTransport::ks_state` (`ULONG`) : décalage 20.
+pub const OS_KS_STATE: usize = 20;
+/// `StreamTransport::refused_allocations` (`ULONGLONG`) : décalage 24.
+pub const OS_REFUSED_ALLOCATIONS: usize = 24;
+
+/// Taille du bloc d'un sens, en octets : **32**.
+pub const STREAM_TRANSPORT_BYTES: usize = 32;
+
+/// L'état du transport d'**un sens** d'un câble : ce que le moteur audio a demandé, et ce
+/// qu'il a obtenu.
+///
+/// # Six `ULONG` puis un `ULONGLONG`, et pourquoi dans cet ordre
+///
+/// `#[repr(C)]`, alignement 8, **rembourrage explicite** : les six `ULONG` pavent les
+/// vingt-quatre premiers octets, si bien que [`Self::refused_allocations`] tombe sur un
+/// multiple de huit sans que le compilateur ait à insérer un trou. Le bloc étant lui-même
+/// placé à un décalage multiple de huit dans [`CableTransport`], l'alignement tient de bout
+/// en bout. Même règle que sur [`CableCounters`] : un rembourrage implicite serait de la
+/// mémoire noyau non initialisée recopiée vers l'espace utilisateur au `GET`.
+///
+/// # Le compteur de refus est le champ qui compte
+///
+/// Les six autres décrivent l'instant ; celui-là décrit ce qui s'est passé. Un refus
+/// d'allocation fait retomber le moteur audio en scrutation **sans une ligne d'erreur** —
+/// c'est ce qui a coûté une journée de diagnostic le 2026-09-06 (`conduit_kmd::stream`, la
+/// note sur `WaveStream::allocate`), corrigé depuis et jamais revérifié. Sans ce compteur,
+/// un relevé montrant [`AllocationMode::Polling`] ne dirait pas si le moteur n'a **jamais**
+/// demandé de notifications ou si nous les lui avons refusées. C'est la différence entre
+/// « Windows ne veut pas de paquets » et « nous ne savons pas les servir », et le reste du
+/// plan en dépend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(C)]
+pub struct StreamTransport {
+    /// Code de [`AllocationMode`] : comment le tampon courant a été alloué.
+    pub mode: u32,
+    /// `NotificationCount` demandé par `AllocateBufferWithNotification` ; 0 dans tout autre
+    /// mode.
+    ///
+    /// **Aucune borne n'est imposée.** La documentation annonce « Valid values are 1 or 2 »
+    /// et nous n'avons jamais rien observé d'autre, mais le pilote reste permissif comme
+    /// SYSVAD (voir `conduit_kmd::stream`) : refuser ici ce que le pilote accepte ferait
+    /// mentir le relevé sur ce qui a réellement été demandé.
+    pub notification_count: u32,
+    /// Taille du tampon alloué, en octets ; 0 sans tampon.
+    pub buffer_bytes: u32,
+    /// Taille du tampon alloué, en **trames** ; 0 sans tampon.
+    ///
+    /// Redondante avec [`Self::buffer_bytes`] seulement si l'on connaît le format du câble,
+    /// ce qu'un relevé n'a pas sous la main : c'est en trames que se comptent une période de
+    /// notification et une latence, et faire cette division de tête à trois heures du matin
+    /// est le genre d'économie qui coûte une erreur.
+    pub buffer_frames: u32,
+    /// Nombre d'événements enregistrés par `RegisterNotificationEvent` (0 à 2).
+    pub notification_events: u32,
+    /// Code de [`KsRunState`] : l'état KS courant du flux.
+    pub ks_state: u32,
+    /// Allocations **refusées** dans ce sens depuis le dernier `StartDevice`, toutes causes
+    /// confondues.
+    ///
+    /// Cumulé, et porté par le câble et non par le flux : un refus peut être suivi de la
+    /// fermeture de la broche, et un compteur qui mourrait avec le flux ne serait jamais lu.
+    /// Remis à zéro à chaque `StartDevice`, comme les compteurs de la boucle locale.
+    pub refused_allocations: u64,
+}
+
+/// `CableTransport::cable` (`ULONG`) : décalage 0.
+pub const OT_CABLE: usize = 0;
+/// `CableTransport::reserved` (`ULONG`) : décalage 4.
+pub const OT_RESERVED: usize = 4;
+/// `CableTransport::render` ([`StreamTransport`]) : décalage 8.
+pub const OT_RENDER: usize = 8;
+/// `CableTransport::capture` ([`StreamTransport`]) : décalage 40.
+pub const OT_CAPTURE: usize = 40;
+
+/// Taille de la valeur de [`KSPROPERTY_CONDUIT_TRANSPORT`], en octets : **72**.
+///
+/// Fixe et vérifiée par assertion `const` contre `size_of::<CableTransport>()`, comme
+/// [`CABLE_STATE_BYTES`] et [`CABLE_COUNTERS_BYTES`].
+pub const CABLE_TRANSPORT_BYTES: usize = 72;
+
+/// L'état du transport des **deux** sens d'un câble, tel qu'il traverse
+/// `IOCTL_KS_PROPERTY`.
+///
+/// # Les deux sens dans une seule valeur, et non un par filtre
+///
+/// Le filtre interrogé désigne un sens (`TopoRender<n>` ou `TopoCapture<n>`), mais la
+/// réponse porte les deux — comme [`CableCounters`], que les deux filtres d'un câble
+/// rendent à l'identique. Deux raisons. La question du lot 0 porte sur le **câble** (« le
+/// moteur audio demande-t-il des notifications ? »), et y répondre en deux requêtes dont
+/// l'une peut être servie pendant que l'autre ne l'est plus rendrait le relevé plus difficile
+/// à lire, pas moins. Et un relevé des seize câbles ferait sinon trente-deux ouvertures de
+/// filtre au lieu de seize.
+///
+/// # Un instantané, pas une transaction
+///
+/// Le pilote lit les champs d'un sens sous le verrou de ce flux, mais les **deux compteurs
+/// de refus hors de tout verrou** : une allocation peut donc être refusée entre deux
+/// lectures, et l'instantané rendu mélanger deux instants. C'est le même choix que pour
+/// [`CableCounters`], pour la même raison — la mesure ne doit pas sérialiser ce qu'elle
+/// mesure — et il est sans effet sur ce qu'on cherche : un mode et un compte de refus se
+/// lisent l'un après l'autre sans qu'aucune conclusion ne dépende de leur simultanéité.
+///
+/// Le détail est écrit sur `conduit_kmd::cable::Cable::transport_snapshot`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(C)]
+pub struct CableTransport {
+    /// Numéro du câble, de 0 à [`CABLE_MAX`] − 1.
+    ///
+    /// **Un écho, comme [`CableCounters::cable`]** : il n'y a pas de `SET`, donc rien à
+    /// comparer. Il dit quel câble on vient d'interroger, ce qui compte quand on relève les
+    /// seize d'affilée.
+    pub cable: u32,
+    /// Rembourrage **explicite**, toujours nul.
+    ///
+    /// Deux rôles, comme [`CableCounters::reserved`] : garder la place d'un futur champ
+    /// 32 bits, et amener le premier bloc de sens sur un multiple de huit sans trou
+    /// implicite. Le `GET` l'écrit toujours à zéro et [`CableTransport::from_bytes`] le
+    /// refuse non nul — c'est ce refus qui garde la place réellement libre.
+    pub reserved: u32,
+    /// Le sens rendu : ce que le lecteur a demandé.
+    pub render: StreamTransport,
+    /// Le sens capture : ce que l'enregistreur a demandé.
+    pub capture: StreamTransport,
+}
+
+// La taille annoncée est celle des structures, et chaque décalage nommé est celui que
+// `repr(C)` produit — même couple d'assertions que pour `CableState` et `CableCounters`, en
+// remplacement d'un golden : c'est notre structure, pas une structure du WDK.
+const _: () = assert!(size_of::<StreamTransport>() == STREAM_TRANSPORT_BYTES);
+const _: () = assert!(align_of::<StreamTransport>() == 8);
+const _: () = assert!(core::mem::offset_of!(StreamTransport, mode) == OS_MODE);
+const _: () =
+    assert!(core::mem::offset_of!(StreamTransport, notification_count) == OS_NOTIFICATION_COUNT);
+const _: () = assert!(core::mem::offset_of!(StreamTransport, buffer_bytes) == OS_BUFFER_BYTES);
+const _: () = assert!(core::mem::offset_of!(StreamTransport, buffer_frames) == OS_BUFFER_FRAMES);
+const _: () =
+    assert!(core::mem::offset_of!(StreamTransport, notification_events) == OS_NOTIFICATION_EVENTS);
+const _: () = assert!(core::mem::offset_of!(StreamTransport, ks_state) == OS_KS_STATE);
+const _: () =
+    assert!(core::mem::offset_of!(StreamTransport, refused_allocations) == OS_REFUSED_ALLOCATIONS);
+// Six `ULONG` contigus, puis un `ULONGLONG` aligné sur huit : aucun trou, donc aucun octet
+// de rembourrage implicite à recopier vers l'espace utilisateur.
+const _: () = assert!(OS_KS_STATE.saturating_add(TAILLE_MOT) == OS_REFUSED_ALLOCATIONS);
+// Le `ULONGLONG` tombe sur un multiple de huit : 24 = 3 × 8, donc aucun trou implicite.
+const _: () = assert!(OS_REFUSED_ALLOCATIONS == TAILLE_MOT_LONG.saturating_mul(3));
+const _: () =
+    assert!(OS_REFUSED_ALLOCATIONS.saturating_add(TAILLE_MOT_LONG) == STREAM_TRANSPORT_BYTES);
+
+const _: () = assert!(size_of::<CableTransport>() == CABLE_TRANSPORT_BYTES);
+const _: () = assert!(align_of::<CableTransport>() == 8);
+const _: () = assert!(core::mem::offset_of!(CableTransport, cable) == OT_CABLE);
+const _: () = assert!(core::mem::offset_of!(CableTransport, reserved) == OT_RESERVED);
+const _: () = assert!(core::mem::offset_of!(CableTransport, render) == OT_RENDER);
+const _: () = assert!(core::mem::offset_of!(CableTransport, capture) == OT_CAPTURE);
+// Les deux `ULONG` de tête pavent les huit premiers octets, puis les deux blocs de sens se
+// suivent sans trou : les deux sont alignés sur huit et la structure s'arrête net.
+const _: () = assert!(OT_RESERVED.saturating_add(TAILLE_MOT) == OT_RENDER);
+const _: () = assert!(OT_RENDER.saturating_add(STREAM_TRANSPORT_BYTES) == OT_CAPTURE);
+const _: () = assert!(OT_CAPTURE.saturating_add(STREAM_TRANSPORT_BYTES) == CABLE_TRANSPORT_BYTES);
+// Les deux blocs tombent sur un multiple de huit : 8 = 1 × 8 et 40 = 5 × 8.
+const _: () = assert!(OT_RENDER == TAILLE_MOT_LONG);
+const _: () = assert!(OT_CAPTURE == TAILLE_MOT_LONG.saturating_mul(5));
+
+/// Ce qui a fait refuser une [`CableTransport`] : un cas, une cause, une ligne de journal.
+///
+/// Distinct de [`ConfigError`] et de [`CountersError`] pour la même raison qu'elles le sont
+/// l'une de l'autre : les longueurs attendues diffèrent, et un message qui annoncerait
+/// « 56 attendus » pour une structure de 72 octets serait un diagnostic faux.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TransportError {
+    /// Longueur du tampon différente de [`CABLE_TRANSPORT_BYTES`] — plus courte **ou** plus
+    /// longue, préfixe valide compris (voir la règle en tête de module).
+    Longueur {
+        /// Octets reçus.
+        recus: usize,
+    },
+    /// [`CableTransport::cable`] au-delà du dernier câble.
+    Cable(u32),
+    /// [`CableTransport::reserved`] non nul.
+    Reserved(u32),
+    /// [`StreamTransport::mode`] au-delà de [`ALLOCATION_MODE_MAX`], dans le sens nommé.
+    Mode {
+        /// Le sens dont le bloc porte le code fautif.
+        sens: StreamSide,
+        /// Le code reçu.
+        code: u32,
+    },
+    /// [`StreamTransport::ks_state`] au-delà de [`KS_RUN_STATE_MAX`], dans le sens nommé.
+    KsState {
+        /// Le sens dont le bloc porte le code fautif.
+        sens: StreamSide,
+        /// Le code reçu.
+        code: u32,
+    },
+}
+
+impl fmt::Display for TransportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Longueur { recus } => write!(
+                f,
+                "valeur de {recus} octets, {CABLE_TRANSPORT_BYTES} attendus exactement"
+            ),
+            Self::Cable(cable) => write!(f, "câble {cable} inconnu (0 à {} )", {
+                CABLE_MAX.saturating_sub(1)
+            }),
+            Self::Reserved(brut) => write!(f, "champ réservé non nul ({brut:#010x})"),
+            Self::Mode { sens, code } => write!(
+                f,
+                "mode d'allocation {code} inconnu côté {} (0 à {ALLOCATION_MODE_MAX})",
+                sens.label()
+            ),
+            Self::KsState { sens, code } => write!(
+                f,
+                "état KS {code} inconnu côté {} (0 à {KS_RUN_STATE_MAX})",
+                sens.label()
+            ),
+        }
+    }
+}
+
+impl StreamTransport {
+    /// Le bloc d'un sens où rien n'est ouvert : tout à zéro, donc
+    /// [`AllocationMode::NoStream`] et [`KsRunState::Stop`].
+    ///
+    /// Les deux codes valent zéro à dessein : un instantané tout à zéro décrit exactement un
+    /// câble au repos, plutôt qu'un état qu'il faudrait interpréter.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            mode: 0,
+            notification_count: 0,
+            buffer_bytes: 0,
+            buffer_frames: 0,
+            notification_events: 0,
+            ks_state: 0,
+            refused_allocations: 0,
+        }
+    }
+
+    /// Le mode d'allocation, ou `None` si le code n'en désigne aucun.
+    ///
+    /// Jamais `None` sur une valeur venue de [`CableTransport::from_bytes`], qui refuse tout
+    /// code hors domaine ; l'`Option` couvre la structure bâtie à la main.
+    #[must_use]
+    pub const fn mode(&self) -> Option<AllocationMode> {
+        AllocationMode::from_code(self.mode)
+    }
+
+    /// L'état KS, ou `None` si le code n'en désigne aucun (voir [`Self::mode`]).
+    #[must_use]
+    pub const fn ks_state(&self) -> Option<KsRunState> {
+        KsRunState::from_code(self.ks_state)
+    }
+
+    /// Le mode **en toutes lettres**, et un repli nommé pour un code que ce contrat ne
+    /// connaît pas.
+    ///
+    /// Un repli plutôt qu'une `Option` : ce texte part dans un relevé, et un pilote plus
+    /// récent que l'outil doit s'y lire « mode inconnu » et non faire disparaître la ligne.
+    #[must_use]
+    pub const fn mode_label(&self) -> &'static str {
+        match self.mode() {
+            Some(mode) => mode.label(),
+            None => "mode inconnu de cet outil",
+        }
+    }
+
+    /// L'état KS en toutes lettres, avec le même repli que [`Self::mode_label`].
+    #[must_use]
+    pub const fn ks_state_label(&self) -> &'static str {
+        match self.ks_state() {
+            Some(etat) => etat.label(),
+            None => "état inconnu de cet outil",
+        }
+    }
+
+    /// Le tampon de ce sens a-t-il été alloué **avec notifications** ?
+    ///
+    /// C'est la lecture que le lot 0 demande, en un seul appel : vrai veut dire qu'un paquet
+    /// WaveRT peut exister sur ce flux, faux qu'il ne le peut pas.
+    #[must_use]
+    pub const fn notifie(&self) -> bool {
+        matches!(self.mode(), Some(mode) if mode.notifie())
+    }
+
+    /// Sérialise le bloc en [`STREAM_TRANSPORT_BYTES`] octets, champ par champ, aux
+    /// décalages [`OS_MODE`] à [`OS_REFUSED_ALLOCATIONS`].
+    #[must_use]
+    pub const fn to_bytes(&self) -> [u8; STREAM_TRANSPORT_BYTES] {
+        let mode = self.mode.to_ne_bytes();
+        let count = self.notification_count.to_ne_bytes();
+        let octets_tampon = self.buffer_bytes.to_ne_bytes();
+        let trames = self.buffer_frames.to_ne_bytes();
+        let evenements = self.notification_events.to_ne_bytes();
+        let etat = self.ks_state.to_ne_bytes();
+        let refus = self.refused_allocations.to_ne_bytes();
+        [
+            mode[0],
+            mode[1],
+            mode[2],
+            mode[3],
+            count[0],
+            count[1],
+            count[2],
+            count[3],
+            octets_tampon[0],
+            octets_tampon[1],
+            octets_tampon[2],
+            octets_tampon[3],
+            trames[0],
+            trames[1],
+            trames[2],
+            trames[3],
+            evenements[0],
+            evenements[1],
+            evenements[2],
+            evenements[3],
+            etat[0],
+            etat[1],
+            etat[2],
+            etat[3],
+            refus[0],
+            refus[1],
+            refus[2],
+            refus[3],
+            refus[4],
+            refus[5],
+            refus[6],
+            refus[7],
+        ]
+    }
+
+    /// Lit le bloc d'un sens au décalage `base` d'un tampon d'alignement quelconque.
+    ///
+    /// Ne valide **rien** : les domaines de `mode` et `ks_state` sont jugés par
+    /// [`CableTransport::from_bytes`], qui seul sait de quel sens il s'agit et peut donc le
+    /// nommer dans son refus.
+    fn lire(data: &[u8], base: usize) -> Option<Self> {
+        Some(Self {
+            mode: mot(data, base.checked_add(OS_MODE)?)?,
+            notification_count: mot(data, base.checked_add(OS_NOTIFICATION_COUNT)?)?,
+            buffer_bytes: mot(data, base.checked_add(OS_BUFFER_BYTES)?)?,
+            buffer_frames: mot(data, base.checked_add(OS_BUFFER_FRAMES)?)?,
+            notification_events: mot(data, base.checked_add(OS_NOTIFICATION_EVENTS)?)?,
+            ks_state: mot(data, base.checked_add(OS_KS_STATE)?)?,
+            refused_allocations: mot_long(data, base.checked_add(OS_REFUSED_ALLOCATIONS)?)?,
+        })
+    }
+
+    /// Le premier code hors domaine de ce bloc, s'il y en a un.
+    fn refus(&self, sens: StreamSide) -> Option<TransportError> {
+        if self.mode > ALLOCATION_MODE_MAX {
+            return Some(TransportError::Mode {
+                sens,
+                code: self.mode,
+            });
+        }
+        if self.ks_state > KS_RUN_STATE_MAX {
+            return Some(TransportError::KsState {
+                sens,
+                code: self.ks_state,
+            });
+        }
+        None
+    }
+}
+
+impl CableTransport {
+    /// L'état d'un câble dont aucun sens n'est ouvert : tout à zéro, sauf le numéro.
+    #[must_use]
+    pub const fn new(cable: u32) -> Self {
+        Self {
+            cable,
+            reserved: 0,
+            render: StreamTransport::new(),
+            capture: StreamTransport::new(),
+        }
+    }
+
+    /// Le bloc du sens `sens`.
+    #[must_use]
+    pub const fn side(&self, sens: StreamSide) -> &StreamTransport {
+        match sens {
+            StreamSide::Render => &self.render,
+            StreamSide::Capture => &self.capture,
+        }
+    }
+
+    /// Le moteur audio a-t-il obtenu un tampon **avec notifications** d'au moins un côté ?
+    ///
+    /// La question du lot 0 en une ligne. « Obtenu » et non « demandé » : une demande
+    /// refusée ne se lit pas ici mais dans [`Self::refused_total`], et les deux ensemble
+    /// disent laquelle des deux histoires s'est produite.
+    #[must_use]
+    pub const fn notifications_obtenues(&self) -> bool {
+        self.render.notifie() || self.capture.notifie()
+    }
+
+    /// Les refus d'allocation des deux sens, cumulés depuis le dernier `StartDevice`.
+    ///
+    /// `saturating_add` : deux compteurs qui déborderaient ensemble ne feraient pas repartir
+    /// le total de zéro — un total qui recule serait le pire des relevés.
+    #[must_use]
+    pub const fn refused_total(&self) -> u64 {
+        self.render
+            .refused_allocations
+            .saturating_add(self.capture.refused_allocations)
+    }
+
+    /// Sérialise l'état en [`CABLE_TRANSPORT_BYTES`] octets : deux `ULONG`, puis les deux
+    /// blocs de sens à [`OT_RENDER`] et [`OT_CAPTURE`].
+    ///
+    /// Le pilote n'utilise pas cette fonction pour répondre à un `GET` — il écrit
+    /// directement dans le tampon `Value`, d'alignement quelconque, par
+    /// `portcls::property::Champs` — mais elle en est le miroir exact, et c'est elle que
+    /// l'aller-retour du proptest vérifie.
+    #[must_use]
+    pub const fn to_bytes(&self) -> [u8; CABLE_TRANSPORT_BYTES] {
+        let cable = self.cable.to_ne_bytes();
+        let reserved = self.reserved.to_ne_bytes();
+        let r = self.render.to_bytes();
+        let c = self.capture.to_bytes();
+        [
+            cable[0],
+            cable[1],
+            cable[2],
+            cable[3],
+            reserved[0],
+            reserved[1],
+            reserved[2],
+            reserved[3],
+            r[0],
+            r[1],
+            r[2],
+            r[3],
+            r[4],
+            r[5],
+            r[6],
+            r[7],
+            r[8],
+            r[9],
+            r[10],
+            r[11],
+            r[12],
+            r[13],
+            r[14],
+            r[15],
+            r[16],
+            r[17],
+            r[18],
+            r[19],
+            r[20],
+            r[21],
+            r[22],
+            r[23],
+            r[24],
+            r[25],
+            r[26],
+            r[27],
+            r[28],
+            r[29],
+            r[30],
+            r[31],
+            c[0],
+            c[1],
+            c[2],
+            c[3],
+            c[4],
+            c[5],
+            c[6],
+            c[7],
+            c[8],
+            c[9],
+            c[10],
+            c[11],
+            c[12],
+            c[13],
+            c[14],
+            c[15],
+            c[16],
+            c[17],
+            c[18],
+            c[19],
+            c[20],
+            c[21],
+            c[22],
+            c[23],
+            c[24],
+            c[25],
+            c[26],
+            c[27],
+            c[28],
+            c[29],
+            c[30],
+            c[31],
+        ]
+    }
+
+    /// **Le** parseur de l'état du transport : des octets hostiles vers un instantané
+    /// valide, ou une cause de refus.
+    ///
+    /// Pure, sans allocation, sans panique, sans appel noyau — appelable à n'importe quel
+    /// IRQL et fuzzable en mode utilisateur, comme [`CableState::from_bytes`].
+    ///
+    /// La longueur est vérifiée **avant** tout le reste et exigée **exacte** : ni plus
+    /// courte, ni plus longue, ni un préfixe valide suivi d'octets en trop.
+    ///
+    /// # Ce qui est validé, et ce qui ne l'est pas
+    ///
+    /// Deux domaines par sens, et deux seulement : [`StreamTransport::mode`] et
+    /// [`StreamTransport::ks_state`] sont des **énumérations fermées** de ce contrat, et un
+    /// code hors domaine dit que le pilote et le client ne parlent pas de la même chose.
+    ///
+    /// Le reste ne l'est pas, et surtout pas la **cohérence entre champs** : un mode
+    /// [`AllocationMode::NoStream`] accompagné d'une taille de tampon non nulle a l'air
+    /// impossible, mais l'instantané n'est pas pris d'un seul coup (voir la note de
+    /// structure) — une broche qui se ferme entre deux lectures produit exactement cela.
+    /// Refuser une telle valeur transformerait une observation légitime en erreur de
+    /// protocole, et ferait disparaître du relevé le seul instant qui l'intéressait.
+    ///
+    /// # Erreurs
+    ///
+    /// [`TransportError`], qui nomme le **premier** champ fautif dans l'ordre de la
+    /// structure, le rendu avant la capture.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, TransportError> {
+        if data.len() != CABLE_TRANSPORT_BYTES {
+            return Err(TransportError::Longueur { recus: data.len() });
+        }
+        // Les lectures ne peuvent plus échouer (la longueur est exacte) ; le `ok_or`
+        // remplace un `unwrap` interdit par les lints du crate.
+        let longueur = || TransportError::Longueur { recus: data.len() };
+        let cable = mot(data, OT_CABLE).ok_or_else(longueur)?;
+        let reserved = mot(data, OT_RESERVED).ok_or_else(longueur)?;
+        let render = StreamTransport::lire(data, OT_RENDER).ok_or_else(longueur)?;
+        let capture = StreamTransport::lire(data, OT_CAPTURE).ok_or_else(longueur)?;
+
+        if cable >= CABLE_MAX {
+            return Err(TransportError::Cable(cable));
+        }
+        if reserved != 0 {
+            return Err(TransportError::Reserved(reserved));
+        }
+        if let Some(err) = render.refus(StreamSide::Render) {
+            return Err(err);
+        }
+        if let Some(err) = capture.refus(StreamSide::Capture) {
+            return Err(err);
+        }
+        Ok(Self {
+            cable,
+            reserved,
+            render,
+            capture,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------------
 // Persistance : un masque de bits, une seule valeur de registre.
 // ---------------------------------------------------------------------------------
 
@@ -1448,16 +2239,18 @@ mod tests {
         assert_ne!(KSPROPSETID_CONDUIT.data1, 0xCAA7_4E3D);
     }
 
-    /// Les trois identifiants de propriété sont distincts et stables.
+    /// Les quatre identifiants de propriété sont distincts et stables.
     #[test]
     fn les_identifiants_de_propriete_sont_distincts() {
         assert_eq!(KSPROPERTY_CONDUIT_CABLE_STATE, 0);
         assert_eq!(KSPROPERTY_CONDUIT_VERSION, 1);
         assert_eq!(KSPROPERTY_CONDUIT_COUNTERS, 2);
+        assert_eq!(KSPROPERTY_CONDUIT_TRANSPORT, 3);
         let ids = [
             KSPROPERTY_CONDUIT_CABLE_STATE,
             KSPROPERTY_CONDUIT_VERSION,
             KSPROPERTY_CONDUIT_COUNTERS,
+            KSPROPERTY_CONDUIT_TRANSPORT,
         ];
         for (i, gauche) in ids.iter().enumerate() {
             for droite in ids.iter().skip(i + 1) {
@@ -1468,9 +2261,10 @@ mod tests {
                 );
             }
         }
-        // M1b-21 : une propriété qui apparaît est un changement observable du jeu, et ce
-        // numéro en est la seule voie (voir sa documentation).
-        assert_eq!(CONFIG_VERSION, 3);
+        // Une propriété qui apparaît est un changement observable du jeu, et ce numéro en
+        // est la seule voie (voir sa documentation) : 3 avec les compteurs, 4 avec le
+        // transport.
+        assert_eq!(CONFIG_VERSION, 4);
     }
 
     /// Le `pid` de la marque : celui qu'écrit le service et celui que lit le dorsal.
@@ -1565,6 +2359,356 @@ mod tests {
         assert_eq!(mot_long(&brut, OC_DISCARDED_TICKS), Some(55));
         assert_eq!(mot_long(&brut, OC_OVERRUNS), Some(66));
         assert_eq!(CableCounters::from_bytes(&brut), Ok(compteurs));
+    }
+
+    /// Un état de transport dont **aucune** valeur ne se confond avec une autre.
+    ///
+    /// Quatorze champs dont dix pourraient valoir la même chose : deux blocs de sens
+    /// intervertis, ou deux `ULONG` écrits l'un à la place de l'autre, passeraient un
+    /// aller-retour sur des zéros sans que rien ne le signale. C'est ce que ce jeu de
+    /// valeurs, toutes différentes, empêche.
+    fn transport_temoin() -> CableTransport {
+        CableTransport {
+            cable: 3,
+            reserved: 0,
+            render: StreamTransport {
+                mode: AllocationMode::Notifications.code(),
+                notification_count: 2,
+                buffer_bytes: 1_920,
+                buffer_frames: 480,
+                notification_events: 1,
+                ks_state: KsRunState::Run.code(),
+                refused_allocations: 7,
+            },
+            capture: StreamTransport {
+                mode: AllocationMode::Polling.code(),
+                notification_count: 0,
+                buffer_bytes: 3_840,
+                buffer_frames: 960,
+                notification_events: 0,
+                ks_state: KsRunState::Pause.code(),
+                refused_allocations: 11,
+            },
+        }
+    }
+
+    /// La disposition du transport : 72 octets, deux `ULONG` puis deux blocs de 32, aucun
+    /// trou — et chaque champ se relit **à son décalage nommé**.
+    #[test]
+    fn la_disposition_du_transport_est_celle_des_decalages_nommes() {
+        assert_eq!(CABLE_TRANSPORT_BYTES, 72);
+        assert_eq!(STREAM_TRANSPORT_BYTES, 32);
+        assert_eq!(size_of::<CableTransport>(), CABLE_TRANSPORT_BYTES);
+        assert_eq!(size_of::<StreamTransport>(), STREAM_TRANSPORT_BYTES);
+        assert_eq!(align_of::<CableTransport>(), 8);
+        assert_eq!(align_of::<StreamTransport>(), 8);
+
+        // Deux `ULONG` de tête, puis deux blocs contigus, chacun aligné sur huit.
+        assert_eq!(OT_CABLE, 0);
+        assert_eq!(OT_RESERVED, TAILLE_MOT);
+        assert_eq!(OT_RENDER, TAILLE_MOT * 2);
+        assert_eq!(OT_CAPTURE, OT_RENDER + STREAM_TRANSPORT_BYTES);
+        assert_eq!(OT_CAPTURE + STREAM_TRANSPORT_BYTES, CABLE_TRANSPORT_BYTES);
+        assert_eq!(OT_RENDER % TAILLE_MOT_LONG, 0);
+        assert_eq!(OT_CAPTURE % TAILLE_MOT_LONG, 0);
+
+        // Six `ULONG` contigus dans un bloc, puis le `ULONGLONG` des refus.
+        let mots = [
+            OS_MODE,
+            OS_NOTIFICATION_COUNT,
+            OS_BUFFER_BYTES,
+            OS_BUFFER_FRAMES,
+            OS_NOTIFICATION_EVENTS,
+            OS_KS_STATE,
+        ];
+        for (i, decalage) in mots.iter().enumerate() {
+            assert_eq!(*decalage, i * TAILLE_MOT, "champ n° {i}");
+        }
+        assert_eq!(OS_REFUSED_ALLOCATIONS, mots.len() * TAILLE_MOT);
+        assert_eq!(OS_REFUSED_ALLOCATIONS % TAILLE_MOT_LONG, 0);
+        assert_eq!(
+            OS_REFUSED_ALLOCATIONS + TAILLE_MOT_LONG,
+            STREAM_TRANSPORT_BYTES,
+            "le bloc est exactement six mots puis un mot long"
+        );
+
+        let transport = transport_temoin();
+        let brut = transport.to_bytes();
+        assert_eq!(mot(&brut, OT_CABLE), Some(3));
+        assert_eq!(mot(&brut, OT_RESERVED), Some(0));
+        for (sens, base) in [
+            (StreamSide::Render, OT_RENDER),
+            (StreamSide::Capture, OT_CAPTURE),
+        ] {
+            let bloc = transport.side(sens);
+            let nom = sens.label();
+            assert_eq!(mot(&brut, base + OS_MODE), Some(bloc.mode), "{nom}");
+            assert_eq!(
+                mot(&brut, base + OS_NOTIFICATION_COUNT),
+                Some(bloc.notification_count),
+                "{nom}"
+            );
+            assert_eq!(
+                mot(&brut, base + OS_BUFFER_BYTES),
+                Some(bloc.buffer_bytes),
+                "{nom}"
+            );
+            assert_eq!(
+                mot(&brut, base + OS_BUFFER_FRAMES),
+                Some(bloc.buffer_frames),
+                "{nom}"
+            );
+            assert_eq!(
+                mot(&brut, base + OS_NOTIFICATION_EVENTS),
+                Some(bloc.notification_events),
+                "{nom}"
+            );
+            assert_eq!(mot(&brut, base + OS_KS_STATE), Some(bloc.ks_state), "{nom}");
+            assert_eq!(
+                mot_long(&brut, base + OS_REFUSED_ALLOCATIONS),
+                Some(bloc.refused_allocations),
+                "{nom}"
+            );
+        }
+        assert_eq!(CableTransport::from_bytes(&brut), Ok(transport));
+    }
+
+    /// Les longueurs refusées, y compris le préfixe valide suivi d'un octet.
+    ///
+    /// Le palier « 56 octets » compte plus que les autres : c'est la taille de l'**autre**
+    /// structure du jeu en lecture seule, celle qu'un client pourrait allouer par confusion.
+    #[test]
+    fn seule_la_longueur_exacte_du_transport_est_acceptee() {
+        let complet = CableTransport::new(0).to_bytes();
+        assert!(CableTransport::from_bytes(&complet).is_ok());
+
+        for taille in 0..CABLE_TRANSPORT_BYTES {
+            let court = complet.get(..taille).unwrap().to_vec();
+            assert_eq!(
+                CableTransport::from_bytes(&court),
+                Err(TransportError::Longueur { recus: taille }),
+                "taille {taille}"
+            );
+        }
+
+        let mut allonge = std::vec::Vec::from(complet);
+        allonge.push(0);
+        assert_eq!(
+            CableTransport::from_bytes(&allonge),
+            Err(TransportError::Longueur {
+                recus: CABLE_TRANSPORT_BYTES + 1
+            }),
+            "un préfixe valide suivi d'un octet reste un refus"
+        );
+    }
+
+    /// Les seuls domaines du transport : l'écho de câble, le champ réservé, et les deux
+    /// énumérations fermées de chaque sens.
+    #[test]
+    fn le_transport_refuse_les_echos_et_les_codes_hors_domaine() {
+        // Hors bornes de câble.
+        let hors = CableTransport {
+            cable: CABLE_MAX,
+            ..CableTransport::new(0)
+        };
+        assert_eq!(
+            CableTransport::from_bytes(&hors.to_bytes()),
+            Err(TransportError::Cable(CABLE_MAX))
+        );
+
+        // Champ réservé non nul.
+        let sale = CableTransport {
+            reserved: 1,
+            ..CableTransport::new(0)
+        };
+        assert_eq!(
+            CableTransport::from_bytes(&sale.to_bytes()),
+            Err(TransportError::Reserved(1))
+        );
+
+        // Un mode inconnu, dans chaque sens, et le refus **nomme le sens**.
+        for sens in StreamSide::ALL {
+            let mut transport = CableTransport::new(0);
+            let bloc = match sens {
+                StreamSide::Render => &mut transport.render,
+                StreamSide::Capture => &mut transport.capture,
+            };
+            bloc.mode = ALLOCATION_MODE_MAX + 1;
+            assert_eq!(
+                CableTransport::from_bytes(&transport.to_bytes()),
+                Err(TransportError::Mode {
+                    sens,
+                    code: ALLOCATION_MODE_MAX + 1
+                }),
+                "{}",
+                sens.label()
+            );
+
+            let mut transport = CableTransport::new(0);
+            let bloc = match sens {
+                StreamSide::Render => &mut transport.render,
+                StreamSide::Capture => &mut transport.capture,
+            };
+            bloc.ks_state = KS_RUN_STATE_MAX + 1;
+            assert_eq!(
+                CableTransport::from_bytes(&transport.to_bytes()),
+                Err(TransportError::KsState {
+                    sens,
+                    code: KS_RUN_STATE_MAX + 1
+                }),
+                "{}",
+                sens.label()
+            );
+        }
+
+        // Ce qui n'est **pas** validé : l'incohérence entre champs. Un mode « aucun flux »
+        // avec un tampon non nul est ce que produit une broche qui se ferme entre deux
+        // lectures — une observation, pas une erreur de protocole.
+        let incoherent = CableTransport {
+            render: StreamTransport {
+                mode: AllocationMode::NoStream.code(),
+                buffer_bytes: 1_920,
+                buffer_frames: 480,
+                notification_count: 2,
+                ..StreamTransport::new()
+            },
+            ..CableTransport::new(0)
+        };
+        assert!(CableTransport::from_bytes(&incoherent.to_bytes()).is_ok());
+
+        // Et le `NotificationCount` n'a aucune borne : le pilote reste permissif, le contrat
+        // aussi, sans quoi le relevé mentirait sur ce qui a été demandé.
+        let large = CableTransport {
+            render: StreamTransport {
+                mode: AllocationMode::Notifications.code(),
+                notification_count: u32::MAX,
+                ..StreamTransport::new()
+            },
+            ..CableTransport::new(0)
+        };
+        assert!(CableTransport::from_bytes(&large.to_bytes()).is_ok());
+    }
+
+    /// Les codes des deux énumérations sont ceux du contrat, et l'aller-retour est fidèle.
+    ///
+    /// Les codes de [`KsRunState`] sont ceux de `KSSTATE` dans `ks.h` : les changer ferait
+    /// lire « PAUSE » là où le pilote dit « RUN », sans que rien ne le signale.
+    #[test]
+    fn les_codes_des_enumerations_sont_graves() {
+        assert_eq!(AllocationMode::NoStream.code(), 0);
+        assert_eq!(AllocationMode::NoBuffer.code(), 1);
+        assert_eq!(AllocationMode::Polling.code(), 2);
+        assert_eq!(AllocationMode::Notifications.code(), 3);
+        assert_eq!(ALLOCATION_MODE_MAX, 3);
+        assert_eq!(KsRunState::Stop.code(), 0);
+        assert_eq!(KsRunState::Acquire.code(), 1);
+        assert_eq!(KsRunState::Pause.code(), 2);
+        assert_eq!(KsRunState::Run.code(), 3);
+        assert_eq!(KS_RUN_STATE_MAX, 3);
+
+        for code in 0..=ALLOCATION_MODE_MAX {
+            let mode = AllocationMode::from_code(code).expect("code dans le domaine");
+            assert_eq!(mode.code(), code);
+            assert!(!mode.label().is_empty());
+        }
+        assert_eq!(AllocationMode::from_code(ALLOCATION_MODE_MAX + 1), None);
+        for code in 0..=KS_RUN_STATE_MAX {
+            let etat = KsRunState::from_code(code).expect("code dans le domaine");
+            assert_eq!(etat.code(), code);
+        }
+        assert_eq!(KsRunState::from_code(KS_RUN_STATE_MAX + 1), None);
+
+        // Un seul mode autorise un paquet WaveRT, et c'est celui qui nomme la routine.
+        assert!(AllocationMode::Notifications.notifie());
+        for mode in [
+            AllocationMode::NoStream,
+            AllocationMode::NoBuffer,
+            AllocationMode::Polling,
+        ] {
+            assert!(!mode.notifie(), "{}", mode.label());
+        }
+        assert!(AllocationMode::Notifications
+            .label()
+            .contains("AllocateBufferWithNotification"));
+        assert!(AllocationMode::Polling
+            .label()
+            .contains("AllocateAudioBuffer"));
+        // Les quatre libellés se distinguent : un relevé qui en confondrait deux ne
+        // répondrait pas à la question du lot.
+        let libelles = [
+            AllocationMode::NoStream.label(),
+            AllocationMode::NoBuffer.label(),
+            AllocationMode::Polling.label(),
+            AllocationMode::Notifications.label(),
+        ];
+        for (rang, gauche) in libelles.iter().enumerate() {
+            for droite in libelles.iter().skip(rang + 1) {
+                assert_ne!(gauche, droite);
+            }
+        }
+        // Et l'état par défaut d'un câble au repos est bien tout à zéro.
+        assert_eq!(AllocationMode::default(), AllocationMode::NoStream);
+        assert_eq!(KsRunState::default(), KsRunState::Stop);
+        assert_eq!(CableTransport::new(2).to_bytes()[8..], [0u8; 64]);
+    }
+
+    /// Les lectures que le lot 0 demande : le mode en toutes lettres, le total des refus, et
+    /// « des notifications ont-elles été obtenues ».
+    #[test]
+    fn le_transport_repond_a_la_question_du_lot() {
+        let transport = transport_temoin();
+        assert!(transport.render.notifie());
+        assert!(!transport.capture.notifie());
+        assert!(transport.notifications_obtenues());
+        assert_eq!(transport.refused_total(), 7 + 11);
+        assert_eq!(
+            transport.render.mode_label(),
+            AllocationMode::Notifications.label()
+        );
+        assert_eq!(transport.capture.ks_state_label(), "PAUSE");
+
+        // Un câble entièrement scruté : la réponse est « non », et les refus disent si
+        // c'est parce que le moteur n'a rien demandé ou parce qu'on a dit non.
+        let scrute = CableTransport {
+            render: StreamTransport {
+                mode: AllocationMode::Polling.code(),
+                ..StreamTransport::new()
+            },
+            capture: StreamTransport {
+                mode: AllocationMode::Polling.code(),
+                refused_allocations: 4,
+                ..StreamTransport::new()
+            },
+            ..CableTransport::new(1)
+        };
+        assert!(!scrute.notifications_obtenues());
+        assert_eq!(scrute.refused_total(), 4);
+
+        // Un code venu d'un pilote plus récent se lit, il ne disparaît pas du relevé.
+        let inconnu = StreamTransport {
+            mode: ALLOCATION_MODE_MAX + 1,
+            ks_state: KS_RUN_STATE_MAX + 1,
+            ..StreamTransport::new()
+        };
+        assert!(inconnu.mode_label().contains("inconnu"));
+        assert!(inconnu.ks_state_label().contains("inconnu"));
+        assert!(!inconnu.notifie());
+        assert_eq!(inconnu.mode(), None);
+        assert_eq!(inconnu.ks_state(), None);
+
+        // Le total ne recule jamais, même sur deux compteurs au maximum.
+        let deborde = CableTransport {
+            render: StreamTransport {
+                refused_allocations: u64::MAX,
+                ..StreamTransport::new()
+            },
+            capture: StreamTransport {
+                refused_allocations: 1,
+                ..StreamTransport::new()
+            },
+            ..CableTransport::new(0)
+        };
+        assert_eq!(deborde.refused_total(), u64::MAX);
     }
 
     /// Les longueurs refusées, y compris le préfixe valide suivi d'un octet.
@@ -2295,6 +3439,91 @@ mod tests {
             let valide = cable < CABLE_MAX && reserved == 0;
             prop_assert_eq!(
                 CableCounters::from_bytes(&compteurs.to_bytes()).is_ok(),
+                valide
+            );
+        }
+
+        /// Le même critère sur le transport : **quelle que soit l'entrée**, le parseur ne
+        /// panique pas, et toute sortie acceptée se resérialise à l'identique.
+        ///
+        /// L'aller-retour est ce qui attrape un bloc de sens lu au mauvais décalage — rendu
+        /// et capture intervertis passeraient toutes les tables de cas, où ils se
+        /// ressemblent.
+        #[test]
+        fn le_transport_ne_panique_pas_et_l_aller_retour_est_fidele(
+            octets in proptest::collection::vec(any::<u8>(), 0..160),
+        ) {
+            match CableTransport::from_bytes(&octets) {
+                Ok(transport) => {
+                    prop_assert_eq!(octets.len(), CABLE_TRANSPORT_BYTES);
+                    prop_assert_eq!(&transport.to_bytes()[..], &octets[..]);
+                    prop_assert_eq!(
+                        CableTransport::from_bytes(&transport.to_bytes()),
+                        Ok(transport)
+                    );
+                    prop_assert!(transport.cable < CABLE_MAX);
+                    prop_assert_eq!(transport.reserved, 0);
+                    // Les domaines que le relevé tient pour acquis : les deux accesseurs
+                    // ne rendent jamais `None` sur une valeur venue d'ici.
+                    for sens in StreamSide::ALL {
+                        let bloc = transport.side(sens);
+                        prop_assert!(bloc.mode().is_some());
+                        prop_assert!(bloc.ks_state().is_some());
+                    }
+                }
+                Err(err) => {
+                    // Une erreur de longueur exactement quand la longueur est fausse : les
+                    // autres causes ne peuvent tomber que sur soixante-douze octets.
+                    let longueur = matches!(err, TransportError::Longueur { .. });
+                    prop_assert_eq!(longueur, octets.len() != CABLE_TRANSPORT_BYTES);
+                }
+            }
+        }
+
+        /// Sur tout le domaine : accepté si et seulement si l'écho, le champ réservé et les
+        /// deux énumérations de chaque sens sont dans leurs bornes. Les tailles, les comptes
+        /// et les refus n'en ont **aucune**.
+        #[test]
+        fn le_transport_accepte_exactement_les_quatre_domaines(
+            cable in any::<u32>(),
+            reserved in any::<u32>(),
+            mode_rendu in any::<u32>(),
+            etat_rendu in any::<u32>(),
+            mode_capture in any::<u32>(),
+            etat_capture in any::<u32>(),
+            octets_tampon in any::<u32>(),
+            refus in any::<u64>(),
+        ) {
+            let transport = CableTransport {
+                cable,
+                reserved,
+                render: StreamTransport {
+                    mode: mode_rendu,
+                    notification_count: u32::MAX,
+                    buffer_bytes: octets_tampon,
+                    buffer_frames: octets_tampon,
+                    notification_events: u32::MAX,
+                    ks_state: etat_rendu,
+                    refused_allocations: refus,
+                },
+                capture: StreamTransport {
+                    mode: mode_capture,
+                    notification_count: 0,
+                    buffer_bytes: 0,
+                    buffer_frames: 0,
+                    notification_events: 0,
+                    ks_state: etat_capture,
+                    refused_allocations: refus,
+                },
+            };
+            let valide = cable < CABLE_MAX
+                && reserved == 0
+                && mode_rendu <= ALLOCATION_MODE_MAX
+                && mode_capture <= ALLOCATION_MODE_MAX
+                && etat_rendu <= KS_RUN_STATE_MAX
+                && etat_capture <= KS_RUN_STATE_MAX;
+            prop_assert_eq!(
+                CableTransport::from_bytes(&transport.to_bytes()).is_ok(),
                 valide
             );
         }

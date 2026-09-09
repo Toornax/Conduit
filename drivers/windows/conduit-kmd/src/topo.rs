@@ -100,7 +100,7 @@
 use core::fmt;
 
 use conduit_kmd_core::FrameLayout;
-use conduit_kmd_core::config::CableCounters;
+use conduit_kmd_core::config::{CableCounters, CableTransport};
 use portcls::conduit_com::{ComRef, NtStatus, STATUS_SUCCESS};
 use portcls::{
     AudioNodes, CableConfig, ConfigTrace, EventSource, EventTrace, JackInfo, JackTarget, JackTrace,
@@ -502,6 +502,14 @@ impl CableConfig for TopoRender {
         self.cable.counters_snapshot()
     }
 
+    // IRQL: PASSIVE_LEVEL — l'instantané porte les **deux** sens : la question du lot 0 est
+    // celle du câble, et le filtre interrogé n'en choisit pas la moitié. Contrairement aux
+    // compteurs, cette lecture prend les verrous (câble puis flux) : voir
+    // `Cable::transport_snapshot`, qui dit pourquoi il n'y avait pas d'autre choix.
+    fn transport(&self) -> CableTransport {
+        self.cable.transport_snapshot()
+    }
+
     // IRQL: PASSIVE_LEVEL
     fn trace(&self, trace: &ConfigTrace<'_>) {
         kmd_log!("TopoRender{} : {trace:?}", self.n);
@@ -690,6 +698,11 @@ impl CableConfig for TopoCapture {
     // deux sens rendent donc le même instantané.
     fn counters(&self) -> CableCounters {
         self.cable.counters_snapshot()
+    }
+
+    // IRQL: PASSIVE_LEVEL — voir `TopoRender` : les deux sens, quel que soit le filtre visé.
+    fn transport(&self) -> CableTransport {
+        self.cable.transport_snapshot()
     }
 
     // IRQL: PASSIVE_LEVEL

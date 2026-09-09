@@ -3,8 +3,9 @@
 //! lui parler.
 //!
 //! Le pilote expose `KSPROPERTY_CONDUIT_CABLE_STATE` (lecture/écriture),
-//! `KSPROPERTY_CONDUIT_VERSION` (lecture) et, depuis M1b-21,
-//! `KSPROPERTY_CONDUIT_COUNTERS` (lecture) sur la table d'automation du **filtre** de
+//! `KSPROPERTY_CONDUIT_VERSION` (lecture), `KSPROPERTY_CONDUIT_COUNTERS` (lecture, depuis
+//! M1b-21) et `KSPROPERTY_CONDUIT_TRANSPORT` (lecture, depuis le lot 0 du mode paquets
+//! WaveRT) sur la table d'automation du **filtre** de
 //! topologie de chaque côté de câble. Ce module est le seul endroit du dépôt qui sache
 //! les atteindre depuis l'espace utilisateur ; il servira à la mesure de M1b-04
 //! aujourd'hui et au `CableControl` de M1b-34 demain, d'où le découpage :
@@ -63,11 +64,15 @@ use conduit_backend::CableId;
 /// Le contrat lui-même, ré-exporté : les clients de ce module (l'outil de diagnostic
 /// aujourd'hui, `CableControl` demain) lisent la structure d'échange et le nombre de
 /// câbles **ici**, sans dépendre du crate du pilote ni en recopier quoi que ce soit.
-pub use conduit_kmd_core::config::{CableCounters, CableState, CABLE_MAX};
+pub use conduit_kmd_core::config::{
+    AllocationMode, CableCounters, CableState, CableTransport, KsRunState, StreamSide,
+    StreamTransport, CABLE_MAX,
+};
 use conduit_kmd_core::config::{
-    ConfigError, ConfigGuid, CountersError, CABLE_COUNTERS_BYTES, CABLE_STATE_BYTES,
-    CONFIG_VERSION, KSPROPERTY_CONDUIT_CABLE_STATE, KSPROPERTY_CONDUIT_COUNTERS,
-    KSPROPERTY_CONDUIT_VERSION, KSPROPSETID_CONDUIT,
+    ConfigError, ConfigGuid, CountersError, TransportError, CABLE_COUNTERS_BYTES,
+    CABLE_STATE_BYTES, CABLE_TRANSPORT_BYTES, CONFIG_VERSION, KSPROPERTY_CONDUIT_CABLE_STATE,
+    KSPROPERTY_CONDUIT_COUNTERS, KSPROPERTY_CONDUIT_TRANSPORT, KSPROPERTY_CONDUIT_VERSION,
+    KSPROPSETID_CONDUIT,
 };
 use windows::core::PCWSTR;
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
@@ -579,6 +584,40 @@ pub fn parse_counters(buffer: &[u8], returned: usize) -> Result<CableCounters, C
         });
     }
     CableCounters::from_bytes(utiles).map_err(|e: CountersError| CableConfigError::Reponse {
+        cause: e.to_string(),
+    })
+}
+
+/// Analyse la réponse d'un `GET` de [`KSPROPERTY_CONDUIT_TRANSPORT`] :
+/// `returned` octets utiles dans `buffer`.
+///
+/// Même forme que [`parse_counters`], et pour la même raison : la longueur **rendue** est
+/// vérifiée avant le contenu, puis le jugement sur les octets est délégué au parseur du
+/// contrat, celui-là même que le pilote partage. Rien n'est validé deux fois.
+///
+/// # Erreurs
+///
+/// [`CableConfigError::Reponse`] si le pilote a écrit un nombre d'octets inattendu ou une
+/// valeur que le contrat refuse — un mode d'allocation ou un état KS hors domaine, ce qui
+/// dirait que le pilote et cet outil ne parlent pas de la même chose.
+pub fn parse_transport(buffer: &[u8], returned: usize) -> Result<CableTransport, CableConfigError> {
+    let utiles = buffer
+        .get(..returned)
+        .ok_or_else(|| CableConfigError::Reponse {
+            cause: format!(
+                "{returned} octets annoncés pour un tampon de {} : le pilote a débordé",
+                buffer.len()
+            ),
+        })?;
+    if utiles.len() != CABLE_TRANSPORT_BYTES {
+        return Err(CableConfigError::Reponse {
+            cause: format!(
+                "{} octets rendus, {CABLE_TRANSPORT_BYTES} attendus pour un CableTransport",
+                utiles.len()
+            ),
+        });
+    }
+    CableTransport::from_bytes(utiles).map_err(|e: TransportError| CableConfigError::Reponse {
         cause: e.to_string(),
     })
 }
@@ -1380,6 +1419,48 @@ impl TopologyFilter {
         parse_counters(&valeur, rendus)
     }
 
+    /// Lit [`KSPROPERTY_CONDUIT_TRANSPORT`], l'état du transport des **deux** sens du câble
+    /// (lot 0 du mode paquets WaveRT).
+    ///
+    /// # Ce que la lecture répond
+    ///
+    /// Comment le tampon du flux courant a été alloué de chaque côté — `AllocateAudioBuffer`
+    /// (le moteur audio **scrute**) ou `AllocateBufferWithNotification` (des paquets WaveRT
+    /// peuvent exister) —, le `NotificationCount` demandé, la taille du tampon en octets et
+    /// en trames, les événements enregistrés, l'état KS, et surtout le **compte cumulé
+    /// d'allocations refusées** : un refus fait retomber le moteur en scrutation sans une
+    /// ligne d'erreur, et sans ce compteur un relevé montrant « scrutation » ne dirait pas si
+    /// le moteur n'a jamais rien demandé ou si le pilote lui a dit non.
+    ///
+    /// Les deux sens viennent ensemble quel que soit le côté ouvert : la question porte sur
+    /// le câble.
+    ///
+    /// # Ce que l'instantané vaut, et ce qu'il ne vaut pas
+    ///
+    /// Les compteurs de refus sont lus hors verrou et les blocs de sens l'un après l'autre :
+    /// l'instantané peut mélanger deux instants. C'est un choix, écrit sur
+    /// `conduit_kmd::cable::Cable::transport_snapshot`, et il n'affecte pas ce à quoi cette
+    /// lecture sert.
+    ///
+    /// Aucun privilège n'est exigé, comme pour [`Self::read_counters`].
+    ///
+    /// # Erreurs
+    ///
+    /// Voir [`Self::read_state`]. Sur un pilote antérieur au lot 0, la propriété n'existe
+    /// pas : le refus arrive en [`CableConfigError::Requete`], et c'est
+    /// [`Self::read_version`] qui dit pourquoi.
+    pub fn read_transport(&self) -> Result<CableTransport, CableConfigError> {
+        let mut valeur = [0u8; CABLE_TRANSPORT_BYTES];
+        let rendus = self.property(
+            KSPROPERTY_CONDUIT_TRANSPORT,
+            KSPROPERTY_TYPE_GET,
+            &mut valeur,
+            "KSPROPERTY_CONDUIT_TRANSPORT",
+            "GET",
+        )?;
+        parse_transport(&valeur, rendus)
+    }
+
     /// Écrit [`KSPROPERTY_CONDUIT_CABLE_STATE`] : connecte ou déconnecte le câble.
     ///
     /// # Une lecture, puis l'écriture — et c'est le contrat, pas une précaution
@@ -1722,6 +1803,68 @@ mod tests {
         .to_bytes();
         let erreur = parse_counters(&reserve, CABLE_COUNTERS_BYTES).expect_err("réservé non nul");
         assert!(erreur.to_string().contains("réservé"), "{erreur}");
+    }
+
+    /// La réponse du transport doit faire exactement soixante-douze octets, et le message
+    /// d'erreur doit dire **cette** longueur-là.
+    ///
+    /// Les paliers 16 et 56 comptent : ce sont les tailles des deux autres structures du même
+    /// jeu, donc les erreurs qu'un client fait en confondant les propriétés.
+    #[test]
+    fn la_reponse_du_transport_doit_faire_exactement_soixante_douze_octets() {
+        let valide = CableTransport {
+            render: StreamTransport {
+                mode: AllocationMode::Notifications.code(),
+                notification_count: 2,
+                buffer_bytes: 1_920,
+                buffer_frames: 480,
+                notification_events: 1,
+                ks_state: KsRunState::Run.code(),
+                refused_allocations: 3,
+            },
+            ..CableTransport::new(2)
+        }
+        .to_bytes();
+        let transport = parse_transport(&valide, CABLE_TRANSPORT_BYTES).expect("transport valide");
+        assert_eq!(transport.cable, 2);
+        assert!(
+            transport.notifications_obtenues(),
+            "un tampon avec notifications côté rendu : c'est la lecture du lot 0"
+        );
+        assert_eq!(transport.refused_total(), 3);
+        assert_eq!(
+            transport.capture.mode(),
+            Some(AllocationMode::NoStream),
+            "l'autre sens n'a pas de flux, et se lit comme tel"
+        );
+
+        for rendus in [0, 4, 16, 56, 71] {
+            let erreur = parse_transport(&valide, rendus).expect_err("longueur");
+            assert!(
+                matches!(erreur, CableConfigError::Reponse { .. }),
+                "{rendus} octets rendus"
+            );
+        }
+        // Plus d'octets que le tampon n'en contient : le pilote a débordé.
+        assert!(matches!(
+            parse_transport(&valide, CABLE_TRANSPORT_BYTES + 1),
+            Err(CableConfigError::Reponse { .. })
+        ));
+        // Contenu refusé par le contrat : le message vient de `TransportError`, et il nomme
+        // le sens fautif.
+        let mode_inconnu = CableTransport {
+            capture: StreamTransport {
+                mode: 99,
+                ..StreamTransport::new()
+            },
+            ..CableTransport::new(0)
+        }
+        .to_bytes();
+        let erreur =
+            parse_transport(&mode_inconnu, CABLE_TRANSPORT_BYTES).expect_err("mode inconnu");
+        let rendu = erreur.to_string();
+        assert!(rendu.contains("capture"), "{rendu}");
+        assert!(rendu.contains("99"), "{rendu}");
     }
 
     #[test]
