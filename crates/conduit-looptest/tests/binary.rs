@@ -196,6 +196,32 @@ fn l_aide_annonce_le_mode_exclusif() {
     assert!(out.contains("--exclusif"), "{out}");
 }
 
+/// L'aide annonce aussi l'ouverture partagée faible latence et la période qu'on peut
+/// lui demander : c'est ce que la VM lit avant de lancer la passe qui doit trancher
+/// la question du transport. `--help` n'ouvre rien.
+#[test]
+fn l_aide_annonce_la_faible_latence() {
+    let (code, out, err) = run(&["--help"]);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("--faible-latence"), "{out}");
+    assert!(out.contains("--periode-ms"), "{out}");
+}
+
+/// `--faible-latence` se contredit avec `--exclusif` et avec `--loopback`, et le
+/// refus **précède** toute ouverture : aucun flux n'est ouvert, aucun son n'est émis.
+#[test]
+fn la_faible_latence_exclut_l_exclusif_et_l_echo() {
+    for (args, attendu) in [
+        (vec!["--faible-latence", "--exclusif"], "--exclusif"),
+        (vec!["--faible-latence", "--loopback"], "--loopback"),
+        (vec!["--periode-ms", "3"], "--faible-latence"),
+    ] {
+        let (code, _, err) = run(&args);
+        assert_eq!(code, Some(2), "{args:?} : {err}");
+        assert!(err.contains(attendu), "{args:?} : {err}");
+    }
+}
+
 #[test]
 fn echo_et_capture_se_contredisent() {
     let (code, _, err) = run(&["--loopback", "--capture", "Conduit 1"]);

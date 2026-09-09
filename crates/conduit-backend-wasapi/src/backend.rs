@@ -12,6 +12,7 @@ use conduit_core::types::ChannelCount;
 
 use crate::devices::{cable_name, CableName, EndpointInfo};
 use crate::exclusive::ExclusivePolicy;
+use crate::lowlat::SharedPeriod;
 use crate::mmdevice_thread::{Command, Message};
 use crate::stream::WasapiHandle;
 
@@ -43,6 +44,9 @@ pub struct WasapiBackend {
     thread: Option<JoinHandle<()>>,
     /// Ce que les prochaines ouvertures font du mode exclusif (M1b-32).
     policy: ExclusivePolicy,
+    /// Ce que les prochaines ouvertures **partagées** demandent comme période
+    /// (module `lowlat`). Défaut : au choix du moteur, comme avant.
+    period: SharedPeriod,
     /// Le contrôle des câbles, **injecté** : voir [`WasapiBackend::set_cable_control`].
     cables: Option<Box<dyn CableControl + Send>>,
 }
@@ -52,6 +56,7 @@ impl core::fmt::Debug for WasapiBackend {
         f.debug_struct("WasapiBackend")
             .field("thread_alive", &self.thread.is_some())
             .field("exclusive_policy", &self.policy)
+            .field("shared_period", &self.period)
             .field("cable_control", &self.cables.is_some())
             .finish()
     }
@@ -79,6 +84,7 @@ impl WasapiBackend {
                 sender,
                 thread: Some(thread),
                 policy: ExclusivePolicy::default(),
+                period: SharedPeriod::default(),
                 cables: None,
             }),
             Ok(Err(e)) => {
@@ -115,6 +121,35 @@ impl WasapiBackend {
     /// Politique de mode exclusif en vigueur ([`Self::set_exclusive_policy`]).
     pub fn exclusive_policy(&self) -> ExclusivePolicy {
         self.policy
+    }
+
+    /// Quelle **période** les prochaines ouvertures **partagées** demanderont au
+    /// moteur audio (module `lowlat`).
+    ///
+    /// Réglage propre à ce backend, hors du trait [`Backend`] pour la même raison
+    /// que [`Self::set_exclusive_policy`] : le trait est portable. Le défaut est
+    /// [`SharedPeriod::Default`], c'est-à-dire le comportement de toujours — la
+    /// période que le moteur choisit, et le chemin `IAudioClient3` seulement quand
+    /// il se présente.
+    ///
+    /// [`SharedPeriod::Minimal`] et [`SharedPeriod::Requested`] **exigent**
+    /// `IAudioClient3::InitializeSharedAudioStream` au format de mixage : le flux
+    /// reste partagé — le périphérique demeure utilisable par les autres
+    /// applications — mais sa période est la plus courte que le moteur accepte, ou
+    /// celle qu'on lui demande. Un refus (interface absente, périodicité déjà
+    /// verrouillée par un autre flux, format demandé différent du mélange) devient
+    /// une [`BackendError::UnsupportedFormat`] : jamais un repli silencieux sur la
+    /// période par défaut, qui ferait mesurer le moteur audio là où on croit mesurer
+    /// le transport du pilote.
+    ///
+    /// Le changement ne concerne que les ouvertures suivantes.
+    pub fn set_shared_period(&mut self, period: SharedPeriod) {
+        self.period = period;
+    }
+
+    /// Politique de période partagée en vigueur ([`Self::set_shared_period`]).
+    pub fn shared_period(&self) -> SharedPeriod {
+        self.period
     }
 
     /// Installe le contrôle des câbles que [`Backend::cable_control`] rendra (M1b-34).
@@ -278,11 +313,13 @@ impl WasapiBackend {
     ) -> Result<WasapiHandle, BackendError> {
         let id = id.clone();
         let policy = self.policy;
+        let period = self.period;
         let opened = self.request(
             move |reply| Command::Open {
                 id,
                 format,
                 policy,
+                period,
                 loopback,
                 reply,
             },

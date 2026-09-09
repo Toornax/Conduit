@@ -26,6 +26,7 @@ use crate::devices::{
     default_endpoint_id, describe_id, direction_from_flow, enumerate, EndpointInfo,
 };
 use crate::exclusive::ExclusivePolicy;
+use crate::lowlat::SharedPeriod;
 use crate::notify::{Notification, NotificationClient};
 use crate::open::Opened;
 
@@ -46,12 +47,15 @@ pub(crate) enum Command {
         reply: mpsc::Sender<Result<Option<DeviceId>, BackendError>>,
     },
     /// Ouvrir un flux (objets WASAPI créés ici, consommés par le fil du flux).
-    /// `policy` décide du mode de partage (partagé par défaut) ; `loopback`
-    /// demande une capture d'écho sur un endpoint de rendu (module `loopback`).
+    /// `policy` décide du mode de partage (partagé par défaut) ; `period` décide de
+    /// la période d'un flux partagé (au choix du moteur par défaut, module
+    /// `lowlat`) ; `loopback` demande une capture d'écho sur un endpoint de rendu
+    /// (module `loopback`).
     Open {
         id: DeviceId,
         format: StreamFormat,
         policy: ExclusivePolicy,
+        period: SharedPeriod,
         loopback: bool,
         reply: mpsc::Sender<Result<Opened, BackendError>>,
     },
@@ -169,6 +173,7 @@ impl State {
                 id,
                 format,
                 policy,
+                period,
                 loopback,
                 reply,
             } => {
@@ -177,6 +182,7 @@ impl State {
                     &id,
                     format,
                     policy,
+                    period,
                     loopback,
                 ));
             }

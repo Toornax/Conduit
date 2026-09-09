@@ -13,6 +13,7 @@
 //! conduit-looptest --self-test          # test de l'outil, sans périphérique
 //! conduit-looptest --loopback           # capture en écho : le moteur délivre-t-il ?
 //! conduit-looptest --exclusif --seconds 20     # rendu et capture en exclusif WASAPI
+//! conduit-looptest --faible-latence --seconds 20  # partagé, période minimale (IAudioClient3)
 //! conduit-looptest --list --show-volume # les endpoints, volume, coupure et plage
 //! conduit-looptest --set-volume 0.5 --unmute   # règle, affiche, et sort
 //! conduit-looptest --cable-etat                # l'état des 16 câbles (propriété KS)
@@ -57,6 +58,24 @@
 //! le mode normal d'un câble : un câble Conduit est fait pour coexister avec les
 //! autres applications. Incompatible avec `--loopback`, dont l'écho n'existe qu'en
 //! partagé.
+//!
+//! `--faible-latence` ouvre les deux flux en **mode partagé**, mais par
+//! `IAudioClient3` : `GetSharedModeEnginePeriod` pour connaître les périodes que le
+//! moteur accepte, puis `InitializeSharedAudioStream` avec la **minimale** — ou celle
+//! de `--periode-ms` — au format de mixage. Le périphérique reste utilisable par les
+//! autres applications, contrairement à `--exclusif` ; ce qui change est la période,
+//! et c'est justement l'hypothèse à trancher : le moteur audio ne monte peut-être les
+//! **notifications** et les paquets WaveRT du pilote que pour un flux faible latence,
+//! là où un flux partagé ordinaire se contente d'un tampon en scrutation. La réponse
+//! ne se lit pas dans cette passe mais dans le pilote, par `--cable-transport`, lancé
+//! pendant qu'elle tourne. Aucun code WASAPI n'est écrit ici non plus : la politique
+//! `SharedPeriod` du dorsal fait le travail, et elle est **exigeante** — un refus
+//! (interface absente, périodicité déjà verrouillée, format demandé différent du
+//! mélange) est une erreur, pas un repli silencieux sur la période par défaut.
+//! L'en-tête imprime, par flux, les quatre périodes annoncées, celle qui est servie
+//! et le tampon obtenu. Incompatible avec `--exclusif` — qui supprime le moteur dont
+//! on demande ici la période courte — et avec `--loopback`, dont l'indicateur d'écho
+//! n'est pas accepté par `InitializeSharedAudioStream`.
 //!
 //! **Le volume de l'endpoint est vérifié avant chaque mesure.** Un endpoint coupé
 //! ou à zéro rend la boucle muette, et ce silence-là est indiscernable d'un pilote

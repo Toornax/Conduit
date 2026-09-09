@@ -73,7 +73,8 @@ use crate::clock::{hns_to_ns, read_position, ClockScale, ClockSource, Qpc};
 use crate::com::{platform_error, ComApartment, Event, Woken};
 use crate::convert::{self, SampleType};
 use crate::exclusive::ShareMode;
-use crate::open::{Opened, Service, StreamLatency, StreamObjects};
+use crate::lowlat::EnginePeriods;
+use crate::open::{InitPath, Opened, Service, StreamLatency, StreamObjects};
 
 /// Délai maximal entre deux réveils avant d'aller « toucher » le client : un
 /// périphérique disparu sans signaler son événement est ainsi détecté.
@@ -291,6 +292,29 @@ impl WasapiHandle {
         StreamLatency {
             write_ahead_frames: self.write_ahead_frames(),
             ..self.latency
+        }
+    }
+
+    /// Les quatre périodes que le moteur audio annonce pour ce flux — défaut,
+    /// fondamentale, minimum, maximum, en trames —, et la période qu'il dit servir
+    /// après l'initialisation.
+    ///
+    /// `None` pour un flux qui n'est pas passé par
+    /// `IAudioClient3::InitializeSharedAudioStream` (chemin par conversion, écho,
+    /// mode exclusif) : ces valeurs n'existent que là, et les inventer ailleurs
+    /// serait mentir. Le tampon obtenu, lui, est toujours dans
+    /// [`StreamLatency::buffer_frames`] ([`Self::latency`]).
+    ///
+    /// Rendu **hors trait `DeviceHandle`**, comme [`Self::latency`] : le trait est
+    /// portable et ne connaît pas les périodes du moteur audio de Windows.
+    pub fn engine_periods(&self) -> Option<(EnginePeriods, u32)> {
+        match self.latency.path {
+            InitPath::LowLatency {
+                current_period_frames,
+                periods,
+                ..
+            } => Some((periods, current_period_frames)),
+            _ => None,
         }
     }
 

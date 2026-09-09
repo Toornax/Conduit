@@ -27,6 +27,15 @@
 //! mesurerait le moteur audio en croyant mesurer le transport. Ce que les flux ont
 //! réellement obtenu est relu sur la poignée (`FluxObserve`, interne) et imprimé
 //! sous l'en-tête.
+//!
+//! En **faible latence partagée** (`--faible-latence`), même partage du travail : la
+//! session pose une `SharedPeriod` forcée — `Minimal`, ou `Requested(ms)` avec
+//! `--periode-ms` — sur le dorsal, qui interroge `GetSharedModeEnginePeriod`, ouvre
+//! par `InitializeSharedAudioStream` au format de mixage et relit
+//! `GetCurrentSharedModeEnginePeriod`. Forcée, là encore, parce qu'un repli sur la
+//! période par défaut du moteur ferait mesurer exactement ce qu'on cherche à écarter.
+//! Les quatre périodes annoncées, celle qui est servie et le tampon obtenu passent
+//! par le même bloc « négocié » que le mode exclusif.
 
 #![forbid(unsafe_code)]
 
@@ -40,8 +49,8 @@ use conduit_backend::{
     StreamIo,
 };
 use conduit_backend_wasapi::{
-    EndpointVolumeControl, ExclusivePolicy, InitPath, ShareMode, StreamLatency, WasapiBackend,
-    WasapiHandle,
+    EndpointVolumeControl, ExclusivePolicy, InitPath, ShareMode, SharedPeriod, StreamLatency,
+    WasapiBackend, WasapiHandle,
 };
 use conduit_core::types::SampleRate;
 
@@ -122,6 +131,33 @@ impl Recorder {
     }
 }
 
+/// Ce que l'en-tête annonce du mode d'ouverture des flux de la passe.
+///
+/// Trois modes, et non deux : un flux **partagé faible latence** est partagé — le
+/// périphérique reste utilisable par les autres applications — mais sa période n'est
+/// pas celle, longue, que le moteur choisit par défaut. Les confondre reviendrait à
+/// ne pas dire ce qui est justement mesuré.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModeOuverture {
+    /// Partagé, période au choix du moteur : le défaut.
+    Partage,
+    /// Partagé, mais ouvert par `IAudioClient3` avec une période courte
+    /// (`--faible-latence`).
+    FaibleLatence,
+    /// Exclusif : le moteur audio est court-circuité (`--exclusif`).
+    Exclusif,
+}
+
+impl core::fmt::Display for ModeOuverture {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Partage => "partagé",
+            Self::FaibleLatence => "partagé faible latence (IAudioClient3)",
+            Self::Exclusif => "exclusif",
+        })
+    }
+}
+
 /// Ce qu'un flux ouvert dit de lui-même, une fois la passe faite.
 ///
 /// Rien n'est calculé ici et aucun champ n'est inventé : tout vient de
@@ -148,6 +184,10 @@ pub struct Session {
     /// Vrai en `--exclusif` : les flux sont ouverts en mode exclusif WASAPI, et un
     /// refus fait échouer l'ouverture ([`ExclusivePolicy::Required`]).
     exclusif: bool,
+    /// Période demandée au moteur pour les flux **partagés** : au choix du moteur
+    /// par défaut, minimale ou précise en `--faible-latence`. Un refus fait échouer
+    /// l'ouverture, comme en exclusif.
+    partage: SharedPeriod,
     format: StreamFormat,
     spec: SineSpec,
     seconds: f64,
@@ -173,6 +213,16 @@ impl Session {
         if args.exclusif {
             backend.set_exclusive_policy(ExclusivePolicy::Required);
         }
+        // Même raisonnement pour la faible latence partagée : la politique du dorsal
+        // **exige** `IAudioClient3` et fait échouer l'ouverture s'il n'est pas
+        // disponible ou si le moteur refuse la période courte. Un repli sur la
+        // période par défaut ferait mesurer exactement ce qu'on cherche à écarter.
+        let partage = match (args.faible_latence, args.periode_ms) {
+            (true, Some(ms)) => SharedPeriod::Requested(ms),
+            (true, None) => SharedPeriod::Minimal,
+            (false, _) => SharedPeriod::Default,
+        };
+        backend.set_shared_period(partage);
         let devices = enumerate(&backend)?;
         let render = choose(&devices, DeviceDirection::Render, args.render.as_deref())?;
         let capture = if args.loopback || args.capture_disabled() {
@@ -217,6 +267,7 @@ impl Session {
             capture,
             loopback: args.loopback,
             exclusif: args.exclusif,
+            partage,
             format: StreamFormat {
                 sample_rate: rate,
                 channels,
@@ -299,20 +350,23 @@ impl Session {
         entete(&self.render, self.capture.as_ref(), self.mode_effectif())
     }
 
-    /// Le mode de partage que les flux de cette session auront **effectivement**.
+    /// Le mode d'ouverture que les flux de cette session auront **effectivement**.
     ///
     /// Ce n'est pas une intention affichée pour faire joli : `--exclusif` pose
     /// [`ExclusivePolicy::Required`] sur le dorsal, qui **fait échouer l'ouverture**
-    /// au lieu de rendre un flux partagé. Une passe qui démarre est donc exclusive,
-    /// ou n'a pas démarré du tout ; sans `--exclusif`, la politique du dorsal reste
-    /// [`ExclusivePolicy::Never`] et le partagé est tout aussi certain. Le format
-    /// matériel réellement négocié, lui, n'est connu qu'après l'ouverture :
-    /// [`Self::bloc_negocie`] le donne.
-    fn mode_effectif(&self) -> ShareMode {
+    /// au lieu de rendre un flux partagé, et `--faible-latence` pose une
+    /// [`SharedPeriod`] forcée, qui fait échouer l'ouverture au lieu de retomber sur
+    /// la période par défaut. Une passe qui démarre est donc dans le mode annoncé, ou
+    /// n'a pas démarré du tout ; sans l'une ni l'autre option, le partagé ordinaire
+    /// est tout aussi certain. Le format matériel et les périodes réellement obtenus,
+    /// eux, ne sont connus qu'après l'ouverture : [`Self::bloc_negocie`] les donne.
+    fn mode_effectif(&self) -> ModeOuverture {
         if self.exclusif {
-            ShareMode::Exclusive
+            ModeOuverture::Exclusif
+        } else if self.partage.forces() {
+            ModeOuverture::FaibleLatence
         } else {
-            ShareMode::Shared
+            ModeOuverture::Partage
         }
     }
 
@@ -452,15 +506,16 @@ impl Session {
     }
 }
 
-/// L'en-tête de la passe : un endpoint par ligne, avec le **mode de partage** que
+/// L'en-tête de la passe : un endpoint par ligne, avec le **mode d'ouverture** que
 /// son flux aura.
 ///
-/// Le mode est annoncé avant l'ouverture, et c'est exact : la politique du dorsal
-/// est soit `Never` (partagé garanti), soit `Required` (exclusif ou échec de
-/// l'ouverture). Une passe qui démarre est donc dans le mode annoncé. Ce que le
-/// matériel a concédé — format, période, tampon — n'est connu qu'ensuite, et
-/// s'imprime par [`bloc_negocie`].
-fn entete(render: &DeviceInfo, capture: Option<&DeviceInfo>, mode: ShareMode) -> String {
+/// Le mode est annoncé avant l'ouverture, et c'est exact : chaque politique du dorsal
+/// est soit celle du défaut (partagé ordinaire garanti), soit une politique
+/// **exigeante** — exclusif ou faible latence — qui fait échouer l'ouverture plutôt
+/// que de rendre autre chose. Une passe qui démarre est donc dans le mode annoncé. Ce
+/// que le moteur ou le matériel a concédé — format, périodes, tampon — n'est connu
+/// qu'ensuite, et s'imprime par [`bloc_negocie`].
+fn entete(render: &DeviceInfo, capture: Option<&DeviceInfo>, mode: ModeOuverture) -> String {
     format!(
         "rendu   : {} ({}) — {mode}\ncapture : {}",
         render.name,
@@ -475,17 +530,19 @@ fn entete(render: &DeviceInfo, capture: Option<&DeviceInfo>, mode: ShareMode) ->
 /// L'en-tête « négocié » : une ligne par flux ouvert, disant ce que WASAPI a
 /// accordé.
 ///
-/// Rendu seulement quand au moins un flux est **exclusif**. En mode partagé, la
-/// période et le tampon sont ceux du moteur audio, que les lignes `rendu :` /
-/// `capture :` résument déjà par le mot « partagé » : un bloc de plus n'y ajouterait
-/// que du bruit. En exclusif, au contraire, le format n'est plus celui qu'on a
-/// demandé — le matériel l'impose — et la période est celle du pilote, éventuellement
-/// réalignée : ce sont les trois chiffres que la mesure du transport veut lire.
+/// Rendu seulement quand au moins un flux est **exclusif** ou **faible latence**. Un
+/// flux partagé ordinaire n'a rien à ajouter : sa période et son tampon sont ceux que
+/// le moteur choisit toujours, que les lignes `rendu :` / `capture :` résument déjà
+/// par le mot « partagé ». En exclusif, au contraire, le format n'est plus celui
+/// qu'on a demandé — le matériel l'impose — et la période est celle du pilote,
+/// éventuellement réalignée ; en faible latence, ce sont les quatre périodes du
+/// moteur, celle qu'il sert et le tampon obtenu. Ce sont, dans les deux cas, les
+/// chiffres que la mesure du transport vient lire.
 fn bloc_negocie(observes: &[FluxObserve]) -> Option<String> {
-    if !observes
-        .iter()
-        .any(|flux| flux.latency.path.share_mode() == ShareMode::Exclusive)
-    {
+    if !observes.iter().any(|flux| {
+        flux.latency.path.share_mode() == ShareMode::Exclusive
+            || matches!(flux.latency.path, InitPath::LowLatency { .. })
+    }) {
         return None;
     }
     let mut out = String::new();
@@ -520,9 +577,19 @@ fn ligne_flux(flux: &FluxObserve) -> String {
                 ""
             }
         ),
-        // Un flux partagé au milieu d'un bloc exclusif : le cas ne se produit qu'en
-        // `--no-capture` inversé ou si le dorsal changeait de politique en cours de
-        // route. Le dire reste plus honnête que de l'omettre.
+        InitPath::LowLatency {
+            period_frames,
+            current_period_frames,
+            periods,
+        } => format!(
+            "faible latence (IAudioClient3), période demandée {period_frames} trames \
+             ({ms} ms), servie {current_period_frames} trames, tampon {} trames — moteur : \
+             défaut {}, fondamentale {}, min {}, max {} trames",
+            latence.buffer_frames, periods.default, periods.fundamental, periods.min, periods.max
+        ),
+        // Un flux partagé ordinaire au milieu d'un bloc : le cas se produit quand un
+        // seul des deux flux a obtenu le mode demandé, ou si le dorsal changeait de
+        // politique en cours de route. Le dire reste plus honnête que de l'omettre.
         _ => format!(
             "{}, période {} trames ({ms} ms), tampon {} trames",
             latence.path.share_mode(),
@@ -810,7 +877,7 @@ fn check_same_cable(render: &DeviceInfo, capture: &DeviceInfo) -> Result<(), Str
 mod tests {
     use super::*;
     use conduit_backend::DeviceId;
-    use conduit_backend_wasapi::SampleType;
+    use conduit_backend_wasapi::{EnginePeriods, SampleType};
 
     /// **Aucun test de ce module n'ouvre de flux ni n'émet de son** : tout ce qui
     /// touche à WASAPI demande un vrai endpoint, et une passe exclusive prendrait la
@@ -851,14 +918,26 @@ mod tests {
         let rendu = cable(1, DeviceDirection::Render);
         let capture = cable(1, DeviceDirection::Capture);
 
-        let partage = entete(&rendu, Some(&capture), ShareMode::Shared);
+        let partage = entete(&rendu, Some(&capture), ModeOuverture::Partage);
         assert_eq!(partage.lines().count(), 2, "{partage}");
         assert!(
             partage.lines().all(|ligne| ligne.contains("— partagé")),
             "{partage}"
         );
 
-        let exclusif = entete(&rendu, Some(&capture), ShareMode::Exclusive);
+        // Un flux faible latence est partagé, et le dire n'est pas la même chose que
+        // dire « partagé » tout court : c'est la période qui change, et c'est elle
+        // qu'on mesure.
+        let faible = entete(&rendu, Some(&capture), ModeOuverture::FaibleLatence);
+        assert!(
+            faible
+                .lines()
+                .all(|ligne| ligne.contains("— partagé faible latence (IAudioClient3)")),
+            "{faible}"
+        );
+        assert!(!faible.contains("exclusif"), "{faible}");
+
+        let exclusif = entete(&rendu, Some(&capture), ModeOuverture::Exclusif);
         assert!(exclusif.starts_with("rendu   : Conduit 1"), "{exclusif}");
         assert!(
             exclusif.lines().all(|ligne| ligne.contains("— exclusif")),
@@ -870,15 +949,69 @@ mod tests {
         assert!(exclusif.contains(capture.id.as_str()), "{exclusif}");
 
         // `--no-capture` : pas de mode annoncé pour un flux qui n'existe pas.
-        let sans = entete(&rendu, None, ShareMode::Exclusive);
+        let sans = entete(&rendu, None, ModeOuverture::Exclusif);
         assert!(sans.contains("aucune (--no-capture)"), "{sans}");
         assert_eq!(sans.matches("exclusif").count(), 1, "{sans}");
     }
 
-    /// Le bloc « négocié » ne dit que ce que le dorsal a rapporté, et ne sort qu'en
-    /// exclusif : en partagé, il répéterait le mot que l'en-tête porte déjà.
+    /// Le chemin faible latence tel que le dorsal le rapporterait sur « Conduit 1 » :
+    /// période minimale de 144 trames = 3 ms à 48 kHz, servie telle quelle.
+    fn faible_latence(current_period_frames: u32) -> InitPath {
+        InitPath::LowLatency {
+            period_frames: 144,
+            current_period_frames,
+            periods: EnginePeriods {
+                default: 480,
+                fundamental: 48,
+                min: 144,
+                max: 960,
+            },
+        }
+    }
+
+    /// En faible latence, le bloc « négocié » porte les **quatre** périodes que le
+    /// moteur annonce, celle qu'il sert et le tampon obtenu : c'est exactement ce
+    /// qu'on relit à côté de `--cable-transport` pour savoir si le moteur a changé de
+    /// chemin sur le pilote.
     #[test]
-    fn le_bloc_negocie_ne_sort_qu_en_exclusif() {
+    fn le_bloc_negocie_porte_les_periodes_du_moteur() {
+        let bloc = bloc_negocie(&[
+            flux("rendu", faible_latence(144), 288),
+            flux("capture", faible_latence(144), 288),
+        ])
+        .expect("deux flux faible latence");
+        assert!(bloc.starts_with("négocié : rendu"), "{bloc}");
+        assert_eq!(bloc.lines().count(), 2, "{bloc}");
+        assert!(bloc.contains("faible latence (IAudioClient3)"), "{bloc}");
+        assert!(bloc.contains("période demandée 144 trames"), "{bloc}");
+        assert!(bloc.contains("3,00 ms"), "{bloc}");
+        assert!(bloc.contains("servie 144 trames"), "{bloc}");
+        assert!(bloc.contains("tampon 288 trames"), "{bloc}");
+        assert!(
+            bloc.contains("défaut 480, fondamentale 48, min 144, max 960 trames"),
+            "{bloc}"
+        );
+        assert!(bloc.contains("capture — faible latence"), "{bloc}");
+        // Aucun mot du mode exclusif ne s'y glisse : ce flux est partagé.
+        assert!(!bloc.contains("exclusif"), "{bloc}");
+    }
+
+    /// Une période servie différente de la période demandée est **dite**, pas
+    /// masquée : c'est le signe qu'un autre flux tenait déjà la périodicité du
+    /// moteur, et c'est l'explication d'une mesure qui ne bouge pas.
+    #[test]
+    fn une_periode_servie_differente_est_dite() {
+        let bloc = bloc_negocie(&[flux("rendu", faible_latence(480), 960)])
+            .expect("un flux faible latence");
+        assert!(bloc.contains("période demandée 144 trames"), "{bloc}");
+        assert!(bloc.contains("servie 480 trames"), "{bloc}");
+    }
+
+    /// Le bloc « négocié » ne dit que ce que le dorsal a rapporté, et ne sort que
+    /// pour un mode qui a quelque chose à ajouter : en partagé ordinaire, il
+    /// répéterait le mot que l'en-tête porte déjà.
+    #[test]
+    fn le_bloc_negocie_ne_sort_pas_en_partage_ordinaire() {
         assert!(bloc_negocie(&[]).is_none());
         assert!(bloc_negocie(&[flux("rendu", InitPath::Converted, 1_056)]).is_none());
         assert!(

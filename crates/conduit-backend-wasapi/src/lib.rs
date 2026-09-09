@@ -58,6 +58,18 @@
 //! format que le matériel accepte — souvent de l'entier, que le fil du flux
 //! convertit lui-même (module `convert`) puisqu'il n'y a plus d'`AUTOCONVERTPCM`.
 //!
+//! L'**ouverture partagée faible latence** (module `lowlat`) est le second réglage
+//! du même genre, `SharedPeriod::Default` par défaut — c'est-à-dire le comportement
+//! actuel. `SharedPeriod::Minimal` et `SharedPeriod::Requested` exigent le chemin
+//! `IAudioClient3::InitializeSharedAudioStream` au format de mixage, avec la période
+//! minimale du moteur ou une période précise : le flux reste **partagé** — le
+//! périphérique demeure utilisable par les autres applications — mais sa période
+//! n'est plus celle, longue, que le moteur choisit par défaut. C'est ce qui rend
+//! testable l'hypothèse du transport : le moteur audio ne monte peut-être les
+//! notifications et les paquets WaveRT du pilote que pour un flux faible latence. Un
+//! refus est une **erreur d'ouverture**, jamais un repli silencieux sur la période
+//! par défaut.
+//!
 //! Les noms cités ici sont en code et non en liens : ils ne désignent, comme
 //! tout ce crate, que des éléments compilés sous Windows, et un lien vers eux
 //! ne se résoudrait pas quand la documentation est produite sur une autre
@@ -116,6 +128,8 @@ mod exclusive;
 #[cfg(windows)]
 mod loopback;
 #[cfg(windows)]
+mod lowlat;
+#[cfg(windows)]
 mod mmdevice_thread;
 #[cfg(windows)]
 mod notify;
@@ -146,7 +160,9 @@ pub use devices::{
 #[cfg(windows)]
 pub use exclusive::{aligned_period_hns, ExclusivePolicy, ShareMode};
 #[cfg(windows)]
-pub use open::{choose_period, EnginePeriods, InitPath, StreamLatency};
+pub use lowlat::{choose_period, frames_from_ms, EnginePeriods, SharedPeriod};
+#[cfg(windows)]
+pub use open::{InitPath, StreamLatency};
 #[cfg(windows)]
 pub use session::{current_session_id, SERVICES_SESSION};
 #[cfg(windows)]

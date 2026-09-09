@@ -15,8 +15,11 @@
 //! 1. **Basse latence** — le format demandé est le format de mixage du moteur (et
 //!    celui-ci est float32) : `IAudioClient3::InitializeSharedAudioStream` avec la
 //!    plus petite période prise en charge ≥ `block_frames`
-//!    ([`choose_period`]). Aucune conversion, période au choix entre le minimum du
-//!    pilote et le maximum du moteur.
+//!    (`lowlat::choose_period`). Aucune conversion, période au choix entre le
+//!    minimum du pilote et le maximum du moteur. `SharedPeriod` (module `lowlat`)
+//!    permet d'**exiger** ce chemin et d'y imposer la période minimale, ou une
+//!    période précise : le refus devient alors une erreur d'ouverture au lieu d'un
+//!    repli sur le chemin 2.
 //! 2. **Conversion** — sinon : `IAudioClient::Initialize` en mode partagé avec
 //!    `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | SRC_DEFAULT_QUALITY` et un
 //!    `WAVEFORMATEXTENSIBLE` float32 aux valeurs demandées ; Windows convertit
@@ -49,8 +52,8 @@ use std::time::Duration;
 use conduit_backend::{BackendError, DeviceDirection, DeviceId, DeviceInfo, StreamFormat};
 use windows::core::{AgileReference, Interface};
 use windows::Win32::Media::Audio::{
-    IAudioCaptureClient, IAudioClient, IAudioClient3, IAudioClock, IAudioRenderClient,
-    IMMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+    IAudioCaptureClient, IAudioClient, IAudioClock, IAudioRenderClient, IMMDeviceEnumerator,
+    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
     AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, WAVEFORMATEX,
 };
 
@@ -62,42 +65,20 @@ use crate::devices::{
     mix_format, Defaults, DEFAULT_PERIOD_HNS,
 };
 use crate::exclusive::{required_error, try_exclusive, ExclusivePolicy, ShareMode};
-
-/// Périodes du moteur audio pour un format donné, en trames
-/// (`IAudioClient3::GetSharedModeEnginePeriod`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EnginePeriods {
-    /// Période par défaut (celle du chemin par conversion).
-    pub default: u32,
-    /// Période fondamentale : toute période acceptée en est un multiple.
-    pub fundamental: u32,
-    /// Plus petite période acceptée (pilote).
-    pub min: u32,
-    /// Plus grande période acceptée (moteur).
-    pub max: u32,
-}
-
-/// Plus petite période acceptée ≥ `requested` : le multiple de la fondamentale
-/// immédiatement supérieur ou égal, borné à `[min, max]`.
-pub fn choose_period(requested: usize, periods: EnginePeriods) -> u32 {
-    let fundamental = u64::from(periods.fundamental.max(1));
-    let requested = u64::try_from(requested).unwrap_or(u64::MAX).max(1);
-    let multiple = requested.div_ceil(fundamental).saturating_mul(fundamental);
-    let clamped = multiple.clamp(
-        u64::from(periods.min),
-        u64::from(periods.max.max(periods.min)),
-    );
-    u32::try_from(clamped).unwrap_or(u32::MAX)
-}
+use crate::lowlat::{self, EnginePeriods, SharedPeriod};
 
 /// Comment le flux a été initialisé.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitPath {
     /// `IAudioClient3::InitializeSharedAudioStream` au format de mixage, avec la
-    /// période choisie (en trames).
+    /// période choisie (en trames). Voir le module `lowlat` et [`SharedPeriod`].
     LowLatency {
-        /// Période obtenue.
+        /// Période **demandée** à `InitializeSharedAudioStream`.
         period_frames: u32,
+        /// Période que le moteur dit servir après l'initialisation
+        /// (`GetCurrentSharedModeEnginePeriod`). Différente de la précédente quand
+        /// un autre flux tenait déjà la périodicité du moteur.
+        current_period_frames: u32,
         /// Périodes annoncées par le moteur.
         periods: EnginePeriods,
     },
@@ -217,14 +198,17 @@ pub(crate) struct Opened {
 /// Ouvre un flux sur l'endpoint `id`. À appeler depuis le fil MMDevice.
 ///
 /// `policy` décide du mode de partage : partagé par défaut, exclusif tenté ou exigé
-/// selon [`ExclusivePolicy`]. `loopback` demande une **capture d'écho** sur un
-/// endpoint de rendu (module `loopback`) : partagé obligatoire, service de capture
+/// selon [`ExclusivePolicy`]. `period` décide de la **période** d'un flux partagé :
+/// au choix du moteur par défaut, ou faible latence exigée par `IAudioClient3`
+/// ([`SharedPeriod`], module `lowlat`). `loopback` demande une **capture d'écho** sur
+/// un endpoint de rendu (module `loopback`) : partagé obligatoire, service de capture
 /// au lieu du service de rendu.
 pub(crate) fn open(
     enumerator: &IMMDeviceEnumerator,
     id: &DeviceId,
     format: StreamFormat,
     policy: ExclusivePolicy,
+    period: SharedPeriod,
     loopback: bool,
 ) -> Result<Opened, BackendError> {
     let device =
@@ -246,6 +230,9 @@ pub(crate) fn open(
     // rattachement d'un câble à ses endpoints (`backend::resoudre_endpoints`), pas
     // l'ouverture d'un flux.
     let info = describe(&device, &Defaults::query(enumerator)?)?.info;
+    // Une politique de période forcée écarte l'exclusif et l'écho, avant tout appel
+    // COM : les combinaisons se contredisent (module `lowlat`).
+    lowlat::check_compatible(id, policy, period, loopback)?;
     if loopback {
         // Refusés avant tout appel COM : un écho ne se prend que sur un endpoint de
         // rendu, et seulement en mode partagé (module `loopback`).
@@ -285,9 +272,9 @@ pub(crate) fn open(
                 return Err(required_error(id, &reason))
             }
             // `Preferred` : repli en partagé, la raison voyage jusqu'à la poignée.
-            Some(Err(reason)) => shared(&device, id, &client, &mix, channels, format, mask)
+            Some(Err(reason)) => shared(&device, id, &client, &mix, channels, format, mask, period)
                 .map(|(client, path, block)| (client, path, block, Some(reason)))?,
-            None => shared(&device, id, &client, &mix, channels, format, mask)
+            None => shared(&device, id, &client, &mix, channels, format, mask, period)
                 .map(|(client, path, block)| (client, path, block, None))?,
         }
     };
@@ -369,6 +356,11 @@ pub(crate) fn open(
 /// `probe` est le client déjà activé qui a servi à lire le format de mixage : il
 /// est réutilisé si `InitializeSharedAudioStream` réussit, abandonné sinon (un
 /// `IAudioClient` dont l'initialisation a échoué n'est pas réutilisable).
+///
+/// `period` décide de la suite : en [`SharedPeriod::Default`], le chemin 1 est
+/// **tenté** quand le format demandé est celui du mixage et son échec retombe
+/// silencieusement sur le chemin 2 ; sinon le chemin 1 est **exigé** et tout refus
+/// devient une erreur d'ouverture qui dit pourquoi (module `lowlat`).
 fn shared(
     device: &windows::Win32::Media::Audio::IMMDevice,
     id: &DeviceId,
@@ -377,21 +369,33 @@ fn shared(
     channels: u16,
     format: StreamFormat,
     mask: u32,
+    period: SharedPeriod,
 ) -> Result<(IAudioClient, InitPath, usize), BackendError> {
     let matches_mix = mix.parsed.float32
         && mix.parsed.channels == channels
         && mix.parsed.sample_rate == format.sample_rate.hz();
+    // Politique forcée : le format demandé doit être celui du mélange, faute de
+    // conversion automatique sur ce chemin.
+    lowlat::check_mix(id, &mix.parsed, channels, format.sample_rate.hz(), period)?;
     if matches_mix {
-        if let Ok((period_frames, periods)) = low_latency(probe, mix.as_ptr(), format.block_frames)
-        {
-            return Ok((
-                probe.clone(),
-                InitPath::LowLatency {
-                    period_frames,
-                    periods,
-                },
-                period_frames as usize,
-            ));
+        match lowlat::try_low_latency(probe, mix, period, format.block_frames) {
+            Ok(init) => {
+                return Ok((
+                    probe.clone(),
+                    InitPath::LowLatency {
+                        period_frames: init.period_frames,
+                        current_period_frames: init.current_period_frames,
+                        periods: init.periods,
+                    },
+                    init.period_frames as usize,
+                ));
+            }
+            // Politique forcée : pas de repli silencieux — on mesurerait le moteur
+            // audio en croyant mesurer le transport.
+            Err(reason) if period.forces() => {
+                return Err(lowlat::required_error(id, period, &reason))
+            }
+            Err(_) => {}
         }
     }
     // Chemin 1 refusé (ou format différent du mixage) : un client neuf.
@@ -468,58 +472,6 @@ fn audio_clock(
     }
 }
 
-/// Chemin 1 : `IAudioClient3` au format de mixage, période choisie. `Err` signifie
-/// « retomber sur le chemin 2 », sans autre conséquence.
-fn low_latency(
-    client: &IAudioClient,
-    mix: *const WAVEFORMATEX,
-    block_frames: usize,
-) -> Result<(u32, EnginePeriods), BackendError> {
-    let client3: IAudioClient3 = client
-        .cast()
-        .map_err(|e| platform_error("IAudioClient::QueryInterface(IAudioClient3)", &e))?;
-    let periods = engine_periods(&client3, mix)?;
-    let period = choose_period(block_frames, periods);
-    // SAFETY: `mix` pointe le bloc rendu par `GetMixFormat`, vivant pendant l'appel ;
-    // aucun GUID de session.
-    unsafe {
-        client3.InitializeSharedAudioStream(AUDCLNT_STREAMFLAGS_EVENTCALLBACK, period, mix, None)
-    }
-    .map_err(|e| platform_error("IAudioClient3::InitializeSharedAudioStream", &e))?;
-    Ok((period, periods))
-}
-
-/// Périodes du moteur pour un format (`GetSharedModeEnginePeriod`).
-fn engine_periods(
-    client3: &IAudioClient3,
-    format: *const WAVEFORMATEX,
-) -> Result<EnginePeriods, BackendError> {
-    let mut periods = EnginePeriods {
-        default: 0,
-        fundamental: 0,
-        min: 0,
-        max: 0,
-    };
-    // SAFETY: `format` est un `WAVEFORMATEX` valide pendant l'appel ; les quatre
-    // sorties sont des champs d'une locale vivante.
-    unsafe {
-        client3.GetSharedModeEnginePeriod(
-            format,
-            &mut periods.default,
-            &mut periods.fundamental,
-            &mut periods.min,
-            &mut periods.max,
-        )
-    }
-    .map_err(|e| platform_error("IAudioClient3::GetSharedModeEnginePeriod", &e))?;
-    if periods.fundamental == 0 || periods.max == 0 {
-        return Err(BackendError::Platform(
-            "IAudioClient3::GetSharedModeEnginePeriod a rendu des périodes nulles".into(),
-        ));
-    }
-    Ok(periods)
-}
-
 /// Référence agile vers une interface, pour la faire voyager vers le fil du flux.
 fn agile<T: Interface>(interface: &T, what: &str) -> Result<AgileReference<T>, BackendError> {
     AgileReference::new(interface)
@@ -555,38 +507,26 @@ mod tests {
         max: 960,
     };
 
+    /// Le chemin faible latence reste un chemin **partagé**, et son tampon reste du
+    /// float32 : c'est le mode exclusif, et lui seul, qui change les deux.
+    ///
+    /// L'arithmétique de la période, elle, vit dans le module `lowlat` et s'y teste.
     #[test]
-    fn period_is_the_next_multiple_of_the_fundamental() {
-        assert_eq!(choose_period(480, MAXWELL_LIKE), 480);
-        assert_eq!(choose_period(481, MAXWELL_LIKE), 528);
-        assert_eq!(choose_period(256, MAXWELL_LIKE), 288);
-        assert_eq!(choose_period(144, MAXWELL_LIKE), 144);
-        assert_eq!(choose_period(145, MAXWELL_LIKE), 192);
-    }
-
-    #[test]
-    fn period_is_clamped_to_the_engine_range() {
-        assert_eq!(choose_period(1, MAXWELL_LIKE), 144);
-        assert_eq!(choose_period(0, MAXWELL_LIKE), 144);
-        assert_eq!(choose_period(100_000, MAXWELL_LIKE), 960);
-        assert_eq!(choose_period(usize::MAX, MAXWELL_LIKE), 960);
-    }
-
-    #[test]
-    fn degenerate_periods_do_not_panic() {
-        let zero = EnginePeriods {
-            default: 0,
-            fundamental: 0,
-            min: 0,
-            max: 0,
+    fn le_chemin_faible_latence_est_partage_et_en_float32() {
+        let path = InitPath::LowLatency {
+            period_frames: SharedPeriod::Minimal.period_frames(48_000, 480, MAXWELL_LIKE),
+            current_period_frames: 144,
+            periods: MAXWELL_LIKE,
         };
-        assert_eq!(choose_period(480, zero), 0);
-        let inverted = EnginePeriods {
-            default: 480,
-            fundamental: 32,
-            min: 512,
-            max: 128,
-        };
-        assert_eq!(choose_period(480, inverted), 512);
+        assert_eq!(path.share_mode(), ShareMode::Shared);
+        assert_eq!(path.sample_type(), SampleType::F32);
+        assert!(!path.is_loopback());
+        assert!(matches!(
+            path,
+            InitPath::LowLatency {
+                period_frames: 144,
+                ..
+            }
+        ));
     }
 }

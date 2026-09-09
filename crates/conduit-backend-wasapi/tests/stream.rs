@@ -247,12 +247,22 @@ fn render_default_at_48k_stereo() {
     assert_eq!(latency.period_frames, got.block_frames);
     if let InitPath::LowLatency {
         period_frames,
+        current_period_frames,
         periods,
     } = latency.path
     {
         assert!(period_frames >= periods.min && period_frames <= periods.max);
         assert_eq!(period_frames % periods.fundamental, 0);
         assert!(period_frames as usize >= 480 || period_frames == periods.max);
+        // La période que le moteur dit servir est elle aussi dans les bornes qu'il
+        // annonce : c'est la même valeur que `engine_periods()` publie.
+        assert!(current_period_frames >= periods.min && current_period_frames <= periods.max);
+        assert_eq!(
+            handle.engine_periods(),
+            Some((periods, current_period_frames))
+        );
+    } else {
+        assert_eq!(handle.engine_periods(), None);
     }
 
     // 1 s à 48 kHz avec des tampons ≤ 960 trames : au moins 50 réveils.

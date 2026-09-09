@@ -106,6 +106,28 @@ pub struct Args {
     /// coexister avec le reste du système.
     #[arg(long)]
     pub exclusif: bool,
+    /// Ouverture partagée faible latence (`IAudioClient3`), pour mesurer si le moteur
+    /// audio passe alors en notifications/paquets sur le pilote ; voir
+    /// `--cable-transport`.
+    ///
+    /// Le rendu **et** la capture s'ouvrent en mode **partagé** — le périphérique
+    /// reste utilisable par les autres applications, contrairement à `--exclusif` —
+    /// mais par `IAudioClient3::GetSharedModeEnginePeriod` puis
+    /// `InitializeSharedAudioStream` avec la période **minimale** du moteur au lieu
+    /// de sa période par défaut (10 ms). Le format est celui du **mélange**
+    /// (`GetMixFormat`) : ce chemin n'a pas de conversion automatique, donc `--rate`
+    /// et `--channels` doivent être ceux du mélange de l'endpoint (voir `--list`).
+    /// Un refus est une **erreur**, jamais un repli silencieux sur la période par
+    /// défaut. L'en-tête imprime, par flux, les quatre périodes que le moteur annonce,
+    /// celle qu'il sert et la taille du tampon.
+    #[arg(long = "faible-latence")]
+    pub faible_latence: bool,
+    /// Avec `--faible-latence` : période à demander au moteur, en millisecondes, à la
+    /// place de sa période minimale. Elle est arrondie **vers le haut** au multiple de
+    /// la période fondamentale du moteur, puis bornée à son minimum et à son maximum ;
+    /// l'en-tête dit la valeur obtenue.
+    #[arg(long = "periode-ms", value_name = "MS")]
+    pub periode_ms: Option<f64>,
     /// Sortie JSON.
     #[arg(long)]
     pub json: bool,
@@ -356,6 +378,7 @@ impl Args {
             }
         }
         self.validate_cable()?;
+        self.validate_faible_latence()?;
         if self.loopback {
             if self.capture.is_some() {
                 return Err(
@@ -393,6 +416,60 @@ impl Args {
             }
         }
         Ok(rate)
+    }
+
+    /// Cohérence des options de l'ouverture partagée faible latence
+    /// (`--faible-latence`, `--periode-ms`).
+    ///
+    /// Séparée de [`Self::validate`] pour la même raison que [`Self::validate_cable`] :
+    /// rester lisible. Les deux refus qu'elle porte disent chacun *pourquoi* les
+    /// options se contredisent, pas seulement qu'elles se contredisent.
+    fn validate_faible_latence(&self) -> Result<(), String> {
+        if let Some(ms) = self.periode_ms {
+            if self.faible_latence {
+                if !(ms > 0.0 && ms <= 500.0) {
+                    return Err(format!("--periode-ms {ms} doit être dans ]0, 500]"));
+                }
+            } else {
+                return Err(
+                    "--periode-ms est la période à demander au moteur audio par IAudioClient3 : \
+                     elle n'a de sens qu'avec --faible-latence, seul mode qui l'impose. \
+                     Ajoutez --faible-latence"
+                        .to_string(),
+                );
+            }
+        }
+        if !self.faible_latence {
+            return Ok(());
+        }
+        // Les deux modes se contredisent : la faible latence demande une période
+        // courte **au moteur audio**, l'exclusif supprime le moteur.
+        if self.exclusif {
+            return Err(
+                "--faible-latence demande une période courte au moteur audio de Windows, et \
+                 --exclusif court-circuite ce moteur : les deux se contredisent. Gardez l'un \
+                 des deux — --exclusif mesure le transport sans le moteur, --faible-latence le \
+                 mesure avec un moteur en période courte"
+                    .to_string(),
+            );
+        }
+        // `InitializeSharedAudioStream` ne prend pas `AUDCLNT_STREAMFLAGS_LOOPBACK` :
+        // il n'y a pas d'écho en faible latence, et le dorsal le refuse aussi.
+        if self.loopback {
+            return Err(
+                "--loopback prélève le mélange par AUDCLNT_STREAMFLAGS_LOOPBACK, indicateur \
+                 qu'InitializeSharedAudioStream n'accepte pas : il n'y a pas d'écho en faible \
+                 latence. Gardez l'un des deux"
+                    .to_string(),
+            );
+        }
+        if self.self_test {
+            return Err(
+                "--faible-latence demande de vrais endpoints : --self-test n'en ouvre aucun"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 
     /// Cohérence des options du jeu de propriétés (`--cable-*`).
@@ -581,6 +658,100 @@ mod tests {
         assert!(parse(&["--exclusif", "--no-capture"]).validate().is_ok());
         assert!(parse(&["--exclusif", "--cable-etat"]).validate().is_ok());
         assert!(parse(&["--exclusif", "--cable-transport"])
+            .validate()
+            .is_ok());
+    }
+
+    /// `--faible-latence` est **opt-in** : le défaut reste l'ouverture partagée
+    /// ordinaire, ici comme dans le dorsal (`SharedPeriod::Default`).
+    #[test]
+    fn la_faible_latence_est_opt_in() {
+        assert!(!parse(&[]).faible_latence);
+        assert_eq!(parse(&[]).periode_ms, None);
+        assert!(parse(&["--faible-latence"]).faible_latence);
+        assert!(parse(&["--faible-latence"]).validate().is_ok());
+    }
+
+    /// La faible latence partagée et l'exclusif se contredisent — l'une demande une
+    /// période courte au moteur audio, l'autre supprime le moteur —, et l'écho n'a
+    /// pas de faible latence (`InitializeSharedAudioStream` ne prend pas
+    /// `AUDCLNT_STREAMFLAGS_LOOPBACK`). Les deux refus nomment les deux options.
+    #[test]
+    fn la_faible_latence_exclut_l_exclusif_et_l_echo() {
+        let err = parse(&["--faible-latence", "--exclusif"])
+            .validate()
+            .expect_err("faible latence + exclusif");
+        assert!(err.contains("--faible-latence"), "{err}");
+        assert!(err.contains("--exclusif"), "{err}");
+        assert!(err.contains("moteur"), "{err}");
+
+        let err = parse(&["--faible-latence", "--loopback"])
+            .validate()
+            .expect_err("faible latence + écho");
+        assert!(err.contains("--loopback"), "{err}");
+        assert!(err.contains("LOOPBACK"), "{err}");
+
+        let err = parse(&["--faible-latence", "--self-test"])
+            .validate()
+            .expect_err("faible latence + self-test");
+        assert!(err.contains("--self-test"), "{err}");
+    }
+
+    /// `--periode-ms` ne veut rien dire seule, et sa valeur reste dans des bornes
+    /// plausibles pour une période de moteur audio.
+    #[test]
+    fn la_periode_demandee_suppose_la_faible_latence() {
+        let err = parse(&["--periode-ms", "3"])
+            .validate()
+            .expect_err("période sans faible latence");
+        assert!(err.contains("--faible-latence"), "{err}");
+
+        assert!(parse(&["--faible-latence", "--periode-ms", "3"])
+            .validate()
+            .is_ok());
+        assert_eq!(
+            parse(&["--faible-latence", "--periode-ms", "2.5"]).periode_ms,
+            Some(2.5)
+        );
+        // `--periode-ms=-1` et non `--periode-ms -1` : clap prendrait la valeur
+        // négative pour une option courte inconnue.
+        for hors in ["--periode-ms=0", "--periode-ms=-1", "--periode-ms=501"] {
+            let err = parse(&["--faible-latence", hors])
+                .validate()
+                .expect_err(hors);
+            assert!(err.contains("--periode-ms"), "{err}");
+        }
+        assert!(parse(&["--faible-latence", "--periode-ms=nan"])
+            .validate()
+            .is_err());
+    }
+
+    /// Tout le reste de la ligne de commande continue de marcher avec
+    /// `--faible-latence` : il ne change que le **mode d'ouverture** des deux flux.
+    /// Les options `--cable-*`, qui n'ouvrent aucun flux, ne sont pas concernées —
+    /// c'est même la combinaison qu'on lance pour lire le transport pendant une
+    /// passe.
+    #[test]
+    fn la_faible_latence_se_combine_avec_le_reste() {
+        let a = parse(&[
+            "--faible-latence",
+            "--render",
+            "Conduit 1",
+            "--capture",
+            "Conduit 1",
+            "--repeat",
+            "10",
+            "--seconds",
+            "20",
+        ]);
+        assert!(a.validate().is_ok());
+        assert!(a.faible_latence);
+        assert_eq!(a.repeat, 10);
+        assert_eq!(a.seconds, 20.0);
+        assert!(parse(&["--faible-latence", "--no-capture"])
+            .validate()
+            .is_ok());
+        assert!(parse(&["--faible-latence", "--cable-transport"])
             .validate()
             .is_ok());
     }
