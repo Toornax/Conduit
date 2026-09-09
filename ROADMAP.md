@@ -549,6 +549,28 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   enregistrés. La rupture est entre le magasin des formats et ce que Windows obtient de la
   broche. Premier suspect : le `unwrap_or_else(wave_render_filter_default)` de `wave.rs`,
   qui **avale une variante introuvable en silence**.
+  *Instruction du 2026-09-09, à la table plutôt qu'en machine — trois suspects écartés,
+  preuve à l'appui* : le pilote **livré** a été démonté (en-tête PE, table des symboles du
+  `.map`, contenu de `.rdata`, table de relocation). Les quatre tables de descripteurs y
+  sont **exactes, entrée par entrée** : les 24 rangées de `SYSTEM_RANGE_VALUES` portent bien
+  (44,1 / 48 / 96 kHz) × (1 à 8 canaux) × (F32 32, PCM 24, I16 16), dans l'ordre annoncé ;
+  les 24 rangées de `SYSTEM_RANGES_TABLE` visent bien leur propre triplet de plages ; les
+  48 broches système visent bien leur propre rangée de pointeurs, avec `DataRangesCount = 3`
+  et une instance ; les 48 descripteurs de filtre wave visent bien leur propre paire de
+  broches, `Nodes` nul et une connexion ; les 32 filtres de topologie visent bien leur propre
+  paire de broches et le GUID de nom de **leur** câble (`Data4[7]` = 0 à 15) ; et les
+  **1 072** pointeurs logés dans `.rdata`/`.data` ont tous leur relocation, aucun n'en
+  manque. Conséquences : (1) aucun décalage d'index dans `variant_of` ni dans l'indexation
+  des tables ; (2) le repli silencieux ne peut **pas** produire le symptôme — il rend la
+  variante 9, dont les octets sont ceux que Conduit 1 sert et qui marche ; (3) les deux bouts
+  d'un même câble s'accordent, table pour table. Les seize câbles reçoivent des descripteurs
+  **identiques** au format par défaut : le pilote ne peut donc pas être la source d'une
+  différence *entre* câbles à format égal. Reste à instruire, dans l'ordre : ce que Windows
+  fait de la **troisième** plage (PCM 24 bits en conteneur de trois octets, la seule chose
+  que M1b-05 ajoute à ce que la broche déclarait) et le moment où l'endpoint d'un câble
+  activé **après** le démarrage se voit attribuer son `PKEY_AudioEngine_DeviceFormat` —
+  l'expérience qui tranche est de retirer la plage PCM24 de `SAMPLE_DEPTHS` et de rejouer la
+  séquence, ce qui ramène la broche à ce qu'elle déclarait avant M1b-05.
 - [ ] **M1b-06** `feat(driver): gestion d'alimentation et arrêt propre`
   *Fait quand* : veille/reprise 50 fois avec flux ouvert, sans erreur ni fuite.
   *Code livré le 2026-09-09* : enveloppe de `PcRegisterAdapterPowerManagement`,
@@ -616,7 +638,9 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   compare le nombre de canaux demandé **sans vérifier que celui de l'entrée soit
   représentable** — un format accepté dont `layout()` vaut `None`. Inatteignable tant que la
   liste supportée était une `const` à deux canaux ; **M1b-05 la construit à l'exécution**.
-  Passé à la correction de M1b-05.
+  *Corrigé le 2026-09-09* : `accepts` commence par refuser une entrée sans trame, et le test
+  `accepts_refuse_une_entree_sans_trame` rejoue l'entrée déclenchante du fuzzer (demande et
+  entrée toutes deux à `channels: 0`). Il échoue sans la garde, passe avec.
 - [ ] **M1b-09** `test(driver): 1000 cycles activation/désactivation et 48 h de stress`
   *Fait quand* : aucune fuite (pool tags stables), aucun BSOD, Driver Verifier actif.
   **Reporté (2026-09-08)** : la priorité va au fonctionnel. La campagne d'une heure sous

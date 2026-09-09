@@ -257,7 +257,21 @@ impl MiniportTopology for TopoRender {
         // (même idiome que `cable::NodeState::volume`). `n < CABLE_COUNT` est garanti par
         // l'appelant : `adapter::install_cable` ne construit ce miniport que pour un
         // câble dont `cable::cable(n)` et `portcls::subdevice_names(n)` ont répondu.
-        topo_render_filter(self.n).unwrap_or_else(topo_render_filter_0)
+        //
+        // Le repli se dit, comme celui de `wave::WaveRender::description` : deux endpoints
+        // portant le nom du câble 0 seraient indistinguables dans le panneau de son, et
+        // rien d'autre ne le signalerait.
+        match topo_render_filter(self.n) {
+            Some(filtre) => filtre,
+            None => {
+                kmd_log!(
+                    "TopoRender{} : aucun descripteur pour ce câble — repli sur celui du \
+                     câble 0, l'endpoint portera le mauvais nom",
+                    self.n
+                );
+                topo_render_filter_0()
+            }
+        }
     }
 }
 
@@ -431,8 +445,18 @@ impl MiniportTopology for TopoCapture {
 
     // IRQL: PASSIVE_LEVEL
     fn description(&self) -> &'static PCFILTER_DESCRIPTOR {
-        // Repli documenté sur le câble 0 : voir `TopoRender::description`.
-        topo_capture_filter(self.n).unwrap_or_else(topo_capture_filter_0)
+        // Repli documenté sur le câble 0, et dit : voir `TopoRender::description`.
+        match topo_capture_filter(self.n) {
+            Some(filtre) => filtre,
+            None => {
+                kmd_log!(
+                    "TopoCapture{} : aucun descripteur pour ce câble — repli sur celui du \
+                     câble 0, l'endpoint portera le mauvais nom",
+                    self.n
+                );
+                topo_capture_filter_0()
+            }
+        }
     }
 }
 

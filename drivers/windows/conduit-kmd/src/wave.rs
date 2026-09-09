@@ -232,7 +232,27 @@ impl MiniportWaveRT for WaveRender {
         // variante par défaut n'est là que pour qu'aucun chemin ne panique (même idiome
         // que `topo::TopoRender::description`). Il est inatteignable pour un format sorti
         // de `CableFormat::sanitize`, seul chemin d'écriture du magasin.
-        wave_render_filter(cable_format(self.n)).unwrap_or_else(wave_render_filter_default)
+        //
+        // **Le repli se dit.** Un `unwrap_or_else` nu avalait ici la seule panne que ce
+        // chemin sache produire — un endpoint servant un format que personne n'a demandé —
+        // et rien, nulle part, ne l'aurait signalée. Ce que ce module peut en dire est
+        // limité (`kmd_log!` est vide en release) ; le garde-fou qui compte est
+        // `descriptors::check_cable_pins`, appelé par `adapter::start_device` et qui, lui,
+        // écrit au journal d'événements.
+        let format = cable_format(self.n);
+        match wave_render_filter(format) {
+            Some(filtre) => filtre,
+            None => {
+                kmd_log!(
+                    "WaveRender{} : aucune variante pour {} Hz sur {} canaux — repli sur le \
+                     format par défaut, l'endpoint ne servira pas ce que le registre annonce",
+                    self.n,
+                    format.sample_rate,
+                    format.channels
+                );
+                wave_render_filter_default()
+            }
+        }
     }
 
     // IRQL: PASSIVE_LEVEL
@@ -289,10 +309,24 @@ impl MiniportWaveRT for WaveCapture {
 
     // IRQL: PASSIVE_LEVEL
     fn description(&self) -> &'static PCFILTER_DESCRIPTOR {
-        // Voir `WaveRender::description` : même variante, l'autre sens. Les deux bouts du
-        // câble lisent le **même** `cable_format(n)`, ce qui est exactement ce qui les
-        // empêche de se désaccorder.
-        wave_capture_filter(cable_format(self.n)).unwrap_or_else(wave_capture_filter_default)
+        // Voir `WaveRender::description` : même variante, l'autre sens, et le même repli
+        // qui se dit. Les deux bouts du câble lisent le **même** `cable_format(n)`, ce qui
+        // est exactement ce qui les empêche de se désaccorder — et
+        // `descriptors::check_cable_pins` le vérifie sur les deux au démarrage.
+        let format = cable_format(self.n);
+        match wave_capture_filter(format) {
+            Some(filtre) => filtre,
+            None => {
+                kmd_log!(
+                    "WaveCapture{} : aucune variante pour {} Hz sur {} canaux — repli sur le \
+                     format par défaut, l'endpoint ne servira pas ce que le registre annonce",
+                    self.n,
+                    format.sample_rate,
+                    format.channels
+                );
+                wave_capture_filter_default()
+            }
+        }
     }
 
     // IRQL: PASSIVE_LEVEL

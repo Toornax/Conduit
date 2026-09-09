@@ -880,6 +880,21 @@ impl CableFormat {
     pub const fn rate_index(self) -> Option<usize> {
         sample_rate_index(self.sample_rate)
     }
+
+    /// L'index de **variante de descripteurs** de ce format, ou `None` s'il n'en a pas.
+    ///
+    /// C'est la seule traduction « format d'un câble → rangée des tables KS » du dépôt,
+    /// et elle est ici plutôt que dans le pilote pour être testable en mode utilisateur
+    /// (voir la matrice de [`crate::format`]). `None` est **impossible** pour un format
+    /// sorti de [`Self::sanitize`] ou de [`Self::decode`] — les deux bornent la fréquence
+    /// aux trois et les canaux à `MIN_CHANNELS..=MAX_CHANNELS` —, ce que l'assertion
+    /// `const` ci-dessous dit du défaut et ce que les tests disent de tout le domaine.
+    /// L'appelant qui reçoit quand même `None` tient la preuve d'une divergence entre ce
+    /// magasin et la matrice, et le pilote la consigne au journal d'événements.
+    #[must_use]
+    pub const fn variant(self) -> Option<usize> {
+        crate::format::variant_of(self.sample_rate, self.channels)
+    }
 }
 
 // L'encodage du défaut est bien celui qu'on annonce partout — dans l'INF, dans la
@@ -887,6 +902,10 @@ impl CableFormat {
 // un pilote qui en attend une autre : tous les câbles se replieraient, avec seize lignes
 // de journal, sur un format qui se trouverait être le bon.
 const _: () = assert!(CABLE_FORMAT_DEFAULT.encode() == 0x0002_0302);
+// Le défaut a bien une variante, et c'est celle qu'on croit : 48 kHz (rang 1) sur 2 canaux,
+// donc 1 × 8 + 1 = 9. C'est la rangée sur laquelle tout se replie ; qu'elle existe est ce
+// qui rend le repli du pilote sûr.
+const _: () = assert!(matches!(CABLE_FORMAT_DEFAULT.variant(), Some(9)));
 const _: () = assert!(matches!(
     CableFormat::decode(0x0002_0302),
     Ok(f) if f.sample_rate == RATE_48000 && f.channels == 2

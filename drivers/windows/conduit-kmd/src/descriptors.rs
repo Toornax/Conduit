@@ -67,7 +67,9 @@
 //!   pointent.
 //! - Les **plages système** des filtres wave varient, depuis M1b-05, par **variante de
 //!   format** : la fréquence et le nombre de canaux du câble, soit
-//!   `3 × 8 = `[`VARIANT_COUNT`] combinaisons ([`variant_of`]). Les filtres wave sont donc
+//!   `3 × 8 = `[`VARIANT_COUNT`] combinaisons (`conduit_kmd_core::variant_of`, qui **n'est
+//!   plus ici** : l'arithmétique des variantes est dans le crate portable depuis la
+//!   correction de M1b-05, pour être testée en mode utilisateur). Les filtres wave sont donc
 //!   eux aussi des tables — [`WAVE_RENDER_FILTERS`], [`WAVE_CAPTURE_FILTERS`] — mais
 //!   indexées par variante et non par câble : deux câbles réglés pareil partagent la même
 //!   rangée, et c'est ce qui garde la table à 24 entrées au lieu de 16.
@@ -108,12 +110,24 @@
 //! sortie ; c'est pourquoi les constantes sont nommées par filtre et non par rôle.
 //!
 //! Ce crate ne se teste pas en mode utilisateur : les invariants (nombre de broches,
-//! orientation, tailles des structures, cohérence avec `conduit_kmd_core::M1A_FORMATS`,
-//! bonne formation du graphe de topologie et des tables d'automatisation) sont des
-//! assertions `const`, vérifiées à la compilation. Ce sont les **seules** vérifications
-//! disponibles ici, et deux d'entre elles attrapent des pannes muettes : une table de
-//! connexions incohérente ne donne « aucun endpoint, aucun message d'erreur », et une
-//! table d'automatisation mal remplie fait taire la propriété sans rien signaler.
+//! orientation, tailles des structures, cohérence avec la matrice de
+//! `conduit_kmd_core::format`, bonne formation du graphe de topologie et des tables
+//! d'automatisation) sont des assertions `const`, vérifiées à la compilation. Deux d'entre
+//! elles attrapent des pannes muettes : une table de connexions incohérente ne donne
+//! « aucun endpoint, aucun message d'erreur », et une table d'automatisation mal remplie
+//! fait taire la propriété sans rien signaler.
+//!
+//! # Ce que les assertions `const` ne voient pas, et qui le voit (correction de M1b-05)
+//!
+//! Elles vérifient les **tables**, c'est-à-dire ce qui est écrit à la compilation. Elles ne
+//! disent rien de ce qui se décide au **démarrage** : quel format le registre a posé dans
+//! [`CABLE_FORMATS`], quelle rangée `wave::description` en tirera, ni ce que PortCls lira au
+//! bout des pointeurs `DataRanges`. C'est là que se logeait le seul repli muet du module —
+//! les `unwrap_or_else` de `wave.rs`, qui rendent la variante du défaut sans que rien ne le
+//! dise. [`check_cable_pins`] referme cet intervalle : `adapter::start_device` l'appelle
+//! pour chaque câble de la réserve, **avant** le premier `GetDescription`, et une divergence
+//! part au journal d'événements — donc visible en release, sans débogueur, là où
+//! `kmd_log!` est vide.
 
 use core::fmt;
 use core::mem::size_of;
@@ -121,7 +135,9 @@ use core::ptr;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use conduit_kmd_core::config::{CABLE_FORMAT_DEFAULT, CableFormat};
-use conduit_kmd_core::{FORMATS_PER_CABLE, FrameLayout, SAMPLE_DEPTHS, SAMPLE_RATES, SampleFormat};
+use conduit_kmd_core::{
+    FORMATS_PER_CABLE, FrameLayout, SAMPLE_DEPTHS, SAMPLE_RATES, SampleFormat, VARIANT_COUNT,
+};
 use portcls::{
     CABLE_COUNT, CABLE_STATE_ACCESS_FLAGS, JACK_ACCESS_FLAGS, JACK_EVENT_FLAGS,
     JACK_INFO_CHANGE_ID, PIN_NAME_GUIDS, VERSION_ACCESS_FLAGS, cable_state_item,
@@ -206,105 +222,49 @@ pub const MAX_CHANNELS: usize = FrameLayout::MAX_CHANNELS as usize;
 /// Nombre de fréquences d'échantillonnage servables (`conduit_kmd_core::SAMPLE_RATES`).
 pub const RATE_COUNT: usize = SAMPLE_RATES.len();
 
-/// Nombre de **variantes de descripteurs wave** : une par couple (fréquence, canaux).
-///
-/// **24, et non 72.** La profondeur ne multiplie rien : les trois sont déclarées dans
-/// toutes les variantes, parce que `copy_frames` les convertit à la volée et que les deux
-/// bouts d'un câble n'ont donc pas à s'accorder dessus. Seuls la fréquence et le nombre de
-/// canaux figent quelque chose (voir l'en-tête de `conduit_kmd_core::format`).
-pub const VARIANT_COUNT: usize = RATE_COUNT.saturating_mul(MAX_CHANNELS);
-
 /// Nombre de plages système par broche : une par profondeur.
 pub const RANGES_PER_SYSTEM_PIN: usize = FORMATS_PER_CABLE;
 
-/// L'index de variante du couple (`rate_index`, `channels`), ou `None` hors domaine.
-///
-/// Rangement : les huit comptes de canaux d'une fréquence sont contigus, ce qui rend la
-/// table lisible dans un vidage mémoire — les entrées 0 à 7 sont le 44,1 kHz, 8 à 15 le
-/// 48 kHz, 16 à 23 le 96 kHz.
-#[must_use]
-pub const fn variant_index(rate_index: usize, channels: u8) -> Option<usize> {
-    if rate_index >= RATE_COUNT || channels == 0 || channels as usize > MAX_CHANNELS {
-        return None;
-    }
-    // `rate_index < 3` et `channels ≤ 8` : le produit vaut au plus 23, sans débordement
-    // possible. Les `checked_*` remplacent des opérateurs que les lints du crate refusent.
-    match rate_index.checked_mul(MAX_CHANNELS) {
-        Some(base) => base.checked_add((channels as usize).wrapping_sub(1)),
-        None => None,
-    }
-}
-
-/// L'index de variante d'un [`CableFormat`], ou `None` si sa fréquence n'est pas une des
-/// trois (impossible pour un format sorti de `CableFormat::sanitize`).
-#[must_use]
-pub const fn variant_of(format: CableFormat) -> Option<usize> {
-    match format.rate_index() {
-        Some(rate_index) => variant_index(rate_index, format.channels),
-        None => None,
-    }
-}
-
 /// L'index de variante du format par défaut (48 kHz, 2 canaux) : le repli de toutes les
 /// fonctions de sélection, et le seul index dont on puisse prouver l'existence en `const`.
-pub const DEFAULT_VARIANT: usize = match variant_of(CABLE_FORMAT_DEFAULT) {
+pub const DEFAULT_VARIANT: usize = match CABLE_FORMAT_DEFAULT.variant() {
     Some(index) => index,
-    // Inatteignable : le défaut est dans le domaine, ce que l'assertion ci-dessous
-    // reformule. Un `0` plutôt qu'un `panic!`, interdit en noyau comme en `const` ici.
+    // Inatteignable : le défaut est dans le domaine, ce que l'assertion `const` de
+    // `conduit_kmd_core::config` établit. Un `0` plutôt qu'un `panic!`, interdit ici.
     None => 0,
 };
 
-/// Fréquence de la variante `variant`, en Hz ; 48 000 hors domaine (repli du défaut).
+/// Fréquence de la variante `variant`, en Hz ; celle du défaut hors domaine.
+///
+/// Total, parce que les constructeurs `const` des tables ne savent ni paniquer ni traiter
+/// une `Option` ; le repli est **inatteignable** pour `variant < VARIANT_COUNT` — c'est
+/// `conduit_kmd_core::variant_rate` qui le garantit, et
+/// [`variant_ranges_are_well_formed`] le recoupe sur les valeurs réellement bâties.
 const fn variant_rate(variant: usize) -> ULONG {
-    match conduit_kmd_core::sample_rate_at(variant.wrapping_div(MAX_CHANNELS)) {
+    match conduit_kmd_core::variant_rate(variant) {
         Some(hz) => hz,
         None => CABLE_FORMAT_DEFAULT.sample_rate,
     }
 }
 
-/// Nombre de canaux de la variante `variant` ; 1 hors domaine (le seul repli qui donne
-/// toujours une trame valide).
+/// Nombre de canaux de la variante `variant` ; celui du défaut hors domaine (voir
+/// [`variant_rate`]).
 const fn variant_channels(variant: usize) -> ULONG {
-    // `% 8` puis `+ 1` : l'inverse exact de `variant_index`, et le résultat est dans 1..=8
-    // quel que soit `variant`, y compris hors domaine.
-    variant.wrapping_rem(MAX_CHANNELS).wrapping_add(1) as ULONG
+    match conduit_kmd_core::variant_channels(variant) {
+        Some(canaux) => canaux as ULONG,
+        None => CABLE_FORMAT_DEFAULT.channels as ULONG,
+    }
 }
 
 const _: () = {
     assert!(RATE_COUNT == 3 && MAX_CHANNELS == 8);
     assert!(VARIANT_COUNT == 24, "3 fréquences × 8 canaux, pas 72");
     assert!(SAMPLE_DEPTHS.len() == RANGES_PER_SYSTEM_PIN && RANGES_PER_SYSTEM_PIN == 3);
-    // Le défaut a bien une variante, et c'est celle qu'on croit : 48 kHz (rang 1) sur
-    // 2 canaux, donc 1 × 8 + 1 = 9.
-    assert!(matches!(variant_of(CABLE_FORMAT_DEFAULT), Some(9)));
+    // La réciprocité de l'indexation est vérifiée — et **testée en mode utilisateur** —
+    // dans `conduit_kmd_core::format` depuis la correction de M1b-05 ; ici on ne garde que
+    // le lien avec les tables de ce module : le défaut a bien une variante, et c'est celle
+    // qu'on croit (48 kHz, rang 1, sur 2 canaux : 1 × 8 + 1 = 9).
     assert!(DEFAULT_VARIANT == 9 && DEFAULT_VARIANT < VARIANT_COUNT);
-    // `variant_index` et les deux accesseurs sont bien réciproques sur tout le domaine.
-    // Écrit en boucle `while` plutôt qu'en `for` (interdit en `const`) : c'est la seule
-    // vérification qui attrape un rangement inversé — 24 variantes toutes valides mais
-    // décalées d'un cran donneraient un câble à six canaux servi en quatre, sans un mot.
-    let mut rate_index = 0;
-    while rate_index < RATE_COUNT {
-        let mut channels = 1u8;
-        while channels as usize <= MAX_CHANNELS {
-            let variant = match variant_index(rate_index, channels) {
-                Some(v) => v,
-                None => 0,
-            };
-            assert!(variant < VARIANT_COUNT);
-            assert!(variant_channels(variant) == channels as ULONG);
-            let attendue = match conduit_kmd_core::sample_rate_at(rate_index) {
-                Some(hz) => hz,
-                None => 0,
-            };
-            assert!(variant_rate(variant) == attendue);
-            channels = channels.wrapping_add(1);
-        }
-        rate_index = rate_index.wrapping_add(1);
-    }
-    // Hors domaine : aucune variante, jamais un index qu'on indexerait quand même.
-    assert!(variant_index(RATE_COUNT, 2).is_none());
-    assert!(variant_index(0, 0).is_none());
-    assert!(variant_index(0, 9).is_none());
 };
 
 // ---------------------------------------------------------------------------------
@@ -1291,14 +1251,18 @@ pub fn cable_format(cable: u32) -> CableFormat {
 /// pas.
 #[must_use]
 pub fn wave_render_filter(format: CableFormat) -> Option<&'static PCFILTER_DESCRIPTOR> {
-    variant_of(format).and_then(|variant| WAVE_RENDER_FILTER_TABLE.get().get(variant))
+    format
+        .variant()
+        .and_then(|variant| WAVE_RENDER_FILTER_TABLE.get().get(variant))
 }
 
 /// Descripteur du filtre `WaveCapture` servant `format`, `None` si sa variante n'existe
 /// pas.
 #[must_use]
 pub fn wave_capture_filter(format: CableFormat) -> Option<&'static PCFILTER_DESCRIPTOR> {
-    variant_of(format).and_then(|variant| WAVE_CAPTURE_FILTER_TABLE.get().get(variant))
+    format
+        .variant()
+        .and_then(|variant| WAVE_CAPTURE_FILTER_TABLE.get().get(variant))
 }
 
 /// Le filtre `WaveRender` du format par défaut, repli de [`wave_render_filter`].
@@ -1347,6 +1311,147 @@ pub fn topo_render_filter_0() -> &'static PCFILTER_DESCRIPTOR {
 pub fn topo_capture_filter_0() -> &'static PCFILTER_DESCRIPTOR {
     let [premier, ..] = TOPO_CAPTURE_FILTER_TABLE.get();
     premier
+}
+
+// ---------------------------------------------------------------------------------
+// Le garde-fou de bout en bout (correction de M1b-05).
+//
+// Les assertions `const` de ce module vérifient les **tables**. Elles ne disent rien du
+// chemin qui va du magasin `CABLE_FORMATS` — écrit au démarrage, depuis le registre — à la
+// rangée que `wave::description` finira par rendre, ni de ce que PortCls lira au bout des
+// pointeurs `DataRanges`. C'est précisément l'intervalle où un défaut serait **muet** : les
+// deux `unwrap_or_else` de `wave.rs` avalent une variante introuvable, et `kmd_log!` est
+// vide en release. [`check_cable_pins`] referme cet intervalle, à `StartDevice`, câble par
+// câble, et son échec part au **journal d'événements** — visible sans débogueur.
+// ---------------------------------------------------------------------------------
+
+/// Ce qui sépare le format retenu pour un câble de ce que sa broche système déclare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinMismatch {
+    /// Le format du câble n'a aucune variante : `wave::description` se replierait sur
+    /// celle du défaut, et l'endpoint servirait un autre format que la clé n'annonce.
+    SansVariante,
+    /// La variante existe mais la table de filtres du sens ne la contient pas.
+    SansFiltre(usize),
+    /// Le descripteur est là, mais sa broche système ne porte aucune plage audio lisible.
+    SansPlage(usize),
+    /// La broche déclare `(fréquence, canaux)` là où la clé annonce autre chose.
+    Plage {
+        /// Ce que la broche déclare : fréquence en Hz, nombre de canaux.
+        declares: (ULONG, ULONG),
+        /// Ce que le magasin des formats annonce.
+        attendus: (ULONG, ULONG),
+    },
+}
+
+impl fmt::Display for PinMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SansVariante => f.write_str(
+                "le format retenu n'a aucune variante de descripteurs (repli silencieux \
+                 sur celle du format par défaut)",
+            ),
+            Self::SansFiltre(variant) => write!(
+                f,
+                "la variante {variant} n'a pas de descripteur de filtre wave \
+                 (table de {VARIANT_COUNT} entrées)"
+            ),
+            Self::SansPlage(variant) => write!(
+                f,
+                "la broche système de la variante {variant} ne porte aucune plage audio"
+            ),
+            Self::Plage {
+                declares: (hz, canaux),
+                attendus: (hz_attendu, canaux_attendus),
+            } => write!(
+                f,
+                "la broche système déclare {hz} Hz sur {canaux} canaux, \
+                 le registre annonce {hz_attendu} Hz sur {canaux_attendus}"
+            ),
+        }
+    }
+}
+
+/// La fréquence et le nombre de canaux que la broche `pin` de `filter` déclare
+/// **réellement**, lus au bout des pointeurs que PortCls suivra ; `None` si cette broche
+/// n'existe pas ou ne porte pas de plage audio (une broche bridge, par exemple).
+fn declared_by_pin(filter: &'static PCFILTER_DESCRIPTOR, pin: ULONG) -> Option<(ULONG, ULONG)> {
+    let index = usize::try_from(pin).ok()?;
+    let count = usize::try_from(filter.PinCount).ok()?;
+    if index >= count || filter.Pins.is_null() {
+        return None;
+    }
+    // SAFETY: `filter` est une rangée d'une des tables `static` de ce module ; son champ
+    // `Pins` vise un tableau de `PinCount` `PCPIN_DESCRIPTOR` bâti en `const` dans ce même
+    // module, immuable et jamais libéré. `index < count`, donc le décalage reste dedans.
+    let descriptor = unsafe { &*filter.Pins.add(index) };
+    let ranges = descriptor.KsPinDescriptor.DataRanges;
+    if ranges.is_null() || descriptor.KsPinDescriptor.DataRangesCount == 0 {
+        return None;
+    }
+    // SAFETY: `DataRanges` vise un tableau de `DataRangesCount` pointeurs de plage logé
+    // dans `SYSTEM_RANGES_TABLE` ou dans `BRIDGE_RANGES` ; le compte est non nul, donc la
+    // première entrée existe.
+    let first = unsafe { *ranges };
+    if first.is_null() {
+        return None;
+    }
+    // SAFETY: `first` vise une `KSDATARANGE` — le préfixe commun aux deux formes de plage
+    // de ce module —, logée dans une `static` immuable. Lire l'en-tête est donc légitime
+    // avant de savoir laquelle des deux formes on tient.
+    let header = unsafe { (*first).__bindgen_anon_1 };
+    if header.FormatSize != KSDATARANGE_AUDIO_SIZE {
+        // Plage analogique (64 octets) : ce n'est pas une broche système. C'est ce
+        // contrôle qui rend l'élargissement ci-dessous sûr, plutôt qu'une convention.
+        return None;
+    }
+    // SAFETY: `FormatSize` annonce les 88 octets d'une `KSDATARANGE_AUDIO`, et toutes les
+    // plages de cette taille de ce module sont bâties par `audio_range` puis logées dans
+    // `SYSTEM_RANGE_VALUES` : l'élargissement du type ne dépasse pas l'objet.
+    let audio = unsafe { &*first.cast::<KSDATARANGE_AUDIO>() };
+    Some((audio.MinimumSampleFrequency, audio.MaximumChannels))
+}
+
+/// Vérifie que les **deux** broches système du câble `cable` déclareront bien la fréquence
+/// et le nombre de canaux que son format annonce.
+///
+/// C'est le seul contrôle du dépôt qui traverse toute la chaîne — magasin `CABLE_FORMATS`
+/// → variante → rangée de `WAVE_*_FILTER_TABLE` → tableau `DataRanges` → `KSDATARANGE_AUDIO`
+/// — et il la traverse **par les pointeurs que PortCls suivra**, pas par les valeurs qui ont
+/// servi à les bâtir. Un décalage d'index, une variante introuvable, une rangée qui ne
+/// correspondrait plus : tout cela se dit ici, au démarrage, dans le journal d'événements.
+///
+/// Les deux sens sont contrôlés ensemble et **doivent** s'accorder : c'est l'accord des deux
+/// bouts d'un câble, celui sans lequel `copy_frames` refuserait de copier
+/// (`RingError::ChannelMismatch`).
+///
+/// IRQL : quelconque ; ne lit que des `static` immuables et un atomique.
+///
+/// # Erreurs
+///
+/// [`PinMismatch`], qui nomme le maillon rompu.
+pub fn check_cable_pins(cable: u32) -> Result<(), PinMismatch> {
+    let format = cable_format(cable);
+    let variant = format.variant().ok_or(PinMismatch::SansVariante)?;
+    let attendus = (format.sample_rate, ULONG::from(format.channels));
+    let render = WAVE_RENDER_FILTER_TABLE
+        .get()
+        .get(variant)
+        .ok_or(PinMismatch::SansFiltre(variant))?;
+    let capture = WAVE_CAPTURE_FILTER_TABLE
+        .get()
+        .get(variant)
+        .ok_or(PinMismatch::SansFiltre(variant))?;
+    for (filtre, broche) in [
+        (render, WAVE_RENDER_PIN_SYSTEM),
+        (capture, WAVE_CAPTURE_PIN_SYSTEM),
+    ] {
+        let declares = declared_by_pin(filtre, broche).ok_or(PinMismatch::SansPlage(variant))?;
+        if declares != attendus {
+            return Err(PinMismatch::Plage { declares, attendus });
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------
@@ -1480,10 +1585,7 @@ const fn variant_ranges_are_well_formed() -> bool {
         let frequence = variant_rate(variant);
         // La variante doit se retrouver depuis ses propres valeurs : c'est le contrôle
         // qui attrape un rangement décalé d'un cran.
-        let index = match conduit_kmd_core::sample_rate_index(frequence) {
-            Some(rate_index) => variant_index(rate_index, canaux as u8),
-            None => None,
-        };
+        let index = conduit_kmd_core::variant_of(frequence, canaux as u8);
         if !matches!(index, Some(i) if i == variant) {
             return false;
         }

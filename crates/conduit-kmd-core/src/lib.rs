@@ -87,8 +87,9 @@ pub use config::{
 pub use format::{
     buffer_bytes, buffer_bytes_for_notifications, buffer_bytes_for_notifications_with_floor,
     buffer_bytes_with_floor, cable_formats, sample_rate_at, sample_rate_index, validate,
-    FormatError, RequestedFormat, SampleKind, SupportedFormat, FORMATS_PER_CABLE, SAMPLE_DEPTHS,
-    SAMPLE_RATES,
+    variant_channels, variant_index, variant_of, variant_rate, FormatError, RequestedFormat,
+    SampleKind, SupportedFormat, FORMATS_PER_CABLE, MAX_CHANNELS_PER_CABLE, SAMPLE_DEPTHS,
+    SAMPLE_RATES, VARIANT_COUNT,
 };
 pub use loopback::{CopyOp, Loopback, Plan, SilenceCause, SilenceOp, StreamView, LEAD_MS};
 pub use notify::{align_frames, boundaries_crossed, Notifier};

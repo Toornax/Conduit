@@ -88,7 +88,27 @@ impl SupportedFormat {
     /// le tampon avec un pas de 3 là où le moteur audio écrit avec un pas de 4 — un
     /// décalage qui grandit d'un octet par échantillon, c'est-à-dire du bruit. Le moteur
     /// se rabat alors sur un format que nous déclarons vraiment.
+    ///
+    /// # Une entrée dont la trame n'existe pas n'accepte rien (M1b-05)
+    ///
+    /// Le premier contrôle porte sur **l'entrée**, pas sur la demande : une
+    /// [`SupportedFormat`] dont [`Self::layout`] vaut `None` — `channels == 0`, ou
+    /// au-delà de [`FrameLayout::MAX_CHANNELS`] — ne décrit **aucune trame**. L'accepter
+    /// rendrait à [`validate`] un format que l'appelant croirait servable et dont il ne
+    /// saurait pas dimensionner la trame : `wave::open_stream` le passe tel quel à
+    /// `stream::WaveStream::new`, qui doit alors traiter un `layout()` absent sur un
+    /// format qu'on vient de lui dire supporté.
+    ///
+    /// Le trou était **inatteignable** tant que la liste supportée était une `const` à
+    /// deux canaux (`M1A_FORMATS`) ; M1b-05 la construit à l'exécution
+    /// ([`cable_formats`], depuis le registre), et il a fallu ce contrôle. Trouvé par le
+    /// fuzzing de M1b-08, entrée déclenchante consignée dans le test
+    /// `accepts_refuse_une_entree_sans_trame` : demande et entrée toutes deux à
+    /// `channels: 0`, que l'égalité seule laissait passer.
     pub fn accepts(self, requested: &RequestedFormat) -> bool {
+        if self.layout().is_none() {
+            return false;
+        }
         if requested.sample_rate != self.sample_rate
             || requested.channels != u16::from(self.channels)
         {
@@ -144,8 +164,10 @@ pub const FORMATS_PER_CABLE: usize = SAMPLE_DEPTHS.len();
 ///
 /// Aucune validation ici — `sample_rate` et `channels` viennent d'une
 /// `crate::config::CableFormat`, déjà écrêtée. Une valeur aberrante ne produirait qu'un
-/// format que personne ne demande (et [`SupportedFormat::layout`] rendrait `None` pour
-/// `channels == 0`), jamais une panique.
+/// format que personne ne demande, jamais une panique : depuis M1b-08,
+/// [`SupportedFormat::accepts`] refuse **de lui-même** une entrée dont
+/// [`SupportedFormat::layout`] vaut `None`, si bien qu'une liste bâtie sur `channels == 0`
+/// n'accepte plus rien plutôt que d'accepter un format sans trame.
 #[must_use]
 pub const fn cable_formats(sample_rate: u32, channels: u8) -> [SupportedFormat; FORMATS_PER_CABLE] {
     [
@@ -194,6 +216,118 @@ pub const fn sample_rate_at(index: usize) -> Option<u32> {
         _ => None,
     }
 }
+
+// ---------------------------------------------------------------------------------
+// La matrice des variantes de descripteurs (M1b-05, §5.4).
+//
+// Cette arithmétique **vivait dans `conduit_kmd::descriptors`**, c'est-à-dire dans le seul
+// crate du dépôt qui ne se teste pas en mode utilisateur : ses seules vérifications étaient
+// des assertions `const`, et une assertion `const` ne dit rien de ce qu'elle ne sait pas
+// lire. Elle est ici depuis la correction de M1b-05 — pure, sans le moindre type du WDK,
+// donc testable et fuzzable comme le reste du crate. Le pilote n'en garde que la
+// construction des tables KS.
+// ---------------------------------------------------------------------------------
+
+/// Nombre maximal de canaux d'un câble (SPEC F-03), du type des index d'ici.
+pub const MAX_CHANNELS_PER_CABLE: usize = FrameLayout::MAX_CHANNELS as usize;
+
+/// Nombre de **variantes de descripteurs** d'un sens : une par couple (fréquence, canaux).
+///
+/// **24, et non 72.** La profondeur ne multiplie rien : les trois de [`SAMPLE_DEPTHS`] sont
+/// déclarées dans toutes les variantes, parce que [`crate::ring::copy_frames`] les convertit
+/// à la volée et que les deux bouts d'un câble n'ont donc pas à s'accorder dessus. Seuls la
+/// fréquence et le nombre de canaux figent quelque chose (voir l'en-tête de module).
+pub const VARIANT_COUNT: usize = SAMPLE_RATES.len().saturating_mul(MAX_CHANNELS_PER_CABLE);
+
+/// L'index de variante du couple (`rate_index`, `channels`), ou `None` hors domaine.
+///
+/// Rangement : les huit comptes de canaux d'une fréquence sont contigus, ce qui rend la
+/// table lisible dans un vidage mémoire — les entrées 0 à 7 sont le 44,1 kHz, 8 à 15 le
+/// 48 kHz, 16 à 23 le 96 kHz. [`variant_rate`] et [`variant_channels`] en sont les
+/// réciproques exactes, ce que les tests d'ici vérifient sur les 24.
+#[must_use]
+pub const fn variant_index(rate_index: usize, channels: u8) -> Option<usize> {
+    if rate_index >= SAMPLE_RATES.len()
+        || channels == 0
+        || channels as usize > MAX_CHANNELS_PER_CABLE
+    {
+        return None;
+    }
+    // `rate_index < 3` et `channels ≤ 8` : le produit vaut au plus 23, sans débordement
+    // possible. Les `checked_*` remplacent des opérateurs que les lints du crate refusent.
+    match rate_index.checked_mul(MAX_CHANNELS_PER_CABLE) {
+        Some(base) => base.checked_add((channels as usize).wrapping_sub(1)),
+        None => None,
+    }
+}
+
+/// L'index de variante du couple (`sample_rate`, `channels`), ou `None` si la fréquence
+/// n'est pas une des trois de [`SAMPLE_RATES`] ou le compte de canaux hors de `1..=8`.
+#[must_use]
+pub const fn variant_of(sample_rate: u32, channels: u8) -> Option<usize> {
+    match sample_rate_index(sample_rate) {
+        Some(rate_index) => variant_index(rate_index, channels),
+        None => None,
+    }
+}
+
+/// La fréquence de la variante `variant`, en Hz, ou `None` au-delà de la dernière.
+///
+/// **`Option`, et pas un repli.** La version d'origine rendait 48 000 Hz hors domaine et
+/// [`variant_channels`] y bouclait sur `1..=8` : deux replis muets, dans le module même dont
+/// l'en-tête dit que son pire mode de panne est silencieux. Ici, hors domaine se dit.
+#[must_use]
+pub const fn variant_rate(variant: usize) -> Option<u32> {
+    if variant >= VARIANT_COUNT {
+        return None;
+    }
+    sample_rate_at(variant.wrapping_div(MAX_CHANNELS_PER_CABLE))
+}
+
+/// Le nombre de canaux de la variante `variant`, ou `None` au-delà de la dernière (voir
+/// [`variant_rate`] sur l'absence de repli).
+#[must_use]
+pub const fn variant_channels(variant: usize) -> Option<u8> {
+    if variant >= VARIANT_COUNT {
+        return None;
+    }
+    // `variant < 24`, donc le reste est dans `0..8` et le `+ 1` dans `1..=8` : la
+    // conversion ne perd rien.
+    Some(variant.wrapping_rem(MAX_CHANNELS_PER_CABLE).wrapping_add(1) as u8)
+}
+
+// La matrice est bien celle qu'on annonce partout — 24 variantes, huit canaux, trois
+// fréquences — et l'aller-retour index → (fréquence, canaux) → index est l'identité sur
+// tout le domaine. C'est la vérification qui attrape un rangement décalé d'un cran : 24
+// variantes toutes valides mais permutées donneraient un câble à six canaux servi en
+// quatre, sans un mot. Écrite en `while` (le `for` est interdit en `const`).
+const _: () = {
+    assert!(MAX_CHANNELS_PER_CABLE == 8 && SAMPLE_RATES.len() == 3);
+    assert!(VARIANT_COUNT == 24, "3 fréquences × 8 canaux, pas 72");
+    let mut variant = 0;
+    while variant < VARIANT_COUNT {
+        let rate = match variant_rate(variant) {
+            Some(hz) => hz,
+            None => 0,
+        };
+        let channels = match variant_channels(variant) {
+            Some(canaux) => canaux,
+            None => 0,
+        };
+        assert!(matches!(variant_of(rate, channels), Some(i) if i == variant));
+        variant = variant.wrapping_add(1);
+    }
+    // Hors domaine : aucune variante, jamais un index qu'on indexerait quand même.
+    assert!(variant_index(SAMPLE_RATES.len(), 2).is_none());
+    assert!(variant_index(0, 0).is_none());
+    assert!(variant_index(0, 9).is_none());
+    assert!(variant_rate(VARIANT_COUNT).is_none());
+    assert!(variant_channels(VARIANT_COUNT).is_none());
+    assert!(variant_of(0, 2).is_none());
+    assert!(variant_of(RATE_48000, 0).is_none());
+    // Le format d'un câble neuf : 48 kHz (rang 1) sur 2 canaux, donc 1 × 8 + 1 = 9.
+    assert!(matches!(variant_of(RATE_48000, 2), Some(9)));
+};
 
 // Les deux écritures de la liste des fréquences disent la même chose. Sans cette
 // assertion, ajouter une fréquence à `SAMPLE_RATES` sans toucher aux deux `match`
@@ -624,6 +758,131 @@ mod tests {
         };
         assert!(bad.layout().is_none());
         assert!(cable_formats(48_000, 9)[0].layout().is_none());
+    }
+
+    /// **Le trou du fuzzing de M1b-08**, corrigé avec M1b-05 : une entrée dont le nombre
+    /// de canaux n'est pas représentable est refusée, au lieu d'être acceptée par la seule
+    /// égalité des comptes.
+    ///
+    /// L'entrée déclenchante est celle que le fuzzer a consignée : demande et entrée
+    /// toutes deux à `channels: 0`. Avant la correction, `validate` rendait `Ok` d'un
+    /// format dont `layout()` vaut `None` — l'appelant croyait tenir un format servable et
+    /// n'avait pas de trame.
+    #[test]
+    fn accepts_refuse_une_entree_sans_trame() {
+        let sans_trame = SupportedFormat {
+            sample_rate: 0,
+            channels: 0,
+            format: SampleFormat::F32,
+        };
+        assert!(sans_trame.layout().is_none());
+        let demande = req(0, 0, 32, 32, SampleKind::Float);
+        assert!(!sans_trame.accepts(&demande));
+        assert_eq!(
+            validate(&demande, &[sans_trame]),
+            Err(FormatError::Unsupported)
+        );
+
+        // Le même trou par le haut : neuf canaux, au-delà de `FrameLayout::MAX_CHANNELS`.
+        let trop = SupportedFormat {
+            sample_rate: 48_000,
+            channels: 9,
+            format: SampleFormat::I16,
+        };
+        assert!(trop.layout().is_none());
+        assert!(!trop.accepts(&req(48_000, 9, 16, 16, SampleKind::Pcm)));
+
+        // Corollaire : toute liste rendue par `cable_formats` avec un compte aberrant
+        // n'accepte plus rien, quel que soit ce qu'on lui demande.
+        for canaux in [0u8, 9, 255] {
+            for jeu in cable_formats(48_000, canaux) {
+                assert!(jeu.layout().is_none(), "{canaux} canaux");
+                let bits = jeu.format.bits_per_sample() as u16;
+                let kind = if matches!(jeu.format, SampleFormat::F32) {
+                    SampleKind::Float
+                } else {
+                    SampleKind::Pcm
+                };
+                assert!(!jeu.accepts(&req(48_000, u16::from(canaux), bits, bits, kind)));
+            }
+        }
+
+        // Et rien n'a bougé pour un format servable : la garde ne mord que l'aberrant.
+        let [f32_, ..] = DEFAUT;
+        assert!(f32_.accepts(&req(48_000, 2, 32, 32, SampleKind::Float)));
+    }
+
+    /// Les 24 variantes : l'aller-retour est l'identité sur tout le domaine, et rien
+    /// au-dehors n'a d'index. C'est la vérification que le pilote ne pouvait pas faire —
+    /// `conduit-kmd` ne se teste pas en mode utilisateur.
+    #[test]
+    fn les_variantes_sont_reciproques_sur_tout_le_domaine() {
+        assert_eq!(VARIANT_COUNT, 24);
+        assert_eq!(MAX_CHANNELS_PER_CABLE, 8);
+        let mut vues = std::vec::Vec::new();
+        for (rang, rate) in SAMPLE_RATES.iter().enumerate() {
+            for channels in 1u8..=8 {
+                let variant = variant_index(rang, channels).unwrap();
+                assert!(variant < VARIANT_COUNT);
+                assert_eq!(variant_of(*rate, channels), Some(variant));
+                assert_eq!(variant_rate(variant), Some(*rate));
+                assert_eq!(variant_channels(variant), Some(channels));
+                vues.push(variant);
+            }
+        }
+        // Une variante et une seule par couple : la bijection, pas seulement l'injection.
+        vues.sort_unstable();
+        vues.dedup();
+        assert_eq!(vues.len(), VARIANT_COUNT);
+
+        // Le rangement annoncé : 0 à 7 le 44,1 kHz, 8 à 15 le 48 kHz, 16 à 23 le 96 kHz.
+        assert_eq!(variant_of(RATE_44100, 1), Some(0));
+        assert_eq!(variant_of(RATE_48000, 2), Some(9));
+        assert_eq!(variant_of(RATE_96000, 8), Some(23));
+
+        // Hors domaine, des deux côtés.
+        assert_eq!(variant_index(3, 2), None);
+        assert_eq!(variant_index(usize::MAX, 2), None);
+        assert_eq!(variant_index(0, 0), None);
+        assert_eq!(variant_index(0, 9), None);
+        assert_eq!(variant_index(0, u8::MAX), None);
+        assert_eq!(variant_of(44_101, 2), None);
+        assert_eq!(variant_of(0, 2), None);
+        assert_eq!(variant_of(RATE_48000, 0), None);
+        assert_eq!(variant_rate(VARIANT_COUNT), None);
+        assert_eq!(variant_rate(usize::MAX), None);
+        assert_eq!(variant_channels(VARIANT_COUNT), None);
+        assert_eq!(variant_channels(usize::MAX), None);
+    }
+
+    /// Chaque variante déclare exactement les trois profondeurs de **son** couple, et une
+    /// demande faite au format d'une **autre** variante est refusée. C'est l'accord des
+    /// deux bouts d'un câble, vérifié sur les 24 × 24 couples plutôt que sur un seul.
+    #[test]
+    fn chaque_variante_n_accepte_que_sa_ligne() {
+        for variante in 0..VARIANT_COUNT {
+            let rate = variant_rate(variante).unwrap();
+            let channels = variant_channels(variante).unwrap();
+            let jeu = cable_formats(rate, channels);
+            for autre in 0..VARIANT_COUNT {
+                let r = variant_rate(autre).unwrap();
+                let c = variant_channels(autre).unwrap();
+                for depth in SAMPLE_DEPTHS {
+                    let bits = depth.bits_per_sample() as u16;
+                    let kind = if matches!(depth, SampleFormat::F32) {
+                        SampleKind::Float
+                    } else {
+                        SampleKind::Pcm
+                    };
+                    let demande = req(r, u16::from(c), bits, bits, kind);
+                    assert_eq!(
+                        validate(&demande, &jeu).is_ok(),
+                        autre == variante,
+                        "variante {variante} contre {autre}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

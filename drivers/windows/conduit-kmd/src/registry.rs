@@ -167,7 +167,7 @@ const _: () = {
 ///
 /// L'octet de poids faible est le rang du paramètre dans [`Param::ALL`] ; l'octet
 /// au-dessus dit la nature de l'anomalie.
-mod code {
+pub(crate) mod code {
     /// La clé matérielle du périphérique n'a pas pu être ouverte.
     pub(super) const CLE: u32 = 0x0001_0000;
     /// Valeur absente de la clé.
@@ -182,6 +182,14 @@ mod code {
     pub(super) const CLE_ECRITURE: u32 = 0x0006_0000;
     /// `ZwSetValueKey` a échoué : l'état actif ne survivra pas au redémarrage.
     pub(super) const ECRITURE: u32 = 0x0007_0000;
+    /// La broche système d'un câble ne déclare pas le format que sa clé annonce
+    /// (`descriptors::check_cable_pins`, correction de M1b-05).
+    ///
+    /// Le seul code de ce module qui ne parle pas du registre mais de ce que le registre a
+    /// produit : il se compose avec [`super::RANG_FORMAT`] et le numéro du câble, comme les
+    /// codes de `CableFormat<n>`, pour qu'une entrée du journal désigne le câble fautif
+    /// sans son texte.
+    pub(crate) const DESCRIPTEUR: u32 = 0x0008_0000;
 }
 
 /// Rang du paramètre dans [`Param::ALL`], pour composer un `UniqueErrorValue`.
@@ -204,7 +212,7 @@ const RANG_MASQUE: u32 = 3;
 /// L'octet de poids faible d'un `UniqueErrorValue` porte donc directement le numéro du
 /// câble, décalé de 4 — c'est ce qui rend une entrée du journal exploitable sans le texte
 /// (voir [`crate::eventlog`]).
-const RANG_FORMAT: u32 = 4;
+pub(crate) const RANG_FORMAT: u32 = 4;
 
 // Les rangs des seize formats tiennent dans l'octet de poids faible du code d'événement :
 // au-delà, ils déborderaient sur l'octet qui dit la nature de l'anomalie, et deux pannes

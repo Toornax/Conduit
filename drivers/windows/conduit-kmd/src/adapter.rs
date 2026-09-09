@@ -49,9 +49,9 @@ use portcls_sys::{
 use crate::cable;
 use crate::descriptors::{
     TOPO_CAPTURE_PIN_BRIDGE, TOPO_RENDER_PIN_BRIDGE, WAVE_CAPTURE_PIN_BRIDGE,
-    WAVE_RENDER_PIN_BRIDGE,
+    WAVE_RENDER_PIN_BRIDGE, cable_format, check_cable_pins,
 };
-use crate::eventlog::EventLog;
+use crate::eventlog::{EventLog, kmd_event};
 use crate::power;
 use crate::registry;
 use crate::topo::{TopoCapture, TopoRender};
@@ -310,6 +310,44 @@ pub unsafe fn start_device(
     // ceinture, pas une correction — il garantit que la boucle ne demande jamais un câble
     // que `cable::cable(n)` ne connaît pas.
     let reserve = u32::from(params.reserve).min(cable::CABLE_COUNT);
+
+    // Le garde-fou de la correction de M1b-05, **avant** le premier `GetDescription`.
+    //
+    // Tout ce qui précède a posé le format de chaque câble dans le magasin de
+    // `descriptors` ; tout ce qui suit va demander à ce magasin une rangée de tables KS,
+    // dont PortCls gardera le pointeur à vie. Entre les deux, personne ne vérifiait rien :
+    // une variante introuvable est avalée par les `unwrap_or_else` de `wave.rs`, et
+    // `kmd_log!` est vide en release. `check_cable_pins` traverse la chaîne entière — par
+    // les pointeurs que PortCls suivra — et une divergence part au journal d'événements,
+    // lisible sans débogueur.
+    //
+    // Elle ne fait **pas** échouer `StartDevice` : un endpoint au mauvais format vaut mieux
+    // que pas de carte son du tout, c'est la règle du module `registry` et elle vaut ici.
+    for n in 0..reserve {
+        match check_cable_pins(n) {
+            Ok(()) => {
+                let format = cable_format(n);
+                kmd_log!(
+                    "StartDevice : câble {n} servira {} Hz sur {} canaux (variante {:?})",
+                    format.sample_rate,
+                    format.channels,
+                    format.variant()
+                );
+            }
+            Err(ecart) => {
+                kmd_log!("StartDevice : câble {n} — {ecart}");
+                kmd_event!(
+                    log,
+                    registry::code::DESCRIPTEUR
+                        .saturating_add(registry::RANG_FORMAT)
+                        .saturating_add(n),
+                    "câble {n} : {ecart}. L'endpoint apparaîtra, mais pas au format que la \
+                     clé du périphérique annonce."
+                );
+            }
+        }
+    }
+
     for n in 0..reserve {
         // SAFETY: contrat de la fonction relayé.
         if let Err(status) = unsafe { install_cable(device, irp, &resources, n) } {
