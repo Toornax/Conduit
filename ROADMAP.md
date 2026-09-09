@@ -541,19 +541,31 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   `BufferMs` enfin appliqué. Coût : **+20,3 Kio** de section de données.
   *La moitié espace utilisateur n'est pas faite* : ordre 8 du protocole, version 3,
   `conduitctl cable set-format`, et le format dans `CableSpec`/`CableInfo`.
-  **Régression mesurée le 2026-09-09, en cours de correction** : **un câble configuré pour
-  autre chose que deux canaux ne peut plus être activé.** Comparaison contrôlée, une seule
-  variable — le nombre de canaux configuré :
+  **Deux défauts trouvés en machine le 2026-09-09.**
+  *Le premier, corrigé* : un câble configuré pour autre chose que la stéréo ne pouvait plus
+  être **activé** (`Win32 87`). Le `SET` de `KSPROPERTY_CONDUIT_CABLE_STATE` comparait les
+  canaux de la requête à ceux configurés pour le câble, alors que le service envoyait
+  toujours 2 — défaut de frontière entre deux lots écrits en parallèle. Tranché en écrivant
+  la sémantique du champ : `channels` est un **écho vérifié**, comme `cable`, et un client
+  qui veut seulement brancher le jack renvoie ce que le `GET` vient de lui rendre. Le refus
+  nomme désormais la valeur attendue au lieu de rendre « code 87 ».
+  *Le second, ouvert* : **seule la variante par défaut produit un endpoint utilisable.**
+  Quatre câbles neufs, quatre formats, activés par la propriété KS, une dimension à la fois :
 
-  | Câble | `CableFormat<n>` | `conduit-helper activer` |
-  |---|---|---|
-  | 4 | `0x00020302` — 48 kHz, **2** canaux | succès |
-  | 3 | `0x00060303` — 96 kHz, **6** canaux | **refus, Win32 87** |
+  | Format du câble | Endpoint obtenu |
+  |---|---|
+  | 48 kHz, 2 canaux — **témoin** | 2 canaux, 48000 Hz, 16 bits |
+  | 48 kHz, **6 canaux** | **aucun format** |
+  | **96 kHz**, 2 canaux | **aucun format** |
+  | 48 kHz, 2 canaux, PCM24 préférée | 2 canaux, 48000 Hz, 16 bits |
 
-  Le `SET` de `KSPROPERTY_CONDUIT_CABLE_STATE` compare désormais les canaux de la requête à
-  ceux **configurés pour le câble visé**, alors que le service envoie toujours 2. Défaut de
-  frontière entre deux lots écrits en parallèle : le pilote a changé de contrat, le client
-  ne le sait pas.
+  « Aucun format » : l'endpoint existe et devient actif, mais `IAudioClient::GetMixFormat`
+  échoue. Ce qui est **écarté** : les tables du binaire livré sont exactes entrée par entrée
+  (démontage du PE, relocations comprises) ; le garde-fou `check_cable_pins`, qui traverse
+  la chaîne **par les pointeurs que PortCls suivra**, ne signale rien ; le pilote lit la
+  bonne valeur ; et le chemin d'activation est hors de cause, le témoin passant par le même.
+  Le pilote est donc cohérent avec lui-même : ce qu'il déclare **ailleurs** que dans les
+  plages de la broche wave dit encore « 48 kHz stéréo ».
   *Fausse piste, consignée pour ne pas y revenir* : j'ai d'abord cru que l'endpoint d'un
   câble activé au-delà des deux par défaut n'avait pas de format (`GetMixFormat` échouait).
   C'était **mon** chemin d'activation : écrire le masque `ActiveCables` en registre puis
