@@ -17,8 +17,22 @@ members = [
     "crates/conduit-looptest",
     "crates/conduit-helper",
 ]
-# `drivers/windows` est le workspace noyau, indépendant (ADR-012).
-exclude = ["crates/conduit-protocol/fuzz", "drivers/windows"]
+# Ce que ce workspace ne construit pas : `drivers/windows` est le workspace noyau,
+# indépendant (ADR-012), et les trois crates `fuzz` ne sont constructibles qu'en nightly
+# (`libfuzzer-sys`), donc hors de portée de `--workspace` et du check `cross-windows` de
+# `nix/checks.nix`.
+#
+# **`exclude` ne suffit pas** pour un crate logé **sous** un membre : cargo ne l'y honore
+# pas, et `cargo build` depuis `crates/*/fuzz` échoue sur « current package believes it's
+# in a workspace when it's not ». C'est le `[workspace]` vide de chaque `fuzz/Cargo.toml`
+# qui les affranchit ; ces lignes-ci disent l'intention et couvrent `drivers/windows`
+# (M1b-08).
+exclude = [
+    "crates/conduit-protocol/fuzz",
+    "crates/conduit-kmd-core/fuzz",
+    "crates/conduit-helper/fuzz",
+    "drivers/windows",
+]
 
 [workspace.package]
 version = "0.1.0"

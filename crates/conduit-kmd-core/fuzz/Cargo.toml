@@ -1,0 +1,41 @@
+[package]
+name = "conduit-kmd-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# La feature `std` est obligatoire ici : `libfuzzer-sys` produit un binaire lié à la
+# bibliothèque standard, et c'est elle qui ouvre `impl std::error::Error` sur les
+# erreurs du crate. Le pilote, lui, construit `conduit-kmd-core` sans elle.
+conduit-kmd-core = { path = "..", features = ["std"] }
+
+[[bin]]
+name = "etat-cable"
+path = "fuzz_targets/etat-cable.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parametres-registre"
+path = "fuzz_targets/parametres-registre.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "formats"
+path = "fuzz_targets/formats.rs"
+test = false
+doc = false
+bench = false
+
+# Ce crate est son propre workspace : logé sous un membre du workspace racine, il ne
+# serait pas affranchi par le seul `exclude` de celui-ci (cargo ne l'y honore pas), et
+# `cargo fuzz` échouerait avant de compiler quoi que ce soit.
+[workspace]
