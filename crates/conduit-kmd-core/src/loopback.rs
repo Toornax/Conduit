@@ -46,9 +46,28 @@
 //! ([`Plan::overrun`]), n'écrit rien et resynchronise le curseur sur `C + avance`. Le
 //! **lien survit** au débordement : un tick en retard fait un trou dans la capture, il
 //! ne décale pas l'alignement rendu ↔ capture des trames suivantes.
+//!
+//! # Un seul côté ouvert : deux régimes, et de quoi les mesurer
+//!
 //! Sans rendu en `RUN`, la capture reçoit du silence (SPEC §5.3 : « l'entrée sans
 //! producteur lit du silence ») ; sans capture en `RUN`, rien n'est copié (« la sortie
-//! sans lecteur est jetée »).
+//! sans lecteur est jetée »). Les deux comportements sont asymétriques, et la trace
+//! qu'ils laissent l'était trop : rien ne permettait de les **constater** en machine.
+//!
+//! - Le silence a **deux causes** ([`SilenceCause`]) qu'une simple quantité de trames
+//!   confond : l'absence de producteur, régime permanent qui dure tant que le rendu
+//!   n'ouvre pas, et le rendu plus jeune que le lien, transitoire et borné par le
+//!   décalage de ce lien. Un compteur unique montrerait la même chose dans les deux cas,
+//!   et « la capture seule lit du silence » ne se distinguerait pas de « le rendu vient
+//!   de démarrer ».
+//! - Le rendu seul ne produit **rien du tout** : ni copie, ni silence, ni débordement.
+//!   Sans témoin, ce cas serait indistinguable d'un câble au repos, et « aucune
+//!   accumulation » ne se vérifierait que par l'absence d'une preuve. D'où
+//!   [`Plan::discarded`], le seul champ du plan qui ne décrit pas des octets à écrire mais
+//!   des octets qu'on a choisi de ne pas garder.
+//!
+//! Aucun des deux ne change ce que le tick écrit : ce sont des **témoins**, que
+//! `conduit_kmd::cable::Counters` additionne séparément.
 //!
 //! IRQL : tout ici est appelable à `DISPATCH_LEVEL` : aucune allocation, aucune panique.
 
@@ -78,6 +97,22 @@ pub struct CopyOp {
     pub count: u64,
 }
 
+/// Pourquoi un tick écrit du silence. Deux causes, un seul geste : `ring::silence` n'en
+/// tient aucun compte, mais les compteurs du pilote les additionnent séparément (voir
+/// l'en-tête de module).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SilenceCause {
+    /// Aucun flux de rendu en `RUN` : « l'entrée sans producteur lit du silence »
+    /// (SPEC §5.3). **Régime permanent** : tant que le rendu n'ouvre pas, chaque tick
+    /// écrit son avance de silence, indéfiniment.
+    NoRender,
+    /// Un rendu est bien en `RUN`, mais les trames demandées sont antérieures à son
+    /// départ (`k < 0`, voir « Décalage fixe rendu ↔ capture »). **Régime transitoire** :
+    /// la quantité est bornée par le décalage du lien et ne se reproduit pas tant que ce
+    /// lien tient.
+    BeforeRenderStart,
+}
+
 /// `count` trames de silence dans la capture à partir de la trame absolue
 /// `dst_start`, pour [`crate::ring::silence`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +121,8 @@ pub struct SilenceOp {
     pub dst_start: u64,
     /// Nombre de trames (≥ 1, ≤ taille du tampon de capture).
     pub count: u64,
+    /// Pourquoi ces trames sont du silence plutôt qu'une copie.
+    pub cause: SilenceCause,
 }
 
 /// Ce qu'un tick doit écrire dans le tampon de capture. Le silence, s'il y en a,
@@ -100,6 +137,14 @@ pub struct Plan {
     pub overrun: bool,
     /// Un lien rendu ↔ capture vient d'être établi à ce tick.
     pub linked: bool,
+    /// Un rendu tournait **sans capture** : ses trames sont jetées (SPEC §5.3, « la
+    /// sortie sans lecteur est jetée »).
+    ///
+    /// Le seul champ qui ne demande rien : les quatre autres sont vides dans ce cas, et
+    /// c'est précisément le problème qu'il résout — sans lui, « le rendu tournait seul »
+    /// et « rien ne tournait » rendent le même plan vide, et la non-accumulation ne se
+    /// constate pas, elle se suppose.
+    pub discarded: bool,
 }
 
 /// Positions des deux flux au moment où le lien a été établi (même instant virtuel).
@@ -172,7 +217,10 @@ impl Loopback {
     ) -> Plan {
         let mut plan = Plan::default();
         let Some(capture) = capture else {
+            // Rendu seul : le curseur et le lien sont oubliés, aucun tampon n'est même
+            // consulté, et le tick ne laisserait aucune trace sans ce témoin.
             self.reset();
+            plan.discarded = render.is_some();
             return plan;
         };
         let target = capture.frames.saturating_add(lead);
@@ -197,6 +245,7 @@ impl Loopback {
                 plan.silence = Some(SilenceOp {
                     dst_start: start,
                     count,
+                    cause: SilenceCause::NoRender,
                 });
             }
             return plan;
@@ -229,6 +278,7 @@ impl Loopback {
             plan.silence = Some(SilenceOp {
                 dst_start: start,
                 count: missing,
+                cause: SilenceCause::BeforeRenderStart,
             });
             (
                 0,
@@ -271,8 +321,26 @@ mod tests {
         })
     }
 
+    /// Un plan qui ne demande rien et ne jette rien : le câble au repos.
+    const REPOS: Plan = Plan {
+        silence: None,
+        copy: None,
+        overrun: false,
+        linked: false,
+        discarded: false,
+    };
+
+    /// Le plan d'un tick où le rendu tourne sans capture : rien à écrire, mais un témoin.
+    const JETE: Plan = Plan {
+        silence: None,
+        copy: None,
+        overrun: false,
+        linked: false,
+        discarded: true,
+    };
+
     #[test]
-    fn lead_frames_is_two_ms() {
+    fn l_avance_vaut_deux_millisecondes() {
         assert_eq!(Loopback::lead_frames(48_000), 96);
         assert_eq!(Loopback::lead_frames(44_100), 88);
         assert_eq!(Loopback::lead_frames(8_000), 16);
@@ -281,17 +349,20 @@ mod tests {
     }
 
     #[test]
-    fn no_capture_means_nothing_and_reset() {
+    fn sans_capture_rien_n_est_ecrit_et_tout_est_oublie() {
         let mut lb = Loopback::new();
         assert!(lb.plan(view(1_000, 960), view(500, 960), LEAD).linked);
         assert!(lb.is_linked());
-        assert_eq!(lb.plan(view(1_048, 960), None, LEAD), Plan::default());
+        // Le plan ne demande rien — mais il dit que le rendu tournait pour rien.
+        assert_eq!(lb.plan(view(1_048, 960), None, LEAD), JETE);
         assert!(!lb.is_linked());
         assert_eq!(lb, Loopback::default());
+        // Les deux côtés fermés : même plan vide, sans le témoin.
+        assert_eq!(lb.plan(None, None, LEAD), REPOS);
     }
 
     #[test]
-    fn capture_alone_gets_silence_ahead() {
+    fn la_capture_seule_recoit_du_silence_en_avance() {
         let mut lb = Loopback::new();
         // Premier tick : [C, C + avance).
         let p = lb.plan(None, view(500, 960), LEAD);
@@ -300,7 +371,8 @@ mod tests {
             Plan {
                 silence: Some(SilenceOp {
                     dst_start: 500,
-                    count: LEAD
+                    count: LEAD,
+                    cause: SilenceCause::NoRender
                 }),
                 ..Plan::default()
             }
@@ -311,16 +383,17 @@ mod tests {
             p.silence,
             Some(SilenceOp {
                 dst_start: 596,
-                count: 48
+                count: 48,
+                cause: SilenceCause::NoRender
             })
         );
-        assert!(p.copy.is_none() && !p.overrun && !p.linked);
+        assert!(p.copy.is_none() && !p.overrun && !p.linked && !p.discarded);
         // Horloge immobile : rien.
-        assert_eq!(lb.plan(None, view(548, 960), LEAD), Plan::default());
+        assert_eq!(lb.plan(None, view(548, 960), LEAD), REPOS);
     }
 
     #[test]
-    fn link_maps_same_virtual_instant() {
+    fn le_lien_associe_le_meme_instant_virtuel() {
         let mut lb = Loopback::new();
         // Capture seule pendant deux ticks : silence [500, 596) puis [596, 644), le
         // curseur est donc à 644 quand le rendu arrive.
@@ -352,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn render_before_its_origin_is_silenced() {
+    fn le_rendu_anterieur_a_son_origine_devient_du_silence() {
         let mut lb = Loopback::new();
         // Rendu à peine démarré (R = 10), capture loin devant : les trames de rendu
         // « négatives » deviennent du silence, le reste est copié depuis 0.
@@ -394,7 +467,8 @@ mod tests {
             p.silence,
             Some(SilenceOp {
                 dst_start: 10,
-                count: 40
+                count: 40,
+                cause: SilenceCause::BeforeRenderStart
             })
         );
         assert_eq!(
@@ -408,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn overrun_skips_and_resyncs() {
+    fn le_debordement_saute_et_resynchronise() {
         let mut lb = Loopback::new();
         // Curseur 596 ; puis 20 ms de retard : bloc de 960 + 96 > 480 (plus petit
         // tampon).
@@ -439,13 +513,14 @@ mod tests {
             p.silence,
             Some(SilenceOp {
                 dst_start: 2_096,
-                count: 48
+                count: 48,
+                cause: SilenceCause::NoRender
             })
         );
     }
 
     #[test]
-    fn render_stop_drops_link_and_silences() {
+    fn l_arret_du_rendu_oublie_le_lien_et_fait_silence() {
         let mut lb = Loopback::new();
         lb.plan(view(1_000, 480), view(500, 960), LEAD);
         assert!(lb.is_linked());
@@ -455,7 +530,8 @@ mod tests {
             p.silence,
             Some(SilenceOp {
                 dst_start: 596,
-                count: 48
+                count: 48,
+                cause: SilenceCause::NoRender
             })
         );
         // Retour du rendu : nouveau lien.
@@ -472,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn saturates_at_u64_max() {
+    fn tout_sature_a_u64_max() {
         let mut lb = Loopback::new();
         let p = lb.plan(view(u64::MAX, 480), view(u64::MAX, 960), LEAD);
         assert!(p.linked);
@@ -482,8 +558,198 @@ mod tests {
         assert_eq!(p, Plan::default());
     }
 
+    // -----------------------------------------------------------------------------
+    // M1b-07 : un seul côté ouvert.
+    // -----------------------------------------------------------------------------
+
+    /// **Le critère de M1b-07, en table** : les quatre combinaisons d'ouverture, chacune
+    /// depuis une boucle neuve. Ce que le tick écrit, et la trace qu'il laisse.
+    #[test]
+    fn un_seul_cote_ouvert_table() {
+        /// Une ligne : ce que le tick voit, le plan attendu, l'état du lien après.
+        struct Cas {
+            nom: &'static str,
+            render: Option<StreamView>,
+            capture: Option<StreamView>,
+            attendu: Plan,
+            lie: bool,
+        }
+        let cas = [
+            Cas {
+                nom: "les deux fermés : rien, et rien à signaler",
+                render: None,
+                capture: None,
+                attendu: REPOS,
+                lie: false,
+            },
+            Cas {
+                nom: "capture seule : du silence, faute de producteur",
+                render: None,
+                capture: view(500, 960),
+                attendu: Plan {
+                    silence: Some(SilenceOp {
+                        dst_start: 500,
+                        count: LEAD,
+                        cause: SilenceCause::NoRender,
+                    }),
+                    ..Plan::default()
+                },
+                lie: false,
+            },
+            Cas {
+                nom: "rendu seul : rien n'est accumulé, et le tick le dit",
+                render: view(1_000, 480),
+                capture: None,
+                attendu: JETE,
+                lie: false,
+            },
+            Cas {
+                nom: "les deux : lien et copie, aucun silence",
+                render: view(1_000, 480),
+                capture: view(500, 960),
+                attendu: Plan {
+                    copy: Some(CopyOp {
+                        src_start: 1_000,
+                        dst_start: 500,
+                        count: LEAD,
+                    }),
+                    linked: true,
+                    ..Plan::default()
+                },
+                lie: true,
+            },
+        ];
+        for c in cas {
+            let mut lb = Loopback::new();
+            assert_eq!(lb.plan(c.render, c.capture, LEAD), c.attendu, "{}", c.nom);
+            assert_eq!(lb.is_linked(), c.lie, "{}", c.nom);
+        }
+    }
+
+    /// Ouverture puis fermeture d'un côté **pendant que l'autre tourne**, dans les deux
+    /// sens. C'est la transition qui compte : le silence s'arrête exactement où la copie
+    /// commence, et reprend au tick qui suit la fermeture, sans trou ni recouvrement.
+    #[test]
+    fn un_cote_s_ouvre_puis_se_ferme_pendant_que_l_autre_tourne() {
+        // 1. La capture tourne sans interruption ; le rendu ouvre, puis ferme.
+        let mut lb = Loopback::new();
+        let p = lb.plan(None, view(500, 960), LEAD);
+        assert_eq!(
+            p.silence,
+            Some(SilenceOp {
+                dst_start: 500,
+                count: 96,
+                cause: SilenceCause::NoRender
+            })
+        );
+        let p = lb.plan(None, view(548, 960), LEAD);
+        assert_eq!(
+            p.silence,
+            Some(SilenceOp {
+                dst_start: 596,
+                count: 48,
+                cause: SilenceCause::NoRender
+            })
+        );
+        // Le rendu ouvre : lien, copie, et plus une trame de silence.
+        let p = lb.plan(view(10_000, 480), view(596, 960), LEAD);
+        assert!(p.linked && p.silence.is_none() && !p.discarded);
+        assert_eq!(
+            p.copy,
+            Some(CopyOp {
+                src_start: 10_048,
+                dst_start: 644,
+                count: 48
+            })
+        );
+        // Le rendu ferme : le silence reprend là où la copie s'est arrêtée (692).
+        let p = lb.plan(None, view(644, 960), LEAD);
+        assert!(!lb.is_linked() && p.copy.is_none() && !p.discarded);
+        assert_eq!(
+            p.silence,
+            Some(SilenceOp {
+                dst_start: 692,
+                count: 48,
+                cause: SilenceCause::NoRender
+            })
+        );
+
+        // 2. Le rendu tourne sans interruption ; la capture ouvre, puis ferme.
+        let mut lb = Loopback::new();
+        assert_eq!(lb.plan(view(2_000, 480), None, LEAD), JETE);
+        // La capture ouvre : lien et copie dès ce tick, plus rien de jeté.
+        let p = lb.plan(view(2_048, 480), view(0, 960), LEAD);
+        assert!(p.linked && !p.discarded && p.silence.is_none());
+        assert_eq!(
+            p.copy,
+            Some(CopyOp {
+                src_start: 2_048,
+                dst_start: 0,
+                count: 96
+            })
+        );
+        // La capture ferme : retour au régime « jeté », et la boucle oublie tout.
+        assert_eq!(lb.plan(view(2_144, 480), None, LEAD), JETE);
+        assert_eq!(lb, Loopback::default());
+    }
+
+    /// **Aucune accumulation** : un rendu seul sur cent mille ticks ne demande jamais rien
+    /// à écrire et ne laisse jamais grandir le moindre état de la boucle — pendant que le
+    /// rendu, lui, avance. L'absence d'écriture n'est pas celle d'un flux immobile.
+    #[test]
+    fn le_rendu_seul_n_accumule_rien_sur_beaucoup_de_ticks() {
+        const TICKS: u64 = 100_000; // 100 s à un tick par milliseconde.
+        let mut lb = Loopback::new();
+        let mut r = 1_000_u64;
+        let mut jetes = 0_u64;
+        for _ in 0..TICKS {
+            let p = lb.plan(view(r, 480), None, LEAD);
+            assert_eq!(p, JETE);
+            jetes += 1;
+            // La boucle est identique à une boucle neuve, à chaque tick.
+            assert_eq!(lb, Loopback::default());
+            r += 48;
+        }
+        assert_eq!(jetes, TICKS);
+        assert_eq!(
+            r,
+            1_000 + 48 * TICKS,
+            "le rendu a bien tourné pendant ce temps"
+        );
+    }
+
+    /// **Silence continu** : une capture seule sur cent mille ticks écrit du silence à
+    /// chaque tick, toujours pour la même cause, sans trou ni recouvrement, et pas une
+    /// seule trame copiée.
+    #[test]
+    fn la_capture_seule_ecrit_du_silence_sans_trou_sur_beaucoup_de_ticks() {
+        const TICKS: u64 = 100_000;
+        let mut lb = Loopback::new();
+        let mut c = 500_u64;
+        let mut prochain = 500_u64;
+        let mut total = 0_u64;
+        for _ in 0..TICKS {
+            let p = lb.plan(None, view(c, 960), LEAD);
+            assert!(p.copy.is_none() && !p.overrun && !p.linked && !p.discarded);
+            let s = p
+                .silence
+                .expect("un tick de capture seule écrit toujours du silence");
+            assert_eq!(s.cause, SilenceCause::NoRender);
+            assert_eq!(
+                s.dst_start, prochain,
+                "trou ou recouvrement dans la capture"
+            );
+            prochain = s.dst_start + s.count;
+            total += s.count;
+            c += 48;
+        }
+        // Les blocs pavent exactement `[500, dernier C + avance)`.
+        assert_eq!(prochain, c - 48 + LEAD);
+        assert_eq!(total, 48 * (TICKS - 1) + LEAD);
+    }
+
     /// Fenêtre écrite par un plan : `[début, fin)` en trames de capture, silence puis copie.
-    fn written(plan: &Plan) -> Vec<(u64, u64)> {
+    fn ecrit(plan: &Plan) -> Vec<(u64, u64)> {
         let mut v = Vec::new();
         if let Some(s) = plan.silence {
             v.push((s.dst_start, s.dst_start + s.count));
@@ -499,7 +765,7 @@ mod tests {
         /// écrits se suivent exactement, de `C0` à `C_n + avance`, sans trou ni
         /// recouvrement ; la copie garde un décalage constant et finit à `R + avance`.
         #[test]
-        fn blocks_are_contiguous_and_offset_constant(
+        fn les_blocs_sont_contigus_et_le_decalage_constant(
             r0 in 0u64..1 << 40,
             c0 in 0u64..1 << 40,
             render_buf in 96u64..=4_800,
@@ -538,12 +804,12 @@ mod tests {
 
                 if count > cap {
                     prop_assert!(plan.overrun);
-                    prop_assert!(written(&plan).is_empty());
+                    prop_assert!(ecrit(&plan).is_empty());
                     prop_assert_eq!(with_render, offset.is_some());
                     continue;
                 }
                 prop_assert!(!plan.overrun);
-                let blocks = written(&plan);
+                let blocks = ecrit(&plan);
                 if count == 0 {
                     prop_assert!(blocks.is_empty());
                 } else {
@@ -561,20 +827,26 @@ mod tests {
                         prop_assert!(copy.count <= cap);
                     }
                     if let Some(s) = plan.silence {
-                        // Silence seulement pour des trames de rendu négatives.
+                        // Silence seulement pour des trames de rendu négatives, et il le
+                        // dit : avec un rendu en `RUN`, la cause ne peut pas être son
+                        // absence.
                         prop_assert!(i128::from(s.dst_start) - off < 0);
+                        prop_assert_eq!(s.cause, SilenceCause::BeforeRenderStart);
                     }
                 } else if let Some(s) = plan.silence {
                     prop_assert_eq!(s.count, count);
                     prop_assert!(s.count <= capture_buf);
+                    prop_assert_eq!(s.cause, SilenceCause::NoRender);
                 }
+                // La capture est toujours là : rien n'est jamais jeté ici.
+                prop_assert!(!plan.discarded);
             }
         }
 
         /// Quoi qu'il arrive (retards, reculs, valeurs extrêmes) : jamais de panique,
         /// `count` borné par le plus petit tampon, blocs non vides et dans l'ordre.
         #[test]
-        fn never_exceeds_buffers(
+        fn jamais_au_dela_des_tampons(
             render in proptest::option::of((any::<u64>(), 1u64..=100_000)),
             capture in proptest::option::of((any::<u64>(), 1u64..=100_000)),
             lead in 0u64..=10_000,
@@ -592,13 +864,23 @@ mod tests {
                 (None, Some(c)) => c.buffer_frames,
                 _ => 0,
             };
-            for (a, b) in written(&plan) {
+            for (a, b) in ecrit(&plan) {
                 prop_assert!(b > a);
                 prop_assert!(b - a <= cap);
             }
             if let Some(c) = plan.copy { prop_assert!(c.count >= 1 && c.count <= cap); }
             if let Some(s) = plan.silence { prop_assert!(s.count >= 1 && s.count <= cap); }
-            if cv.is_none() { prop_assert_eq!(plan, Plan::default()); }
+            // Sans capture, le plan est vide **sauf** le témoin, qui distingue un rendu
+            // qui tourne pour rien d'un câble au repos.
+            if cv.is_none() {
+                prop_assert_eq!(plan, Plan { discarded: rv.is_some(), ..Plan::default() });
+            } else {
+                prop_assert!(!plan.discarded);
+            }
+            // La cause du silence et la présence du rendu ne peuvent pas se contredire.
+            if let Some(s) = plan.silence {
+                prop_assert_eq!(s.cause == SilenceCause::NoRender, rv.is_none());
+            }
         }
     }
 }

@@ -85,7 +85,7 @@ pub use format::{
     buffer_bytes, buffer_bytes_for_notifications, validate, FormatError, RequestedFormat,
     SampleKind, SupportedFormat, M1A_FORMATS,
 };
-pub use loopback::{CopyOp, Loopback, Plan, SilenceOp, StreamView, LEAD_MS};
+pub use loopback::{CopyOp, Loopback, Plan, SilenceCause, SilenceOp, StreamView, LEAD_MS};
 pub use notify::{align_frames, boundaries_crossed, Notifier};
 pub use params::{
     decode_dword, sanitize, Correction, Fix, Param, Params, RawParams, Report, REG_DWORD,

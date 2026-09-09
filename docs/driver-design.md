@@ -636,6 +636,18 @@ petit des deux tampons, les trames sont irrécupérables (déjà réécrites d'u
 de l'autre) : rien n'est écrit, le curseur est resynchronisé sur `C + avance` et le
 compteur `overruns` est incrémenté. C'est un trou dans la capture, pas un décalage.
 
+**Un seul côté ouvert (M1b-07).** Les étapes 3 et 4 sont asymétriques, et la trace qu'elles
+laissaient l'était trop. Le silence a **deux causes** que la quantité de trames confondait :
+l'absence de rendu en `RUN`, régime permanent, et un rendu plus jeune que son lien,
+transitoire et borné par le décalage. Le plan les distingue désormais
+(`kmd-core::loopback::SilenceCause`), et le pilote les compte séparément. Le rendu seul, lui,
+ne produisait **rien** — ni copie, ni silence, ni débordement — donc rien ne le distinguait
+d'un câble au repos : `Plan::discarded` est le témoin de ce cas, et le compteur qu'il
+alimente est ce qui **démontre** la non-accumulation au lieu de la supposer. Ni l'un ni
+l'autre ne change ce que le tick écrit. Le minuteur reste **armé** pour un rendu seul : les
+notifications de période en dépendent, et un client WASAPI en mode événementiel se
+bloquerait sans elles.
+
 Latence de traversée = période du moteur audio (10 ms en mode partagé) + avance de copie
 (2 ms). Le tampon interne « 2 × 10 ms » de SPEC §5.3 est la taille par défaut demandée au
 moteur, pas un tampon supplémentaire du pilote.
@@ -650,8 +662,9 @@ des octets : `cable::Cable::on_tick` construit deux `StreamView`, applique le pl
 client : octets lus et écrits sans hypothèse d'atomicité, comme tout pilote WaveRT), puis
 appelle `KeSetEvent` pour les événements des flux dont une frontière de période est
 franchie (`kmd-core::notify::Notifier`, sur la position absolue en trames : le bouclage
-n'est pas un cas particulier puisque le tampon est un multiple de la période). Quatre
-compteurs atomiques par câble (ticks, trames copiées, silences, débordements) sont
+n'est pas un cas particulier puisque le tampon est un multiple de la période). Six
+compteurs atomiques par câble (ticks, trames copiées, silences faute de rendu, silences pour
+des trames antérieures au départ du rendu, ticks de rendu sans capture, débordements) sont
 journalisés toutes les 1000 ticks — **en debug seulement** (`kmd_log!` est vide en
 release) — et **remis à zéro par `Cable::start`**, à chaque `StartDevice` : le pilote ne
 se décharge pas entre deux cycles de périphérique, et des compteurs cumulés font lire une

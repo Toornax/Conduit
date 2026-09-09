@@ -99,8 +99,8 @@ use core::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use conduit_kmd_core::config::{self, ACTIVE_CABLES_DEFAULT};
 use conduit_kmd_core::{
-    FrameLayout, Loopback, Notifier, StreamPosition, StreamView, VirtualClock, byte_offset,
-    copy_frames, silence,
+    FrameLayout, Loopback, Notifier, SilenceCause, StreamPosition, StreamView, VirtualClock,
+    byte_offset, copy_frames, silence,
 };
 use portcls::conduit_com::{NtStatus, STATUS_INSUFFICIENT_RESOURCES};
 use portcls::{JackTarget, JackTargets, PortEvents, VOLUME_MAX};
@@ -479,6 +479,20 @@ impl fmt::Debug for CableState {
 /// cycles de périphérique, et une trace qui additionnerait les cycles précédents ferait
 /// croire à une image obsolète du pilote (plusieurs heures perdues ainsi le 2026-09-06).
 /// Une trace qui ment coûte plus cher qu'une trace absente.
+///
+/// # Un compteur par cause, pas un compteur par geste (M1b-07)
+///
+/// Le silence a **deux causes** (`conduit_kmd_core::loopback::SilenceCause`) que le
+/// même `ring::silence` sert : la capture sans producteur, régime permanent, et le rendu
+/// plus jeune que son lien, transitoire de quelques trames. Un compteur unique les
+/// additionnait, donc n'en démontrait aucune : une valeur qui monte ne disait pas si le
+/// rendu était absent ou s'il venait d'ouvrir. Ils sont désormais séparés.
+///
+/// Symétriquement, le cas « rendu seul » ne laissait **aucune** trace — ni copie, ni
+/// silence, ni débordement — et ne se distinguait donc pas d'un câble au repos.
+/// [`Counters::discarded_ticks`] est le témoin qui manquait : c'est lui, resté seul à
+/// monter pendant que `copied` et les deux silences restent à zéro, qui **démontre** la
+/// non-accumulation demandée par M1b-07.
 #[derive(Debug)]
 struct Counters {
     /// Ticks du timer du câble depuis le dernier `StartDevice`.
@@ -487,9 +501,18 @@ struct Counters {
     copied: AtomicU64,
     /// Ticks trop en retard pour rattraper (`Plan::overrun`) : un trou dans la capture.
     overruns: AtomicU64,
-    /// Trames de silence écrites dans la capture (capture sans rendu, ou rendu plus
-    /// jeune que le lien).
-    silenced: AtomicU64,
+    /// Trames de silence écrites faute de rendu en `RUN` : « l'entrée sans producteur lit
+    /// du silence ». Monte tant que la capture tourne seule, à raison de l'avance de copie
+    /// par tick.
+    silenced_no_render: AtomicU64,
+    /// Trames de silence écrites alors qu'un rendu tourne, pour des trames antérieures à
+    /// son départ. Borné par le décalage du lien : quelques trames par lien, pas un
+    /// régime.
+    silenced_before_render: AtomicU64,
+    /// Ticks où le rendu tournait **sans capture** : ses trames sont jetées, rien n'est
+    /// accumulé. Le seul compteur qui ne compte pas des trames écrites, mais des trames
+    /// qu'on a choisi de ne pas garder.
+    discarded_ticks: AtomicU64,
 }
 
 impl Counters {
@@ -498,11 +521,13 @@ impl Counters {
             ticks: AtomicU64::new(0),
             copied: AtomicU64::new(0),
             overruns: AtomicU64::new(0),
-            silenced: AtomicU64::new(0),
+            silenced_no_render: AtomicU64::new(0),
+            silenced_before_render: AtomicU64::new(0),
+            discarded_ticks: AtomicU64::new(0),
         }
     }
 
-    /// Remet les quatre compteurs à zéro (nouveau cycle de périphérique).
+    /// Remet les six compteurs à zéro (nouveau cycle de périphérique).
     ///
     /// IRQL : `PASSIVE_LEVEL`, timer arrêté : aucun tick ne peut incrémenter en
     /// parallèle, `Relaxed` suffit.
@@ -510,7 +535,20 @@ impl Counters {
         self.ticks.store(0, Ordering::Relaxed);
         self.copied.store(0, Ordering::Relaxed);
         self.overruns.store(0, Ordering::Relaxed);
-        self.silenced.store(0, Ordering::Relaxed);
+        self.silenced_no_render.store(0, Ordering::Relaxed);
+        self.silenced_before_render.store(0, Ordering::Relaxed);
+        self.discarded_ticks.store(0, Ordering::Relaxed);
+    }
+
+    /// Ajoute `frames` trames de silence au compteur de sa **cause**.
+    ///
+    /// IRQL : `<= DISPATCH_LEVEL`, hors de tout verrou.
+    fn add_silence(&self, cause: SilenceCause, frames: u64) {
+        let compteur = match cause {
+            SilenceCause::NoRender => &self.silenced_no_render,
+            SilenceCause::BeforeRenderStart => &self.silenced_before_render,
+        };
+        compteur.fetch_add(frames, Ordering::Relaxed);
     }
 }
 
@@ -1063,13 +1101,22 @@ impl Cable {
         if copied > 0 {
             self.counters.copied.fetch_add(copied, Ordering::Relaxed);
         }
-        if silenced > 0 {
-            self.counters
-                .silenced
-                .fetch_add(silenced, Ordering::Relaxed);
+        // Le silence est compté sous **sa** cause : le plan la porte, `ring::silence` n'en
+        // a que faire, et un compteur unique ne démontrerait ni l'une ni l'autre.
+        if let Some(op) = plan.silence
+            && silenced > 0
+        {
+            self.counters.add_silence(op.cause, silenced);
         }
         if plan.overrun {
             self.counters.overruns.fetch_add(1, Ordering::Relaxed);
+        }
+        // Rendu sans capture : le seul cas où le tick n'écrit rien **et** n'est pas au
+        // repos. Sans ce compteur, la non-accumulation ne se lirait nulle part.
+        if plan.discarded {
+            self.counters
+                .discarded_ticks
+                .fetch_add(1, Ordering::Relaxed);
         }
         self.log_counters(ticks.wrapping_add(1));
     }
@@ -1084,10 +1131,14 @@ impl Cable {
             return;
         }
         kmd_log!(
-            "câble {} : {ticks} ticks, {} trames copiées, {} silences, {} débordements",
+            "câble {} : {ticks} ticks, {} trames copiées, {} silences sans rendu, \
+             {} silences avant le départ du rendu, {} ticks jetés (rendu sans capture), \
+             {} débordements",
             self.index,
             self.counters.copied.load(Ordering::Relaxed),
-            self.counters.silenced.load(Ordering::Relaxed),
+            self.counters.silenced_no_render.load(Ordering::Relaxed),
+            self.counters.silenced_before_render.load(Ordering::Relaxed),
+            self.counters.discarded_ticks.load(Ordering::Relaxed),
             self.counters.overruns.load(Ordering::Relaxed)
         );
     }
@@ -1116,11 +1167,13 @@ impl Cable {
         // par un statut nommé, jamais par un déréférencement.
         self.device.store(ptr::null_mut(), Ordering::Relaxed);
         kmd_log!(
-            "câble {} : timer supprimé après {} ticks depuis le dernier StartDevice ({} trames copiées, {} silences, {} débordements)",
+            "câble {} : timer supprimé après {} ticks depuis le dernier StartDevice ({} trames copiées, {} silences sans rendu, {} silences avant le départ du rendu, {} ticks jetés, {} débordements)",
             self.index,
             self.counters.ticks.load(Ordering::Relaxed),
             self.counters.copied.load(Ordering::Relaxed),
-            self.counters.silenced.load(Ordering::Relaxed),
+            self.counters.silenced_no_render.load(Ordering::Relaxed),
+            self.counters.silenced_before_render.load(Ordering::Relaxed),
+            self.counters.discarded_ticks.load(Ordering::Relaxed),
             self.counters.overruns.load(Ordering::Relaxed)
         );
     }
