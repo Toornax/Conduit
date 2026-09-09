@@ -531,7 +531,7 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   **présent mais désactivé** dans tout jeton neuf, **y compris celui de `LocalSystem`**.
   Le pilote l'exige actif ; c'est au client de l'armer, et `AdjustTokenPrivileges` rend
   `TRUE` même quand elle n'a rien armé — seul `ERROR_NOT_ALL_ASSIGNED` le dit.
-- [ ] **M1b-05** `feat(driver): formats 44,1/48/96 kHz, float32, PCM16 et PCM24`
+- [x] **M1b-05** `feat(driver): formats 44,1/48/96 kHz, float32, PCM16 et PCM24`
   *Fait quand* : test de boucle pour chaque format (F-04).
   *Code livré le 2026-09-09, côté pilote et côté crate portable* : `SampleFormat::Pcm24`,
   matrice de formats, **24 variantes** de descripteurs par sens (3 fréquences × 8 canaux —
@@ -584,8 +584,17 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   Les profondeurs retenues suivent la règle documentée — « *the highest value in each
   parameter's region of intersection* » — là où le gestionnaire par défaut ne rendait jamais
   que du 16 bits.
-  *Reste à mesurer* : une **passe de boucle par format** (le critère F-04), qui demande une
-  session console dans la VM.
+  *Critère F-04 tenu, mesuré le 2026-09-09* en session console, débogueur détaché —
+  **douze passes, quatre formats, aucune faute** : 440,00 Hz, amplitude 0,500, zéro saut de
+  phase, zéro trou, à 48 kHz stéréo, **44,1 kHz stéréo**, **96 kHz stéréo** et
+  **48 kHz sur six canaux**. Le bloc suit la fréquence (441, 480, 960 trames).
+  *Piège d'exploitation à connaître* : le format du moteur d'un endpoint est **mis en cache
+  à sa création**. Changer `CableFormat<n>` d'un câble déjà actif ne le déplace pas — il faut
+  un câble dont l'endpoint n'existait pas encore. C'est ce qui rend le redémarrage du
+  périphérique nécessaire et non suffisant, et il faudra le dire à l'utilisateur quand
+  `conduitctl cable set-format` existera.
+  *Reste* : la moitié espace utilisateur (`conduitctl cable set-format`, ordre 8 du
+  protocole, format dans `CableSpec`/`CableInfo`).
 
   « Aucun format » : l'endpoint existe et devient actif, mais `IAudioClient::GetMixFormat`
   échoue. Ce qui est **écarté** : les tables du binaire livré sont exactes entrée par entrée
