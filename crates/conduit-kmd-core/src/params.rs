@@ -59,9 +59,9 @@
 //!   installés), pas de ce module ; jusque-là, mieux vaut le dire ici que le laisser
 //!   croire.
 //! - **Mode paquets** : effectif depuis le lot 2 du mode paquets WaveRT, et le seul
-//!   paramètre **transitoire** du lot — il commande l'exposition d'interfaces désormais
-//!   servies (lot 3), à 0 le temps de la campagne Driver Verifier, et il disparaîtra.
-//!   Voir [`DEFAULT_PACKET_MODE`].
+//!   paramètre **transitoire** du lot — il commande l'exposition d'interfaces **servies**
+//!   depuis le lot 3, à **1 par défaut** depuis la campagne Driver Verifier du 2026-09-10,
+//!   et il disparaîtra. Voir [`DEFAULT_PACKET_MODE`].
 //!
 //! Tout ici est sans allocation ni panique ; l'appel a lieu à `PASSIVE_LEVEL`
 //! (`StartDevice`), mais rien n'interdit un appel à `DISPATCH_LEVEL`.
@@ -152,17 +152,19 @@ pub const MAX_BUFFER_MS: u32 = crate::format::MAX_BUFFER_MS;
 /// l'importance que le plancher descende bien sous 5 ms.
 pub const DEFAULT_BUFFER_MS: u32 = 10;
 
-/// Valeur minimale du mode paquets : 0, « n'expose rien ».
+/// Valeur minimale du mode paquets : 0, « n'expose rien » — le **repli de diagnostic**,
+/// depuis que le défaut est 1 (voir [`DEFAULT_PACKET_MODE`]).
 pub const MIN_PACKET_MODE: u32 = 0;
 
-/// Valeur maximale du mode paquets : 1, « expose les interfaces du mode paquets ».
+/// Valeur maximale du mode paquets : 1, « expose les interfaces du mode paquets » — et
+/// c'est le défaut depuis la campagne Driver Verifier du 2026-09-10.
 ///
 /// Un booléen, et volontairement pas une énumération de modes : il n'y a que deux états à
 /// distinguer — exposer ou non —, et le paramètre est de toute façon transitoire (voir
 /// [`DEFAULT_PACKET_MODE`]). Un domaine plus large inviterait à inventer des demi-modes.
 pub const MAX_PACKET_MODE: u32 = 1;
 
-/// Mode paquets par défaut : **0** pour l'instant, 1 après la campagne Driver Verifier.
+/// Mode paquets par défaut : **1** depuis la campagne Driver Verifier du 2026-09-10.
 ///
 /// # Ce que ce paramètre fait, exactement
 ///
@@ -186,26 +188,45 @@ pub const MAX_PACKET_MODE: u32 = 1;
 /// WASAPI exclusif événementiel appelle `GetReadPacket` quatre cents fois par seconde dès
 /// que l'interface existe, et le refus casse son transport.
 ///
-/// Le lot 3 sert les quatre méthodes, et le paramètre n'est donc plus une expérience :
-/// c'est **activable pour mesure**, et il passera à 1 par défaut après la campagne Driver
-/// Verifier du lot 3, dans un commit dédié. Il disparaîtra ensuite — un pilote n'a pas à
-/// rendre optionnelle la conformité qu'il tient.
+/// Le lot 3 sert les quatre méthodes, et le paramètre n'est donc plus une expérience : le
+/// mode paquets est **servi**, et c'est ce que le pilote livre.
 ///
-/// Jusque-là, le défaut reste 0 et l'INF écrit 0 : ce qui n'a pas passé Verifier ne se
-/// livre pas activé, même quand le code est écrit.
-pub const DEFAULT_PACKET_MODE: u32 = 0;
+/// # Pourquoi le défaut est passé à 1
+///
+/// La condition écrite partout était « 1 par défaut après la campagne Driver Verifier », et
+/// la campagne a eu lieu. **Driver Verifier `/standard`, une heure, le 2026-09-10, à
+/// `PacketMode = 1`** : 382 tours de boucle locale, moitié exclusifs et moitié classiques,
+/// **0 incident, 0 redémarrage, 0 vidage**, Verifier constaté actif au début et à la fin ;
+/// 936 296 appels de paquets servis à `PASSIVE_LEVEL` pendant que la DPC du minuteur tenait
+/// les mêmes verrous (305 763 `SetWritePacket`, 614 962 `GetReadPacket`, 581
+/// `GetPacketCount`, 14 990 `GetOutputStreamPresentationPosition`).
+///
+/// Le mode exclusif servi passe désormais la phase de préremplissage qui le tuait quand les
+/// interfaces étaient refusées, et le contrôle l'a mesuré : à `PacketMode = 0`, sans paquets
+/// servis, l'exclusif rend **8 passes sur 10** avec les mêmes sauts sub-trame que le mode
+/// servi (9 sur 10). Servi et non servi font jeu égal — les échecs résiduels sont le bruit
+/// du mode exclusif à 5 ms sous Hyper-V, pas un défaut du mode paquets. En partagé, où le
+/// moteur scrute, le mode paquets ne change rien : 20 sur 20.
+///
+/// # Ce que 0 est devenu
+///
+/// Un **repli de diagnostic**, plus un défaut : à 0 le pilote se comporte comme avant le lot
+/// 2 — `PacketInterfaces::None`, aucun IID de plus —, ce qui reste la façon la plus courte
+/// d'établir qu'une panne ne vient pas du mode paquets. Le paramètre disparaîtra ensuite :
+/// un pilote n'a pas à rendre optionnelle la conformité qu'il tient.
+pub const DEFAULT_PACKET_MODE: u32 = 1;
 
 // Cohérences que le compilateur peut vérifier : le défaut est dans ses bornes, et le
 // plafond des canaux ne dépasse pas ce que `FrameLayout` sait décrire.
 const _: () = assert!(MIN_RESERVE <= DEFAULT_RESERVE && DEFAULT_RESERVE <= MAX_RESERVE);
 const _: () = assert!(MIN_CHANNELS <= DEFAULT_CHANNELS && DEFAULT_CHANNELS <= MAX_CHANNELS);
 const _: () = assert!(MIN_BUFFER_MS <= DEFAULT_BUFFER_MS && DEFAULT_BUFFER_MS <= MAX_BUFFER_MS);
-// Le mode paquets est un booléen dont le défaut est le plancher. Les trois valeurs sont
-// écrites en toutes lettres plutôt que comparées entre elles : `MIN_PACKET_MODE` étant le
-// minimum du type, `MIN <= DEFAULT <= MAX` est une tautologie que le compilateur signale, et
-// ce qu'il faut réellement garder est que le **défaut n'expose rien** — un changement de
-// cette valeur doit être un acte, pas une distraction.
-const _: () = assert!(MIN_PACKET_MODE == 0 && MAX_PACKET_MODE == 1 && DEFAULT_PACKET_MODE == 0);
+// Le mode paquets est un booléen dont le défaut est désormais le plafond. Les trois valeurs
+// sont écrites en toutes lettres plutôt que comparées entre elles : `MIN_PACKET_MODE` étant
+// le minimum du type, `MIN <= DEFAULT <= MAX` est une tautologie que le compilateur signale,
+// et ce qu'il faut réellement garder est que le **défaut expose et sert** — le repasser à 0
+// doit être un acte, pas une distraction.
+const _: () = assert!(MIN_PACKET_MODE == 0 && MAX_PACKET_MODE == 1 && DEFAULT_PACKET_MODE == 1);
 const _: () = assert!(MAX_CHANNELS == FrameLayout::MAX_CHANNELS as u32);
 // Les valeurs retenues tiennent dans le `u8` de `Params` (voir `narrow`).
 const _: () = assert!(MAX_RESERVE <= u8::MAX as u32);
@@ -269,8 +290,8 @@ pub enum Param {
     Channels,
     /// Durée du tampon, en millisecondes.
     BufferMs,
-    /// Mode paquets : 0 (rien d'exposé) ou 1 (**expérience**, voir
-    /// [`DEFAULT_PACKET_MODE`]).
+    /// Mode paquets : 1 (le défaut : interfaces exposées et servies) ou 0 (repli de
+    /// diagnostic, rien d'exposé). Voir [`DEFAULT_PACKET_MODE`].
     PacketMode,
 }
 
@@ -415,7 +436,8 @@ pub struct RawParams {
     pub channels: Option<u32>,
     /// `BufferMs` : durée du tampon, en millisecondes.
     pub buffer_ms: Option<u32>,
-    /// `PacketMode` : 0 ou 1 (**expérience**, voir [`DEFAULT_PACKET_MODE`]).
+    /// `PacketMode` : 1 (le défaut) ou 0 (repli de diagnostic). Voir
+    /// [`DEFAULT_PACKET_MODE`].
     pub packet_mode: Option<u32>,
 }
 
@@ -446,8 +468,8 @@ pub struct Params {
     pub buffer_ms: u32,
     /// Mode paquets, dans `MIN_PACKET_MODE..=MAX_PACKET_MODE` — c'est-à-dire 0 ou 1.
     ///
-    /// **Transitoire** : à 1 il expose des interfaces désormais servies, et il passera à 1
-    /// par défaut après la campagne Driver Verifier du lot 3. Voir
+    /// **Transitoire** : à 1 — le défaut depuis la campagne Driver Verifier du 2026-09-10 —
+    /// il expose des interfaces servies ; 0 est le repli de diagnostic. Voir
     /// [`DEFAULT_PACKET_MODE`].
     pub packet_mode: u8,
 }
@@ -461,7 +483,9 @@ impl Params {
         packet_mode: narrow(DEFAULT_PACKET_MODE),
     };
 
-    /// Le mode paquets est-il demandé ? Faux par défaut, et faux sur tout poste livré.
+    /// Le mode paquets est-il demandé ? **Vrai** par défaut, et sur tout poste livré depuis
+    /// la campagne Driver Verifier du 2026-09-10 ; faux seulement si l'exploitant a posé le
+    /// repli de diagnostic.
     #[must_use]
     pub const fn packet_mode_actif(&self) -> bool {
         self.packet_mode != 0
@@ -695,14 +719,15 @@ mod tests {
 
     #[test]
     fn packet_mode_table() {
-        // Bornes : 0 à 1, défaut 0 le temps de la campagne Driver Verifier du lot 3 (voir
+        // Bornes : 0 à 1, défaut 1 depuis la campagne Driver Verifier du 2026-09-10 (voir
         // `DEFAULT_PACKET_MODE`).
         let cases: [(Option<u32>, u8, Option<Fix>); 5] = [
-            // Absente : rien n'est exposé, sans correction (installation neuve).
-            (None, 0, None),
+            // Absente : le défaut, donc le mode paquets servi, sans correction (installation
+            // neuve, ou clé d'un pilote antérieur au paramètre).
+            (None, 1, None),
+            // Le repli de diagnostic, demandé explicitement : dans les bornes, donc aucune
+            // correction à journaliser.
             (Some(0), 0, None),
-            // L'exposition, telle qu'on la demande en machine de mesure : dans les bornes,
-            // donc aucune correction à journaliser.
             (Some(1), 1, None),
             // Un de trop : écrêté à 1, comme les autres paramètres — un `2` reste une
             // demande d'exposition, pas un refus de charger.
@@ -719,12 +744,12 @@ mod tests {
                 "mode paquets {found:?}"
             );
         }
-        // Le défaut du contrat est bien « rien d'exposé » : c'est ce que l'INF écrit et ce
-        // qu'un poste livré porte tant que la campagne Verifier n'a pas eu lieu. Le commit
-        // qui le passera à 1 fera tomber cette assertion, et c'est voulu — le changement
-        // doit être un acte.
-        assert_eq!(DEFAULT_PACKET_MODE, 0);
-        assert!(!Params::DEFAULT.packet_mode_actif());
+        // Le défaut du contrat est bien « exposé et servi » : c'est ce que l'INF écrit et ce
+        // qu'un poste livré porte depuis la campagne Verifier du 2026-09-10. Un retour à 0
+        // ferait tomber cette assertion, et c'est voulu — ce serait une régression de
+        // conformité, pas une distraction.
+        assert_eq!(DEFAULT_PACKET_MODE, 1);
+        assert!(Params::DEFAULT.packet_mode_actif());
     }
 
     #[test]

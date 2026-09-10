@@ -198,13 +198,18 @@ pub(crate) mod code {
     /// naît de la connexion des deux filtres, et une divergence entre eux ne se voit ni dans
     /// les tables ni dans le côté wave.
     pub(crate) const TOPOLOGIE: u32 = 0x0009_0000;
-    /// Le pilote tourne avec une **expérience** activée par le registre (lot 2 du mode
-    /// paquets : `PacketMode = 1`).
+    // 0x000B est RETIRÉ et n'est pas réattribué : il portait « une expérience est activée par
+    // le registre » (`PacketMode = 1`, lots 1 et 2), état qui n'existe plus depuis que le mode
+    // paquets est servi et livré à 1 (2026-09-10). Un poste installé peut avoir des entrées
+    // d'hier qui le portent, et les relire de travers coûterait plus cher qu'un numéro.
+    /// Le pilote tourne sur le **repli de diagnostic** du mode paquets (`PacketMode = 0`)
+    /// alors que le défaut est 1.
     ///
     /// Le seul code de ce module qui ne signale ni une anomalie ni une correction, mais un
-    /// pilote qui se comporte volontairement autrement qu'en service. Il se compose avec
-    /// [`super::RANG_PACKET_MODE`], comme les autres codes de paramètre.
-    pub(super) const EXPERIENCE: u32 = 0x000B_0000;
+    /// pilote qui se comporte volontairement autrement qu'en service — en deçà de la
+    /// conformité qu'il tient. Il se compose avec [`super::RANG_PACKET_MODE`], comme les
+    /// autres codes de paramètre.
+    pub(super) const REPLI: u32 = 0x000E_0000;
     /// Aucune intersection entre ce que Windows demande et ce que le câble déclare
     /// (`intersect::Negotiation::resolve`, M1b-21).
     ///
@@ -524,18 +529,20 @@ pub(crate) unsafe fn read_params(device: PDEVICE_OBJECT, log: EventLog) -> Param
         params.packet_mode,
         params.channels
     );
-    // Un `PacketMode = 1` reste un état à remarquer, mais plus pour la même raison : depuis
-    // le lot 3, les quatre méthodes servent. Ce qui n'a pas encore eu lieu est la campagne
-    // Driver Verifier, et un chemin de code neuf qui n'a pas passé Verifier n'a rien à faire
-    // sur un poste en service. Ce n'est pas une correction — la valeur est dans ses bornes —
-    // mais un état de configuration que l'exploitant doit pouvoir lire sans débogueur.
-    if params.packet_mode_actif() {
+    // L'état à remarquer s'est INVERSÉ avec le défaut (2026-09-10). `PacketMode = 1` est
+    // désormais le pilote livré, éprouvé par la campagne Driver Verifier, et le journaliser à
+    // chaque démarrage n'apprendrait plus rien. C'est `PacketMode = 0` qui mérite une entrée :
+    // le pilote tourne alors volontairement en deçà de la conformité qu'il tient, et une
+    // machine laissée sur ce repli après un diagnostic ne le dirait autrement par aucun
+    // moyen. Ce n'est pas une correction — la valeur est dans ses bornes — mais un état de
+    // configuration que l'exploitant doit pouvoir lire sans débogueur.
+    if !params.packet_mode_actif() {
         kmd_event!(
             log,
-            code::EXPERIENCE.saturating_add(RANG_PACKET_MODE),
-            "{} ({}) = 1 : les interfaces du mode paquets seront EXPOSÉES et SERVIES. Le \
-             chemin n'a pas encore passé la campagne Driver Verifier — sur un poste en \
-             service, remettre 0 et redémarrer le périphérique",
+            code::REPLI.saturating_add(RANG_PACKET_MODE),
+            "{} ({}) = 0 : les interfaces du mode paquets ne seront PAS exposées. C'est le \
+             repli de diagnostic, pas le défaut — remettre 1 (ou supprimer la valeur) et \
+             redémarrer le périphérique pour retrouver le pilote livré",
             Param::PacketMode.label(),
             Param::PacketMode.value_name()
         );
@@ -592,9 +599,10 @@ static PACKET_MODE: AtomicU32 = AtomicU32::new(params::DEFAULT_PACKET_MODE);
 
 /// Les interfaces du mode paquets doivent-elles être **exposées** sur les nouveaux flux ?
 ///
-/// Faux par défaut, et sur tout poste livré tant que la campagne Driver Verifier du lot 3
-/// n'a pas eu lieu. Vrai, elles sont exposées **et servies** (`stream::WaveStream`) : toute
-/// la réserve est écrite sur [`conduit_kmd_core::params::DEFAULT_PACKET_MODE`].
+/// **Vrai par défaut**, et sur tout poste livré depuis la campagne Driver Verifier du
+/// 2026-09-10 : les interfaces sont exposées **et servies** (`stream::WaveStream`). Faux
+/// seulement sur le repli de diagnostic. Toute la réserve est écrite sur
+/// [`conduit_kmd_core::params::DEFAULT_PACKET_MODE`].
 ///
 /// IRQL : quelconque.
 #[must_use]

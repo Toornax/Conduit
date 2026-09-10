@@ -38,10 +38,10 @@
 //! allocation, un seul compteur de références, plusieurs têtes de vtable. Le paramètre de
 //! registre `PacketMode` décide de ce qu'il expose, et rien d'autre ne le décide.
 //!
-//! À 1, il expose l'interface de paquets du sens du flux, que `stream::WaveStream`
-//! **sert** depuis le lot 3. À 0 — le défaut, le temps de la campagne Driver Verifier — il
-//! est construit avec `PacketInterfaces::None`, donc sans exposer une interface de plus
-//! qu'un flux ordinaire. Voir `open_stream` et
+//! À 1 — le défaut depuis la campagne Driver Verifier du 2026-09-10 — il expose l'interface
+//! de paquets du sens du flux, que `stream::WaveStream` **sert** depuis le lot 3. À 0, le
+//! repli de diagnostic, il est construit avec `PacketInterfaces::None`, donc sans exposer une
+//! interface de plus qu'un flux ordinaire. Voir `open_stream` et
 //! `conduit_kmd_core::params::DEFAULT_PACKET_MODE`.
 //!
 //! # Lecture du format
@@ -217,16 +217,14 @@ fn open_stream(
     supported: SupportedFormat,
 ) -> Result<StreamObject, NtStatus> {
     let name = direction.stream_name();
-    // Mode paquets. Par défaut l'objet est composite mais n'expose RIEN :
-    // `PacketInterfaces::None` fait répondre son `QueryInterface` exactement comme celui
-    // d'un flux ordinaire — aucun IID de plus.
+    // Mode paquets. L'objet est composite dans les deux cas ; ce que le paramètre décide est
+    // ce qu'il EXPOSE. À 0 — le repli de diagnostic —, `PacketInterfaces::None` fait répondre
+    // son `QueryInterface` exactement comme celui d'un flux ordinaire, aucun IID de plus.
     //
-    // Ce n'est plus faute de savoir servir : depuis le lot 3, les quatre méthodes de
-    // `stream::WaveStream` servent. C'est faute d'avoir passé la campagne Driver Verifier —
-    // ce qui n'a pas été éprouvé en machine ne se livre pas activé. Le paramètre de registre
-    // `PacketMode`, à 1, expose donc des interfaces réellement servies, et il passera à 1 par
-    // défaut après la campagne (voir `conduit_kmd_core::params::DEFAULT_PACKET_MODE`). Le
-    // relevé `KSPROPERTY_CONDUIT_PACKETS` dit ce que le moteur audio en fait.
+    // À 1 — le défaut depuis la campagne Driver Verifier du 2026-09-10 (382 tours, 0 incident ;
+    // voir `conduit_kmd_core::params::DEFAULT_PACKET_MODE`) —, il expose des interfaces
+    // réellement servies : les quatre méthodes de `stream::WaveStream` servent depuis le lot
+    // 3. Le relevé `KSPROPERTY_CONDUIT_PACKETS` dit ce que le moteur audio en fait.
     //
     // Le paramètre est lu au `StartDevice` et déposé dans un atomique
     // (`registry::packet_mode`) : ce n'est pas une lecture de registre par flux, et une

@@ -358,8 +358,8 @@ pub enum PacketInterfaces {
     /// qu'avec les méthodes derrière. C'est ce que le pilote a fait au lot 3 — les quatre
     /// méthodes de `conduit_kmd::stream::WaveStream` **servent** —, si bien que le
     /// paramètre de registre `PacketMode`
-    /// (`conduit_kmd_core::params::DEFAULT_PACKET_MODE`) ne commande plus une expérience
-    /// mais une exposition, encore à 0 le temps de la campagne Driver Verifier.
+    /// (`conduit_kmd_core::params::DEFAULT_PACKET_MODE`) ne commande plus une expérience mais
+    /// une exposition, à 1 par défaut depuis la campagne Driver Verifier du 2026-09-10.
     ///
     /// Cette variante reste le bon choix, et le défaut, pour tout flux dont les quatre
     /// méthodes s'en tiendraient aux défauts du trait : ceux-ci refusent, et un IID rendu

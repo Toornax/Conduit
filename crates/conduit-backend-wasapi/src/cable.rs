@@ -1500,9 +1500,10 @@ impl TopologyFilter {
     ///
     /// # Ce que la lecture répond
     ///
-    /// Le paramètre `PacketMode` **effectif** (0 : rien n'est exposé, le pilote livré tant que
-    /// la campagne Driver Verifier du lot 3 n'a pas eu lieu ; 1 : les interfaces sont
-    /// exposées **et servies**), ce que le flux courant de chaque sens expose, puis, cumulés
+    /// Le paramètre `PacketMode` **effectif** (1 : les interfaces sont exposées **et
+    /// servies**, le pilote livré depuis la campagne Driver Verifier du 2026-09-10 ; 0 : rien
+    /// n'est exposé, le repli de diagnostic), ce que le flux courant de chaque sens expose,
+    /// puis, cumulés
     /// depuis le dernier `StartDevice` : les `QueryInterface` reçus sur les deux IID de
     /// paquets et ceux auxquels le pilote a répondu, les appels des quatre méthodes par sens
     /// et par méthode, l'IRQL du dernier appel et le maximum vu, et les horodatages QPC du

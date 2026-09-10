@@ -718,10 +718,10 @@ fn lignes_paquets(paquets: &CablePackets) -> String {
         "    mode paquets : PacketMode = {} ({})\n",
         paquets.packet_mode,
         if paquets.mode_actif() {
-            "interfaces EXPOSÉES et servies — activable pour mesure, 1 par défaut après \
-             la campagne Verifier"
+            "interfaces EXPOSÉES et servies — servi, 1 par défaut depuis la campagne \
+             Verifier du 2026-09-10"
         } else {
-            "rien n'est exposé : le pilote livré aujourd'hui"
+            "rien n'est exposé : le repli de diagnostic, plus le défaut"
         }
     );
     for sens in StreamSide::ALL {

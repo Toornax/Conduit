@@ -151,22 +151,24 @@ HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GRGWGX;;;BA)(A;;GRGWGX;;;WD)(A;;GRGWGX;;;RC)"
 ; bornes, elle est remplacée par le défaut et consignée au journal d'événements. Elles
 ; sont écrites pour que `regedit` montre à l'administrateur ce qu'il peut régler.
 ;
-; PacketMode (mode paquets WaveRT) est le seul paramètre TRANSITOIRE de cette section. À 1,
-; le pilote EXPOSE les interfaces IMiniportWaveRTInputStream / IMiniportWaveRTOutputStream
-; sur ses flux, et depuis le lot 3 il les SERT : SetWritePacket valide le numéro de paquet et
-; borne la copie, GetReadPacket rend le dernier paquet complet de la capture,
-; GetOutputStreamPresentationPosition la position en trames absolues, GetPacketCount le
-; nombre de paquets transférés. La propriété KS KSPROPERTY_CONDUIT_PACKETS rend les appels
-; lisibles sans débogueur.
+; PacketMode (mode paquets WaveRT) est le seul paramètre TRANSITOIRE de cette section. À 1 —
+; le DÉFAUT —, le pilote EXPOSE les interfaces IMiniportWaveRTInputStream /
+; IMiniportWaveRTOutputStream sur ses flux, et depuis le lot 3 il les SERT : SetWritePacket
+; valide le numéro de paquet et borne la copie, GetReadPacket rend le dernier paquet complet
+; de la capture, GetOutputStreamPresentationPosition la position en trames absolues,
+; GetPacketCount le nombre de paquets transférés. La propriété KS KSPROPERTY_CONDUIT_PACKETS
+; rend les appels lisibles sans débogueur.
 ;
-; Le défaut reste 0 tant que ce chemin n'a pas passé la campagne Driver Verifier : ce qui n'a
-; pas été éprouvé en machine ne se livre pas activé. Il passera à 1 par défaut ensuite, puis
-; le paramètre disparaîtra. Le paramètre est lu au StartDevice : une modification ne prend
-; effet qu'au démarrage suivant du périphérique.
+; Le défaut est passé à 1 après la campagne Driver Verifier /standard du 2026-09-10 : une
+; heure, 382 tours de boucle locale, 0 incident et 0 vidage, 936 296 appels de paquets servis
+; à PASSIVE_LEVEL. À 0, le pilote n'expose plus rien de plus qu'un flux ordinaire : c'est le
+; REPLI DE DIAGNOSTIC, la façon la plus courte d'établir qu'une panne ne vient pas du mode
+; paquets. Le paramètre disparaîtra ensuite. Il est lu au StartDevice : une modification ne
+; prend effet qu'au démarrage suivant du périphérique.
 HKR,,ReserveSize,0x10001,16
 HKR,,Channels,0x10001,2
 HKR,,BufferMs,0x10001,10
-HKR,,PacketMode,0x10001,0
+HKR,,PacketMode,0x10001,1
 
 ; État actif des câbles (M1b-04, F-05). Masque de bits : le bit n vaut « câble n+1
 ; connecté ». 0x00000003 = « Conduit 1 » et « Conduit 2 » actifs, les quatorze autres

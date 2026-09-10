@@ -25,8 +25,9 @@
 //! mesurer ce que le moteur audio en faisait. La mesure a répondu : un client WASAPI exclusif
 //! événementiel appelle `GetReadPacket` quatre cents fois par seconde dès qu'elles existent,
 //! et le refus casse son transport. C'est cet état — exposer sans servir — que le lot 3 fait
-//! cesser. `PacketMode` reste à 0 par défaut le temps de la campagne Driver Verifier ; il ne
-//! commande plus une expérience, seulement l'exposition.
+//! cesser. `PacketMode` est à **1 par défaut** depuis la campagne Driver Verifier du
+//! 2026-09-10 ; il ne commande plus une expérience, seulement l'exposition, et 0 n'en est
+//! plus que le repli de diagnostic.
 //!
 //! # Ce que les quatre méthodes comptent
 //!
@@ -713,10 +714,11 @@ impl MiniportWaveRTStreamNotification for WaveStream {
 // ---------------------------------------------------------------------------------
 // Mode paquets : les quatre méthodes **servent** et **comptent** (lot 3).
 //
-// Elles ne sont atteignables que sous `PacketMode = 1`, qui expose les interfaces du sens du
-// flux ; à 0, PortCls n'obtient jamais l'adresse des têtes satellites et rien de ce qui suit
-// ne tourne. Ce que le paramètre commande n'est plus une expérience — exposer sans servir —
-// mais l'exposition seule, en attendant la campagne Driver Verifier.
+// Elles ne sont atteignables que sous `PacketMode = 1` — le défaut depuis la campagne Driver
+// Verifier du 2026-09-10 —, qui expose les interfaces du sens du flux ; sur le repli de
+// diagnostic (0), PortCls n'obtient jamais l'adresse des têtes satellites et rien de ce qui
+// suit ne tourne. Ce que le paramètre commande n'est plus une expérience — exposer sans
+// servir — mais l'exposition seule.
 //
 // Elles prennent le verrou du flux (les trois premières) ou celui du câble puis du flux
 // (`SetWritePacket`), n'allouent rien et n'attendent rien. Rien de paginé (voir l'en-tête de

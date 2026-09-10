@@ -25,10 +25,12 @@ Statut : brouillon 0.1 (2026-09-05), à ajuster par ADR à mesure que le spike a
   à 1 ms, un par câble, sont ce qu'il y a de plus lourd dans le pilote (§5.3).
 - **Paramètres du registre** (clé matérielle du périphérique, lus au `StartDevice`,
   bornes dans `conduit-kmd-core::params`) : `ReserveSize`, `Channels` (supplanté par
-  `CableFormat<n>`), `BufferMs`, et `PacketMode` — ce dernier étant une **expérience de
-  mesure** du mode paquets WaveRT (§6), à 0 par défaut, jamais livrée à 1 : elle expose des
-  interfaces que le pilote ne sert pas. Aucun n'est nécessaire au chargement : hors bornes,
-  écrêté et journalisé, jamais d'échec (M1b-01).
+  `CableFormat<n>`), `BufferMs`, et `PacketMode` — ce dernier commandant le mode paquets
+  WaveRT (§6), **servi depuis le lot 3** et à **1 par défaut** depuis la campagne Driver
+  Verifier du 2026-09-10 ; 0 n'est plus le défaut mais le **repli de diagnostic**, où le
+  pilote n'expose rien de plus qu'un flux ordinaire. Le paramètre est transitoire et
+  disparaîtra. Aucun n'est nécessaire au chargement : hors bornes, écrêté et journalisé,
+  jamais d'échec (M1b-01).
 - **Réserve fixe** (ADR-004) : 16 câbles enregistrés au démarrage, inactifs masqués par
   l'état de jack. Le spike M1a n'en enregistre qu'un ; la réserve arrive en M1b-02.
 - **Rust d'abord** (ADR-003) : `windows-drivers-rs` (crates publiés `wdk-sys`/`wdk-build`
@@ -1087,12 +1089,29 @@ les horodatages QPC du premier et du dernier appel. Tout est cumulé depuis le d
 
 Elle tranche la question que le lot 0 a laissée ouverte : le moteur audio scrute-t-il **par
 politique**, ou parce qu'il ne trouve pas les interfaces de paquets, que le pilote n'expose
-pas ? Le paramètre de registre `PacketMode` (§1, `conduit-kmd-core::params`) les expose sur
-une machine d'essai **sans les servir** — les quatre méthodes rendent `STATUS_NOT_SUPPORTED`
-et se contentent de compter — et cette propriété rend ce qui s'est passé ensuite. Elle est
-utile même à `PacketMode = 0` : les `QueryInterface` sont comptés que l'IID soit rendu ou non,
-si bien qu'un compteur de demandes non nul prouve que le moteur cherche le mode paquets sans
-qu'on ait rien promis. Pas de `SET` (le mode se règle par le registre **et** un redémarrage du
+pas ? Le paramètre de registre `PacketMode` (§1, `conduit-kmd-core::params`) les expose, et
+cette propriété rend ce qui s'est passé ensuite. Aux lots 1 et 2, il les exposait **sans les
+servir** : les quatre méthodes rendaient `STATUS_NOT_SUPPORTED` et se contentaient de
+compter. Depuis le **lot 3**, elles servent — `SetWritePacket` valide le numéro et borne la
+copie, `GetReadPacket` rend le dernier paquet complet de la capture,
+`GetOutputStreamPresentationPosition` des trames absolues, `GetPacketCount` un compte base 1.
+
+Le défaut est passé à **1** le 2026-09-10, au vu de la campagne **Driver Verifier
+`/standard`** qui en était la condition : une heure à `PacketMode = 1`, **382 tours** de
+boucle locale (moitié exclusifs, moitié classiques), **0 incident, 0 redémarrage, 0 vidage**,
+Verifier constaté actif au début et à la fin, et **936 296 appels de paquets servis à
+`PASSIVE_LEVEL`** pendant que la DPC du minuteur tenait les mêmes verrous (305 763
+`SetWritePacket`, 614 962 `GetReadPacket`, 581 `GetPacketCount`, 14 990
+`GetOutputStreamPresentationPosition`). Le contrôle décisif est ailleurs : à `PacketMode = 0`,
+sans paquets servis, le mode exclusif rend **8 passes sur 10** avec les mêmes sauts sub-trame
+que le mode servi (**9 sur 10**) — servi et non servi font jeu égal, et les échecs résiduels
+sont le bruit du mode exclusif à 5 ms sous Hyper-V, non un défaut du mode paquets. En
+partagé, où le moteur scrute, `PacketMode = 1` ne change rien : **20 sur 20**. À 0, le
+paramètre n'est donc plus un défaut mais un **repli de diagnostic**.
+
+Le relevé reste utile même à `PacketMode = 0` : les `QueryInterface` sont comptés que l'IID
+soit rendu ou non, si bien qu'un compteur de demandes non nul prouve que le moteur cherche le
+mode paquets sans qu'on ait rien promis. Pas de `SET` (le mode se règle par le registre **et** un redémarrage du
 périphérique ; accepter une écriture rendrait `STATUS_SUCCESS` pour un réglage sans effet) ni
 de contrôle de privilège, comme les compteurs et le transport : `conduit-looptest
 --cable-transport` sort les deux relevés ensemble.
