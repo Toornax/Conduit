@@ -539,8 +539,8 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   et les canaux doivent s'accorder entre les deux bouts), une valeur `CableFormat<n>` par
   câble, `CHANNELS` libérée (ses six assertions devenues des invariants de domaine),
   `BufferMs` enfin appliqué. Coût : **+20,3 Kio** de section de données.
-  *La moitié espace utilisateur n'est pas faite* : ordre 8 du protocole, version 3,
-  `conduitctl cable set-format`, et le format dans `CableSpec`/`CableInfo`.
+  *La moitié espace utilisateur n'est pas faite* : ordre 7 (le huitième) du protocole,
+  version 3, `conduitctl cable set-format`, et le format dans `CableSpec`/`CableInfo`.
   **Deux défauts trouvés en machine le 2026-09-09.**
   *Le premier, corrigé* : un câble configuré pour autre chose que la stéréo ne pouvait plus
   être **activé** (`Win32 87`). Le `SET` de `KSPROPERTY_CONDUIT_CABLE_STATE` comparait les
@@ -593,8 +593,9 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   un câble dont l'endpoint n'existait pas encore. C'est ce qui rend le redémarrage du
   périphérique nécessaire et non suffisant, et il faudra le dire à l'utilisateur quand
   `conduitctl cable set-format` existera.
-  *Reste* : la moitié espace utilisateur (`conduitctl cable set-format`, ordre 8 du
-  protocole, format dans `CableSpec`/`CableInfo`).
+  *Reste* : la chaîne client (`conduitctl cable set-format`, format dans
+  `CableSpec`/`CableInfo`) — le service, lui, sait le faire (ordre 7, le huitième, en
+  version 3 du protocole du canal nommé).
 
   « Aucun format » : l'endpoint existe et devient actif, mais `IAudioClient::GetMixFormat`
   échoue. Ce qui est **écarté** : les tables du binaire livré sont exactes entrée par entrée

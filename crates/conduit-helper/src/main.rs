@@ -44,6 +44,7 @@ mod windows {
     use conduit_helper::cli::{Args, Commande};
     use conduit_helper::protocole::Requete;
     use conduit_helper::{rapport, scm, tube};
+    use conduit_kmd_core::config::CableFormat;
     use std::process::ExitCode;
 
     /// Analyse la ligne de commande et exécute la sous-commande.
@@ -72,6 +73,12 @@ mod windows {
                 nom,
             }),
             Commande::NomDefaut { cable } => client(Requete::NomDefaut(CableId(cable))),
+            Commande::Format {
+                cable,
+                frequence,
+                profondeur,
+                canaux,
+            } => format(cable, frequence, profondeur, canaux),
         };
         match resultat {
             Ok(()) => ExitCode::SUCCESS,
@@ -135,6 +142,54 @@ mod windows {
             conduit_helper::protocole::NOM_TUBE
         );
         scm::servir_en_console(verbeux).map_err(|e| e.to_string())
+    }
+
+    /// `format <câble> <fréquence> <profondeur> <canaux>`.
+    ///
+    /// Les trois valeurs sont assemblées en un [`CableFormat`] **ici**, puis validées par
+    /// le codec du contrat avant que quoi que ce soit ne parte sur le canal : un refus se
+    /// lit alors avec le champ fautif nommé, dans la langue du dépôt, sans qu'un
+    /// aller-retour ait été fait pour rien.
+    ///
+    /// `canaux` est confronté à `u8` d'abord, parce que [`CableFormat::channels`] en est
+    /// un : un `cargo run -- format 1 48000 f32 300` doit dire « 300 canaux hors de 1 à
+    /// 8 » et non déborder silencieusement à 44.
+    fn format(
+        cable: u32,
+        frequence: u32,
+        profondeur: conduit_helper::cli::Profondeur,
+        canaux: u32,
+    ) -> Result<(), String> {
+        let canaux = u8::try_from(canaux).map_err(|_| {
+            format!(
+                "format refusé : {canaux} canaux — {}",
+                conduit_helper::cli::domaines()
+            )
+        })?;
+        let voulu = CableFormat {
+            sample_rate: frequence,
+            depth: profondeur.en_contrat(),
+            channels: canaux,
+        };
+        // Le codec du contrat est le seul juge : il refuse une fréquence qui n'est pas des
+        // trois, un nombre de canaux hors bornes, et il est le même que celui du pilote au
+        // démarrage du devnode. L'aller-retour par `encode`/`decode` est ce qui l'invoque
+        // sans réécrire ses domaines ici — `encode` se replie silencieusement sur 48 kHz
+        // pour une fréquence inconnue, et c'est `decode` qui le fait voir.
+        let format = CableFormat::decode(voulu.encode())
+            .ok()
+            .filter(|relu| *relu == voulu)
+            .ok_or_else(|| {
+                format!(
+                    "format refusé : {frequence} Hz, {}, {canaux} canaux — {}",
+                    profondeur.mot(),
+                    conduit_helper::cli::domaines()
+                )
+            })?;
+        client(Requete::Format {
+            cable: CableId(cable),
+            format,
+        })
     }
 
     /// Les sous-commandes clientes : envoyer un ordre, afficher la réponse.

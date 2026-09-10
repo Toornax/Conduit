@@ -76,7 +76,7 @@ use crate::cables;
 use crate::journal::{Appelant, Journal};
 use crate::protocole::{
     decouper, longueur_annoncee, ErreurReponse, Reponse, Requete, Statut, EN_TETE_OCTETS, NOM_TUBE,
-    PROTOCOLE_VERSION, TAILLE_REPONSE,
+    PROTOCOLE_VERSION, TAILLE_REPONSE_MAX,
 };
 use crate::securite::{DescripteurTube, ErreurSecurite, ACCES_OUVERTURE_CLIENT};
 
@@ -948,7 +948,11 @@ pub fn demander_octets(trame: &[u8]) -> Result<Vec<u8>, ErreurClient> {
     ecrire_synchrone(tube.0, trame).map_err(|code| ErreurClient::Echange {
         cause: format!("envoi de l'ordre : erreur Win32 {code}"),
     })?;
-    let mut brut = vec![0u8; EN_TETE_OCTETS.saturating_add(TAILLE_REPONSE)];
+    // **La plus longue réponse**, pas la plus courte : depuis la version 3 du protocole,
+    // un `lister` en rend 92 et non 28. Dimensionner ce tampon sur `TAILLE_REPONSE`
+    // tronquerait tout `lister` — la lecture s'arrêterait sur un tampon plein et
+    // `decouper` refuserait la trame incomplète.
+    let mut brut = vec![0u8; EN_TETE_OCTETS.saturating_add(TAILLE_REPONSE_MAX)];
     let mut lus = 0usize;
     // Le serveur répond puis raccroche : on lit jusqu'à la fermeture, en bornant par la
     // taille d'une réponse cadrée. Un serveur qui en enverrait plus ne serait pas le

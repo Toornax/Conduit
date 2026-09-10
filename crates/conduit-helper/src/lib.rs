@@ -17,7 +17,7 @@
 //! ne peut donc pas écrire lui-même. Ce service tourne en `LocalSystem` et fait
 //! l'écriture pour lui, sur ordre reçu par un canal nommé.
 //!
-//! # Les huit modules, et ce que chacun garantit
+//! # Les modules, et ce que chacun garantit
 //!
 //! | Module | Rôle | Testé sans Windows ? |
 //! |---|---|---|
@@ -26,6 +26,7 @@
 //! | [`rapport`] | la mise en forme des réponses à l'écran | **oui**, entièrement |
 //! | [`cli`] | les sous-commandes du binaire | **oui**, entièrement |
 //! | [`registre`] | le nom d'endpoint dans `HKLM` (M1b-21) | oui, sauf l'écriture |
+//! | [`devnode`] | le format d'un câble dans la clé matérielle (M1b-05) | oui, sauf l'écriture |
 //! | [`journal`] | l'horodatage, les niveaux, l'identité de l'appelant | oui, sauf l'heure du système |
 //! | [`securite`] | le SDDL du canal et sa vérification | le SDDL oui, sa conversion non |
 //! | `tube` | le serveur et le client du canal nommé | non (Windows) |
@@ -78,6 +79,7 @@
 // avoir écrits purs.
 pub mod cli;
 pub mod controle;
+pub mod devnode;
 pub mod journal;
 pub mod protocole;
 pub mod rapport;

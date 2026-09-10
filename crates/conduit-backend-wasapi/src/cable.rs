@@ -77,7 +77,11 @@ use conduit_kmd_core::config::{
 use windows::core::PCWSTR;
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_Device_Interface_ListW, CM_Get_Device_Interface_List_SizeW,
-    CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CONFIGRET, CR_BUFFER_SMALL, CR_SUCCESS,
+    CM_Get_Device_Interface_PropertyW, CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CONFIGRET,
+    CR_BUFFER_SMALL, CR_SUCCESS,
+};
+use windows::Win32::Devices::Properties::{
+    DEVPKEY_Device_InstanceId, DEVPROPTYPE, DEVPROP_TYPE_STRING,
 };
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_NOT_ALL_ASSIGNED as WIN32_NOT_ALL_ASSIGNED, GENERIC_READ,
@@ -273,6 +277,175 @@ pub fn find_reference<'a>(paths: &'a [String], reference: &str) -> Option<&'a st
         .iter()
         .find(|path| matches_reference(path, reference))
         .map(String::as_str)
+}
+
+// ---------------------------------------------------------------------------------
+// Du chemin d'interface à l'identifiant d'instance du devnode (M1b-05, lot A1).
+// ---------------------------------------------------------------------------------
+
+/// L'identifiant d'instance du périphérique, **déduit** d'un chemin d'interface.
+///
+/// Fonction **pure** : c'est la moitié vérifiable en table de cas de
+/// [`devnode_instance`], et le repli de celui-ci quand le gestionnaire de configuration
+/// ne rend pas la propriété.
+///
+/// Un chemin d'interface est de la forme
+/// `\\?\<identifiant d'instance>#{<GUID de classe d'interface>}\<chaîne de référence>`,
+/// l'identifiant d'instance ayant vu ses `\` remplacés par des `#`. On défait donc
+/// exactement cela :
+///
+/// 1. retirer le préfixe `\\?\` (ou `\\.\`, que Windows emploie aussi) ;
+/// 2. couper au **dernier** `#{`. Le dernier, et non le premier : un chemin
+///    `\\?\SWD#DEVGEN#{…}#{guid}\WaveRender0` en porte deux, et le `#{…}` interne est un
+///    **niveau de l'identifiant** — `SWD\DEVGEN\{…}` — que couper au premier ferait
+///    perdre. Seul le dernier est le GUID de classe d'interface ;
+/// 3. remplacer les `#` restants par des `\` ;
+/// 4. mettre en majuscules ce qui n'est **pas** un segment entre accolades : Windows
+///    écrit `ROOT\MEDIA\0000` mais garde le GUID d'un `SWD\DEVGEN\{…}` tel quel.
+///
+/// # Pourquoi ce n'est qu'un repli — mesuré le 2026-09-11
+///
+/// La casse **n'est pas déductible**. Sur les treize interfaces `KSCATEGORY_TOPOLOGY` de
+/// la machine de développement, `DEVPKEY_Device_InstanceId` rend
+/// `HDAUDIO\FUNC_01&…\5&28a47e64&0&0001` là où cette fonction déduit `…\5&28A47E64&0&0001` :
+/// Windows conserve le suffixe d'instance dans la casse que l'énumérateur a écrite, que le
+/// chemin d'interface, lui, a déjà normalisée. Aucune règle sur le texte ne rattrape cela,
+/// et c'est précisément pourquoi [`devnode_instance`] interroge le gestionnaire de
+/// configuration d'abord. Sans conséquence pratique — `CM_Locate_DevNodeW` compare sans
+/// distinguer la casse — mais qui interdit de tenir cette fonction pour la source de
+/// vérité.
+///
+/// `None` si le chemin ne porte pas de `#{`, c'est-à-dire n'est pas un chemin
+/// d'interface.
+#[must_use]
+pub fn instance_id_du_chemin(path: &str) -> Option<String> {
+    let sans_prefixe = path
+        .strip_prefix(r"\\?\")
+        .or_else(|| path.strip_prefix(r"\\.\"))
+        .unwrap_or(path);
+    let (instance, _) = sans_prefixe.rsplit_once("#{")?;
+    if instance.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(instance.len());
+    for (rang, segment) in instance.split('#').enumerate() {
+        if rang != 0 {
+            out.push('\\');
+        }
+        if segment.starts_with('{') {
+            out.push_str(segment);
+        } else {
+            out.extend(segment.chars().flat_map(char::to_uppercase));
+        }
+    }
+    Some(out)
+}
+
+/// Le premier chemin de `chemins` qui porte une chaîne de référence de Conduit.
+///
+/// Les seize câbles vivent sur **un seul** devnode — c'est le périphérique que l'INF
+/// installe —, donc n'importe lequel de ses trente-deux filtres désigne le même. On prend
+/// le premier trouvé plutôt que d'exiger `TopoRender0` : un poste dont la réserve commence
+/// plus loin (paramètre `Reserve` du registre, M1b-01) n'en a pas moins un devnode.
+fn premier_chemin_conduit(chemins: &[String]) -> Option<&str> {
+    (0..CABLE_MAX).find_map(|index| {
+        FilterSide::ALL.iter().find_map(|cote| {
+            let reference = cote.reference(index)?;
+            find_reference(chemins, &reference)
+        })
+    })
+}
+
+/// Lit `DEVPKEY_Device_InstanceId` sur un chemin d'interface, ou `None`.
+///
+/// Deux passes, comme toute propriété de taille inconnue : la première demande la taille
+/// (tampon nul, `CR_BUFFER_SMALL` attendu), la seconde lit. Un type rendu qui ne serait
+/// pas `DEVPROP_TYPE_STRING` fait rendre `None` plutôt qu'interpréter des octets comme de
+/// l'UTF-16 : l'appelant se repliera sur [`instance_id_du_chemin`].
+fn instance_id_par_propriete(chemin: &str) -> Option<String> {
+    let large: Vec<u16> = chemin.encode_utf16().chain(core::iter::once(0)).collect();
+    let mut genre = DEVPROPTYPE::default();
+    let mut octets: u32 = 0;
+    // SAFETY: `large` est terminé par un NUL et vit jusqu'à la fin de l'appel ; la clé de
+    // propriété est une constante statique ; `genre` et `octets` sont des locales valides
+    // en écriture, et le tampon nul est la façon documentée de demander la taille.
+    let ret = unsafe {
+        CM_Get_Device_Interface_PropertyW(
+            PCWSTR(large.as_ptr()),
+            &DEVPKEY_Device_InstanceId,
+            &mut genre,
+            None,
+            &mut octets,
+            0,
+        )
+    };
+    if ret != CR_BUFFER_SMALL || octets == 0 {
+        return None;
+    }
+    let mut tampon = vec![0u8; octets as usize];
+    // SAFETY: mêmes garanties, et `tampon` fait exactement les `octets` que l'appel
+    // précédent a demandés — c'est cette longueur que `octets` transmet à l'appelé.
+    let ret = unsafe {
+        CM_Get_Device_Interface_PropertyW(
+            PCWSTR(large.as_ptr()),
+            &DEVPKEY_Device_InstanceId,
+            &mut genre,
+            Some(tampon.as_mut_ptr()),
+            &mut octets,
+            0,
+        )
+    };
+    if ret != CR_SUCCESS || genre != DEVPROP_TYPE_STRING {
+        return None;
+    }
+    let unites: Vec<u16> = tampon
+        .chunks_exact(2)
+        .map(|paire| u16::from_le_bytes([paire[0], paire[1]]))
+        .collect();
+    // La chaîne rendue est terminée par un `NUL` que la longueur compte : on s'arrête là
+    // plutôt que de le laisser dans un identifiant qu'on passera à `CM_Locate_DevNodeW`.
+    let utile = unites.split(|unite| *unite == 0).next()?;
+    (!utile.is_empty()).then(|| String::from_utf16_lossy(utile))
+}
+
+/// L'identifiant d'instance du devnode qui porte les câbles Conduit.
+///
+/// C'est ce qu'attend `CM_Locate_DevNodeW`, donc la clé matérielle du périphérique et son
+/// redémarrage (`conduit_helper::devnode`).
+///
+/// **La source de vérité est le gestionnaire de configuration**, pas l'analyse du chemin :
+/// `CM_Get_Device_Interface_PropertyW(DEVPKEY_Device_InstanceId)` rend l'identifiant tel
+/// que Windows l'écrit, casse comprise, sans que ce module ait à connaître la façon dont
+/// un chemin d'interface encode un identifiant. [`instance_id_du_chemin`] n'est le repli
+/// que si la propriété n'est pas rendue — un cas qu'on ne sait pas provoquer, mais qui
+/// laisserait sinon le service sans aucun moyen d'écrire un format.
+///
+/// `chemins` est l'énumération que [`topology_interfaces`] rend : le service en tient déjà
+/// une pour lire l'état des câbles, et la refaire ici coûterait une seconde traversée du
+/// gestionnaire de configuration pour la même réponse.
+///
+/// # Erreurs
+///
+/// [`CableConfigError::FiltreAbsent`] si aucun chemin ne porte de chaîne de référence de
+/// Conduit — le pilote n'est pas chargé ; [`CableConfigError::Reponse`] si le chemin
+/// trouvé n'est ni interprétable par le gestionnaire de configuration ni analysable, ce
+/// qui voudrait dire que ce n'est pas un chemin d'interface.
+pub fn devnode_instance(chemins: &[String]) -> Result<String, CableConfigError> {
+    let Some(chemin) = premier_chemin_conduit(chemins) else {
+        return Err(CableConfigError::FiltreAbsent {
+            reference: FilterSide::Render
+                .reference(0)
+                .unwrap_or_else(|| FilterSide::Render.prefix().to_owned()),
+        });
+    };
+    instance_id_par_propriete(chemin)
+        .or_else(|| instance_id_du_chemin(chemin))
+        .ok_or_else(|| CableConfigError::Reponse {
+            cause: format!(
+                "« {chemin} » ne rend pas DEVPKEY_Device_InstanceId et ne porte pas la forme \
+                 d'un chemin d'interface"
+            ),
+        })
 }
 
 // ---------------------------------------------------------------------------------
@@ -2178,6 +2351,141 @@ mod tests {
             .chain(core::iter::once(0))
             .collect();
         assert_eq!(split_multi_sz(&avec_reste), vec!["x".to_string()]);
+    }
+
+    /// **Du chemin d'interface à l'identifiant d'instance**, en table de cas.
+    ///
+    /// La fonction est pure, donc c'est ici — et non en machine virtuelle — que se
+    /// vérifie la règle qui compte : couper au **dernier** `#{`, jamais au premier.
+    #[test]
+    fn instance_id_du_chemin_table() {
+        let cas: [(&str, Option<&str>); 9] = [
+            // La forme d'un périphérique installé par un INF racine, avec chaîne de
+            // référence — c'est celle des câbles Conduit.
+            (
+                r"\\?\root#media#0000#{dda54a40-1e4c-11d1-a050-405705c10000}\TopoRender0",
+                Some(r"ROOT\MEDIA\0000"),
+            ),
+            // La même sans chaîne de référence : même identifiant.
+            (
+                r"\\?\root#media#0000#{dda54a40-1e4c-11d1-a050-405705c10000}",
+                Some(r"ROOT\MEDIA\0000"),
+            ),
+            // **Le cas qui tranche** : `SWD#DEVGEN#{…}` porte un `#{` interne qui est un
+            // niveau de l'identifiant. Couper au premier rendrait `SWD\DEVGEN`.
+            (
+                r"\\?\SWD#DEVGEN#{5b8fc0f2-3c1e-4b6a-9d21-0c7a1f8e4d33}#{6994ad04-93ef-11d0-a3cc-00a0c9223196}\WaveRender0",
+                Some(r"SWD\DEVGEN\{5b8fc0f2-3c1e-4b6a-9d21-0c7a1f8e4d33}"),
+            ),
+            // Le préfixe `\\.\` est celui que Windows emploie aussi.
+            (
+                r"\\.\root#media#0001#{dda54a40-1e4c-11d1-a050-405705c10000}\TopoCapture1",
+                Some(r"ROOT\MEDIA\0001"),
+            ),
+            // Sans préfixe du tout : la fonction ne s'en offusque pas.
+            (
+                r"root#media#0000#{dda54a40-1e4c-11d1-a050-405705c10000}\TopoRender0",
+                Some(r"ROOT\MEDIA\0000"),
+            ),
+            // Ce qui n'est pas un chemin d'interface.
+            (r"\\?\root#media#0000", None),
+            (r"TopoRender0", None),
+            (r"", None),
+            // Un `#{` en tête ne laisse aucun identifiant devant lui.
+            (
+                r"\\?\#{dda54a40-1e4c-11d1-a050-405705c10000}\TopoRender0",
+                None,
+            ),
+        ];
+        for (chemin, attendu) in cas {
+            assert_eq!(
+                instance_id_du_chemin(chemin).as_deref(),
+                attendu,
+                "« {chemin} »"
+            );
+        }
+    }
+
+    /// Le premier chemin Conduit est trouvé par sa chaîne de référence, et rien d'autre
+    /// ne l'est.
+    #[test]
+    fn le_premier_chemin_conduit_est_un_des_notres() {
+        let etrangers = vec![
+            chemin("Wave"),
+            "\\\\?\\hdaudio#func_01#{6994ad04-93ef-11d0-a3cc-00a0c9223196}\\Speakers".to_owned(),
+        ];
+        assert_eq!(premier_chemin_conduit(&etrangers), None);
+
+        // Le plus petit index d'abord, quel que soit l'ordre de l'énumération.
+        let mut avec = etrangers.clone();
+        avec.push(chemin("TopoCapture3"));
+        avec.push(chemin("TopoRender1"));
+        assert_eq!(
+            premier_chemin_conduit(&avec),
+            Some(chemin("TopoRender1").as_str())
+        );
+
+        // Un poste dont la réserve ne commence pas à zéro a quand même un devnode.
+        let tardif = vec![chemin("TopoCapture15")];
+        assert_eq!(
+            premier_chemin_conduit(&tardif),
+            Some(chemin("TopoCapture15").as_str())
+        );
+    }
+
+    /// Sans le moindre chemin de Conduit, `devnode_instance` dit **le pilote n'est pas
+    /// là** — le statut qui renvoie à l'installation, pas un refus du système.
+    #[test]
+    fn sans_pilote_le_devnode_est_introuvable() {
+        let erreur = devnode_instance(&[]).expect_err("aucun chemin");
+        assert!(
+            matches!(erreur, CableConfigError::FiltreAbsent { .. }),
+            "{erreur:?}"
+        );
+        assert!(erreur.to_string().contains("TopoRender0"), "{erreur}");
+    }
+
+    /// **Les deux sources d'identifiant d'instance coïncident sur cette machine.**
+    ///
+    /// `#[ignore]` pour la raison des autres tests machine de ce fichier : elle interroge
+    /// le gestionnaire de configuration, n'ouvre aucun périphérique et n'écrit rien, mais
+    /// son résultat dépend du poste.
+    ///
+    /// Ce qu'elle établit : le repli pur ([`instance_id_du_chemin`]) rend bien ce que
+    /// Windows rend lui-même. Sur un poste **sans** le pilote Conduit, il n'y a rien à
+    /// comparer et le test le dit sans échouer — les chemins des cartes son du poste
+    /// servent alors de témoins, puisque la règle du format d'un chemin d'interface ne
+    /// leur est pas moins applicable.
+    #[test]
+    #[ignore = "interroge le gestionnaire de configuration de la machine"]
+    fn les_deux_sources_d_instance_coincident() {
+        let chemins = topology_interfaces().expect("énumération KSCATEGORY_TOPOLOGY");
+        let mut compares = 0usize;
+        for chemin in &chemins {
+            let Some(par_propriete) = instance_id_par_propriete(chemin) else {
+                std::println!("{chemin} : pas de DEVPKEY_Device_InstanceId");
+                continue;
+            };
+            let deduit = instance_id_du_chemin(chemin).expect("chemin d'interface analysable");
+            std::println!("{chemin}\n  propriété : {par_propriete}\n  déduit    : {deduit}");
+            // La casse est la seule liberté qu'on laisse : `CM_Locate_DevNodeW` compare
+            // sans la distinguer, et le repli ne prétend pas la deviner partout.
+            assert!(
+                par_propriete.eq_ignore_ascii_case(&deduit),
+                "« {chemin} » : Windows dit « {par_propriete} », la déduction dit « {deduit} »"
+            );
+            compares = compares.saturating_add(1);
+        }
+        assert!(
+            compares > 0,
+            "aucune interface n'a rendu DEVPKEY_Device_InstanceId : machine sans carte son ?"
+        );
+
+        // Et si le pilote est là, le devnode se nomme.
+        match devnode_instance(&chemins) {
+            Ok(instance) => std::println!("devnode Conduit : {instance}"),
+            Err(erreur) => std::println!("pas de pilote Conduit sur ce poste : {erreur}"),
+        }
     }
 
     /// Vérification du **branchement** de l'énumération, à lancer à la main.

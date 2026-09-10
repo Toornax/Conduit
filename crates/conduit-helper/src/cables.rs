@@ -67,11 +67,13 @@
 
 use conduit_backend::CableId;
 use conduit_backend_wasapi::cable::{
-    armer_privilege, cable_id, contract_version, driver_index, topology_interfaces, Armement,
-    CableConfigError, CableState, FilterSide, TopologyFilter, CABLE_MAX,
+    armer_privilege, cable_id, contract_version, devnode_instance, driver_index,
+    topology_interfaces, Armement, CableConfigError, CableState, FilterSide, TopologyFilter,
+    CABLE_MAX,
 };
-use conduit_kmd_core::config::{is_active, with_active};
+use conduit_kmd_core::config::{is_active, with_active, CableFormat};
 
+use crate::devnode::ErreurDevnode;
 use crate::journal::{Appelant, Journal};
 use crate::protocole::{Reponse, Requete, Statut};
 
@@ -87,6 +89,20 @@ pub struct EtatCables {
     pub actifs: u32,
     /// Version du contrat KS servie par le pilote, 0 si aucun câble n'a pu être lu.
     pub version_ks: u32,
+    /// Encodage du format des seize câbles, index **pilote**, 0 quand il est inconnu
+    /// (M1b-05).
+    ///
+    /// # La source est le registre, pas `CableState`
+    ///
+    /// [`CableState`] ne porte que les **canaux** : la fréquence et la profondeur préférée
+    /// n'existent que dans `CableFormat<n>`, dans la clé matérielle du devnode. Lire le
+    /// registre est donc la seule façon de rendre un format entier.
+    ///
+    /// Les deux peuvent diverger — un câble dont le format vient d'être écrit sert encore
+    /// l'ancien jusqu'au redémarrage du devnode. **C'est un renseignement, pas une
+    /// panne** : l'écart se journalise, et rien ici ne tente de le corriger. Le corriger
+    /// reviendrait à cacher ce qu'on est venu montrer.
+    pub formats: [u32; CABLE_MAX as usize],
 }
 
 /// Lit l'état de tous les câbles : lesquels existent, lesquels sont connectés.
@@ -105,13 +121,27 @@ pub struct EtatCables {
 /// [`CableConfigError::Enumeration`] si le gestionnaire de configuration refuse : c'est
 /// le seul cas où l'on ne sait rien dire du tout.
 pub fn lire_etat() -> Result<EtatCables, CableConfigError> {
-    let chemins = topology_interfaces()?;
+    Ok(lire_etat_dans(&topology_interfaces()?))
+}
+
+/// La même lecture, sur une énumération **déjà faite**.
+///
+/// Exposée séparément pour que [`regler_format`] n'énumère pas deux fois : il a besoin des
+/// chemins pour trouver le devnode, et de l'état pour savoir si le câble est connecté. Une
+/// seconde traversée du gestionnaire de configuration rendrait la même réponse, et rien ne
+/// garantit qu'elle la rendrait au même instant — deux vues de la machine pour un seul
+/// ordre, c'est un écart qui finit par se voir.
+///
+/// Ne rend pas de `Result` : une fois les chemins obtenus, plus rien ne peut échouer au
+/// point de ne rien savoir dire. Un câble illisible est simplement absent des masques.
+#[must_use]
+pub fn lire_etat_dans(chemins: &[String]) -> EtatCables {
     let mut etat = EtatCables::default();
     for index in 0..CABLE_MAX {
         let Some(numero) = cable_id(index) else {
             continue;
         };
-        let Ok(filtre) = TopologyFilter::open_in(&chemins, numero, COTE) else {
+        let Ok(filtre) = TopologyFilter::open_in(chemins, numero, COTE) else {
             // Absent de la machine, ou refus d'ouverture : dans les deux cas ce câble
             // n'est pas pilotable, et le masque `presents` le dit.
             continue;
@@ -126,7 +156,16 @@ pub fn lire_etat() -> Result<EtatCables, CableConfigError> {
             etat.actifs = with_active(etat.actifs, index, lu.is_connected());
         }
     }
-    Ok(etat)
+    // Les seize formats, en **une seule** ouverture de la clé matérielle. Un échec n'est
+    // pas une panne de la lecture d'état : les masques et la version sont là, la table
+    // reste à zéro, et le protocole sait dire « format inconnu ». Refuser de lister parce
+    // qu'on n'a pas pu lire un registre serait perdre plus qu'on ne gagne.
+    if let Ok(instance) = devnode_instance(chemins) {
+        if let Ok(formats) = crate::devnode::lire_formats(&instance) {
+            etat.formats = formats;
+        }
+    }
+    etat
 }
 
 /// Exécute un ordre **déjà validé** par le parseur du protocole et rend la réponse à
@@ -147,13 +186,13 @@ pub fn executer(requete: Requete, appelant: &Appelant, journal: &Journal) -> Rep
             // La version du **protocole** dans `detail`, celle du contrat KS dans
             // `version_ks` : un client qui interroge la version veut les deux, et il ne
             // doit pas avoir à déduire la première du simple fait qu'on lui a répondu.
-            let mut reponse = reponse_de_lecture(code, Statut::Succes, 0);
+            let mut reponse = reponse_de_lecture(code, Statut::Succes, 0, None);
             if reponse.statut.succes() {
                 reponse.detail = u32::from(crate::protocole::PROTOCOLE_VERSION);
             }
             reponse
         }
-        Requete::Lister => reponse_de_lecture(code, Statut::Succes, 0),
+        Requete::Lister => reponse_de_lecture(code, Statut::Succes, 0, None),
         Requete::Activer(cable) => ecrire_connexion(code, cable, true, appelant, journal),
         Requete::Desactiver(cable) => ecrire_connexion(code, cable, false, appelant, journal),
         Requete::Canaux { cable, canaux } => regler_canaux(code, cable, canaux, appelant, journal),
@@ -161,6 +200,7 @@ pub fn executer(requete: Requete, appelant: &Appelant, journal: &Journal) -> Rep
             ecrire_nom(code, cable, Some(nom), appelant, journal)
         }
         Requete::NomDefaut(cable) => ecrire_nom(code, cable, None, appelant, journal),
+        Requete::Format { cable, format } => regler_format(code, cable, format, appelant, journal),
     }
 }
 
@@ -198,7 +238,7 @@ fn ecrire_nom(
             // la machine, pas l'intention. Le renommage ne change ni les masques ni les
             // canaux, mais un client qui vient de renommer doit pouvoir constater que le
             // câble est toujours là.
-            reponse_de_lecture(code, Statut::Succes, 0)
+            reponse_de_lecture(code, Statut::Succes, 0, Some(cable))
         }
         Err(erreur) => {
             journal.erreur(&format!(
@@ -223,19 +263,181 @@ fn statut_registre(erreur: &crate::registre::ErreurRegistre) -> Statut {
     }
 }
 
+/// Change le **format** d'un câble : écriture dans la clé matérielle, puis redémarrage du
+/// devnode (M1b-05).
+///
+/// C'est ce que [`Statut::CanauxNonApplicables`] annonçait depuis M1b-05 et que personne
+/// ne savait demander. La forme est celle de [`ecrire_nom`] — traduire l'issue d'un
+/// module de registre en [`Reponse`] et journaliser — avec deux choses en plus.
+///
+/// # Le refus qui précède tout : un câble **connecté** ne change pas de format
+///
+/// Le format du moteur d'un endpoint est mis en cache à sa **création** (mesuré en M1b-05,
+/// tableau de la ROADMAP) : redémarrer le devnode d'un câble actif republierait ses
+/// endpoints sans déplacer leur format, et l'utilisateur constaterait un silence d'une
+/// seconde pour rien. On refuse donc **avant** toute écriture, avant tout privilège armé,
+/// et le message dit la séquence : désactiver, régler, réactiver.
+///
+/// # Le privilège est armé, alors que rien ne passe par le pilote
+///
+/// `CM_Query_And_Remove_SubTreeW` exige `SeLoadDriverPrivilege` armé — la même règle que
+/// le gestionnaire de propriété KS, pour un chemin qui n'a rien à voir avec lui. C'est ce
+/// qui fait que [`Requete::touche_le_pilote`] ne peut plus se lire comme « faut-il armer
+/// le privilège ? » : il rend `false` pour cet ordre-ci, et le privilège est armé quand
+/// même. Le garde meurt à la sortie de la fonction, comme dans [`ecrire`].
+fn regler_format(
+    code: u8,
+    cable: CableId,
+    format: CableFormat,
+    appelant: &Appelant,
+    journal: &Journal,
+) -> Reponse {
+    let chemins = match topology_interfaces() {
+        Ok(chemins) => chemins,
+        Err(erreur) => {
+            journal.erreur(&format!(
+                "format câble {} par {appelant} : énumération impossible — {erreur}",
+                cable.0
+            ));
+            return refus_de_transport(code, &erreur);
+        }
+    };
+    // L'état des seize, sur **ces** chemins-là : une seule énumération pour tout l'ordre,
+    // donc une seule vue de la machine.
+    let etat = lire_etat_dans(&chemins);
+    let Some(index) = driver_index(cable) else {
+        // Ne peut pas arriver : le parseur du protocole a déjà borné le numéro.
+        return Reponse::refus(code, Statut::CableInconnu);
+    };
+    if !is_active(etat.presents, index) {
+        journal.info(&format!(
+            "format câble {} par {appelant} : refus — ce câble n'est pas enregistré par le \
+             pilote sur cette machine",
+            cable.0
+        ));
+        return Reponse::refus(code, Statut::PiloteAbsent);
+    }
+    if is_active(etat.actifs, index) {
+        journal.info(&format!(
+            "format câble {} par {appelant} : refus — le câble est connecté, {}",
+            cable.0,
+            Statut::CableActif
+        ));
+        return Reponse::refus(code, Statut::CableActif);
+    }
+
+    // Le devnode qui porte les seize câbles, depuis les mêmes chemins.
+    let instance = match devnode_instance(&chemins) {
+        Ok(instance) => instance,
+        Err(erreur) => {
+            journal.erreur(&format!(
+                "format câble {} par {appelant} : devnode introuvable — {erreur}",
+                cable.0
+            ));
+            return refus_de_transport(code, &erreur);
+        }
+    };
+
+    let (issue, _garde) = match armer_privilege() {
+        Ok(couple) => couple,
+        Err(erreur) => {
+            journal.erreur(&format!(
+                "format câble {} par {appelant} : {erreur}",
+                cable.0
+            ));
+            return refus_de_transport(code, &erreur);
+        }
+    };
+    if !issue.arme() {
+        let statut = match issue {
+            Armement::Absent => Statut::PrivilegeAbsent,
+            Armement::NonActivable { .. } | Armement::Arme => Statut::ErreurSysteme,
+        };
+        let detail = match issue {
+            Armement::NonActivable { code } => code,
+            Armement::Absent | Armement::Arme => 0,
+        };
+        journal.erreur(&format!(
+            "format câble {} par {appelant} : {issue}",
+            cable.0
+        ));
+        return Reponse::refus_detaille(code, statut, detail);
+    }
+
+    match crate::devnode::appliquer(cable, format, &instance) {
+        Ok(fait) => {
+            journal.info(&format!(
+                "format câble {} par {appelant} : {:#010x} → {:#010x} ({} Hz, {:?}, {} canaux) ; \
+                 devnode « {instance} » retiré en {} ms et rétabli en {} ms",
+                cable.0,
+                fait.ancien,
+                fait.nouveau,
+                format.sample_rate,
+                format.depth,
+                format.channels,
+                fait.retrait.as_millis(),
+                fait.retablissement.as_millis()
+            ));
+            reponse_de_lecture(
+                code,
+                Statut::Succes,
+                u32::from(format.channels),
+                Some(cable),
+            )
+        }
+        Err(erreur) => {
+            journal.erreur(&format!(
+                "format câble {} par {appelant} : {erreur}",
+                cable.0
+            ));
+            Reponse::refus_detaille(code, statut_devnode(&erreur), erreur.detail())
+        }
+    }
+}
+
+/// Le statut qui correspond à un refus du devnode.
+///
+/// Sur le modèle de [`statut_registre`], et avec le même principe : le cas qui appelle une
+/// conduite particulière a son propre statut, plutôt qu'un « refus du système » qui
+/// laisserait chercher.
+///
+/// **Le partage n'est pas prononcé ici** : c'est [`ErreurDevnode::ecrite`] qui dit de quel
+/// côté de l'écriture l'échec est tombé, à l'endroit où les variantes sont définies. Deux
+/// listes à tenir d'accord finiraient par diverger, et l'écart se solderait par un statut
+/// « rien n'a changé » sur une valeur écrite — exactement le contresens que ces deux
+/// statuts existent pour éviter.
+fn statut_devnode(erreur: &ErreurDevnode) -> Statut {
+    if erreur.ecrite() {
+        Statut::RedemarrageEchoue
+    } else {
+        Statut::FormatNonEcrit
+    }
+}
+
 /// La réponse d'un ordre qui ne modifie rien : l'état des câbles, ou le refus qui
 /// explique pourquoi on n'a pas pu le lire.
-fn reponse_de_lecture(code: u8, statut: Statut, canaux: u32) -> Reponse {
+///
+/// `vise` est le câble sur lequel l'ordre portait, quand il y en a un : c'est lui dont le
+/// format part dans le champ de tête ([`Reponse::format`]). La **table** des seize,
+/// elle, part toujours — c'est [`crate::protocole::Reponse::to_bytes`] qui décide de
+/// l'émettre ou non, et il ne l'émet que pour `lister`.
+fn reponse_de_lecture(code: u8, statut: Statut, canaux: u32, vise: Option<CableId>) -> Reponse {
     match lire_etat() {
-        Ok(etat) => Reponse {
-            ordre: code,
-            statut,
-            detail: 0,
-            presents: etat.presents,
-            actifs: etat.actifs,
-            version_ks: etat.version_ks,
-            canaux,
-        },
+        Ok(etat) => {
+            let mut reponse = Reponse {
+                ordre: code,
+                statut,
+                detail: 0,
+                presents: etat.presents,
+                actifs: etat.actifs,
+                version_ks: etat.version_ks,
+                canaux,
+                format: 0,
+                formats: etat.formats,
+            };
+            reponse.format = vise.map_or(0, |cable| reponse.format_de(cable));
+            reponse
+        }
         Err(erreur) => refus_de_transport(code, &erreur),
     }
 }
@@ -298,15 +500,19 @@ fn ecrire_connexion(
 /// alors sans effet, mais elle vaut confirmation, et le chemin d'écriture reste celui des
 /// autres ordres (relecture comprise).
 ///
-/// # Ce qui manque encore, et où
+/// # Ce qui manquait est fait, et cet ordre ne le fera pas pour autant
 ///
 /// Changer réellement le format d'un câble demande d'écrire `CableFormat<n>` dans la clé
-/// **matérielle** du périphérique puis de **redémarrer le devnode** (`cfgmgr32`, environ une
-/// seconde de silence sur les seize câbles). Les deux gestes sont en espace utilisateur, et
-/// c'est exactement là qu'ils doivent être — mais le chemin d'accès au périphérique
-/// (énumération `cfgmgr32`, chemin d'instance) vit dans `conduit_backend_wasapi::cable`, que
-/// ce service consomme sans le posséder. Tant qu'il n'expose pas ce chemin, l'ordre
-/// `canaux` ne peut que constater.
+/// **matérielle** du périphérique puis de **redémarrer le devnode** — environ une seconde
+/// de silence sur les seize câbles. C'est ce que fait [`regler_format`] depuis M1b-05 (lot
+/// A1), par [`crate::devnode`] et sur le chemin d'instance que
+/// `conduit_backend_wasapi::cable::devnode_instance` expose désormais.
+///
+/// Cet ordre-ci ne s'en trouve pas changé, et ce n'est pas un oubli. `canaux` dit « écris
+/// cette valeur dans le pilote » et rend [`Statut::CanauxNonApplicables`] quand le câble en
+/// sert une autre ; il ne peut pas se mettre à couper le son des seize câbles au motif que
+/// quelqu'un a tapé un nombre. Le refus renvoie donc vers l'ordre qui le fait, et le dit :
+/// `conduitctl cable set-format`.
 fn regler_canaux(
     code: u8,
     cable: CableId,
@@ -437,7 +643,7 @@ where
     // Le filtre est fermé avant la relecture générale : elle rouvre les seize, et garder
     // deux handles sur le même filtre n'apporterait rien.
     drop(filtre);
-    let reponse = reponse_de_lecture(code, Statut::Succes, canaux_lus(index));
+    let reponse = reponse_de_lecture(code, Statut::Succes, canaux_lus(index), Some(cable));
     journal.info(&format!(
         "{verbe} câble {} par {appelant} : {} (câble {} avant, {} après ; actifs {:#06x})",
         cable.0,

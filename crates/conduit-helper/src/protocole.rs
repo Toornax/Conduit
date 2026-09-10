@@ -9,10 +9,10 @@
 //!
 //! `conduit-protocol` est le protocole **utilisateur**, entre le démon et `conduitctl` :
 //! MessagePack, extensible, avec négociation de capacités. Celui-ci est autre chose —
-//! sept ordres, deux structures presque toujours de taille fixe, aucune extensibilité,
-//! et un serveur qui tourne en `LocalSystem`. Les mélanger ferait entrer un décodeur
-//! générique dans le processus le plus privilégié du produit ; on écrit donc le strict
-//! nécessaire, et on le refuse dès qu'il n'a pas exactement la forme attendue.
+//! huit ordres, deux structures dont la longueur se déduit de l'ordre, aucune
+//! extensibilité, et un serveur qui tourne en `LocalSystem`. Les mélanger ferait entrer un
+//! décodeur générique dans le processus le plus privilégié du produit ; on écrit donc le
+//! strict nécessaire, et on le refuse dès qu'il n'a pas exactement la forme attendue.
 //!
 //! # Boutisme : petit-boutiste, et c'est un choix
 //!
@@ -25,11 +25,19 @@
 //!
 //! # La règle du parseur : la longueur est exacte, les champs inutilisés sont nuls
 //!
-//! Une requête fait [`TAILLE_REQUETE`] octets, une réponse [`TAILLE_REPONSE`], et **rien
-//! d'autre n'est accepté** : ni plus court, ni plus long, ni un préfixe valide suivi
-//! d'octets en trop. C'est la règle de [`conduit_kmd_core::config::CableState::from_bytes`],
-//! pour les mêmes raisons — accepter un préfixe rend le format non extensible et c'est le
-//! premier écart qu'un fuzzer trouve.
+//! Une trame a **exactement** la longueur que son ordre exige, et **rien d'autre n'est
+//! accepté** : ni plus court, ni plus long, ni un préfixe valide suivi d'octets en trop.
+//! C'est la règle de [`conduit_kmd_core::config::CableState::from_bytes`], pour les mêmes
+//! raisons — accepter un préfixe rend le format non extensible et c'est le premier écart
+//! qu'un fuzzer trouve.
+//!
+//! **La longueur exigée se déduit toujours de l'octet d'ordre, jamais d'un nombre fourni
+//! par le pair.** C'est la propriété qui compte, et elle vaut désormais dans les deux
+//! sens : [`TAILLE_REQUETE`] pour six ordres, [`TAILLE_REQUETE_FORMAT`] pour `format`,
+//! `TAILLE_REQUETE + n` pour `renommer` ; [`TAILLE_REPONSE`] pour tout, sauf
+//! [`ORDRE_LISTER`] qui rend [`TAILLE_REPONSE_LISTER`]. Aucun de ces nombres ne vient de
+//! la trame — ils viennent tous du code d'ordre, que le parseur reconnaît **avant** de
+//! décider quoi que ce soit d'une taille.
 //!
 //! Elle va plus loin ici : les champs qu'un ordre **n'utilise pas** sont exigés nuls
 //! ([`ErreurRequete::ChampParasite`]). Un `Lister` qui porterait un numéro de câble est
@@ -65,10 +73,27 @@
 //! alloue une `String` d'au plus [`MAX_NOM_OCTETS`] octets, après que la borne a été
 //! vérifiée. C'est la seule allocation d'analyse du module, et [`Requete`] n'est donc
 //! plus `Copy`.
+//!
+//! # `format` : le premier ordre à privilège qui ne passe pas par le pilote (M1b-05)
+//!
+//! [`Requete::Format`] change le format d'un câble — fréquence, profondeur préférée,
+//! canaux — en écrivant `CableFormat<n>` dans la clé **matérielle** du devnode puis en
+//! redémarrant celui-ci. Trois conséquences pour ce module :
+//!
+//! - la charge est de **longueur fixe et connue de l'ordre** : quatre octets
+//!   petit-boutistes, l'encodage `REG_DWORD` de
+//!   [`conduit_kmd_core::config::CableFormat`]. Le patron est celui de `renommer` — la
+//!   longueur est exigée *par ordre* — mais sans son incertitude ;
+//! - le codec n'est **pas réécrit** : `encode`/`decode` vivent dans le contrat partagé
+//!   avec le pilote, y compris le refus de l'octet de poids fort non nul, et c'est ce
+//!   refus-là qui rend l'aller-retour du fuzz exact ;
+//! - [`Requete::touche_le_pilote`] rend **`false`** pour lui alors qu'il exige
+//!   `SeLoadDriverPrivilege`. Le prédicat répond « passe par le jeu de propriétés KS »,
+//!   et cesse d'être synonyme de « exige le privilège » : voir sa documentation.
 
 use conduit_backend::cable::{validate_cable_name, MAX_CABLE_NAME_LEN};
 use conduit_backend::CableId;
-use conduit_kmd_core::config::CABLE_MAX;
+use conduit_kmd_core::config::{CableFormat, FormatCodeError, CABLE_MAX};
 use conduit_kmd_core::params::{DEFAULT_CHANNELS, MAX_CHANNELS, MIN_CHANNELS};
 use core::fmt;
 
@@ -95,17 +120,56 @@ use core::fmt;
 /// Le service et le démon sont livrés ensemble et se déplacent ensemble : un démon v1
 /// devant un service v2 reçoit [`Statut::VersionInconnue`] et un message qui dit de les
 /// réinstaller tous les deux, ce qui vaut mieux qu'un `renommer` compris de travers.
-pub const PROTOCOLE_VERSION: u8 = 2;
+///
+/// # Pourquoi 3
+///
+/// **M1b-05** (lot A1) ajoute [`ORDRE_FORMAT`] et, avec lui, trois changements dont
+/// **chacun** est observable par un client :
+///
+/// 1. **huit ordres au lieu de sept** — un service v2 rendrait [`Statut::OrdreInconnu`]
+///    sur un `format`, ce qui est un refus honnête, mais un démon v3 doit savoir
+///    *avant* d'essayer que le service ne sait pas le faire ;
+/// 2. **le dernier mot de la réponse devient un vrai champ** : le second champ réservé
+///    (offset 24) porte désormais [`Reponse::format`]. Un client v2 exige ce mot nul et
+///    refuserait donc toute réponse d'un service v3 qui l'a rempli ;
+/// 3. **la longueur de la réponse devient une fonction de l'ordre** : `lister` en rend
+///    [`TAILLE_REPONSE_LISTER`] et non plus [`TAILLE_REPONSE`]. Un client v2 lirait 28
+///    octets d'une trame qui en fait 92.
+///
+/// Aucun des trois ne se négocie, et le service et le démon sont livrés ensemble : un
+/// incrément de version est donc la bonne réponse, et non un champ de capacités que ce
+/// protocole n'a délibérément pas.
+pub const PROTOCOLE_VERSION: u8 = 3;
 
 /// Taille de l'en-tête de trame : un `u32` petit-boutiste, la longueur de la charge.
 pub const EN_TETE_OCTETS: usize = 4;
 
 /// Taille de l'**en-tête** d'une requête : 8 octets, et la requête entière pour les six
-/// ordres qui ne portent pas de nom.
+/// ordres qui ne portent pas de charge.
 ///
-/// Seul [`Requete::Renommer`] fait suivre ces huit octets d'une charge : voir
-/// [`MAX_NOM_OCTETS`] et [`TAILLE_REQUETE_MAX`].
+/// Deux ordres font suivre ces huit octets : [`Requete::Renommer`], d'une charge de
+/// longueur variable (voir [`MAX_NOM_OCTETS`] et [`TAILLE_REQUETE_MAX`]), et
+/// [`Requete::Format`], d'une charge de quatre octets ([`TAILLE_REQUETE_FORMAT`]).
 pub const TAILLE_REQUETE: usize = 8;
+
+/// Taille de la charge de [`Requete::Format`] : l'encodage `REG_DWORD` d'un
+/// [`CableFormat`], petit-boutiste.
+pub const TAILLE_CHARGE_FORMAT: usize = 4;
+
+/// Taille exacte d'une trame [`ORDRE_FORMAT`] : l'en-tête plus les quatre octets du
+/// format, soit **12**.
+///
+/// # Pourquoi une charge, et pas les octets « canaux » et « réservé » de l'en-tête
+///
+/// L'en-tête porte déjà un champ `canaux` (16 bits) et un champ réservé (16 bits) : quatre
+/// octets libres, exactement ce qu'il faudrait. Les employer coûterait pourtant la garde
+/// qui protège **tous** les ordres — `exiger_nul` sur le champ réservé est le premier
+/// contrôle de chaque trame, et la vider pour un seul ordre lui ferait perdre son rôle,
+/// c'est-à-dire distinguer « j'ai compris la requête » de « j'ai compris un préfixe de la
+/// requête ». Le format voyage donc **après** l'en-tête, selon le patron que `renommer` a
+/// établi (la longueur est exigée par ordre), et `canaux` comme `reserve` restent exigés
+/// nuls.
+pub const TAILLE_REQUETE_FORMAT: usize = TAILLE_REQUETE + TAILLE_CHARGE_FORMAT;
 
 /// Longueur maximale, en **octets**, du nom que porte [`Requete::Renommer`].
 ///
@@ -120,11 +184,49 @@ pub const MAX_NOM_OCTETS: usize = MAX_CABLE_NAME_LEN * 4;
 /// Taille de la plus longue requête : l'en-tête plus le plus long nom.
 pub const TAILLE_REQUETE_MAX: usize = TAILLE_REQUETE + MAX_NOM_OCTETS;
 
-/// Taille d'une réponse : **28 octets**, toujours.
+/// Taille de l'**en-tête** d'une réponse : **28 octets**, et la réponse entière pour les
+/// sept ordres qui ne sont pas [`ORDRE_LISTER`].
 ///
-/// Une réponse de taille fixe est la propriété de sécurité la moins chère qui soit : le
-/// serveur n'a jamais à décider d'une longueur à partir de ce qu'il a reçu.
+/// La propriété de sécurité qui comptait — « le serveur ne décide jamais d'une longueur à
+/// partir de ce qu'il a reçu » — est **conservée** ; c'est la phrase « toujours 28 octets »
+/// qui a cessé d'être vraie. La longueur d'une réponse se déduit de l'**octet d'ordre** de
+/// la trame, un nombre qui vient du code et non du pair : voir [`longueur_reponse`].
 pub const TAILLE_REPONSE: usize = 28;
+
+/// Taille de la réponse à un [`ORDRE_LISTER`] : l'en-tête plus la table des seize
+/// formats, soit **92 octets**.
+///
+/// # Pourquoi `lister` et lui seul rend une table
+///
+/// Sans elle, `conduitctl cable list` garde des canaux **inventés** : [`Reponse::canaux`]
+/// vaut 0 pour un ordre qui ne vise aucun câble, et `crate::controle::liste` retombe alors
+/// sur `CANAUX_DEFAUT`, la valeur d'un poste neuf. Or les canaux font partie du format, et
+/// depuis M1b-05 chaque câble a le sien : afficher deux canaux pour un câble qui en sert
+/// six n'est pas une approximation, c'est une erreur. La table rend les seize vrais d'un
+/// coup, pour le prix de soixante-quatre octets et d'une seule ouverture de la clé
+/// matérielle côté service.
+///
+/// Les sept autres ordres visent un câble ou aucun : [`Reponse::format`] leur suffit, et
+/// leur faire porter la table coûterait seize lectures de registre par `activer`.
+pub const TAILLE_REPONSE_LISTER: usize = TAILLE_REPONSE + 4 * CABLE_MAX as usize;
+
+/// La plus longue réponse que ce protocole produit.
+pub const TAILLE_REPONSE_MAX: usize = TAILLE_REPONSE_LISTER;
+
+/// La longueur qu'exige une réponse en écho à l'ordre `ordre`.
+///
+/// **Le seul endroit** où la longueur d'une réponse se décide, et elle se décide sur le
+/// code d'ordre de la trame — un octet que le parseur reconnaît, jamais une longueur
+/// annoncée par le pair. Un ordre inconnu, y compris l'écho d'un ordre que le service a
+/// refusé, exige [`TAILLE_REPONSE`] : un refus ne porte pas de table.
+#[must_use]
+pub const fn longueur_reponse(ordre: u8) -> usize {
+    if ordre == ORDRE_LISTER {
+        TAILLE_REPONSE_LISTER
+    } else {
+        TAILLE_REPONSE
+    }
+}
 
 /// Charge utile maximale acceptée avant toute allocation : la plus longue requête.
 ///
@@ -137,9 +239,17 @@ pub const MAX_TRAME_OCTETS: usize = TAILLE_REQUETE_MAX;
 
 // Les deux structures tiennent dans la borne, avec de la marge.
 const _: () = assert!(TAILLE_REQUETE <= MAX_TRAME_OCTETS);
+const _: () = assert!(TAILLE_REQUETE_FORMAT <= MAX_TRAME_OCTETS);
 const _: () = assert!(TAILLE_REPONSE <= MAX_TRAME_OCTETS);
+// **La ligne qui compte** : la plus longue réponse passe le cadrage. Sans elle, tout
+// `lister` serait refusé par `longueur_annoncee` du côté du client.
+const _: () = assert!(TAILLE_REPONSE_LISTER <= MAX_TRAME_OCTETS);
+const _: () = assert!(TAILLE_REPONSE_MAX == TAILLE_REPONSE_LISTER);
 // La borne du format laisse passer le plus long nom que la règle du dépôt accepte.
 const _: () = assert!(MAX_NOM_OCTETS >= MAX_CABLE_NAME_LEN);
+// La table des formats couvre exactement les câbles adressables, et 28 + 64 = 92.
+const _: () = assert!(TAILLE_REPONSE_LISTER == 92);
+const _: () = assert!(TAILLE_REQUETE_FORMAT == 12);
 
 /// Nom du canal nommé du service.
 ///
@@ -166,16 +276,23 @@ pub const ORDRE_CANAUX: u8 = 4;
 pub const ORDRE_RENOMMER: u8 = 5;
 /// Code de l'ordre `nom-defaut` (M1b-21) : efface le nom personnalisé.
 pub const ORDRE_NOM_DEFAUT: u8 = 6;
+/// Code de l'ordre `format` (M1b-05, lot A1) : change le format d'un câble.
+///
+/// **7, et c'est le huitième ordre.** La ROADMAP de M1b-05 disait « ordre 8 » en comptant
+/// les ordres et non leurs codes, lesquels partent de zéro ; l'écart est consigné ici et
+/// la ROADMAP corrigée, parce qu'un lecteur qui chercherait l'octet 8 dans une trame ne le
+/// trouverait jamais.
+pub const ORDRE_FORMAT: u8 = 7;
 
 /// Le plus grand code d'ordre servi, pour les messages de refus.
-pub const ORDRE_MAX: u8 = ORDRE_NOM_DEFAUT;
+pub const ORDRE_MAX: u8 = ORDRE_FORMAT;
 
 /// Une requête du démon au service : l'interface **fixe** du canal nommé.
 ///
-/// Sept ordres, et jamais un huitième sans changer [`PROTOCOLE_VERSION`]. Deux ne
-/// modifient rien ([`Self::Version`], [`Self::Lister`]) ; les cinq autres écrivent — dans
-/// le pilote pour trois d'entre eux, dans le registre pour les deux de M1b-21 — et sont
-/// donc journalisés avec l'identité de l'appelant.
+/// Huit ordres, et jamais un neuvième sans changer [`PROTOCOLE_VERSION`]. Deux ne
+/// modifient rien ([`Self::Version`], [`Self::Lister`]) ; les six autres écrivent — dans
+/// le pilote pour trois d'entre eux, dans le registre pour les deux de M1b-21 et pour
+/// celui de M1b-05 — et sont donc journalisés avec l'identité de l'appelant.
 ///
 /// **Non `Copy`** : [`Self::Renommer`] possède son nom. Voir l'en-tête de module.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -220,6 +337,23 @@ pub enum Requete {
     /// pas des `HKR` du périphérique et survivent au retrait du pilote, donc Conduit doit
     /// savoir défaire ce qu'il a écrit.
     NomDefaut(CableId),
+    /// Change le **format** du câble : fréquence, profondeur préférée, canaux (M1b-05).
+    ///
+    /// **N'atteint pas le pilote** au sens du jeu de propriétés KS — les tables KS d'un
+    /// filtre sont immuables et PortCls en retient les pointeurs pour toute sa vie. Le
+    /// service écrit `CableFormat<n>` dans la clé **matérielle** du devnode et **redémarre
+    /// le devnode** : le pilote relit alors la valeur à son démarrage. Voir
+    /// [`crate::devnode`].
+    ///
+    /// C'est ce que [`Statut::CanauxNonApplicables`] annonçait depuis M1b-05 et que
+    /// personne ne savait demander.
+    Format {
+        /// Le câble visé.
+        cable: CableId,
+        /// Le format voulu, déjà validé par
+        /// [`conduit_kmd_core::config::CableFormat::decode`].
+        format: CableFormat,
+    },
 }
 
 impl Requete {
@@ -234,6 +368,7 @@ impl Requete {
             Self::Canaux { .. } => ORDRE_CANAUX,
             Self::Renommer { .. } => ORDRE_RENOMMER,
             Self::NomDefaut(_) => ORDRE_NOM_DEFAUT,
+            Self::Format { .. } => ORDRE_FORMAT,
         }
     }
 
@@ -248,6 +383,7 @@ impl Requete {
             Self::Canaux { .. } => "canaux",
             Self::Renommer { .. } => "renommer",
             Self::NomDefaut(_) => "nom par défaut",
+            Self::Format { .. } => "format",
         }
     }
 
@@ -270,21 +406,40 @@ impl Requete {
             | Self::Desactiver(_)
             | Self::Canaux { .. }
             | Self::Renommer { .. }
-            | Self::NomDefaut(_) => true,
+            | Self::NomDefaut(_)
+            | Self::Format { .. } => true,
         }
     }
 
-    /// Cet ordre passe-t-il par le jeu de propriétés KS du pilote ?
+    /// Cet ordre passe-t-il par le **jeu de propriétés KS** du pilote ?
     ///
-    /// Sépare les deux natures d'écriture du service : celles qui exigent
-    /// `SeLoadDriverPrivilege` armé (le pilote), et celles qui n'exigent que d'être
-    /// `LocalSystem` (le registre `HKLM`, M1b-21). Un privilège armé pour une écriture
-    /// de registre serait une surface offerte pour rien.
+    /// Sépare les deux natures d'écriture du service : celles qui parlent au filtre de
+    /// topologie par `IOCTL_KS_PROPERTY`, et celles qui n'écrivent que dans le registre
+    /// (M1b-21, M1b-05).
+    ///
+    /// # Ce prédicat n'est plus synonyme de « exige le privilège » (M1b-05)
+    ///
+    /// Il l'a été de M1b-20 à M1b-21, et la coïncidence était trompeuse. Ce qu'il répond
+    /// est « passe par le jeu de propriétés KS », rien de plus.
+    ///
+    /// [`Self::Format`] est le **premier ordre à privilège sans propriété KS** : il
+    /// n'ouvre aucun filtre, mais `CM_Query_And_Remove_SubTreeW` exige
+    /// `SeLoadDriverPrivilege` armé exactement comme le gestionnaire de propriété du
+    /// pilote. C'est donc `crate::cables` qui décide de l'armement, ordre par ordre et
+    /// pour la durée de l'écriture, et non ce prédicat — le lire comme « faut-il armer ? »
+    /// laisserait `format` sans privilège et le redémarrage du devnode échouerait.
+    ///
+    /// Sa vraie valeur est ailleurs : ce qui passe par KS est ce que le pilote peut
+    /// refuser lui-même, et ce qui n'y passe pas est ce dont le service répond seul.
     #[must_use]
     pub const fn touche_le_pilote(&self) -> bool {
         match self {
             Self::Activer(_) | Self::Desactiver(_) | Self::Canaux { .. } => true,
-            Self::Version | Self::Lister | Self::Renommer { .. } | Self::NomDefaut(_) => false,
+            Self::Version
+            | Self::Lister
+            | Self::Renommer { .. }
+            | Self::NomDefaut(_)
+            | Self::Format { .. } => false,
         }
     }
 
@@ -294,7 +449,9 @@ impl Requete {
         match self {
             Self::Version | Self::Lister => None,
             Self::Activer(cable) | Self::Desactiver(cable) | Self::NomDefaut(cable) => Some(*cable),
-            Self::Canaux { cable, .. } | Self::Renommer { cable, .. } => Some(*cable),
+            Self::Canaux { cable, .. }
+            | Self::Renommer { cable, .. }
+            | Self::Format { cable, .. } => Some(*cable),
         }
     }
 
@@ -307,27 +464,45 @@ impl Requete {
         }
     }
 
+    /// La charge de quatre octets que porte [`Self::Format`], déjà encodée.
+    ///
+    /// Le pendant de [`Self::nom`] pour l'autre ordre à charge. L'encodage est celui du
+    /// contrat partagé avec le pilote ([`CableFormat::encode`]) : ce module ne compose
+    /// aucun `REG_DWORD` lui-même.
+    #[must_use]
+    pub const fn charge_format(&self) -> Option<u32> {
+        match self {
+            Self::Format { format, .. } => Some(format.encode()),
+            _ => None,
+        }
+    }
+
     /// Sérialise la requête : [`TAILLE_REQUETE`] octets, suivis du nom pour
-    /// [`Self::Renommer`].
+    /// [`Self::Renommer`] et des quatre octets du format pour [`Self::Format`].
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(TAILLE_REQUETE + self.nom().map_or(0, str::len));
+        let charge = self.nom().map_or(0, str::len) + self.charge_format().map_or(0, |_| 4);
+        let mut out = Vec::with_capacity(TAILLE_REQUETE + charge);
         out.extend_from_slice(&self.en_tete());
         if let Some(nom) = self.nom() {
             out.extend_from_slice(nom.as_bytes());
         }
+        if let Some(brut) = self.charge_format() {
+            out.extend_from_slice(&brut.to_le_bytes());
+        }
         out
     }
 
-    /// L'en-tête de [`TAILLE_REQUETE`] octets, commun aux sept ordres.
+    /// L'en-tête de [`TAILLE_REQUETE`] octets, commun aux huit ordres.
     #[must_use]
     pub const fn en_tete(&self) -> [u8; TAILLE_REQUETE] {
         let (cable, canaux) = match self {
             Self::Version | Self::Lister => (0_u16, 0_u16),
             Self::Activer(c) | Self::Desactiver(c) | Self::NomDefaut(c) => (c.0 as u16, 0),
             Self::Canaux { cable, canaux } => (cable.0 as u16, *canaux as u16),
-            // Le nom ne voyage pas dans l'en-tête : sa longueur est celle de la trame.
-            Self::Renommer { cable, .. } => (cable.0 as u16, 0),
+            // Ni le nom ni le format ne voyagent dans l'en-tête : leur longueur est celle
+            // que l'ordre exige, et `canaux` comme `reserve` restent exigés nuls.
+            Self::Renommer { cable, .. } | Self::Format { cable, .. } => (cable.0 as u16, 0),
         };
         let cable = cable.to_le_bytes();
         let canaux = canaux.to_le_bytes();
@@ -359,9 +534,9 @@ impl Requete {
     ///
     /// La longueur est vérifiée en deux temps depuis M1b-21 : le minimum
     /// ([`TAILLE_REQUETE`]) avant de lire quoi que ce soit, puis la longueur exacte de
-    /// l'ordre reconnu. Les six ordres sans nom exigent toujours [`TAILLE_REQUETE`]
+    /// l'ordre reconnu. Les six ordres sans charge exigent toujours [`TAILLE_REQUETE`]
     /// pile ; `renommer` exige l'en-tête plus 1 à [`MAX_NOM_OCTETS`] octets d'UTF-8
-    /// valide.
+    /// valide ; `format` exige l'en-tête plus **exactement** quatre octets.
     ///
     /// # Erreurs
     ///
@@ -397,12 +572,13 @@ impl Requete {
                 | ORDRE_CANAUX
                 | ORDRE_RENOMMER
                 | ORDRE_NOM_DEFAUT
+                | ORDRE_FORMAT
         ) {
             return Err(ErreurRequete::Ordre { code: ordre });
         }
-        // Les six ordres sans nom n'acceptent **rien** après l'en-tête : un préfixe
+        // Les six ordres sans charge n'acceptent **rien** après l'en-tête : un préfixe
         // valide suivi d'octets en trop reste une trame refusée.
-        if ordre != ORDRE_RENOMMER && !suite.is_empty() {
+        if !matches!(ordre, ORDRE_RENOMMER | ORDRE_FORMAT) && !suite.is_empty() {
             return Err(ErreurRequete::Longueur {
                 recus: octets.len(),
             });
@@ -436,6 +612,18 @@ impl Requete {
                 let cable = valider_cable(cable)?;
                 exiger_nul("canaux", canaux)?;
                 Ok(Self::NomDefaut(cable))
+            }
+            // `ORDRE_FORMAT` : le second ordre à charge, et le seul dont la charge est de
+            // longueur **fixe**. Les quatre octets sont exigés exactement — ni trois, ni
+            // cinq — parce que la longueur d'un `REG_DWORD` n'est pas une opinion.
+            ORDRE_FORMAT => {
+                let cable = valider_cable(cable)?;
+                exiger_nul("canaux", canaux)?;
+                let Ok(charge) = <[u8; TAILLE_CHARGE_FORMAT]>::try_from(suite) else {
+                    return Err(ErreurRequete::FormatLongueur { recus: suite.len() });
+                };
+                let format = valider_format(u32::from_le_bytes(charge))?;
+                Ok(Self::Format { cable, format })
             }
             // `ORDRE_RENOMMER` : le seul ordre dont la trame est plus longue que
             // l'en-tête, et le seul qui alloue.
@@ -501,6 +689,25 @@ fn valider_nom(octets: &[u8]) -> Result<String, ErreurRequete> {
     Ok(nom.to_owned())
 }
 
+/// Valide le format que porte un `format` : le codec du **contrat**, et rien d'autre.
+///
+/// [`CableFormat::decode`] est le même juge que le pilote au démarrage d'un devnode, et
+/// il n'est pas réécrit ici — pas plus que la règle du nom ne l'est dans [`valider_nom`].
+/// Son refus de l'**octet de poids fort non nul** est conservé tel quel : c'est ce qui
+/// garde libre la place d'un champ futur, et c'est aussi ce qui rend l'aller-retour du
+/// fuzz exact — sans lui, deux encodages différents donneraient le même format et la
+/// resérialisation ne rendrait plus les octets reçus.
+///
+/// La cause exacte n'est pas recopiée dans le protocole : elle est **portée**
+/// ([`ErreurRequete::Format::cause`]), pour que le journal du service dise « code de
+/// fréquence 7 inconnu » et non « format refusé ».
+const fn valider_format(brut: u32) -> Result<CableFormat, ErreurRequete> {
+    match CableFormat::decode(brut) {
+        Ok(format) => Ok(format),
+        Err(cause) => Err(ErreurRequete::Format { brut, cause }),
+    }
+}
+
 /// Valide un nombre de canaux contre les bornes de [`conduit_kmd_core::params`].
 const fn valider_canaux(brut: u16) -> Result<u32, ErreurRequete> {
     let canaux = brut as u32;
@@ -562,6 +769,18 @@ pub enum ErreurRequete {
     /// Le nom est bien formé mais refusé par
     /// [`conduit_backend::cable::validate_cable_name`].
     NomRefuse,
+    /// La charge d'un `format` ne fait pas exactement [`TAILLE_CHARGE_FORMAT`] octets.
+    FormatLongueur {
+        /// Les octets reçus après l'en-tête.
+        recus: usize,
+    },
+    /// Les quatre octets sont là mais n'encodent pas un format valide.
+    Format {
+        /// L'encodage reçu, tel quel.
+        brut: u32,
+        /// Le champ fautif et sa valeur, tels que le contrat les nomme.
+        cause: FormatCodeError,
+    },
 }
 
 impl ErreurRequete {
@@ -578,9 +797,15 @@ impl ErreurRequete {
             Self::NomVide | Self::NomTropLong { .. } | Self::NomNonUtf8 | Self::NomRefuse => {
                 Statut::NomInvalide
             }
-            Self::Longueur { .. } | Self::ChampParasite { .. } | Self::Reserve { .. } => {
-                Statut::TrameInvalide
-            }
+            // Un encodage hors domaine est un **format** refusé, pas une trame invalide :
+            // la trame était bien formée, et la conduite est d'en demander un autre.
+            Self::Format { .. } => Statut::FormatInvalide,
+            // Une charge de la mauvaise longueur, en revanche, est bien une trame que le
+            // service n'a pas comprise : aucun format n'a même été lu.
+            Self::Longueur { .. }
+            | Self::ChampParasite { .. }
+            | Self::Reserve { .. }
+            | Self::FormatLongueur { .. } => Statut::TrameInvalide,
         }
     }
 }
@@ -627,6 +852,15 @@ impl fmt::Display for ErreurRequete {
                 "nom refusé : au plus {MAX_CABLE_NAME_LEN} caractères, ni caractère de \
                  contrôle ni « /\\:*?\"<>| »"
             ),
+            Self::FormatLongueur { recus } => write!(
+                f,
+                "charge de {recus} octets pour un « format » : {TAILLE_CHARGE_FORMAT} \
+                 attendus exactement (trame de {TAILLE_REQUETE_FORMAT} octets)"
+            ),
+            // La cause vient du contrat et nomme le champ fautif : on ne la reformule pas.
+            Self::Format { brut, cause } => {
+                write!(f, "format {brut:#010x} refusé : {cause}")
+            }
         }
     }
 }
@@ -709,11 +943,51 @@ pub enum Statut {
     /// 0 ou 1 — un seul côté trouvé sur deux est le signe d'un endpoint à moitié publié,
     /// et ce n'est pas la même panne qu'aucun.
     EndpointAbsent,
+    /// Le câble est **connecté** : son format ne peut pas être changé maintenant
+    /// (M1b-05).
+    ///
+    /// Le format du moteur d'un endpoint est mis en cache à la **création** de celui-ci :
+    /// écrire `CableFormat<n>` et redémarrer le devnode d'un câble déjà actif republierait
+    /// l'endpoint sans déplacer son format. Le refus dit donc la séquence — désactiver le
+    /// câble, régler le format, le réactiver — plutôt que de laisser croire à une
+    /// réussite.
+    ///
+    /// Refus **avant toute écriture** : ni privilège armé, ni valeur posée, ni devnode
+    /// retiré.
+    CableActif,
+    /// L'encodage de format demandé n'est pas dans les domaines du contrat.
+    ///
+    /// [`Reponse::detail`] porte le `u32` refusé **tel quel**, pour qu'un client puisse le
+    /// relire en hexadécimal et voir quel octet est fautif. Distinct de
+    /// [`Self::TrameInvalide`] comme [`Self::NomInvalide`] l'est : la trame était bien
+    /// formée, c'est ce qu'elle portait qui ne peut pas être écrit.
+    FormatInvalide,
+    /// La valeur n'a **pas** été écrite : rien n'a changé sur la machine.
+    ///
+    /// [`Reponse::detail`] porte le code Win32 ou le `CONFIGRET` de l'appel qui a échoué.
+    ///
+    /// # Pourquoi ce statut et [`Self::RedemarrageEchoue`] sont distincts
+    ///
+    /// Parce que les conduites de réparation sont **opposées**. Ici, la clé matérielle est
+    /// intacte : le câble sert toujours son ancien format, rien n'est en attente, et
+    /// réessayer est sans danger. Là-bas, la valeur est posée et prendra effet au prochain
+    /// démarrage du périphérique, qu'on le veuille ou non — la conduite est de forcer ce
+    /// redémarrage ou de réécrire l'ancienne valeur, jamais de « réessayer ». Un statut
+    /// unique obligerait l'utilisateur à aller lire le registre pour savoir dans lequel
+    /// des deux cas il est.
+    FormatNonEcrit,
+    /// La valeur est **écrite** mais le devnode n'a pas redémarré.
+    ///
+    /// Le format prendra effet au prochain démarrage du périphérique — au redémarrage de
+    /// la machine, au pire. [`Reponse::detail`] porte le `CONFIGRET` du retrait ou du
+    /// rétablissement ; un veto de retrait (une application tient un flux ouvert) est le
+    /// cas courant et bénin.
+    RedemarrageEchoue,
 }
 
 impl Statut {
     /// Tous les statuts, dans l'ordre de leur code.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 16] = [
         Self::Succes,
         Self::VersionInconnue,
         Self::TrameInvalide,
@@ -726,6 +1000,10 @@ impl Statut {
         Self::ErreurSysteme,
         Self::NomInvalide,
         Self::EndpointAbsent,
+        Self::CableActif,
+        Self::FormatInvalide,
+        Self::FormatNonEcrit,
+        Self::RedemarrageEchoue,
     ];
 
     /// Le code de ce statut, tel qu'il voyage dans la trame.
@@ -744,6 +1022,10 @@ impl Statut {
             Self::ErreurSysteme => 9,
             Self::NomInvalide => 10,
             Self::EndpointAbsent => 11,
+            Self::CableActif => 12,
+            Self::FormatInvalide => 13,
+            Self::FormatNonEcrit => 14,
+            Self::RedemarrageEchoue => 15,
         }
     }
 
@@ -765,6 +1047,10 @@ impl Statut {
             9 => Self::ErreurSysteme,
             10 => Self::NomInvalide,
             11 => Self::EndpointAbsent,
+            12 => Self::CableActif,
+            13 => Self::FormatInvalide,
+            14 => Self::FormatNonEcrit,
+            15 => Self::RedemarrageEchoue,
             _ => return None,
         })
     }
@@ -807,6 +1093,18 @@ impl fmt::Display for Statut {
                 "aucun endpoint audio pour ce câble : Windows ne les publie que lorsque \
                  le câble est connecté — activez-le, puis renommez"
             }
+            Self::CableActif => {
+                "ce câble est connecté : le format d'un endpoint est figé à sa création — \
+                 désactivez le câble, réglez son format, puis réactivez-le"
+            }
+            Self::FormatInvalide => "encodage de format hors des domaines du contrat",
+            Self::FormatNonEcrit => {
+                "format non écrit dans la clé matérielle du périphérique : rien n'a changé"
+            }
+            Self::RedemarrageEchoue => {
+                "format écrit mais non appliqué : le périphérique n'a pas redémarré, la \
+                 valeur prendra effet à son prochain démarrage"
+            }
         };
         f.write_str(texte)
     }
@@ -816,12 +1114,17 @@ impl fmt::Display for Statut {
 // Les réponses.
 // ---------------------------------------------------------------------------------
 
-/// La réponse du service : **toujours** [`TAILLE_REPONSE`] octets, quel que soit l'ordre
-/// et quelle que soit l'issue.
+/// La réponse du service : [`TAILLE_REPONSE`] octets, ou [`TAILLE_REPONSE_LISTER`] pour
+/// un [`ORDRE_LISTER`] — et la longueur se déduit de l'**octet d'ordre**, jamais d'un
+/// nombre reçu.
 ///
 /// Elle porte l'état complet des câbles même sur un refus, ce qui évite au client de
 /// devoir enchaîner un `lister` derrière chaque `activer` — et rend le journal du client
 /// lisible sans corrélation.
+///
+/// **Reste `Copy`** malgré la table des seize formats : 92 octets se recopient sans
+/// remords, et le rendre possédé obligerait tous ses porteurs à choisir entre `clone` et
+/// emprunt pour une structure qui n'est qu'un tampon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Reponse {
     /// Écho du code d'ordre **reçu**, tel quel — y compris quand il est inconnu.
@@ -844,10 +1147,31 @@ pub struct Reponse {
     pub version_ks: u32,
     /// Nombre de canaux du câble visé, 0 quand l'ordre ne vise aucun câble.
     pub canaux: u32,
+    /// Encodage du **format** du câble visé, 0 quand l'ordre ne vise aucun câble ou que la
+    /// clé matérielle n'a pas pu être lue (M1b-05).
+    ///
+    /// Occupe l'ancien second champ réservé (offset 24), d'où l'incrément de
+    /// [`PROTOCOLE_VERSION`] : un client v2 exigeait ce mot nul. Toute valeur non nulle
+    /// doit passer [`CableFormat::decode`] à l'analyse — un format servi qu'on ne saurait
+    /// pas relire ne vaudrait pas mieux que 0, et le laisser passer rendrait
+    /// l'aller-retour infidèle.
+    pub format: u32,
+    /// Le format des **seize** câbles, rempli par [`ORDRE_LISTER`] et lui seul ; tout à
+    /// zéro pour les sept autres ordres et pour tout refus.
+    ///
+    /// Chaque mot est 0 (inconnu) ou décodable, comme [`Self::format`]. L'indice est
+    /// l'index **pilote** : le mot 0 est celui de « Conduit 1 ». Le décalage de un se fait
+    /// une seule fois, dans [`Self::format_de`].
+    pub formats: [u32; CABLE_MAX as usize],
 }
 
 impl Reponse {
     /// Une réponse vide, de statut `statut`, en écho à l'ordre `ordre`.
+    ///
+    /// Le format du câble visé et la table des seize sont mis à **zéro** comme les
+    /// masques, et pour la même raison : un refus ne prétend jamais connaître l'état de la
+    /// machine. Un client qui lirait un format dans un refus croirait à un renseignement
+    /// constaté.
     #[must_use]
     pub const fn refus(ordre: u8, statut: Statut) -> Self {
         Self {
@@ -858,6 +1182,8 @@ impl Reponse {
             actifs: 0,
             version_ks: 0,
             canaux: 0,
+            format: 0,
+            formats: [0; CABLE_MAX as usize],
         }
     }
 
@@ -886,14 +1212,34 @@ impl Reponse {
         conduit_kmd_core::config::is_active(self.presents, cable.0.wrapping_sub(1))
     }
 
-    /// Sérialise la réponse en [`TAILLE_REPONSE`] octets.
+    /// Le format du câble `cable` (numéro **affiché**) d'après [`Self::formats`], 0 hors
+    /// des câbles adressables ou quand il est inconnu.
+    ///
+    /// Le décalage de un est fait ici, une seule fois, pour que le client n'ait pas à le
+    /// refaire — comme [`Self::est_actif`] le fait pour les masques.
     #[must_use]
-    pub const fn to_bytes(&self) -> [u8; TAILLE_REPONSE] {
+    pub fn format_de(&self, cable: CableId) -> u32 {
+        cable
+            .0
+            .checked_sub(1)
+            .and_then(|index| usize::try_from(index).ok())
+            .and_then(|index| self.formats.get(index))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// L'en-tête de [`TAILLE_REPONSE`] octets, commun aux huit ordres.
+    ///
+    /// C'est la réponse **entière** pour les sept qui ne sont pas [`ORDRE_LISTER`] ; voir
+    /// [`Self::to_bytes`], qui y ajoute la table quand l'ordre l'exige.
+    #[must_use]
+    pub const fn en_tete(&self) -> [u8; TAILLE_REPONSE] {
         let detail = self.detail.to_le_bytes();
         let presents = self.presents.to_le_bytes();
         let actifs = self.actifs.to_le_bytes();
         let version_ks = self.version_ks.to_le_bytes();
         let canaux = self.canaux.to_le_bytes();
+        let format = self.format.to_le_bytes();
         [
             PROTOCOLE_VERSION,
             self.ordre,
@@ -919,11 +1265,29 @@ impl Reponse {
             canaux[1],
             canaux[2],
             canaux[3],
-            0,
-            0,
-            0,
-            0,
+            format[0],
+            format[1],
+            format[2],
+            format[3],
         ]
+    }
+
+    /// Sérialise la réponse : [`TAILLE_REPONSE`] octets, suivis de la table des seize
+    /// formats pour [`ORDRE_LISTER`].
+    ///
+    /// La longueur produite est exactement celle que [`longueur_reponse`] exige pour
+    /// [`Self::ordre`] : c'est ce qui rend l'aller-retour fidèle, y compris pour un refus
+    /// dont l'ordre est `lister`.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(longueur_reponse(self.ordre));
+        out.extend_from_slice(&self.en_tete());
+        if self.ordre == ORDRE_LISTER {
+            for mot in self.formats {
+                out.extend_from_slice(&mot.to_le_bytes());
+            }
+        }
+        out
     }
 
     /// Sérialise la réponse, en-tête de trame compris.
@@ -939,14 +1303,27 @@ impl Reponse {
     /// canal nommé se squatte, c'est même la raison du descripteur de sécurité du module
     /// `securite`). La réponse est donc analysée avec la même sévérité.
     ///
+    /// # La longueur exigée vient de l'octet d'ordre, jamais du pair
+    ///
+    /// C'est la propriété que la taille fixe assurait gratuitement et qu'il faut désormais
+    /// tenir explicitement : la longueur se lit dans `octets[1]`, le code d'ordre, par
+    /// [`longueur_reponse`]. Aucun champ de la trame ne dit sa propre taille, donc aucun
+    /// pair ne peut faire lire au client plus que ce que le code prévoit. Une trame trop
+    /// courte pour porter un octet d'ordre exige [`TAILLE_REPONSE`], le minimum.
+    ///
     /// # Erreurs
     ///
     /// [`ErreurReponse`], dont chaque variante porte ce qui a été trouvé.
     pub fn from_bytes(octets: &[u8]) -> Result<Self, ErreurReponse> {
-        let brut: [u8; TAILLE_REPONSE] =
-            octets.try_into().map_err(|_| ErreurReponse::Longueur {
+        let attendue = longueur_reponse(octets.get(1).copied().unwrap_or(u8::MAX));
+        if octets.len() != attendue {
+            return Err(ErreurReponse::Longueur {
                 recus: octets.len(),
-            })?;
+                attendue,
+            });
+        }
+        let tete = octets.get(..TAILLE_REPONSE).unwrap_or(&[]);
+        let brut: [u8; TAILLE_REPONSE] = tete.try_into().unwrap_or([0; TAILLE_REPONSE]);
         let version = brut[0];
         if version != PROTOCOLE_VERSION {
             return Err(ErreurReponse::Version { trouvee: version });
@@ -955,9 +1332,34 @@ impl Reponse {
             return Err(ErreurReponse::Reserve { brut: brut[3] });
         }
         let statut = Statut::from_code(brut[2]).ok_or(ErreurReponse::Statut { code: brut[2] })?;
-        let reserve2 = mot(&brut, 24);
-        if reserve2 != 0 {
-            return Err(ErreurReponse::Reserve2 { brut: reserve2 });
+        // Le format du câble visé : 0 (inconnu) ou décodable, jamais autre chose. Sans ce
+        // contrôle, un encodage aberrant traverserait le client jusqu'à l'affichage.
+        let format = mot(&brut, 24);
+        if let Err(cause) = valider_mot_de_format(format) {
+            return Err(ErreurReponse::Format {
+                brut: format,
+                cause,
+            });
+        }
+        // La table, pour `lister` et lui seul. Les seize mots suivent l'en-tête, dans
+        // l'ordre des index **pilote**, et chacun subit le même contrôle.
+        let mut formats = [0u32; CABLE_MAX as usize];
+        if brut[1] == ORDRE_LISTER {
+            let table = octets.get(TAILLE_REPONSE..).unwrap_or(&[]);
+            for (index, quatre) in table.chunks_exact(4).enumerate() {
+                let Some(place) = formats.get_mut(index) else {
+                    break;
+                };
+                let lu = u32::from_le_bytes([quatre[0], quatre[1], quatre[2], quatre[3]]);
+                if let Err(cause) = valider_mot_de_format(lu) {
+                    return Err(ErreurReponse::TableFormat {
+                        index: index as u32,
+                        brut: lu,
+                        cause,
+                    });
+                }
+                *place = lu;
+            }
         }
         Ok(Self {
             ordre: brut[1],
@@ -967,11 +1369,29 @@ impl Reponse {
             actifs: mot(&brut, 12),
             version_ks: mot(&brut, 16),
             canaux: mot(&brut, 20),
+            format,
+            formats,
         })
     }
 }
 
-/// Lit un `u32` petit-boutiste au décalage `offset` d'une réponse.
+/// Un mot de format d'une réponse est-il acceptable ?
+///
+/// **0 est le seul cas particulier** : c'est « inconnu », ce que le service met quand
+/// l'ordre ne vise aucun câble ou que la clé matérielle n'a pas pu être lue. Toute autre
+/// valeur passe le codec du contrat, le même que le pilote applique au démarrage d'un
+/// devnode.
+const fn valider_mot_de_format(brut: u32) -> Result<(), FormatCodeError> {
+    if brut == 0 {
+        return Ok(());
+    }
+    match CableFormat::decode(brut) {
+        Ok(_) => Ok(()),
+        Err(cause) => Err(cause),
+    }
+}
+
+/// Lit un `u32` petit-boutiste au décalage `offset` d'un en-tête de réponse.
 ///
 /// Les quatre octets sont **recopiés** puis interprétés, jamais transtypés ; `offset`
 /// est toujours un décalage nommé de ce fichier, donc dans les bornes, et le repli à
@@ -991,10 +1411,12 @@ const fn mot(brut: &[u8; TAILLE_REPONSE], offset: usize) -> u32 {
 /// Ce qui a fait refuser une réponse, côté client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErreurReponse {
-    /// Longueur différente de [`TAILLE_REPONSE`].
+    /// Longueur différente de celle que l'ordre de la trame exige.
     Longueur {
         /// Octets reçus.
         recus: usize,
+        /// Octets exigés par [`longueur_reponse`] pour l'ordre trouvé.
+        attendue: usize,
     },
     /// Version de protocole inattendue.
     Version {
@@ -1011,19 +1433,32 @@ pub enum ErreurReponse {
         /// La valeur trouvée.
         brut: u8,
     },
-    /// Le second champ réservé n'est pas nul.
-    Reserve2 {
-        /// La valeur trouvée.
+    /// Le champ « format » du câble visé ne se décode pas (M1b-05).
+    ///
+    /// Remplace le refus du second champ réservé, que la version 3 a promu en vrai champ.
+    Format {
+        /// L'encodage trouvé.
         brut: u32,
+        /// Le champ fautif, tel que le contrat le nomme.
+        cause: FormatCodeError,
+    },
+    /// Un mot de la table des seize formats ne se décode pas.
+    TableFormat {
+        /// L'index **pilote** du câble concerné (0 = « Conduit 1 »).
+        index: u32,
+        /// L'encodage trouvé.
+        brut: u32,
+        /// Le champ fautif, tel que le contrat le nomme.
+        cause: FormatCodeError,
     },
 }
 
 impl fmt::Display for ErreurReponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Longueur { recus } => write!(
+            Self::Longueur { recus, attendue } => write!(
                 f,
-                "réponse de {recus} octets, {TAILLE_REPONSE} attendus exactement"
+                "réponse de {recus} octets, {attendue} attendus exactement pour cet ordre"
             ),
             Self::Version { trouvee } => write!(
                 f,
@@ -1031,7 +1466,14 @@ impl fmt::Display for ErreurReponse {
             ),
             Self::Statut { code } => write!(f, "statut {code} inconnu"),
             Self::Reserve { brut } => write!(f, "champ réservé non nul ({brut:#04x})"),
-            Self::Reserve2 { brut } => write!(f, "second champ réservé non nul ({brut:#010x})"),
+            Self::Format { brut, cause } => {
+                write!(f, "format servi {brut:#010x} illisible : {cause}")
+            }
+            Self::TableFormat { index, brut, cause } => write!(
+                f,
+                "format {brut:#010x} illisible pour « Conduit {} » : {cause}",
+                index.saturating_add(1)
+            ),
         }
     }
 }
@@ -1158,9 +1600,21 @@ mod tests {
         [version, ordre, c[0], c[1], n[0], n[1], r[0], r[1]]
     }
 
-    /// Les sept ordres font l'aller-retour, et le code d'ordre est celui qu'on a gravé.
+    /// Un format valide quelconque, pour les cas où seule sa présence compte.
+    fn un_format() -> CableFormat {
+        conduit_kmd_core::config::CABLE_FORMAT_DEFAULT
+    }
+
+    /// Une trame `format` portant l'encodage `encode`.
+    fn trame_format(cable: u16, encode: u32) -> Vec<u8> {
+        let mut trame = brut(PROTOCOLE_VERSION, ORDRE_FORMAT, cable, 0, 0).to_vec();
+        trame.extend_from_slice(&encode.to_le_bytes());
+        trame
+    }
+
+    /// Les huit ordres font l'aller-retour, et le code d'ordre est celui qu'on a gravé.
     #[test]
-    fn les_sept_ordres_font_l_aller_retour() {
+    fn les_huit_ordres_font_l_aller_retour() {
         let cas = [
             (Requete::Version, ORDRE_VERSION),
             (Requete::Lister, ORDRE_LISTER),
@@ -1181,15 +1635,21 @@ mod tests {
                 ORDRE_RENOMMER,
             ),
             (Requete::NomDefaut(CableId(7)), ORDRE_NOM_DEFAUT),
+            (
+                Requete::Format {
+                    cable: CableId(4),
+                    format: un_format(),
+                },
+                ORDRE_FORMAT,
+            ),
         ];
         for (requete, code) in &cas {
             let octets = requete.to_bytes();
-            // Seul `renommer` dépasse l'en-tête, et exactement de la taille du nom.
-            assert_eq!(
-                octets.len(),
-                TAILLE_REQUETE + requete.nom().map_or(0, str::len),
-                "{requete:?}"
-            );
+            // Deux ordres dépassent l'en-tête : `renommer` de la taille du nom, `format`
+            // de quatre octets.
+            let charge =
+                requete.nom().map_or(0, str::len) + requete.charge_format().map_or(0, |_| 4);
+            assert_eq!(octets.len(), TAILLE_REQUETE + charge, "{requete:?}");
             assert_eq!(octets[0], PROTOCOLE_VERSION, "{requete:?}");
             assert_eq!(octets[1], *code, "{requete:?}");
             assert_eq!(requete.code(), *code);
@@ -1199,10 +1659,14 @@ mod tests {
                 "{requete:?}"
             );
         }
-        // Les codes sont deux à deux distincts et contigus depuis 0.
+        // Les codes sont deux à deux distincts et contigus depuis 0. **Le huitième ordre
+        // porte le code 7** : la ROADMAP disait « ordre 8 » en comptant les ordres, et
+        // c'est cette ligne-ci qui fait foi.
         let codes: Vec<u8> = cas.iter().map(|(_, c)| *c).collect();
-        assert_eq!(codes, vec![0, 1, 2, 3, 4, 5, 6]);
-        assert_eq!(ORDRE_MAX, 6);
+        assert_eq!(codes, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(codes.len(), 8);
+        assert_eq!(ORDRE_MAX, 7);
+        assert_eq!(ORDRE_FORMAT, 7);
 
         // Le nom voyage **après** l'en-tête, tel quel, et nulle part ailleurs.
         let octets = Requete::Renommer {
@@ -1213,17 +1677,182 @@ mod tests {
         assert_eq!(&octets[TAILLE_REQUETE..], "Musique".as_bytes());
         // Les champs « canaux » et « réservé » de l'en-tête restent nuls.
         assert_eq!(&octets[4..8], &[0, 0, 0, 0]);
+
+        // Le format aussi voyage après l'en-tête, en quatre octets petit-boutistes, et
+        // **les octets « canaux » et « réservé » restent nuls** : c'est la décision de
+        // `TAILLE_REQUETE_FORMAT`, et elle se lit dans la trame.
+        let octets = Requete::Format {
+            cable: CableId(2),
+            format: un_format(),
+        }
+        .to_bytes();
+        assert_eq!(octets.len(), TAILLE_REQUETE_FORMAT);
+        assert_eq!(
+            &octets[TAILLE_REQUETE..],
+            &un_format().encode().to_le_bytes()
+        );
+        assert_eq!(&octets[4..8], &[0, 0, 0, 0]);
     }
 
-    /// **Les deux ordres de M1b-21 ne touchent pas au pilote**, et les trois autres
-    /// ordres modifiants si.
+    /// **L'aller-retour de `format` sur tout le domaine du contrat.**
     ///
-    /// C'est ce prédicat qui décide d'armer ou non `SeLoadDriverPrivilege` : le laisser
-    /// glisser vers « tout ce qui modifie » armerait un privilège pour une écriture de
-    /// registre.
+    /// Les trois fréquences, les trois profondeurs, les huit nombres de canaux : les 72
+    /// formats que le codec accepte traversent la trame sans rien perdre, sur les seize
+    /// câbles pour les bornes.
+    #[test]
+    fn format_fait_l_aller_retour_sur_tout_le_domaine() {
+        use conduit_kmd_core::config::{
+            CODE_DEPTH_F32, CODE_DEPTH_PCM16, CODE_DEPTH_PCM24, CODE_RATE_44100, CODE_RATE_48000,
+            CODE_RATE_96000,
+        };
+
+        let mut vus = 0usize;
+        for rate in [CODE_RATE_44100, CODE_RATE_48000, CODE_RATE_96000] {
+            for depth in [CODE_DEPTH_PCM16, CODE_DEPTH_PCM24, CODE_DEPTH_F32] {
+                for canaux in MIN_CHANNELS..=MAX_CHANNELS {
+                    let encode = rate | (depth << 8) | (canaux << 16);
+                    let format = CableFormat::decode(encode).expect("format du domaine");
+                    // L'encodage fait l'aller-retour dans le codec : c'est la prémisse.
+                    assert_eq!(format.encode(), encode, "{encode:#010x}");
+
+                    // Et il le fait dans la trame, aux deux bornes du numéro de câble.
+                    for numero in [1u32, CABLE_MAX] {
+                        let attendue = Requete::Format {
+                            cable: CableId(numero),
+                            format,
+                        };
+                        let octets = attendue.to_bytes();
+                        assert_eq!(octets.len(), TAILLE_REQUETE_FORMAT, "{encode:#010x}");
+                        assert_eq!(
+                            Requete::from_bytes(&octets),
+                            Ok(attendue.clone()),
+                            "{encode:#010x}, câble {numero}"
+                        );
+                        // La trame fabriquée à la main dit la même chose que le
+                        // sérialiseur : le format voyage bien en petit-boutiste.
+                        assert_eq!(
+                            Requete::from_bytes(&trame_format(numero as u16, encode)),
+                            Ok(attendue),
+                            "{encode:#010x}, câble {numero}"
+                        );
+                    }
+                    vus = vus.saturating_add(1);
+                }
+            }
+        }
+        // 3 × 3 × 8 : le compte du contrat, pas un nombre recopié au hasard.
+        assert_eq!(vus, 3 * 3 * (MAX_CHANNELS - MIN_CHANNELS + 1) as usize);
+        assert_eq!(vus, 72);
+    }
+
+    /// **La longueur d'un `format` est exigée à l'octet près** : ni 8, ni 11, ni 13.
+    ///
+    /// C'est la règle du module appliquée au second ordre à charge. Une charge de trois
+    /// octets et une de cinq disent la même chose — ce n'est pas un `REG_DWORD` — et le
+    /// refus les nomme sans jamais lire ce qu'elles portent.
+    #[test]
+    fn la_longueur_d_un_format_est_exacte() {
+        let complet = trame_format(1, un_format().encode());
+        assert_eq!(complet.len(), 12);
+        assert!(Requete::from_bytes(&complet).is_ok());
+
+        // Huit octets : l'en-tête seul, sans charge du tout.
+        let cas: [(usize, usize); 3] = [(8, 0), (11, 3), (13, 5)];
+        for (taille, charge) in cas {
+            let mut trame = brut(PROTOCOLE_VERSION, ORDRE_FORMAT, 1, 0, 0).to_vec();
+            trame.resize(taille, 0);
+            assert_eq!(trame.len(), taille);
+            assert_eq!(
+                Requete::from_bytes(&trame),
+                Err(ErreurRequete::FormatLongueur { recus: charge }),
+                "trame de {taille} octets"
+            );
+        }
+
+        // Une charge de la mauvaise longueur est une **trame** invalide : aucun format n'a
+        // même été lu, donc il n'y a rien à redemander à l'utilisateur.
+        assert_eq!(
+            ErreurRequete::FormatLongueur { recus: 3 }.statut(),
+            Statut::TrameInvalide
+        );
+        let ligne = ErreurRequete::FormatLongueur { recus: 3 }.to_string();
+        assert!(ligne.contains('3'), "{ligne}");
+        assert!(ligne.contains("12"), "{ligne}");
+    }
+
+    /// **L'octet de poids fort d'un format est exigé nul**, et c'est ce qui rend
+    /// l'aller-retour exact.
+    ///
+    /// Le refus vient du contrat ([`CableFormat::decode`]), pas d'une règle réécrite ici :
+    /// sans lui, `0x0102_0302` et `0x0002_0302` donneraient le même format, et la
+    /// resérialisation ne rendrait plus les octets reçus — l'invariant que le fuzz
+    /// éprouve à chaque exécution.
+    #[test]
+    fn un_format_a_octet_fort_non_nul_est_refuse() {
+        let valide = un_format().encode();
+        assert_eq!(valide, 0x0002_0302);
+
+        for fort in [0x01u32, 0x7F, 0xFF] {
+            let brut_avec_fort = valide | (fort << 24);
+            assert_eq!(
+                Requete::from_bytes(&trame_format(1, brut_avec_fort)),
+                Err(ErreurRequete::Format {
+                    brut: brut_avec_fort,
+                    cause: FormatCodeError::Reserve(fort)
+                }),
+                "{brut_avec_fort:#010x}"
+            );
+        }
+
+        // Les autres champs hors domaine sont refusés aussi, et la cause **nomme le
+        // champ** : c'est ce que le journal du service affichera.
+        let cas: [(u32, FormatCodeError); 4] = [
+            (0x0002_0304, FormatCodeError::Rate(4)),
+            (0x0002_0002, FormatCodeError::Depth(0)),
+            (0x0000_0302, FormatCodeError::Channels(0)),
+            (0x0009_0302, FormatCodeError::Channels(9)),
+        ];
+        for (encode, cause) in cas {
+            assert_eq!(
+                Requete::from_bytes(&trame_format(1, encode)),
+                Err(ErreurRequete::Format {
+                    brut: encode,
+                    cause
+                }),
+                "{encode:#010x}"
+            );
+        }
+
+        // Un encodage refusé est un **format** invalide, pas une trame invalide : la trame
+        // était bien formée, et la conduite est d'en demander un autre.
+        let erreur = ErreurRequete::Format {
+            brut: 0xFF02_0302,
+            cause: FormatCodeError::Reserve(0xFF),
+        };
+        assert_eq!(erreur.statut(), Statut::FormatInvalide);
+        let ligne = erreur.to_string();
+        assert!(ligne.contains("0xff020302"), "{ligne}");
+        // La cause du contrat est **portée**, pas reformulée.
+        assert!(
+            ligne.contains(&FormatCodeError::Reserve(0xFF).to_string()),
+            "{ligne}"
+        );
+    }
+
+    /// **Trois ordres seulement passent par le jeu de propriétés KS**, et six modifient.
+    ///
+    /// # Ce que ce test dit depuis M1b-05, et ce qu'il ne dit plus
+    ///
+    /// Il ne dit **plus** « qui arme `SeLoadDriverPrivilege` ». [`Requete::Format`] rend
+    /// `false` à `touche_le_pilote` et exige pourtant le privilège armé
+    /// (`CM_Query_And_Remove_SubTreeW`) : la coïncidence qui tenait de M1b-20 à M1b-21 est
+    /// rompue, et c'est `crate::cables` qui décide de l'armement, ordre par ordre.
+    ///
+    /// Ce qu'il dit encore : ce qui passe par KS est ce que le pilote peut refuser
+    /// lui-même, et tout ce qui y passe modifie la machine.
     #[test]
     fn ce_qui_touche_le_pilote_et_ce_qui_modifie() {
-        let cas: [(Requete, bool, bool); 7] = [
+        let cas: [(Requete, bool, bool); 8] = [
             (Requete::Version, false, false),
             (Requete::Lister, false, false),
             (Requete::Activer(CableId(1)), true, true),
@@ -1245,6 +1874,14 @@ mod tests {
                 false,
             ),
             (Requete::NomDefaut(CableId(1)), true, false),
+            (
+                Requete::Format {
+                    cable: CableId(1),
+                    format: un_format(),
+                },
+                true,
+                false,
+            ),
         ];
         for (requete, modifie, pilote) in &cas {
             assert_eq!(requete.modifie(), *modifie, "{requete:?}");
@@ -1254,6 +1891,33 @@ mod tests {
                 !requete.touche_le_pilote() || requete.modifie(),
                 "{requete:?}"
             );
+        }
+        // Trois ordres passent par KS, six modifient : les deux comptes ne coïncident pas,
+        // et c'est le fait que ce test existe pour fixer.
+        assert_eq!(cas.iter().filter(|(_, _, ks)| *ks).count(), 3);
+        assert_eq!(cas.iter().filter(|(_, m, _)| *m).count(), 6);
+
+        // La charge : `renommer` porte un nom et pas de format, `format` l'inverse, et
+        // aucun autre ordre ne porte quoi que ce soit.
+        for (requete, _, _) in &cas {
+            match requete {
+                Requete::Renommer { .. } => {
+                    assert!(requete.nom().is_some(), "{requete:?}");
+                    assert_eq!(requete.charge_format(), None, "{requete:?}");
+                }
+                Requete::Format { format, .. } => {
+                    assert_eq!(requete.nom(), None, "{requete:?}");
+                    assert_eq!(
+                        requete.charge_format(),
+                        Some(format.encode()),
+                        "{requete:?}"
+                    );
+                }
+                _ => {
+                    assert_eq!(requete.nom(), None, "{requete:?}");
+                    assert_eq!(requete.charge_format(), None, "{requete:?}");
+                }
+            }
         }
     }
 
@@ -1350,12 +2014,13 @@ mod tests {
         }
     }
 
-    /// Les octets en trop restent refusés — pour les six ordres qui n'ont pas de nom.
+    /// Les octets en trop restent refusés — pour les six ordres qui n'ont pas de charge.
     ///
-    /// C'est la règle que M1b-21 aurait pu relâcher par accident : ouvrir la requête à
-    /// une charge variable ne doit l'ouvrir que pour `renommer`.
+    /// C'est la règle que M1b-21 aurait pu relâcher par accident, et que M1b-05 aurait pu
+    /// relâcher une seconde fois : ouvrir la requête à une charge ne l'ouvre que pour
+    /// `renommer` et `format`, chacun avec **sa** longueur.
     #[test]
-    fn seul_renommer_accepte_des_octets_apres_l_en_tete() {
+    fn seuls_renommer_et_format_acceptent_des_octets_apres_l_en_tete() {
         let sans_nom = [
             (ORDRE_VERSION, 0u16),
             (ORDRE_LISTER, 0),
@@ -1378,6 +2043,15 @@ mod tests {
         assert_eq!(
             Requete::from_bytes(&trop),
             Err(ErreurRequete::Longueur { recus: 9 })
+        );
+
+        // Et `format` n'accepte pas les octets en trop **après sa propre charge** : sa
+        // longueur est exacte, pas minimale.
+        let mut trop = trame_format(1, un_format().encode());
+        trop.push(b'x');
+        assert_eq!(
+            Requete::from_bytes(&trop),
+            Err(ErreurRequete::FormatLongueur { recus: 5 })
         );
     }
 
@@ -1454,7 +2128,7 @@ mod tests {
         );
     }
 
-    /// Table des codes d'ordre : les sept connus, tous les autres refusés.
+    /// Table des codes d'ordre : les huit connus, tous les autres refusés.
     #[test]
     fn ordre_table() {
         for code in 0..=u8::MAX {
@@ -1463,9 +2137,10 @@ mod tests {
             match code {
                 ORDRE_VERSION => assert_eq!(resultat, Ok(Requete::Version)),
                 ORDRE_LISTER => assert_eq!(resultat, Ok(Requete::Lister)),
-                // Les ordres qui visent un câble refusent le câble 0, pas l'ordre.
+                // Les ordres qui visent un câble refusent le câble 0, pas l'ordre — et le
+                // câble est jugé avant la charge, y compris pour `format`.
                 ORDRE_ACTIVER | ORDRE_DESACTIVER | ORDRE_CANAUX | ORDRE_RENOMMER
-                | ORDRE_NOM_DEFAUT => {
+                | ORDRE_NOM_DEFAUT | ORDRE_FORMAT => {
                     assert_eq!(
                         resultat,
                         Err(ErreurRequete::Cable { brut: 0 }),
@@ -1475,6 +2150,14 @@ mod tests {
                 _ => assert_eq!(resultat, Err(ErreurRequete::Ordre { code }), "code {code}"),
             }
         }
+        // Le premier code inconnu est celui qui suit le dernier ordre servi : c'est ce que
+        // le message de refus annonce (« 0 à ORDRE_MAX »).
+        assert_eq!(
+            Requete::from_bytes(&brut(PROTOCOLE_VERSION, ORDRE_MAX + 1, 0, 0, 0)),
+            Err(ErreurRequete::Ordre {
+                code: ORDRE_MAX + 1
+            })
+        );
         // Un ordre inconnu est signalé comme tel **même** avec des octets en trop : le
         // code décide de la longueur à exiger, donc il est reconnu d'abord.
         let mut trop = brut(PROTOCOLE_VERSION, 200, 0, 0, 0).to_vec();
@@ -1584,11 +2267,19 @@ mod tests {
                 "ordre {ordre}"
             );
         }
-        // `renommer` et `nom par défaut` n'utilisent pas les canaux non plus.
-        for ordre in [ORDRE_RENOMMER, ORDRE_NOM_DEFAUT] {
+        // `renommer`, `nom par défaut` et `format` n'utilisent pas les canaux non plus.
+        //
+        // **C'est la décision de `TAILLE_REQUETE_FORMAT` qui se vérifie ici** : `format`
+        // aurait pu loger sa fréquence et ses canaux dans ces quatre octets libres. Il ne
+        // le fait pas, et les gardes de l'en-tête gardent donc leur rôle pour les huit
+        // ordres sans exception.
+        for ordre in [ORDRE_RENOMMER, ORDRE_NOM_DEFAUT, ORDRE_FORMAT] {
             let mut trame = brut(PROTOCOLE_VERSION, ordre, 1, 2, 0).to_vec();
             if ordre == ORDRE_RENOMMER {
                 trame.extend_from_slice(b"Musique");
+            }
+            if ordre == ORDRE_FORMAT {
+                trame.extend_from_slice(&un_format().encode().to_le_bytes());
             }
             assert_eq!(
                 Requete::from_bytes(&trame),
@@ -1608,6 +2299,7 @@ mod tests {
             ORDRE_CANAUX,
             ORDRE_RENOMMER,
             ORDRE_NOM_DEFAUT,
+            ORDRE_FORMAT,
         ] {
             assert_eq!(
                 Requete::from_bytes(&brut(PROTOCOLE_VERSION, ordre, 1, 2, 0xBEEF)),
@@ -1713,7 +2405,7 @@ mod tests {
     /// fidèle.
     #[test]
     fn statut_table() {
-        let attendus: [(Statut, u8); 12] = [
+        let attendus: [(Statut, u8); 16] = [
             (Statut::Succes, 0),
             (Statut::VersionInconnue, 1),
             (Statut::TrameInvalide, 2),
@@ -1726,18 +2418,45 @@ mod tests {
             (Statut::ErreurSysteme, 9),
             (Statut::NomInvalide, 10),
             (Statut::EndpointAbsent, 11),
+            // Les quatre de M1b-05.
+            (Statut::CableActif, 12),
+            (Statut::FormatInvalide, 13),
+            (Statut::FormatNonEcrit, 14),
+            (Statut::RedemarrageEchoue, 15),
         ];
         for (statut, code) in attendus {
             assert_eq!(statut.code(), code, "{statut:?}");
             assert_eq!(Statut::from_code(code), Some(statut));
+            // Chaque statut dit quelque chose : un code sans message ne servirait à rien.
+            assert!(!statut.to_string().is_empty(), "{statut:?}");
         }
         assert_eq!(Statut::ALL.len(), attendus.len());
+        // `ALL` est bien dans l'ordre des codes, et sans doublon.
+        for (rang, statut) in Statut::ALL.iter().enumerate() {
+            assert_eq!(u32::from(statut.code()), rang as u32, "{statut:?}");
+        }
         // Un code inconnu n'est pas replié sur une erreur générique.
-        for code in 12..=u8::MAX {
+        for code in 16..=u8::MAX {
             assert_eq!(Statut::from_code(code), None, "code {code}");
         }
         assert!(Statut::Succes.succes());
         assert!(!Statut::ErreurSysteme.succes());
+        assert!(!Statut::CableActif.succes());
+
+        // **Les deux statuts qu'il ne faut jamais confondre.** 14 dit que rien n'a changé,
+        // 15 que la valeur est écrite : leurs messages doivent le dire, parce que les
+        // conduites de réparation sont opposées.
+        let non_ecrit = Statut::FormatNonEcrit.to_string();
+        assert!(non_ecrit.contains("rien n'a changé"), "{non_ecrit}");
+        let echoue = Statut::RedemarrageEchoue.to_string();
+        assert!(echoue.contains("écrit"), "{echoue}");
+        assert!(echoue.contains("prochain démarrage"), "{echoue}");
+        assert_ne!(non_ecrit, echoue);
+
+        // Et celui qui dit la **séquence**.
+        let actif = Statut::CableActif.to_string();
+        assert!(actif.contains("désactivez"), "{actif}");
+        assert!(actif.contains("réactivez"), "{actif}");
     }
 
     /// La réponse fait l'aller-retour, et les masques se relisent par câble affiché.
@@ -1751,11 +2470,17 @@ mod tests {
             actifs: 0b0000_0101,
             version_ks: 1,
             canaux: 2,
+            format: un_format().encode(),
+            formats: [0; CABLE_MAX as usize],
         };
         let octets = reponse.to_bytes();
         assert_eq!(octets.len(), TAILLE_REPONSE);
         assert_eq!(octets[0], PROTOCOLE_VERSION);
         assert_eq!(Reponse::from_bytes(&octets), Ok(reponse));
+        // Le format du câble visé occupe l'ancien second champ réservé.
+        assert_eq!(&octets[24..28], &un_format().encode().to_le_bytes());
+        // L'en-tête est bien les 28 premiers octets, ni plus ni moins.
+        assert_eq!(&reponse.en_tete()[..], &octets[..TAILLE_REPONSE]);
 
         // Le décalage de un est fait par la réponse : bit 0 = « Conduit 1 ».
         assert!(reponse.est_actif(CableId(1)));
@@ -1767,53 +2492,232 @@ mod tests {
         assert!(!reponse.est_present(CableId(17)));
     }
 
-    /// Table des refus de réponse : longueur, version, statut inconnu, réservés.
+    /// **La longueur d'une réponse se déduit de son octet d'ordre**, et de rien d'autre.
+    ///
+    /// C'est la propriété que la taille fixe assurait gratuitement et que la version 3
+    /// doit tenir explicitement. Les quatre cas qui la fixent : `lister` en 92 accepté,
+    /// `lister` en 28 refusé, et l'inverse pour un autre ordre.
+    #[test]
+    fn la_longueur_d_une_reponse_vient_de_son_ordre() {
+        assert_eq!(TAILLE_REPONSE_LISTER, 92);
+        assert_eq!(TAILLE_REPONSE, 28);
+        assert_eq!(longueur_reponse(ORDRE_LISTER), TAILLE_REPONSE_LISTER);
+        for ordre in [
+            ORDRE_VERSION,
+            ORDRE_ACTIVER,
+            ORDRE_DESACTIVER,
+            ORDRE_CANAUX,
+            ORDRE_RENOMMER,
+            ORDRE_NOM_DEFAUT,
+            ORDRE_FORMAT,
+            u8::MAX,
+        ] {
+            assert_eq!(longueur_reponse(ordre), TAILLE_REPONSE, "ordre {ordre}");
+        }
+
+        // `lister` : 92 accepté…
+        let lister = Reponse {
+            formats: [un_format().encode(); CABLE_MAX as usize],
+            ..Reponse::refus(ORDRE_LISTER, Statut::Succes)
+        };
+        let octets = lister.to_bytes();
+        assert_eq!(octets.len(), TAILLE_REPONSE_LISTER);
+        assert_eq!(Reponse::from_bytes(&octets), Ok(lister));
+
+        // … et 28 refusé, en disant que 92 étaient attendus.
+        assert_eq!(
+            Reponse::from_bytes(&octets[..TAILLE_REPONSE]),
+            Err(ErreurReponse::Longueur {
+                recus: TAILLE_REPONSE,
+                attendue: TAILLE_REPONSE_LISTER
+            })
+        );
+
+        // L'inverse pour un autre ordre : 28 accepté…
+        let activer = Reponse::refus(ORDRE_ACTIVER, Statut::Succes);
+        let court = activer.to_bytes();
+        assert_eq!(court.len(), TAILLE_REPONSE);
+        assert_eq!(Reponse::from_bytes(&court), Ok(activer));
+
+        // … et 92 refusé, en disant que 28 étaient attendus.
+        let mut long = court.clone();
+        long.resize(TAILLE_REPONSE_LISTER, 0);
+        assert_eq!(
+            Reponse::from_bytes(&long),
+            Err(ErreurReponse::Longueur {
+                recus: TAILLE_REPONSE_LISTER,
+                attendue: TAILLE_REPONSE
+            })
+        );
+
+        // La table se relit par numéro **affiché**, le décalage de un étant fait une seule
+        // fois. Un format par câble, tous distincts, pour que l'ordre des mots compte.
+        let mut formats = [0u32; CABLE_MAX as usize];
+        for (index, place) in formats.iter_mut().enumerate() {
+            // Canaux de 1 à 8, deux fois : le mot de « Conduit 1 » n'est pas celui de
+            // « Conduit 9 » pour autant, la profondeur les sépare.
+            let canaux = (index % 8 + 1) as u32;
+            let depth = if index < 8 { 3 } else { 1 };
+            *place = 2 | (depth << 8) | (canaux << 16);
+        }
+        let lister = Reponse {
+            formats,
+            ..Reponse::refus(ORDRE_LISTER, Statut::Succes)
+        };
+        let relue = Reponse::from_bytes(&lister.to_bytes()).expect("aller-retour de la table");
+        for numero in 1..=CABLE_MAX {
+            assert_eq!(
+                relue.format_de(CableId(numero)),
+                formats[(numero - 1) as usize],
+                "câble {numero}"
+            );
+        }
+        // Hors des câbles adressables : 0, jamais une panique ni un mot voisin.
+        assert_eq!(relue.format_de(CableId(0)), 0);
+        assert_eq!(relue.format_de(CableId(CABLE_MAX + 1)), 0);
+        assert_eq!(relue.format_de(CableId(u32::MAX)), 0);
+    }
+
+    /// **Un refus ne porte ni format ni table**, quel que soit l'ordre auquel il répond.
+    #[test]
+    fn un_refus_ne_pretend_rien_savoir_des_formats() {
+        for ordre in [ORDRE_LISTER, ORDRE_ACTIVER, ORDRE_FORMAT] {
+            for refus in [
+                Reponse::refus(ordre, Statut::PiloteAbsent),
+                Reponse::refus_detaille(ordre, Statut::FormatInvalide, 0xFF02_0302),
+            ] {
+                assert_eq!(refus.format, 0, "ordre {ordre}");
+                assert_eq!(refus.formats, [0; CABLE_MAX as usize], "ordre {ordre}");
+                // Et l'aller-retour reste fidèle, y compris pour un `lister` refusé, qui
+                // rend bien 92 octets de table nulle.
+                let octets = refus.to_bytes();
+                assert_eq!(octets.len(), longueur_reponse(ordre), "ordre {ordre}");
+                assert_eq!(Reponse::from_bytes(&octets), Ok(refus), "ordre {ordre}");
+            }
+        }
+        // Le détail d'un `FormatInvalide` est le `u32` refusé **tel quel** : c'est ce qui
+        // permet de le relire en hexadécimal, et il n'est pas soumis au codec.
+        let refus = Reponse::refus_detaille(ORDRE_FORMAT, Statut::FormatInvalide, 0xFF02_0302);
+        assert_eq!(refus.detail, 0xFF02_0302);
+        assert_eq!(
+            Reponse::from_bytes(&refus.to_bytes()).map(|r| r.detail),
+            Ok(0xFF02_0302)
+        );
+    }
+
+    /// Table des refus de réponse : longueur, version, statut inconnu, réservé, formats.
     #[test]
     fn reponse_refus_table() {
-        let valide = Reponse::refus(ORDRE_LISTER, Statut::PiloteAbsent).to_bytes();
+        let valide = Reponse::refus(ORDRE_ACTIVER, Statut::PiloteAbsent).to_bytes();
         assert!(Reponse::from_bytes(&valide).is_ok());
 
         assert_eq!(
             Reponse::from_bytes(&valide[..27]),
-            Err(ErreurReponse::Longueur { recus: 27 })
+            Err(ErreurReponse::Longueur {
+                recus: 27,
+                attendue: TAILLE_REPONSE
+            })
         );
-        let mut trop_long = valide.to_vec();
+        let mut trop_long = valide.clone();
         trop_long.push(0);
         assert_eq!(
             Reponse::from_bytes(&trop_long),
-            Err(ErreurReponse::Longueur { recus: 29 })
+            Err(ErreurReponse::Longueur {
+                recus: 29,
+                attendue: TAILLE_REPONSE
+            })
         );
+        // Un tampon trop court pour porter un octet d'ordre exige le minimum, et ne
+        // panique pas en cherchant l'octet 1.
+        for taille in 0..2usize {
+            assert_eq!(
+                Reponse::from_bytes(&valide[..taille]),
+                Err(ErreurReponse::Longueur {
+                    recus: taille,
+                    attendue: TAILLE_REPONSE
+                }),
+                "taille {taille}"
+            );
+        }
 
         // Une version qui n'est pas la nôtre — dite en fonction de la nôtre, pour que ce
         // test ne tombe pas au prochain incrément de `PROTOCOLE_VERSION`.
         let etrangere = PROTOCOLE_VERSION.wrapping_add(1);
-        let mut mauvaise_version = valide;
+        let mut mauvaise_version = valide.clone();
         mauvaise_version[0] = etrangere;
         assert_eq!(
             Reponse::from_bytes(&mauvaise_version),
             Err(ErreurReponse::Version { trouvee: etrangere })
         );
 
-        let mut reserve = valide;
+        let mut reserve = valide.clone();
         reserve[3] = 1;
         assert_eq!(
             Reponse::from_bytes(&reserve),
             Err(ErreurReponse::Reserve { brut: 1 })
         );
 
-        let mut statut = valide;
+        let mut statut = valide.clone();
         statut[2] = 200;
         assert_eq!(
             Reponse::from_bytes(&statut),
             Err(ErreurReponse::Statut { code: 200 })
         );
 
-        let mut reserve2 = valide;
-        reserve2[24] = 0xFF;
+        // L'ancien « second champ réservé » est désormais le format : un octet aberrant
+        // n'y est plus refusé comme « réservé non nul » mais comme un **format illisible**,
+        // et la cause nomme le champ fautif.
+        let mut format = valide;
+        format[24] = 0xFF;
         assert_eq!(
-            Reponse::from_bytes(&reserve2),
-            Err(ErreurReponse::Reserve2 { brut: 0xFF })
+            Reponse::from_bytes(&format),
+            Err(ErreurReponse::Format {
+                brut: 0xFF,
+                cause: FormatCodeError::Rate(0xFF)
+            })
         );
+
+        // Chaque mot de la table subit le même contrôle, et le refus **nomme le câble**.
+        let mut lister = Reponse::refus(ORDRE_LISTER, Statut::Succes).to_bytes();
+        // Le mot du câble d'index 2, soit « Conduit 3 ».
+        lister[TAILLE_REPONSE + 2 * 4] = 0x07;
+        assert_eq!(
+            Reponse::from_bytes(&lister),
+            Err(ErreurReponse::TableFormat {
+                index: 2,
+                brut: 0x07,
+                cause: FormatCodeError::Rate(7)
+            })
+        );
+        let ligne = ErreurReponse::TableFormat {
+            index: 2,
+            brut: 0x07,
+            cause: FormatCodeError::Rate(7),
+        }
+        .to_string();
+        assert!(ligne.contains("Conduit 3"), "{ligne}");
+
+        // Chaque message de refus dit quelque chose.
+        for erreur in [
+            ErreurReponse::Longueur {
+                recus: 27,
+                attendue: 28,
+            },
+            ErreurReponse::Version { trouvee: 9 },
+            ErreurReponse::Statut { code: 200 },
+            ErreurReponse::Reserve { brut: 1 },
+            ErreurReponse::Format {
+                brut: 0xFF,
+                cause: FormatCodeError::Rate(0xFF),
+            },
+            ErreurReponse::TableFormat {
+                index: 0,
+                brut: 0xFF,
+                cause: FormatCodeError::Rate(0xFF),
+            },
+        ] {
+            assert!(!erreur.to_string().is_empty(), "{erreur:?}");
+        }
     }
 
     /// Le cadrage : longueur préfixée, bornée **avant** l'allocation.
@@ -1916,7 +2820,9 @@ mod tests {
             match Requete::from_bytes(&octets) {
                 Ok(requete) => {
                     // La longueur acceptée est celle que l'ordre exige, et rien d'autre.
-                    let attendue = TAILLE_REQUETE + requete.nom().map_or(0, str::len);
+                    let charge = requete.nom().map_or(0, str::len)
+                        + requete.charge_format().map_or(0, |_| 4);
+                    let attendue = TAILLE_REQUETE + charge;
                     prop_assert_eq!(octets.len(), attendue);
                     prop_assert_eq!(&requete.to_bytes()[..], &octets[..]);
                     prop_assert_eq!(
@@ -1938,6 +2844,13 @@ mod tests {
                         prop_assert!(nom.len() <= MAX_NOM_OCTETS);
                         prop_assert!(conduit_backend::cable::validate_cable_name(nom).is_ok());
                     }
+                    // Un format accepté est **toujours** un format que le contrat accepte,
+                    // et son encodage se relit à l'identique — c'est ce que le refus de
+                    // l'octet de poids fort garantit.
+                    if let Some(brut) = requete.charge_format() {
+                        prop_assert_eq!(CableFormat::decode(brut).map(CableFormat::encode),
+                                        Ok(brut));
+                    }
                 }
                 Err(err) => {
                     // Une longueur inférieure à l'en-tête est **toujours** signalée
@@ -1950,19 +2863,88 @@ mod tests {
             }
         }
 
-        /// Idem côté réponse.
+        /// Idem côté réponse, sur les deux longueurs que le protocole produit.
         #[test]
-        fn aucune_reponse_ne_panique(octets in proptest::collection::vec(any::<u8>(), 0..64)) {
+        fn aucune_reponse_ne_panique(
+            octets in proptest::collection::vec(any::<u8>(), 0..120),
+        ) {
+            // La longueur exigée se déduit de l'octet d'ordre, et le parseur ne peut donc
+            // accepter que celle-là.
+            let attendue = longueur_reponse(octets.get(1).copied().unwrap_or(u8::MAX));
             match Reponse::from_bytes(&octets) {
                 Ok(reponse) => {
-                    prop_assert_eq!(octets.len(), TAILLE_REPONSE);
+                    prop_assert_eq!(octets.len(), attendue);
                     prop_assert_eq!(&reponse.to_bytes()[..], &octets[..]);
+                    // Tout format rendu est 0 ou décodable : c'est la propriété qui
+                    // interdit à un encodage aberrant de traverser le client.
+                    for mot in core::iter::once(reponse.format).chain(reponse.formats) {
+                        prop_assert!(mot == 0 || CableFormat::decode(mot).is_ok());
+                    }
                 }
                 Err(err) => {
                     let longueur = matches!(err, ErreurReponse::Longueur { .. });
-                    prop_assert_eq!(longueur, octets.len() != TAILLE_REPONSE);
+                    prop_assert_eq!(longueur, octets.len() != attendue);
                 }
             }
+        }
+
+        /// **L'aller-retour d'une réponse quelconque**, table comprise.
+        ///
+        /// Le pendant du même test côté requête : ce que `to_bytes` produit, `from_bytes`
+        /// le rend à l'identique, pour les huit ordres et les deux longueurs. C'est la
+        /// propriété qui a changé de nature en version 3 — elle ne découle plus d'une
+        /// taille fixe — et donc celle qu'il faut éprouver sur des entrées engendrées.
+        #[test]
+        fn l_aller_retour_d_une_reponse_est_fidele(
+            ordre in 0_u8..=u8::MAX,
+            code_statut in 0_u8..16,
+            detail in any::<u32>(),
+            presents in any::<u32>(),
+            actifs in any::<u32>(),
+            version_ks in any::<u32>(),
+            canaux in any::<u32>(),
+            // Les mots de format sont engendrés dans le **domaine** — 0, ou un encodage
+            // que le contrat accepte : ce sont les seuls qu'un service produit.
+            formats in proptest::collection::vec(
+                prop_oneof![
+                    Just(0_u32),
+                    (1_u32..=3, 1_u32..=3, MIN_CHANNELS..=MAX_CHANNELS)
+                        .prop_map(|(r, d, c)| r | (d << 8) | (c << 16)),
+                ],
+                CABLE_MAX as usize + 1,
+            ),
+        ) {
+            let statut = Statut::from_code(code_statut)
+                .ok_or_else(|| TestCaseError::fail("code de statut hors de ALL"))?;
+            let mut table = [0_u32; CABLE_MAX as usize];
+            for (place, mot) in table.iter_mut().zip(formats.iter()) {
+                *place = *mot;
+            }
+            let reponse = Reponse {
+                ordre,
+                statut,
+                detail,
+                presents,
+                actifs,
+                version_ks,
+                canaux,
+                format: formats.last().copied().unwrap_or(0),
+                // La table ne voyage que pour `lister` : la mettre ailleurs ne survivrait
+                // pas à l'aller-retour, et ce n'est pas un défaut mais le format.
+                formats: if ordre == ORDRE_LISTER { table } else { [0; CABLE_MAX as usize] },
+            };
+            let octets = reponse.to_bytes();
+            prop_assert_eq!(octets.len(), longueur_reponse(ordre));
+            prop_assert!(octets.len() <= TAILLE_REPONSE_MAX);
+            prop_assert_eq!(Reponse::from_bytes(&octets), Ok(reponse));
+            // Et la trame cadrée passe la borne d'allocation : sans quoi tout `lister`
+            // serait refusé côté client.
+            let trame = reponse.encadrer();
+            let (charge, consommes) = decouper(&trame)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?
+                .ok_or_else(|| TestCaseError::fail("trame incomplète"))?;
+            prop_assert_eq!(consommes, trame.len());
+            prop_assert_eq!(Reponse::from_bytes(charge), Ok(reponse));
         }
 
         /// Le découpage ne panique jamais et ne rend jamais plus d'octets que le tampon
@@ -1996,11 +2978,15 @@ mod tests {
         /// laisse passer, et donc celle qui éprouve `MAX_TRAME_OCTETS`.
         #[test]
         fn le_cadrage_est_reversible(
-            ordre in 0_u8..7,
+            ordre in 0_u8..8,
             cable in 1_u32..=CABLE_MAX,
             canaux in MIN_CHANNELS..=MAX_CHANNELS,
             nom in "[a-zA-Zé0-9 _.-]{1,64}",
+            rate in 1_u32..=3,
+            depth in 1_u32..=3,
         ) {
+            let format = CableFormat::decode(rate | (depth << 8) | (canaux << 16))
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
             let requete = match ordre {
                 0 => Requete::Version,
                 1 => Requete::Lister,
@@ -2008,7 +2994,8 @@ mod tests {
                 3 => Requete::Desactiver(CableId(cable)),
                 4 => Requete::Canaux { cable: CableId(cable), canaux },
                 5 => Requete::Renommer { cable: CableId(cable), nom: nom.trim().to_owned() },
-                _ => Requete::NomDefaut(CableId(cable)),
+                6 => Requete::NomDefaut(CableId(cable)),
+                _ => Requete::Format { cable: CableId(cable), format },
             };
             // Un nom qui n'est que des espaces est refusé par la règle du dépôt : la
             // propriété ne porte que sur les requêtes que le protocole peut porter.

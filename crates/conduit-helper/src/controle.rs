@@ -354,8 +354,8 @@ pub fn verifier(reponse: &Reponse, cable: Option<CableId>) -> Result<(), CableEr
         Statut::CanauxNonApplicables => CableError::Unsupported(format!(
             "ce câble sert {detail} canaux : en changer demande d'écrire son format dans \
              la clé matérielle du périphérique puis de redémarrer celui-ci — environ une \
-             seconde de silence sur tous les câbles — et « conduitctl » ne sait pas encore \
-             le demander"
+             seconde de silence sur tous les câbles — utilisez « conduitctl cable \
+             set-format »"
         )),
         Statut::PiloteAbsent => CableError::Driver(
             "le pilote Conduit n'expose aucun filtre de topologie pour ce câble : il n'est \
@@ -385,6 +385,37 @@ pub fn verifier(reponse: &Reponse, cable: Option<CableId>) -> Result<(), CableEr
         Statut::EndpointAbsent => CableError::Driver(format!(
             "{} ({detail} côté(s) sur 2 trouvé(s))",
             Statut::EndpointAbsent
+        )),
+        // M1b-05. Un refus qui **nomme la séquence** : le format d'un endpoint est figé à
+        // sa création, donc changer celui d'un câble connecté ne le déplacerait pas. Un
+        // `Unsupported` et non un `Driver` : rien n'est en panne, c'est l'ordre des gestes
+        // qui n'est pas le bon, et l'appelant peut le corriger seul.
+        Statut::CableActif => CableError::Unsupported(
+            "ce câble est connecté : désactivez-le, réglez son format, puis \
+             réactivez-le — le format d'un endpoint audio est figé à sa création, et le \
+             redémarrage du périphérique ne le déplacerait pas"
+                .to_owned(),
+        ),
+        // Le nom a déjà été validé par le démon avant d'être envoyé, comme pour
+        // `NomInvalide` : si le service le refuse quand même, les deux ne jugent pas avec
+        // le même codec, et cela se rapporte.
+        Statut::FormatInvalide => CableError::Unsupported(format!(
+            "le service d'assistance a refusé le format {detail:#010x} alors que le démon \
+             l'avait accepté : joignez « conduitctl dump » à un rapport de bogue"
+        )),
+        // **Rien n'a changé** : le câble sert toujours son ancien format, et réessayer est
+        // sans danger. C'est la moitié « avant l'écriture » de `crate::devnode`.
+        Statut::FormatNonEcrit => CableError::Driver(format!(
+            "le format n'a pas pu être écrit dans la clé matérielle du périphérique : rien \
+             n'a changé, le câble sert toujours son ancien format (code du système : \
+             {detail})"
+        )),
+        // **La valeur est écrite** : l'inverse du précédent, et la conduite est opposée —
+        // provoquer le redémarrage, non réessayer l'écriture.
+        Statut::RedemarrageEchoue => CableError::Driver(format!(
+            "le format est écrit mais le périphérique n'a pas redémarré : il prendra effet \
+             au prochain démarrage du périphérique, au redémarrage de la machine au pire. \
+             Fermez ce qui tient un flux audio, puis réessayez (code du système : {detail})"
         )),
     })
 }
@@ -749,6 +780,8 @@ mod tests {
             actifs,
             version_ks: 1,
             canaux: 0,
+            format: 0,
+            formats: [0; CABLE_MAX as usize],
         }
     }
 
@@ -920,9 +953,49 @@ mod tests {
                 Statut::NomInvalide => {
                     assert!(matches!(erreur, CableError::InvalidName(_)));
                 }
+                // M1b-05. Le refus **nomme la séquence**, dans l'ordre : désactiver,
+                // régler, réactiver. Un « paramètre invalide » laisserait chercher.
+                Statut::CableActif => {
+                    assert!(texte.contains("désactiv"), "{texte}");
+                    assert!(texte.contains("réactiv"), "{texte}");
+                }
+                Statut::FormatInvalide => {
+                    // Le démon a déjà validé le format : un refus du service est un
+                    // désaccord entre deux codecs, et cela se rapporte.
+                    assert!(texte.contains("rapport de bogue"), "{texte}");
+                }
+                Statut::FormatNonEcrit => {
+                    // **Rien n'a changé** : c'est ce qui distingue 14 de 15, et la
+                    // conduite qui en découle est « réessayez ».
+                    assert!(texte.contains("rien n'a changé"), "{texte}");
+                    assert!(texte.contains("1314"), "{texte}");
+                }
+                Statut::RedemarrageEchoue => {
+                    // **La valeur est écrite** et prendra effet au prochain démarrage du
+                    // périphérique : la conduite opposée de la précédente.
+                    assert!(texte.contains("écrit"), "{texte}");
+                    assert!(texte.contains("prochain démarrage"), "{texte}");
+                }
                 _ => {}
             }
         }
+
+        // Les deux statuts qu'il ne faut jamais confondre ne disent pas la même chose.
+        let non_ecrit = verdict_texte(Statut::FormatNonEcrit);
+        let echoue = verdict_texte(Statut::RedemarrageEchoue);
+        assert_ne!(non_ecrit, echoue);
+        assert!(!non_ecrit.contains("prochain démarrage"), "{non_ecrit}");
+        assert!(!echoue.contains("rien n'a changé"), "{echoue}");
+    }
+
+    /// Le message que `verifier` rend pour `statut`, pour comparer deux statuts entre eux.
+    fn verdict_texte(statut: Statut) -> String {
+        let mut r = reponse(ACTIVE_CABLES_MASK, 0);
+        r.statut = statut;
+        r.detail = 1314;
+        verifier(&r, Some(CableId(3)))
+            .expect_err("statut de refus")
+            .to_string()
     }
 
     /// **La politique du renommage**, en table de cas : ce qui renomme, ce qui efface,

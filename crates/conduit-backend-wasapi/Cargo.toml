@@ -40,7 +40,11 @@ conduit-kmd-core = { path = "../conduit-kmd-core", version = "0.1.0" }
 # - `Win32_Media_KernelStreaming` : KSCATEGORY_TOPOLOGY, IOCTL_KS_PROPERTY et les
 #   drapeaux GET/SET — pris chez Microsoft plutôt que recopiés à la main ;
 # - `Win32_Devices_DeviceAndDriverInstallation` : CM_Get_Device_Interface_List(_Size)W,
-#   l'énumération des interfaces de périphérique publiées par l'INF ;
+#   l'énumération des interfaces de périphérique publiées par l'INF, et
+#   CM_Get_Device_Interface_PropertyW (M1b-05, lot A1) ;
+# - `Win32_Devices_Properties` : DEVPKEY_Device_InstanceId et DEVPROP_TYPE_STRING, la
+#   clé et le type de la propriété ci-dessus — c'est cette feature-là qui compile
+#   `CM_Get_Device_Interface_PropertyW`, pas celle de cfgmgr32 ;
 # - `Win32_Storage_FileSystem` : CreateFileW, pour ouvrir le filtre de topologie ;
 # - `Win32_System_IO` : DeviceIoControl, pour lui envoyer la requête.
 windows = { version = "0.62", features = [
@@ -54,6 +58,7 @@ windows = { version = "0.62", features = [
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_Devices_FunctionDiscovery",
     "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Threading",

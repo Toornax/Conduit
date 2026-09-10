@@ -5,9 +5,33 @@
 //! y compris dans les cas qu'on espère ne jamais voir, comme un pilote absent.
 
 use conduit_backend::CableId;
-use conduit_kmd_core::config::CABLE_MAX;
+use conduit_kmd_core::config::{CableFormat, CABLE_MAX};
+use conduit_kmd_core::ring::SampleFormat;
 
 use crate::protocole::{Reponse, Requete, Statut};
+
+/// Un format en français, l'encodage brut entre parenthèses.
+///
+/// L'encodage est gardé parce que c'est **lui** qu'on retrouve dans `regedit` et dans le
+/// journal du service : afficher l'un sans l'autre obligerait à traduire de tête pour
+/// vérifier ce qui est écrit dans la clé.
+#[must_use]
+fn format_lisible(format: &CableFormat, brut: u32) -> String {
+    let profondeur = match format.depth {
+        SampleFormat::I16 => "PCM 16 bits".to_owned(),
+        SampleFormat::Pcm24 => "PCM 24 bits".to_owned(),
+        SampleFormat::F32 => "float 32 bits".to_owned(),
+        // `SampleFormat` est `#[non_exhaustive]` : une quatrième profondeur ajoutée au
+        // contrat ne doit pas empêcher ce crate de compiler, ni faire afficher un nom
+        // faux. On dit alors ce qu'on sait — le nombre de bits, que le contrat rend pour
+        // toutes ses variantes — plutôt que de deviner un libellé.
+        autre => format!("{} bits", autre.bits_per_sample()),
+    };
+    format!(
+        "{} Hz, {profondeur}, {} canaux ({brut:#010x})",
+        format.sample_rate, format.channels
+    )
+}
 
 /// Met en forme la réponse à `requete`.
 ///
@@ -101,9 +125,50 @@ pub fn precision(reponse: &Reponse) -> Option<String> {
              (voir docs/driver-dev.md)"
                 .to_owned(),
         ),
+        // Un format servi qu'on sait lire s'affiche **lisiblement**, pas en hexadécimal :
+        // « 48000 Hz, float 32 bits, 2 canaux » se comprend, `0x00020302` non. L'encodage
+        // brut reste dans le journal du service, où il sert à retrouver la valeur dans
+        // `regedit`.
+        Statut::Succes if reponse.format != 0 => Some(match CableFormat::decode(reponse.format) {
+            Ok(format) => format!(
+                "format du câble visé : {}",
+                format_lisible(&format, reponse.format)
+            ),
+            // Le parseur des réponses refuse déjà les encodages illisibles ; ce bras
+            // n'est atteignable que par un appel direct, et il ne ment pas pour autant.
+            Err(cause) => format!(
+                "format du câble visé illisible ({:#010x}) : {cause}",
+                reponse.format
+            ),
+        }),
         Statut::Succes if reponse.canaux != 0 => {
             Some(format!("canaux du câble visé : {}", reponse.canaux))
         }
+        // M1b-05. Le refus **redit la séquence** : le message du statut la porte déjà, et
+        // la précision nomme le câble qu'il faut désactiver.
+        Statut::CableActif => Some(
+            "désactivez le câble, réglez son format, puis réactivez-le — le format d'un \
+             endpoint est figé à sa création"
+                .to_owned(),
+        ),
+        Statut::FormatInvalide => Some(format!(
+            "encodage refusé : {:#010x} (fréquence, profondeur et canaux sur un octet \
+             chacun, poids fort nul)",
+            reponse.detail
+        )),
+        // 14 et 15 disent des choses **opposées**, et c'est tout leur intérêt : ici rien
+        // n'a bougé, là-bas la valeur est posée.
+        Statut::FormatNonEcrit => Some(format!(
+            "rien n'a été écrit : le câble sert toujours son ancien format (code du \
+             système : {})",
+            reponse.detail
+        )),
+        Statut::RedemarrageEchoue => Some(format!(
+            "le format est écrit mais pas appliqué : il prendra effet au prochain \
+             démarrage du périphérique, au redémarrage de la machine au pire (code du \
+             système : {})",
+            reponse.detail
+        )),
         // M1b-21. Le message du statut dit déjà quoi faire (« activez le câble, puis
         // renommez ») ; `detail` n'y ajoute que le nombre de côtés trouvés, qui distingue
         // « rien de publié » de « un endpoint publié à moitié ».
@@ -136,6 +201,8 @@ mod tests {
             actifs: 0b0011,
             version_ks: 1,
             canaux: 0,
+            format: 0,
+            formats: [0; CABLE_MAX as usize],
         }
     }
 
@@ -185,7 +252,7 @@ mod tests {
     /// Table des précisions : chaque statut dit ce que son détail signifie.
     #[test]
     fn precision_table() {
-        let cas: [(Statut, u32, Option<&str>); 8] = [
+        let cas: [(Statut, u32, Option<&str>); 12] = [
             (Statut::Succes, 0, None),
             (Statut::TrameInvalide, 0, None),
             (Statut::OrdreInconnu, 0, None),
@@ -195,6 +262,16 @@ mod tests {
             // Le détail est le compte **servi par le câble**, et il doit se lire tel quel.
             (Statut::CanauxNonApplicables, 6, Some("6 canaux")),
             (Statut::PrivilegeAbsent, 0, Some("LocalSystem")),
+            // Les quatre de M1b-05.
+            (Statut::CableActif, 0, Some("désactivez")),
+            // Le détail est le `u32` refusé, relisible en hexadécimal.
+            (Statut::FormatInvalide, 0xFF02_0302, Some("0xff020302")),
+            (Statut::FormatNonEcrit, 5, Some("rien n'a été écrit")),
+            (
+                Statut::RedemarrageEchoue,
+                23,
+                Some("écrit mais pas appliqué"),
+            ),
         ];
         for (statut, detail, attendu) in cas {
             let reponse = Reponse::refus_detaille(0, statut, detail);
@@ -207,6 +284,26 @@ mod tests {
                 }
             }
         }
+        // Les douze cas couvrent les seize statuts moins ceux dont le message se suffit.
+        assert_eq!(cas.len(), 12);
+
+        // **Le refus « câble actif » redit la séquence en entier.**
+        let actif = precision(&Reponse::refus(0, Statut::CableActif)).unwrap_or_default();
+        assert!(actif.contains("désactivez"), "{actif}");
+        assert!(actif.contains("réactivez"), "{actif}");
+
+        // **14 et 15 disent des choses opposées** : rien n'a bougé contre la valeur est
+        // posée. Les confondre coûterait à l'utilisateur la mauvaise réparation.
+        let non_ecrit =
+            precision(&Reponse::refus_detaille(0, Statut::FormatNonEcrit, 5)).unwrap_or_default();
+        assert!(non_ecrit.contains("rien n'a été écrit"), "{non_ecrit}");
+        assert!(non_ecrit.contains("ancien format"), "{non_ecrit}");
+        let echoue = precision(&Reponse::refus_detaille(0, Statut::RedemarrageEchoue, 23))
+            .unwrap_or_default();
+        assert!(echoue.contains("écrit"), "{echoue}");
+        assert!(echoue.contains("prochain démarrage"), "{echoue}");
+        assert!(echoue.contains("23"), "{echoue}");
+
         // Un succès qui porte un nombre de canaux le dit.
         let avec_canaux = Reponse {
             canaux: 2,
@@ -214,6 +311,47 @@ mod tests {
         };
         let texte = precision(&avec_canaux).unwrap_or_default();
         assert!(texte.contains('2'), "{texte}");
+    }
+
+    /// **Un format servi s'affiche en français**, pas en hexadécimal nu.
+    ///
+    /// L'encodage reste là, entre parenthèses : c'est lui qu'on retrouve dans `regedit` et
+    /// dans le journal du service, et devoir le traduire de tête pour vérifier ce qui est
+    /// écrit dans la clé serait une corvée gratuite.
+    #[test]
+    fn un_succes_affiche_le_format_lisiblement() {
+        let cas: [(u32, &str, &str, &str); 3] = [
+            (0x0002_0302, "48000 Hz", "float 32 bits", "2 canaux"),
+            (0x0006_0103, "96000 Hz", "PCM 16 bits", "6 canaux"),
+            (0x0001_0201, "44100 Hz", "PCM 24 bits", "1 canaux"),
+        ];
+        for (brut, frequence, profondeur, canaux) in cas {
+            let reponse = Reponse {
+                format: brut,
+                ..peuplee()
+            };
+            let texte = precision(&reponse).unwrap_or_default();
+            assert!(texte.contains(frequence), "{brut:#010x} : {texte}");
+            assert!(texte.contains(profondeur), "{brut:#010x} : {texte}");
+            assert!(texte.contains(canaux), "{brut:#010x} : {texte}");
+            // L'encodage brut est là aussi, sous la forme qu'on lit dans `regedit`.
+            assert!(
+                texte.contains(&format!("{brut:#010x}")),
+                "{brut:#010x} : {texte}"
+            );
+            // Et il apparaît dans le rendu complet, sur l'ordre qui vise un câble.
+            let rendu = rendre(&Requete::Activer(CableId(1)), &reponse);
+            assert!(rendu.contains(frequence), "{rendu}");
+        }
+
+        // Sans format connu, on n'invente rien : c'est le nombre de canaux qui parle, et
+        // faute de canaux, rien du tout.
+        let sans = Reponse {
+            format: 0,
+            canaux: 0,
+            ..peuplee()
+        };
+        assert_eq!(precision(&sans), None);
     }
 
     /// L'ordre `version` affiche la version du protocole, et lui seul.

@@ -964,6 +964,16 @@ M1b-05 : 44,1/48/96 kHz, float32, PCM16, PCM24, canaux 1 à 8 selon la configura
 câble. Le mode partagé ne voit que le format du moteur ; les autres servent au mode
 exclusif.
 
+Le format d'un câble est lu **au démarrage du devnode seulement** : les tables KS d'un
+filtre sont immuables et PortCls en retient les pointeurs pour toute sa vie. En changer
+demande donc deux gestes, tous deux en espace utilisateur — écrire `CableFormat<n>` dans
+la clé matérielle du périphérique, puis **redémarrer le devnode** (`cfgmgr32`, environ une
+seconde de silence sur les seize câbles). Et ce n'est pas suffisant : le format du moteur
+d'un endpoint étant mis en cache à la **création** de celui-ci, il faut **désactiver le
+câble avant et le réactiver après** — l'événement de jack détruit puis republie les deux
+endpoints, et Windows relit alors le format. Le service refuse d'ailleurs de changer le
+format d'un câble connecté, et le dit (`conduit_helper::protocole::Statut::CableActif`).
+
 ### 5.5 Le câble n'est pas transparent par défaut (mesuré le 2026-09-06)
 
 Les dix passes du test de boucle ont d'abord rendu un sinus à **0,229** d'amplitude pour
