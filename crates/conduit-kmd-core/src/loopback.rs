@@ -77,14 +77,36 @@
 //! *n* », donc les trames `[n × taille, (n+1) × taille)` et rien au-delà (voir
 //! [`crate::packetnum`]).
 //!
-//! Quand cette frontière existe, deux choses changent, et deux seulement :
+//! Quand cette frontière existe, **une** chose change, et une seule : la copie ne lit
+//! jamais au-delà (`src_start + count ≤ committed`), quitte à tronquer le bloc du tick.
+//! Lire plus loin serait lire un emplacement que le client n'a pas encore rempli —
+//! précisément ce que l'avance suppose sans le savoir. La fenêtre **lue** s'arrête donc à
+//! `min(R + avance, committed)` au lieu de `R + avance`.
 //!
-//! 1. **la copie ne lit jamais au-delà** : `src_start + count ≤ committed`, quitte à
-//!    tronquer le bloc du tick. Lire plus loin serait lire un emplacement que le client
-//!    n'a pas encore rempli — précisément ce que l'avance suppose sans le savoir ;
-//! 2. **l'avance tombe à zéro** : elle n'existait que pour couvrir l'incertitude sur `R`,
-//!    et une marge de sécurité par-dessus une certitude n'est plus une marge, c'est un
-//!    décalage. La fenêtre écrite devient `[curseur, C)`.
+//! # Dissymétrie source ↔ cible : la certitude borne la lecture, pas l'écriture
+//!
+//! L'avance, elle, reste entière **côté capture** : la fenêtre écrite est
+//! `[curseur, C + avance)`, bornée ou non. Il est tentant de la mettre aussi à zéro — une
+//! marge de sécurité par-dessus une certitude n'est plus une marge, c'est un décalage —
+//! mais ce raisonnement ne vaut que pour la source. `committed` ne dit rien de `C` : il
+//! parle de ce que le client a écrit dans le tampon de **rendu**, pas de l'endroit où le
+//! moteur en est dans le tampon de **capture**. Là, l'avertissement du début de module
+//! tient toujours : une trame écrite sous `C` arrive trop tard, le moteur est déjà passé
+//! dessus.
+//!
+//! Mesure du 2026-09-10 (mode paquets, exclusif servi, dix passes de huit secondes), avec
+//! l'avance mise à zéro des **deux** côtés : huit passes sur dix, et deux passes avec
+//! quatre puis huit sauts de phase **sub-trame** (~0,02 rad pour un seuil de 0,0173) —
+//! zéro trou, amplitude intacte. La signature exacte d'une écriture qui atterrit sous le
+//! curseur du lecteur et perd la course par instants. D'où la dissymétrie : avance nulle
+//! côté source, où la frontière la remplace ; avance intacte côté cible, où rien ne la
+//! remplace.
+//!
+//! Conséquence sur la correspondance : la cible garde son ancrage `C + avance`, donc la
+//! source vise toujours `R + avance` — le décalage du lien est inchangé, c'est la même
+//! géométrie que le chemin sans frontière. Seule la **fin** du bloc source peut être
+//! rabotée par `committed` ; les trames au-delà n'existent pas encore, elles sont
+//! simplement moins nombreuses et le silence comble comme pour toute sous-alimentation.
 //!
 //! Le curseur, le lien, les causes de silence, le témoin de rejet et le débordement sont
 //! **inchangés** : la frontière borne ce qu'on lit, elle ne change pas la façon dont on
@@ -109,6 +131,11 @@ pub struct StreamView {
     /// Renseignée uniquement sur la vue du **rendu**, et uniquement en mode paquets :
     /// c'est `(dernier paquet accepté + 1) × taille_de_paquet`, en trames absolues. Une
     /// capture ne reçoit jamais de `SetWritePacket` et garde donc `None`.
+    ///
+    /// Elle borne la fenêtre **lue** dans le tampon de rendu, et rien d'autre : l'avance
+    /// ([`LEAD_MS`]) reste entière sur la position d'**écriture** dans la capture, où
+    /// aucune déclaration du client ne la remplace (voir « Dissymétrie source ↔ cible »
+    /// en tête de module, et la mesure du 2026-09-10 qui l'a établie).
     pub committed: Option<u64>,
 }
 
@@ -271,11 +298,12 @@ impl Loopback {
             plan.discarded = render.is_some();
             return plan;
         };
-        // La frontière validée par le client, s'il en déclare une. Elle **remplace**
-        // l'avance : celle-ci ne couvrait que l'incertitude sur la position du rendu (voir
-        // « Une frontière certaine » en tête de module).
+        // La frontière validée par le client, s'il en déclare une. Elle borne ce qu'on
+        // **lit** dans le rendu (plus bas, une fois `src_start` connu) et rien d'autre :
+        // l'avance reste entière sur la cible, où elle ne couvre pas l'incertitude sur `R`
+        // mais la course avec le lecteur de capture (voir « Dissymétrie source ↔ cible »
+        // en tête de module).
         let committed = render.and_then(|r| r.committed);
-        let lead = if committed.is_some() { 0 } else { lead };
         let target = capture.frames.saturating_add(lead);
         let mut start = match self.cursor {
             Some(cursor) if cursor <= target => cursor,
@@ -348,8 +376,9 @@ impl Loopback {
         // comme un débordement. C'est délibéré et c'est le seul comportement honnête — les
         // trames manquantes n'existent pas encore côté rendu, et rien ne les fera exister
         // en les attendant. En régime normal la troncature ne se produit pas : le client
-        // valide un paquet **d'avance** sur la position, donc `committed` dépasse toujours
-        // la fin du bloc, que l'avance vaut zéro depuis qu'il valide.
+        // valide un paquet **d'avance** sur la position, et un paquet dure plus longtemps
+        // que les deux millisecondes de l'avance, donc `committed` dépasse la fin du bloc,
+        // qui s'arrête à `R + avance`.
         if let Some(committed) = committed {
             count = count.min(committed.saturating_sub(src_start));
         }
@@ -831,10 +860,11 @@ mod tests {
     // Lot 3 : la frontière validée par le client (`SetWritePacket`).
     // -----------------------------------------------------------------------------
 
-    /// **La borne, en table** : ce que le client a validé décide de ce que la copie lit,
-    /// et l'avance tombe à zéro dès que la borne existe.
+    /// **La borne ne coûte rien quand elle est large** : le client se met à valider en
+    /// cours de route, avec un paquet d'avance sur la position ; ni la fenêtre écrite ni
+    /// la fenêtre lue ne bougent d'une trame. La borne tronque, elle ne décale pas.
     #[test]
-    fn la_borne_validee_remplace_l_avance() {
+    fn la_borne_large_ne_change_rien() {
         let mut lb = Loopback::new();
         // Premier tick sans borne : régime ordinaire, la copie lit jusqu'à R + avance.
         let p = lb.plan(view(1_000, 480), view(500, 960), LEAD);
@@ -846,25 +876,53 @@ mod tests {
                 count: LEAD
             })
         );
-        // Le client se met à valider, avec une borne large : la copie n'est pas tronquée,
-        // mais l'avance disparaît. La cible devient C (548) au lieu de C + avance (644) ;
-        // le curseur, laissé à 596 par le tick précédent, la dépasse — ce tick n'écrit donc
-        // rien, et c'est exactement le décalage que l'avance couvrait.
+        // Le client se met à valider : la cible reste C + avance (644), le curseur laissé
+        // à 596 enchaîne sans trou, et la source vise toujours R + avance.
         let p = lb.plan(view_committed(1_048, 480, 10_000), view(548, 960), LEAD);
-        assert!(
-            p.copy.is_none() && p.silence.is_none() && !p.overrun,
-            "l'avance tombée à zéro laisse un tick à vide : {p:?}"
+        assert_eq!(
+            p.copy,
+            Some(CopyOp {
+                src_start: 1_096,
+                dst_start: 596,
+                count: 48
+            })
         );
-        // Le régime s'établit ensuite sans trou : cible C, curseur C précédent.
+        assert!(p.silence.is_none() && !p.overrun);
+        // 1 096 + 48 = 1 144 = R + avance : la fenêtre lue est bien celle du chemin sans
+        // borne, seulement plafonnée par 10 000, qui est loin.
         let p = lb.plan(view_committed(1_096, 480, 10_000), view(596, 960), LEAD);
         assert_eq!(
             p.copy,
             Some(CopyOp {
-                src_start: 1_048,
-                dst_start: 548,
+                src_start: 1_144,
+                dst_start: 644,
                 count: 48
             })
         );
+    }
+
+    /// **La dissymétrie source ↔ cible, mise face à face** : deux boucles menées sur la
+    /// même séquence de positions, l'une bornée par un client qui valide un paquet
+    /// d'avance, l'autre pas. Tant que la borne ne tronque rien, les plans sont
+    /// *identiques* — donc en particulier la position d'écriture dans la capture, qui
+    /// garde son avance des deux côtés. C'est le correctif du 2026-09-10 : mettre cette
+    /// avance à zéro avec la borne faisait atterrir l'écriture sous le curseur du lecteur.
+    #[test]
+    fn la_borne_ne_deplace_pas_la_position_d_ecriture() {
+        let mut sans_borne = Loopback::new();
+        let mut avec_borne = Loopback::new();
+        let (mut r, mut c) = (1_000_u64, 500_u64);
+        for tick in 0..32 {
+            let attendu = sans_borne.plan(view(r, 480), view(c, 960), LEAD);
+            // Le client valide dix millisecondes d'avance : bien plus que l'avance de deux.
+            let obtenu = avec_borne.plan(view_committed(r, 480, r + 480), view(c, 960), LEAD);
+            assert_eq!(attendu, obtenu, "tick {tick} (R = {r}, C = {c})");
+            let copy = obtenu.copy.expect("le régime nominal copie à chaque tick");
+            assert_eq!(copy.dst_start + copy.count, c + LEAD, "cible sans avance");
+            assert_eq!(copy.src_start + copy.count, r + LEAD, "source sans avance");
+            r += 48;
+            c += 48;
+        }
     }
 
     /// La borne **tronque** : la copie ne lit jamais au-delà de ce que le client a validé,
@@ -876,21 +934,23 @@ mod tests {
         lb.plan(None, view(500, 960), LEAD);
         lb.plan(None, view(548, 960), LEAD);
         // Le rendu arrive, avec une borne serrée : lien R0 = 10 000, C0 = 596, curseur 644,
-        // cible 644 (avance nulle) → rien. Le tick suivant, cible 692.
+        // cible 692 (l'avance vaut toujours LEAD sur la capture). Bloc [644, 692) ↔ rendu
+        // [10 048, 10 096) ; borne 10 050 : la copie s'arrête à deux trames au lieu de
+        // quarante-huit.
         let p = lb.plan(view_committed(10_000, 480, 10_050), view(596, 960), LEAD);
-        assert!(p.linked && p.copy.is_none());
-        // Bloc [596, 692) ↔ rendu [10 000, 10 096) ; borne 10 050 : la copie s'arrête à
-        // cinquante trames au lieu de quatre-vingt-seize.
-        let p = lb.plan(view_committed(10_096, 480, 10_050), view(692, 960), LEAD);
+        assert!(p.linked && p.silence.is_none() && !p.overrun);
         assert_eq!(
             p.copy,
             Some(CopyOp {
-                src_start: 10_000,
-                dst_start: 596,
-                count: 50
+                src_start: 10_048,
+                dst_start: 644,
+                count: 2
             })
         );
-        // Borne atteinte : plus rien à copier tant que le client ne valide pas.
+        // Borne atteinte : plus rien à copier tant que le client ne valide pas. Le curseur,
+        // lui, continue d'avancer — les trames sautées n'existent pas côté rendu.
+        let p = lb.plan(view_committed(10_096, 480, 10_050), view(692, 960), LEAD);
+        assert!(p.copy.is_none() && p.silence.is_none() && !p.overrun);
         let p = lb.plan(view_committed(10_144, 480, 10_050), view(740, 960), LEAD);
         assert!(p.copy.is_none() && p.silence.is_none() && !p.overrun);
         // Le client valide la suite : la copie repart du curseur, pas de la borne.
@@ -898,8 +958,8 @@ mod tests {
         assert_eq!(
             p.copy,
             Some(CopyOp {
-                src_start: 10_144,
-                dst_start: 740,
+                src_start: 10_240,
+                dst_start: 836,
                 count: 48
             })
         );
