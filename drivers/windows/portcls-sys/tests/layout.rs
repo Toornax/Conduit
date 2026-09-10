@@ -130,6 +130,9 @@ tailles! {
     KSEVENT_ENTRY => KSEVENT_ENTRY,
     KSAUDIO_PACKETSIZE_CONSTRAINTS2 => KSAUDIO_PACKETSIZE_CONSTRAINTS2,
     KSAUDIO_PACKETSIZE_PROCESSINGMODE_CONSTRAINT => KSAUDIO_PACKETSIZE_PROCESSINGMODE_CONSTRAINT,
+    KSATTRIBUTE => KSATTRIBUTE,
+    KSATTRIBUTE_LIST => KSATTRIBUTE_LIST,
+    KSATTRIBUTE_AUDIOSIGNALPROCESSING_MODE => KSATTRIBUTE_AUDIOSIGNALPROCESSING_MODE,
     IUnknownVtbl => IUnknownVtbl,
     IMiniportVtbl => IMiniportVtbl,
     IMiniportWaveRTVtbl => IMiniportWaveRTVtbl,
@@ -192,6 +195,15 @@ decalages! {
     KSP_PIN {
         Property,
         PinId,
+    },
+    KSATTRIBUTE {
+        Size,
+        Flags,
+        Attribute,
+    },
+    KSATTRIBUTE_LIST {
+        Count,
+        Attributes,
     },
     PCNODE_DESCRIPTOR {
         Flags,
@@ -267,7 +279,10 @@ guids! {
     KSEVENTSETID_PinCapsChange,
     KSPROPSETID_Audio,
     KSPROPTYPESETID_General,
+    KSPROPSETID_AudioSignalProcessing,
+    KSATTRIBUTEID_AUDIOSIGNALPROCESSING_MODE,
     AUDIO_SIGNALPROCESSINGMODE_DEFAULT,
+    AUDIO_SIGNALPROCESSINGMODE_RAW,
 }
 
 devpropkeys! {

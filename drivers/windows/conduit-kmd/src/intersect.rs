@@ -36,6 +36,26 @@
 //!
 //! C'est cette entrée-là qui répond, sans débogueur, à la question « qu'est-ce que Windows
 //! demande, au juste ? » quand un endpoint n'a aucun format.
+//!
+//! # Les listes d'attributs ne passent pas par ici (M1b-15)
+//!
+//! Depuis M1b-15, une entrée sur deux du tableau `DataRanges` d'une broche de flux n'est
+//! pas une plage mais une `KSATTRIBUTE_LIST` (driver-design.md §4.4). Ce module n'en voit
+//! **jamais** : PortCls reconnaît la convention au drapeau `KSDATARANGE_ATTRIBUTES` de la
+//! plage qui précède et ne présente à `DataRangeIntersection` que les plages — SYSVAD, qui
+//! a la même construction *et* un gestionnaire d'intersection maison qui transtype
+//! `MyDataRange` en `PKSDATARANGE_AUDIO` sans rien vérifier, le démontre.
+//!
+//! L'attribut lui-même ne change rien à la négociation : il ne nomme aucun mode, une
+//! `KSDATARANGE` qui en porte un garde exactement la même taille, et [`read_our_range`]
+//! ignore `Flags` — seuls `FormatSize`, les trois GUID et les bornes numériques comptent.
+//!
+//! Reste le « si ». Si PortCls nous tendait un jour l'entrée d'attributs comme une plage,
+//! [`read_our_range`] lirait son en-tête : c'est pourquoi cette entrée est logée dans une
+//! structure rembourrée à la taille d'une `KSDATARANGE_AUDIO`
+//! (`descriptors::AttributeListEntry`). La lecture reste alors **dans l'objet**, rend
+//! `FormatSize == 1` (le `Count` de la liste) et se solde par un `STATUS_NO_MATCH` propre,
+//! au lieu d'une lecture hors objet.
 
 use core::mem::{align_of, size_of};
 use core::ptr;

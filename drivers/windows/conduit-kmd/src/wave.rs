@@ -14,6 +14,13 @@
 //! câble qui, dès lors, copie le rendu vers la capture (M1a-08, §5.3).
 //! `GetDeviceDescription` reste au défaut de `portcls`.
 //!
+//! Les deux implémentent aussi `portcls::SignalModes` depuis M1b-15 : c'est ce qui fait
+//! répondre `KSPROPERTY_AUDIOSIGNALPROCESSING_MODES` sur leur filtre, en désignant leur
+//! broche de flux (`WAVE_RENDER_PIN_SYSTEM` d'un côté, `WAVE_CAPTURE_PIN_SYSTEM` de
+//! l'autre). Le trait ne demande **pas** la liste des modes : Conduit n'en sert qu'un,
+//! `AUDIO_SIGNALPROCESSINGMODE_DEFAULT`, et le gestionnaire l'écrit lui-même — seule la
+//! géométrie des broches est propre au miniport.
+//!
 //! # Deux portes, une seule liste de formats
 //!
 //! Windows passe par les deux, et elles doivent dire la même chose :
@@ -59,8 +66,8 @@ use portcls::conduit_com::{
     ComRef, NtStatus, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
 };
 use portcls::{
-    MiniportWaveRT, PacketInterfaces, PortWaveRT, PortWaveRTStream, ResourceList, StreamObject,
-    try_new_packet_stream_object,
+    MiniportWaveRT, ModesTrace, PacketInterfaces, PortWaveRT, PortWaveRTStream, ResourceList,
+    SignalModes, StreamObject, try_new_packet_stream_object,
 };
 use portcls_sys::{
     GUID, IUnknown, KSDATAFORMAT, KSDATAFORMAT_SPECIFIER_WAVEFORMATEX,
@@ -71,7 +78,7 @@ use portcls_sys::{
 
 use crate::cable::{Cable, Direction};
 use crate::descriptors::{
-    WAVE_CAPTURE_PIN_SYSTEM, WAVE_RENDER_PIN_SYSTEM, cable_format, wave_capture_filter,
+    PIN_COUNT, WAVE_CAPTURE_PIN_SYSTEM, WAVE_RENDER_PIN_SYSTEM, cable_format, wave_capture_filter,
     wave_capture_filter_default, wave_render_filter, wave_render_filter_default,
 };
 use crate::eventlog::EventLog;
@@ -377,6 +384,26 @@ impl MiniportWaveRT for WaveRender {
     }
 }
 
+impl SignalModes for WaveRender {
+    fn pin_count(&self) -> u32 {
+        PIN_COUNT as u32
+    }
+
+    fn streaming_pin(&self) -> u32 {
+        WAVE_RENDER_PIN_SYSTEM
+    }
+
+    fn trace(&self, trace: &ModesTrace<'_>) {
+        kmd_log!(
+            "WaveRender{}::MODES {} instance {:?} : {:?}",
+            self.n,
+            trace.verb,
+            trace.instance,
+            trace.pin
+        );
+    }
+}
+
 /// Miniport WaveRT du filtre `WaveCapture<n>` : l'enregistreur lit sur sa broche système.
 #[derive(Debug)]
 pub struct WaveCapture {
@@ -477,5 +504,25 @@ impl MiniportWaveRT for WaveCapture {
             pin,
             supported,
         )
+    }
+}
+
+impl SignalModes for WaveCapture {
+    fn pin_count(&self) -> u32 {
+        PIN_COUNT as u32
+    }
+
+    fn streaming_pin(&self) -> u32 {
+        WAVE_CAPTURE_PIN_SYSTEM
+    }
+
+    fn trace(&self, trace: &ModesTrace<'_>) {
+        kmd_log!(
+            "WaveCapture{}::MODES {} instance {:?} : {:?}",
+            self.n,
+            trace.verb,
+            trace.instance,
+            trace.pin
+        );
     }
 }

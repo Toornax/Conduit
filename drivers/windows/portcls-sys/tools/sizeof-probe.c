@@ -133,6 +133,15 @@ int main(void)
     TAILLE(KSAUDIO_PACKETSIZE_CONSTRAINTS2);
     TAILLE(KSAUDIO_PACKETSIZE_PROCESSINGMODE_CONSTRAINT);
 
+    /* Modes de traitement du signal. Le pilote BÂTIT ces deux structures-ci dans
+     * sa section de données (descriptors.rs) et en donne l'adresse à KS par le tableau
+     * DataRanges d'une broche de flux : leurs tailles sont donc du même ordre de
+     * criticité que celles des descripteurs de filtre. KSATTRIBUTE::Size, en particulier,
+     * est le champ par lequel KS avance dans une liste d'attributs. */
+    TAILLE(KSATTRIBUTE);
+    TAILLE(KSATTRIBUTE_LIST);
+    TAILLE(KSATTRIBUTE_AUDIOSIGNALPROCESSING_MODE);
+
     /* Vtables COM plates : slots × 8. */
     TAILLE(IUnknownVtbl);
     TAILLE(IMiniportVtbl);
@@ -196,6 +205,12 @@ int main(void)
     DECALAGE(KSJACK_DESCRIPTION, IsConnected);
     DECALAGE(KSP_PIN, Property);
     DECALAGE(KSP_PIN, PinId);
+    /* M1b-15 : la liste d'attributs que porte chaque plage d'une broche de flux. */
+    DECALAGE(KSATTRIBUTE, Size);
+    DECALAGE(KSATTRIBUTE, Flags);
+    DECALAGE(KSATTRIBUTE, Attribute);
+    DECALAGE(KSATTRIBUTE_LIST, Count);
+    DECALAGE(KSATTRIBUTE_LIST, Attributes);
     DECALAGE(PCNODE_DESCRIPTOR, Flags);
     DECALAGE(PCNODE_DESCRIPTOR, AutomationTable);
     DECALAGE(PCNODE_DESCRIPTOR, Type);
@@ -270,11 +285,18 @@ int main(void)
     GUID_KS(KSEVENTSETID_PinCapsChange);
     GUID_KS(KSPROPSETID_Audio);
     GUID_KS(KSPROPTYPESETID_General);
-    /* Le mode de traitement de l'unique contrainte de mode que le pilote déclare dans sa
-     * KSAUDIO_PACKETSIZE_CONSTRAINTS2. Se tromper de GUID poserait la contrainte sur un
-     * mode que personne n'emprunte : rien ne planterait, et la période resterait à 10 ms
-     * sans qu'aucune trace ne le dise — la panne la plus muette de tout ce lot. */
+    /* Le mode de traitement que le pilote déclare partout : dans l'unique contrainte de
+     * mode de sa KSAUDIO_PACKETSIZE_CONSTRAINTS2, sur les plages de ses broches de flux,
+     * et dans la réponse de KSPROPERTY_AUDIOSIGNALPROCESSING_MODES. Se tromper de GUID
+     * poserait la contrainte sur un mode que personne n'emprunte : rien ne planterait, et
+     * la période resterait à 10 ms sans qu'aucune trace ne le dise — la panne la plus
+     * muette de tout ce lot. RAW est mesuré à côté de DEFAULT parce que les deux se
+     * ressemblent à la relecture et que déclarer l'un pour l'autre serait parfaitement
+     * muet. */
+    GUID_KS(KSPROPSETID_AudioSignalProcessing);
+    GUID_KS(KSATTRIBUTEID_AUDIOSIGNALPROCESSING_MODE);
     GUID_KS(AUDIO_SIGNALPROCESSINGMODE_DEFAULT);
+    GUID_KS(AUDIO_SIGNALPROCESSINGMODE_RAW);
 
     /* DEVPROPKEY : la clé sur laquelle le pilote pose ses contraintes de taille de paquet.
      * Recopiée à la main côté Rust (les DEFINE_DEVPROPKEY sont en liste de blocage de
