@@ -555,11 +555,12 @@ déclaration de `DEVPKEY_KsAudio_PacketSize_Constraints2` parmi les **obligation
 part : Windows retombait sur son défaut historique de 10 ms.
 
 **Ce que le moteur annonce depuis** (mesuré le 2026-09-10, VM Hyper-V, session console,
-débogueur détaché) : défaut 480, fondamentale 1, **minimum 96, maximum 480** trames à
-48 kHz, et le moteur sert bien la période qu'un client lui demande. Les contraintes sont
-donc lues. Le moteur continue en revanche d'allouer le tampon du pilote **par scrutation**
-(`AllocateAudioBuffer`, 4096 trames, aucune notification), y compris avec une période de
-2 ms servie au client : c'est la mesure, et la cause n'est pas établie.
+débogueur détaché, alors que la période minimale déclarée valait encore 2 ms — elle a été
+remontée à 4 ms depuis, voir plus bas) : défaut 480, fondamentale 1, **minimum 96, maximum
+480** trames à 48 kHz, et le moteur sert bien la période qu'un client lui demande. Les
+contraintes sont donc lues. Le moteur continue en revanche d'allouer le tampon du pilote
+**par scrutation** (`AllocateAudioBuffer`, 4096 trames, aucune notification), y compris avec
+une période de 2 ms servie au client : c'est la mesure, et la cause n'est pas établie.
 
 **Où, et quand.** `adapter::start_device` pose la propriété sur l'interface
 `KSCATEGORY_AUDIO` de chacun des deux filtres **wave** de chaque câble — chaîne de référence

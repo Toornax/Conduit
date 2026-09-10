@@ -800,6 +800,97 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   ([driver-design.md](docs/driver-design.md) §1).
 - [ ] **M1b-10** `test(driver): passage des tests HLK audio`
   *Fait quand* : rapport HLK sans échec bloquant.
+- [x] **M1b-11** `feat(portcls): le flux devient composite, sans exposer une interface de plus`
+  Lot 1 du mode paquets WaveRT (commit `b99366c`). Chaque flux est désormais un **objet
+  composite à plusieurs têtes de vtable** (`PacketStream`, `portcls/src/packet.rs`),
+  construit avec `PacketInterfaces::None` : la mécanique du mode paquets existe et le pilote
+  n'expose **rien de plus qu'avant**.
+  *Fait quand* : le transport est intact — la neutralité est l'objet même du lot.
+  *Mesuré le 2026-09-10*, en session console, débogueur détaché (VM Hyper-V, Windows 11
+  26200) : `conduit-looptest --repeat 20` rend **20 passes sur 20, deux fois** (00:00 puis
+  01:18). Quinze tests de cycle de vie en mode utilisateur, dont un vérifié par mutation.
+  *Une fausse alerte, consignée pour ne pas y revenir* : un premier **14 sur 20** le
+  2026-09-09 à 20:46 était une charge transitoire de la VM — la relance identique rend 20 sur
+  20. L'autre hypothèse, une fuite de référence, est écartée par la **forme** de la panne et
+  non par la relance : elle se serait vue dès la passe n° 2, en `STATUS_DEVICE_BUSY`.
+- [x] **M1b-12** `feat(pilote): ce que le moteur audio a demandé se lit sans débogueur`
+  Lot 0 du mode paquets (commit `4b006cb`). Sélecteur privé
+  `KSPROPERTY_CONDUIT_TRANSPORT = 3`, **GET seul**, rendu par
+  `conduit-looptest --cable-transport` : par sens, le mode d'allocation
+  (`AllocateAudioBuffer`, c'est-à-dire scrutation, contre `AllocateBufferWithNotification`),
+  le `NotificationCount`, la taille du tampon, les événements enregistrés, l'état KS et un
+  compteur cumulé d'allocations **refusées**. `CONFIG_VERSION` **3 → 4**.
+  *Fait quand* : « le moteur scrute-t-il, ou avons-nous dit non ? » se tranche en session
+  console, sans l'outil qui fausse les mesures de transport.
+- [x] **M1b-13** `feat(pilote): exposer le mode paquets sans le servir, et le mesurer`
+  Lot 2 (commit `b57cd11` ; `c0cbb47` pour `conduit-looptest --exclusif`). Paramètre de
+  registre `PacketMode` (REG_DWORD, défaut **0**, **jamais livré à 1**) et sélecteur
+  `KSPROPERTY_CONDUIT_PACKETS = 4` : compteurs par sens et par méthode, IRQL, QPC, et le
+  comptage des `QueryInterface` reçus sur les deux IID de paquets. `CONFIG_VERSION` **4 → 5**.
+  *Fait quand* : on sait si le moteur audio cherche les paquets, et ce qu'il fait quand il
+  les trouve. *Mesuré le 2026-09-10 entre 01:15 et 01:19*, session console, débogueur
+  détaché — la réponse est **non** en partagé et **oui** en exclusif :
+
+  | Client | Allocation obtenue | Appels de paquets à `PacketMode = 1` |
+  |---|---|---|
+  | Partagé classique (`IAudioClient::Initialize`, 10 ms) | `AllocateAudioBuffer` (scrutation), 4096 trames, **0 notification** | **0** — interfaces exposées, rendues au moteur, **jamais appelées** |
+  | Exclusif événementiel (`--exclusif`) | `AllocateBufferWithNotification`, `NotificationCount` **2**, 2 × 240 trames | **8 000 `GetReadPacket` en 20 s** (400/s), tous refusés (`STATUS_NOT_SUPPORTED`) |
+
+  **La décision que la mesure impose** : exposer sans servir **casse** les clients exclusifs —
+  la passe échoue en `0x80070032` au préremplissage —, donc `PacketMode` ne doit jamais être
+  livré à 1. Réversibilité prouvée : retour à 0, 20 passes sur 20.
+  *Un signal qui n'en est pas un* : les `QueryInterface` sur les IID de paquets sont une
+  **sonde systématique de PortCls**, deux par flux créé quel que soit le client. Le compteur
+  ne dit donc rien du moteur.
+- [x] **M1b-14** `feat(pilote): contraintes de taille de paquet, et 4 ms de période en partagé`
+  Commits `8d54aed`, `99dc6c3`, `b84f0d5`, `85b56ac`, plus `7fd05e1` pour l'outil
+  (`conduit-looptest --faible-latence --periode-ms`). *Origine* : **décision de Nathan du
+  2026-09-10**, « j'aimerais être compatible des normes modernes ». Le critère du plan — « le
+  moteur emprunte les paquets » — s'est révélé **inatteignable en l'état** ; plutôt que de
+  clôturer, on a cherché les conditions manquantes. Deux ont été nommées : le mode paquets est
+  **défini** par l'allocation avec notifications (sans notification, pas de paquet), et
+  `DEVPKEY_KsAudio_PacketSize_Constraints2` est classée **obligatoire** par « Low Latency
+  Audio ».
+  *Fait quand* : une application faible latence obtient mieux que les 10 ms historiques sur un
+  câble Conduit, en partagé.
+  *Où* : sur l'interface `KSCATEGORY_AUDIO` de chaque filtre wave (`WaveRender<n>` /
+  `WaveCapture<n>`), **avant** `PcRegisterSubdevice` ; non persistante (elle dépend de
+  `BufferMs`) ; échec journalisé et **non fatal** ; relue par `--cable-transport`.
+  `CONFIG_VERSION` **5 → 6**.
+  *Mesuré le 2026-09-10*, session console, débogueur détaché — **l'entrée de mode est la seule
+  variable qui compte** :
+
+  | Contraintes déclarées | Ce que le moteur en fait |
+  |---|---|
+  | sans entrée de mode (`NumProcessingModeConstraints = 0`) | **ignorées** : min = max = défaut = 480 trames, alors que la propriété est bien posée (16 octets vérifiés dans le registre de la VM) |
+  | avec une entrée `AUDIO_SIGNALPROCESSINGMODE_DEFAULT` **strictement au-dessus** du minimum (la doc l'exige : « higher… otherwise ignored ») | **lues** : fondamentale 1, minimum **96 trames** (2 ms), et la période demandée servie par `IAudioClient3::InitializeSharedAudioStream` |
+
+  *La borne est une mesure, pas un raisonnement.* Tenue de la boucle locale par période
+  moteur : 2 ms → **0/1** (195 sauts), 3 ms → 1/2, **4 ms → 4/4 puis 5/5**, 5 ms → 4/4,
+  8 ms → 2/2, 10 ms → 20/20. Le minimum annoncé a donc été **remonté à 4 ms**
+  (`MIN_PACKET_PERIOD_HNS = 40 000`, commit `85b56ac`) : **le pilote n'annonce que ce qu'il
+  tient.** Mécanisme probable, non instrumenté : l'avance fixe de 2 ms de la boucle locale sur
+  la position de rendu cesse d'être sûre quand la période du moteur descend à 2 ms.
+  **Résultat net** : une application faible latence obtient **4 ms** de période sur un câble
+  Conduit au lieu de 10, en partagé, aujourd'hui.
+- [ ] **M1b-15** `feat(pilote): faire allouer le moteur partagé avec notifications`
+  *Fait quand* : en partagé, le tampon du pilote est alloué par
+  `AllocateBufferWithNotification` — c'est la définition même du mode paquets.
+  *État au 2026-09-10* : le moteur partagé reste en **scrutation** (`AllocateAudioBuffer`,
+  4096 trames, aucune notification) **alors même que les contraintes sont lues et qu'une
+  période de 2 ms est servie au client** ; la cause n'est pas établie et la documentation ne
+  décrit nulle part cette décision. Dernière variable non testée, **en cours** : les modes
+  de traitement déclarés **sur les broches** (attribut
+  `KSATTRIBUTEID_AUDIOSIGNALPROCESSING_MODE` sur les plages,
+  `KSPROPERTY_AUDIOSIGNALPROCESSING_MODES`).
+- [ ] **M1b-16** `feat(pilote): servir réellement les paquets WaveRT (lot 3)`
+  *Fait quand* : les méthodes du mode paquets servent au lieu de refuser, et une passe
+  `--exclusif` réussit avec `PacketMode = 1`.
+  **Prérequis de tout `PacketMode = 1` livré**, et M1b-13 dit pourquoi : les clients exclusifs
+  sont mesurés demandeurs (400 appels par seconde) et cassés par le refus.
+  C'est aussi ce lot qui fera **redescendre la borne des 4 ms** de M1b-14 : la copie saura
+  alors où le rendu en est vraiment, par les paquets servis ou par une avance calculée sur la
+  période effective au lieu d'une constante.
 
 ### M1b.B — Service d'assistance
 
