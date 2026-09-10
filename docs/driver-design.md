@@ -543,15 +543,23 @@ Sources : *Audio Endpoint Builder Algorithm*, *Friendly Names for Audio Endpoint
 
 ### 4.3 Contraintes de taille de paquet (`DEVPKEY_KsAudio_PacketSize_Constraints2`)
 
-**Le fait mesuré.** `IAudioClient3::GetSharedModeEnginePeriod` annonce, sur nos endpoints :
-défaut 480 trames, fondamentale 480, **minimum 480, maximum 480** — 10 ms, et rien d'autre.
-Aucune application ne peut demander plus court, et le moteur audio alloue par scrutation
-(`AllocateAudioBuffer`, 4096 trames, aucune notification). Ce n'est pas une limite du
+**Le fait mesuré qui a rendu ce module nécessaire.**
+`IAudioClient3::GetSharedModeEnginePeriod` annonçait, sur nos endpoints : défaut 480 trames,
+fondamentale 480, **minimum 480, maximum 480** — 10 ms, et rien d'autre. Aucune application
+ne pouvait demander plus court, et le moteur audio allouait par scrutation
+(`AllocateAudioBuffer`, 4096 trames, aucune notification). Ce n'était pas une limite du
 moteur : un client exclusif obtient, lui, `AllocateBufferWithNotification` 2 × 240 trames,
 donc l'interface de notification du pilote est saine. La page *Low Latency Audio* classe la
 déclaration de `DEVPKEY_KsAudio_PacketSize_Constraints2` parmi les **obligations** du pilote
 (« Declare the minimum buffer size », `[Mandatory]`), et le pilote ne la déclarait nulle
 part : Windows retombait sur son défaut historique de 10 ms.
+
+**Ce que le moteur annonce depuis** (mesuré le 2026-09-10, VM Hyper-V, session console,
+débogueur détaché) : défaut 480, fondamentale 1, **minimum 96, maximum 480** trames à
+48 kHz, et le moteur sert bien la période qu'un client lui demande. Les contraintes sont
+donc lues. Le moteur continue en revanche d'allouer le tampon du pilote **par scrutation**
+(`AllocateAudioBuffer`, 4096 trames, aucune notification), y compris avec une période de
+2 ms servie au client : c'est la mesure, et la cause n'est pas établie.
 
 **Où, et quand.** `adapter::start_device` pose la propriété sur l'interface
 `KSCATEGORY_AUDIO` de chacun des deux filtres **wave** de chaque câble — chaîne de référence
@@ -577,20 +585,55 @@ machine. Pour le défaut `BufferMs = 10` :
 
 | Champ | Valeur | Pourquoi |
 |---|---|---|
-| `MinPacketPeriodInHns` | **20 000** (2 ms) | une **constante** : le minuteur du pilote bat à 1 ms, donc 2 ms laissent un tick de marge et une période de 1 ms serait à la merci d'un seul tick en retard. C'est aussi ce que déclare l'exemple `SysvadWaveRtPacketSizeConstraintsRender`. `BufferMs` n'entre pas ici |
+| `MinPacketPeriodInHns` | **40 000** (4 ms) | une **constante**, et une valeur **mesurée** : la période la plus courte que la boucle locale ait tenue sans faute (tableau ci-dessous). `BufferMs` n'entre pas ici |
 | `PacketSizeFileAlignment` | **0** (`FILE_BYTE_ALIGNMENT`) | le pilote n'impose aucun alignement en octets : sa copie travaille en trames |
 | `MaxPacketSizeInBytes` | **30 720** | 10 ms du plus gros format qu'une broche puisse servir (96 kHz × 8 canaux × 4 octets), ce que la documentation exige au minimum |
 | `NumProcessingModeConstraints` | **1** | l'entrée `AUDIO_SIGNALPROCESSINGMODE_DEFAULT` ci-dessous, à 5 ms ; c'est la **longueur du tableau** portable, jamais un littéral, pour que le compte et le contenu ne divergent pas |
 
-**Pourquoi une contrainte de mode, maintenant.** Les trois premières valeurs sont déclarées
-depuis le lot précédent et le moteur audio n'a pas bougé d'une trame : toujours 480 de défaut,
-de fondamentale, de minimum et de maximum, alors que la `DEVPKEY` est bien posée — vérifiée en
-VM, `STATUS_SUCCESS` relu par `KSPROPERTY_CONDUIT_TRANSPORT`. Reste une différence avec
+**D'où viennent les 4 ms : la machine, pas le minuteur.** Le lot précédent déclarait 2 ms,
+et le raisonnement était « le minuteur bat à 1 ms, donc 2 ms laissent un tick de marge ». La
+mesure du 2026-09-10 (VM Hyper-V, session console, débogueur détaché, boucle locale par
+scrutation, `conduit-looptest --faible-latence --periode-ms N`) l'a **réfuté** :
+
+| Période demandée au moteur | Résultat de la boucle locale |
+|---|---|
+| 2 ms (96 trames, tampon 210) | 0/1 : 195 sauts de phase, amplitude 0,31 |
+| 3 ms | 1/2 : 56 sauts à la seconde passe |
+| 4 ms (192 trames, tampon 422) | **4/4 parfaites** |
+| 5 ms (240 trames, tampon 528) | 4/4 parfaites |
+| 8 ms | 2/2 parfaites |
+| 10 ms (défaut) | 20/20 parfaites |
+
+Le pilote annonçait donc une période qu'il ne tenait pas, et ce n'est pas la cadence du
+minuteur qui borne. **L'explication la plus probable** est l'**avance** de la copie sur les
+positions (§5.3) : `kmd-core::loopback::Loopback::plan` écrit, à chaque tick, les trames de
+capture `[curseur, C + avance)` prises aux trames de rendu correspondantes, jusqu'à
+`R + avance`, où `avance` est la **constante** `LEAD_MS` = 2 ms. Sa condition de sûreté est
+écrite dans le module : l'avance ne touche jamais la moitié en cours d'écriture ou de
+lecture par le moteur *tant qu'elle reste inférieure à une période de notification*. À 2 ms
+de période elle ne l'est plus — la copie lit alors jusqu'à une période entière au-delà de la
+position de rendu qu'elle vient de lire, c'est-à-dire des trames que le moteur n'a pas
+encore écrites, et le moteur, qui relit sa position par scrutation, ne cale pas ses
+écritures sur nos ticks. À 4 ms, `R + 2 ms` retombe dans la moitié déjà remplie : le moteur
+garde au moins une période d'avance sur la copie, et c'est bien là que la mesure bascule.
+C'est une explication **probable**, pas un fait démontré : aucune mesure n'a instrumenté
+l'avance elle-même ; le tableau, lui, est acquis.
+
+La borne redescendra quand la copie saura où le rendu en est **vraiment** : mode paquets
+servi (le moteur poussant ses paquets au lieu de scruter), ou avance calculée à partir de la
+période effective du flux au lieu d'une constante. C'est le lot 3 ; d'ici là, 40 000 hns est
+ce que la machine a rendu.
+
+**Pourquoi une contrainte de mode.** Les trois premières valeurs, déclarées seules, n'avaient
+pas fait bouger le moteur audio d'une trame : toujours 480 de défaut, de fondamentale, de
+minimum et de maximum, alors que la `DEVPKEY` était bien posée — vérifiée en VM,
+`STATUS_SUCCESS` relu par `KSPROPERTY_CONDUIT_TRANSPORT`. Restait une différence avec
 l'échantillon de la documentation : `SysvadWaveRtPacketSizeConstraintsRender` porte, lui, une
-entrée de mode de traitement, là où nous n'en déclarions aucune. On bouge donc **cette seule
+entrée de mode de traitement, là où nous n'en déclarions aucune. On a donc bougé **cette seule
 variable** — une entrée pour le mode par défaut, et rien d'autre : pas d'attribut de mode sur
 les plages de format, pas de `KSPROPERTY_AUDIOSIGNALPROCESSING_MODES`, pas de mode `RAW`, rien
-sur les broches.
+sur les broches — et le moteur a bougé : minimum 96 trames au lieu de 480, fondamentale 1,
+période servie. C'était bien l'entrée de mode qui manquait.
 
 Les deux champs de l'entrée ne sont pas cumulatifs, le premier **prime**, et c'est toute la
 raison de la valeur retenue :
@@ -605,27 +648,27 @@ raison de la valeur retenue :
 constraints need to be **higher** than the drivers minimum buffer size, otherwise they're
 ignored by the audio stack ». *Higher* : l'égalité ne compte pas, et une contrainte ignorée
 ne laisse aucune trace — le seul symptôme serait la période de 10 ms qu'on essaie précisément
-de faire descendre. Le lot précédent posait pourtant les deux champs à la **même** valeur, un
-même `max(2 ms, BufferMs / 2)` calculé deux fois : quel que soit `BufferMs`, ils montaient
-ensemble et restaient éternellement égaux.
+de faire descendre. Un lot antérieur posait pourtant les deux champs à la **même** valeur, un
+même `max(période minimale, BufferMs / 2)` calculé deux fois : quel que soit `BufferMs`, ils
+montaient ensemble et restaient éternellement égaux.
 
 Ils répondent maintenant chacun à leur question. `MinPacketPeriodInHns` dit à quelle cadence
-le **transport** sait rendre un paquet — le minuteur, 2 ms, une constante que le registre ne
-touche pas. `ProcessingPacketDurationInHns` dit la taille de paquet du mode de traitement —
-le plancher `BufferMs` divisé par deux, 5 ms pour le défaut. Le `+ 1 ms` de la formule ne
-sert à rien pour `BufferMs = 10` (5 ms dépassent 2 ms de loin) : il tient l'inégalité pour
-les tampons **courts**, où `BufferMs / 2` retomberait sur les 2 ms ou en dessous, c'est-à-dire
-pour tout `BufferMs` inférieur à 6 ms. Le test pur
+le **transport** sait rendre un paquet — 4 ms, la période mesurée, une constante que le
+registre ne touche pas. `ProcessingPacketDurationInHns` dit la taille de paquet du mode de
+traitement — le plancher `BufferMs` divisé par deux, 5 ms pour le défaut. Pour `BufferMs = 10`
+les deux bornes de la formule coïncident exactement (5 ms = 4 ms + 1 ms), et le `+ 1 ms` est
+ce qui tient l'inégalité pour les tampons **courts**, où `BufferMs / 2` retomberait sur les
+4 ms ou en dessous, c'est-à-dire pour tout `BufferMs` inférieur ou égal à 10 ms. Le test pur
 `la_contrainte_de_mode_depasse_toujours_la_periode_minimale` balaie
 `MIN_BUFFER_MS..=MAX_BUFFER_MS` et fige l'inégalité sur toute la plage.
 
-**Ce que l'écart entre les deux valeurs laisse au pilote à faire.** Annoncer 2 ms de période
+**Ce que l'écart entre les deux valeurs laisse au pilote à faire.** Annoncer 4 ms de période
 alors qu'on alloue par tranches de 5 ms n'ouvre pas un trou : c'est déjà le comportement
-d'aujourd'hui. Un client qui lit les 2 ms peut demander deux paquets de 2 ms, soit un tampon
-de 4 ms, sous le plancher `BufferMs` ; `stream::allocate_inner` le remonte alors à `BufferMs`
+d'aujourd'hui. Un client qui lit les 4 ms peut demander deux paquets de 4 ms, soit un tampon
+de 8 ms, sous le plancher `BufferMs` ; `stream::allocate_inner` le remonte alors à `BufferMs`
 (`buffer_bytes_with_floor`) et **rend la taille réellement allouée** — un client WaveRT lit la
 taille de son tampon, il ne la dicte pas. La période effective vaut alors `taille réelle /
-NotificationCount`, c'est-à-dire les 5 ms de `ProcessingPacketDurationInHns` et non les 2 ms
+NotificationCount`, c'est-à-dire les 5 ms de `ProcessingPacketDurationInHns` et non les 4 ms
 demandées. Le pilote ne refuse donc jamais un paquet qu'il a annoncé : il sert plus long que
 demandé, en le disant.
 

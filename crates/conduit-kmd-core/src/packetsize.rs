@@ -19,7 +19,7 @@
 //!
 //! | Champ | Valeur | Ce qui la fixe |
 //! |---|---|---|
-//! | `MinPacketPeriodInHns` | [`MIN_PACKET_PERIOD_HNS`] | le minuteur de 1 ms du pilote, et rien d'autre |
+//! | `MinPacketPeriodInHns` | [`MIN_PACKET_PERIOD_HNS`] | la **mesure** : la période la plus courte que la boucle locale ait tenue |
 //! | `PacketSizeFileAlignment` | [`PACKET_SIZE_FILE_ALIGNMENT`] | rien : le pilote n'impose aucun alignement en octets |
 //! | `MaxPacketSizeInBytes` | [`MAX_PACKET_SIZE_BYTES`] | 10 ms du plus gros format qu'une broche puisse servir |
 //! | `NumProcessingModeConstraints` | [`PROCESSING_MODE_CONSTRAINT_COUNT`] | la **longueur** du tableau ci-dessous, jamais un littéral |
@@ -31,8 +31,9 @@
 //! la première :
 //!
 //! - `MinPacketPeriodInHns` demande à quelle cadence le pilote sait rendre un paquet. La
-//!   réponse est son **minuteur** : la boucle locale bat à 1 ms, donc 2 ms, quelle que soit
-//!   la taille de tampon réglée dans le registre ([`MIN_PACKET_PERIOD_HNS`]).
+//!   réponse est **mesurée** en machine, pas déduite du minuteur : 4 ms, la période la plus
+//!   courte que la boucle locale ait tenue sans faute, quelle que soit la taille de tampon
+//!   réglée dans le registre ([`MIN_PACKET_PERIOD_HNS`]).
 //! - `ProcessingPacketDurationInHns` demande la taille de paquet du mode de traitement. La
 //!   réponse est le plancher `BufferMs`, divisé par [`NOTIFICATION_COUNT`], parce qu'un
 //!   paquet WaveRT n'est pas le tampon : « Several WaveRT packets (typically 2) are
@@ -45,7 +46,7 @@
 //! size, otherwise they're ignored by the audio stack ». Une durée **égale** à la période
 //! minimale n'est pas supérieure : elle est ignorée. D'où
 //! [`PROCESSING_DURATION_MARGIN_HNS`], qui tient l'inégalité stricte même pour un `BufferMs`
-//! si court que sa moitié passerait sous les 2 ms.
+//! si court que sa moitié passerait sous les 4 ms.
 //!
 //! La conséquence — un client peut demander un tampon plus court que le plancher — est
 //! traitée sur [`PacketConstraints`] : le pilote alloue plus grand et le **dit**, ce que
@@ -66,34 +67,79 @@ pub const HNS_PER_MS: u32 = 10_000;
 /// deux paquets, donc le paquet vaut la moitié du plancher `BufferMs`.
 pub const NOTIFICATION_COUNT: u32 = 2;
 
-/// `MinPacketPeriodInHns` : **20 000 hns**, soit 2 ms. Une constante.
+/// `MinPacketPeriodInHns` : **40 000 hns**, soit 4 ms. Une constante, et une valeur
+/// **mesurée**.
 ///
-/// C'est la période de transport la plus courte que le pilote sache honorer, et elle ne
-/// dépend que de son **minuteur** : la boucle locale bat à 1 ms (`conduit_kmd::timer`), donc
-/// une période de 1 ms se retrouverait à la merci d'un seul tick en retard, et un tick perdu
-/// sur deux périodes s'entend. Deux millisecondes laissent un tick de marge, et c'est aussi
-/// ce que déclare l'exemple `SysvadWaveRtPacketSizeConstraintsRender` de la documentation
-/// Microsoft.
+/// C'est la période de transport la plus courte que le pilote sache honorer. Elle ne se
+/// déduit **pas** de la cadence du minuteur — le raisonnement « la boucle bat à 1 ms, donc
+/// 2 ms » a été tenu jusqu'au lot précédent, et la machine l'a réfuté.
+///
+/// # Ce qui a été mesuré (2026-09-10, VM Hyper-V, session console, débogueur détaché)
+///
+/// Depuis que le pilote déclare ces contraintes, le moteur audio les lit :
+/// `IAudioClient3::GetSharedModeEnginePeriod` annonce défaut 480, fondamentale 1,
+/// **minimum 96, maximum 480** trames à 48 kHz, et le moteur sert bien la période demandée.
+/// Il alloue en revanche toujours le tampon du pilote **par scrutation**
+/// (`AllocateAudioBuffer`, 4096 trames, aucune notification). `conduit-looptest
+/// --faible-latence --periode-ms N` donne alors :
+///
+/// | Période demandée au moteur | Résultat de la boucle locale |
+/// |---|---|
+/// | 2 ms (96 trames, tampon 210) | 0/1 : 195 sauts de phase, amplitude 0,31 |
+/// | 3 ms | 1/2 : 56 sauts à la seconde passe |
+/// | 4 ms (192 trames, tampon 422) | **4/4 parfaites** |
+/// | 5 ms (240 trames, tampon 528) | 4/4 parfaites |
+/// | 8 ms | 2/2 parfaites |
+/// | 10 ms (défaut) | 20/20 parfaites |
+///
+/// Quatre millisecondes est donc la plus courte période **tenue**, et annoncer moins serait
+/// annoncer une période que le pilote ne sert pas.
+///
+/// # L'explication la plus probable : l'avance de la copie, pas la cadence du minuteur
+///
+/// [`crate::loopback`] écrit, à chaque tick, les trames de capture `[curseur, C + avance)`
+/// prises aux trames de rendu correspondantes, jusqu'à `R + avance` — la copie travaille
+/// donc **en avance** des deux positions, d'une avance **constante** de
+/// [`crate::loopback::LEAD_MS`] millisecondes (2 ms), choisie pour couvrir la période du
+/// tick et sa gigue. Son en-tête pose la condition de sûreté : « tant que `avance` reste
+/// inférieure à une période de notification, elle ne touche jamais la moitié en cours
+/// d'écriture ou de lecture par le moteur ». Une période de 2 ms n'est pas *supérieure* à
+/// cette avance : la copie lit alors jusqu'à une période entière au-delà de la position de
+/// rendu qu'elle vient de lire, c'est-à-dire des trames que le moteur n'a pas encore
+/// écrites — et le moteur, qui relit sa position par scrutation, ne cale pas ses écritures
+/// sur nos ticks. À 4 ms, `R + 2 ms` retombe dans la moitié déjà remplie et le moteur garde
+/// au moins une période d'avance sur la copie ; c'est bien là que la mesure bascule.
+///
+/// C'est l'explication la plus **probable**, pas un fait démontré : aucune mesure n'a
+/// instrumenté l'avance elle-même. Ce qui est établi, c'est le tableau ci-dessus.
+///
+/// # Quand cette borne redescendra
+///
+/// Quand la copie saura où le rendu en est **vraiment** : mode paquets servi
+/// (`IMiniportWaveRTStreamNotification`, le moteur poussant ses paquets au lieu de scruter),
+/// ou avance calculée à partir de la période effective du flux au lieu d'une constante.
+/// C'est le lot 3 ; d'ici là la valeur reste ce que la machine a rendu.
 ///
 /// `BufferMs` n'entre **pas** dans ce champ, alors qu'il y entrait jusqu'au lot précédent :
 /// une période minimale qui suivait le plancher de tampon montait avec la durée de la
 /// contrainte de mode, si bien que les deux restaient éternellement égales — et une
 /// contrainte de mode qui n'est pas *supérieure* à la période minimale est ignorée par la
 /// pile audio. Ce que `BufferMs` gouverne, c'est [`processing_packet_duration_hns`].
-pub const MIN_PACKET_PERIOD_HNS: u32 = 2u32.saturating_mul(HNS_PER_MS);
+pub const MIN_PACKET_PERIOD_HNS: u32 = 4u32.saturating_mul(HNS_PER_MS);
 
 /// La marge qui garde la durée de la contrainte de mode **strictement** au-dessus de
-/// [`MIN_PACKET_PERIOD_HNS`] : 1 ms, soit un tick de minuteur.
+/// [`MIN_PACKET_PERIOD_HNS`] : 1 ms, inchangée depuis le lot précédent.
 ///
 /// « Low Latency Audio » : « the mode-specific constraints need to be **higher** than the
 /// drivers minimum buffer size, otherwise they're ignored by the audio stack ». *Higher*,
 /// donc : l'égalité ne compte pas, et une contrainte ignorée ne laisse aucune trace — le
 /// seul symptôme serait la période de 10 ms qu'on essaie précisément de faire descendre.
 ///
-/// Pour le défaut `BufferMs = 10`, la moitié du plancher (5 ms) dépasse déjà largement les
-/// 2 ms et cette marge ne sert à rien. Elle tient l'inégalité pour les tampons **courts** :
-/// tout `BufferMs` inférieur à 6 ms donnerait sinon une durée sous la période minimale, ou
-/// juste dessus.
+/// Pour le défaut `BufferMs = 10`, la moitié du plancher (5 ms) et la somme
+/// `4 ms + 1 ms` coïncident : la contrainte de mode vaut 50 000 hns, strictement au-dessus
+/// des 40 000 de la période minimale. La marge est ce qui tient l'inégalité pour les tampons
+/// **courts** : tout `BufferMs` inférieur ou égal à 10 ms donnerait sinon une durée sous la
+/// période minimale, ou juste dessus.
 pub const PROCESSING_DURATION_MARGIN_HNS: u32 = HNS_PER_MS;
 
 /// `PacketSizeFileAlignment` : **`FILE_BYTE_ALIGNMENT`**, c'est-à-dire aucune contrainte.
@@ -207,9 +253,9 @@ const fn arrondi_alignement(octets: u32, masque: u32) -> u32 {
 /// [`crate::params::sanitize`] : la valeur vient du registre et un appelant distrait ne
 /// doit pas pouvoir faire annoncer une durée aberrante.
 ///
-/// Avec le défaut `BufferMs = 10` : `max(10 × 10 000 / 2, 20 000 + 10 000)` = **50 000
-/// hns**, soit 5 ms — la moitié des 10 ms d'aujourd'hui, et deux fois et demie la période
-/// minimale de 2 ms.
+/// Avec le défaut `BufferMs = 10` : `max(10 × 10 000 / 2, 40 000 + 10 000)` = **50 000
+/// hns**, soit 5 ms — la moitié des 10 ms d'aujourd'hui, et une milliseconde de plus que la
+/// période minimale de 4 ms, ce que l'inégalité stricte demande.
 #[must_use]
 pub const fn processing_packet_duration_hns(buffer_ms: u32) -> u32 {
     let buffer_ms = if buffer_ms < MIN_BUFFER_MS {
@@ -319,18 +365,20 @@ const _: () =
 /// `KSAUDIO_PACKETSIZE_CONSTRAINTS2`, dont la disposition est vérifiée contre `cl.exe`
 /// (`layout.golden`).
 ///
-/// # L'hypothèse que la contrainte de mode teste
+/// # La contrainte de mode est ce qui a fait bouger le moteur
 ///
-/// Les trois premières valeurs sont déclarées depuis le lot précédent, et **le moteur audio
-/// n'a pas bougé** : `IAudioClient3::GetSharedModeEnginePeriod` annonce toujours 480 trames
-/// de défaut, de fondamentale, de minimum et de maximum, alors que la `DEVPKEY` est bien
-/// posée — vérifiée en machine virtuelle, `STATUS_SUCCESS` relu par
-/// `KSPROPERTY_CONDUIT_TRANSPORT`. Reste une différence avec l'exemple de la documentation
-/// Microsoft : `SysvadWaveRtPacketSizeConstraintsRender` porte, lui, une entrée de mode de
-/// traitement, là où nous n'en déclarions aucune. C'est donc **cette seule variable** qu'on
-/// bouge — une à la fois, comme toujours : une entrée pour
-/// [`AUDIO_SIGNALPROCESSINGMODE_DEFAULT`], et rien d'autre (ni attribut de mode sur les
-/// plages de format, ni `KSPROPERTY_AUDIOSIGNALPROCESSING_MODES`, ni mode `RAW`).
+/// Les trois premières valeurs, déclarées seules au lot antérieur, n'avaient rien changé :
+/// `IAudioClient3::GetSharedModeEnginePeriod` annonçait encore 480 trames de défaut, de
+/// fondamentale, de minimum et de maximum. Une entrée de mode de traitement était la seule
+/// différence qui restait avec l'exemple de la documentation Microsoft
+/// (`SysvadWaveRtPacketSizeConstraintsRender`) ; c'est **cette seule variable** qu'on a
+/// bougée — une entrée pour [`AUDIO_SIGNALPROCESSINGMODE_DEFAULT`], et rien d'autre (ni
+/// attribut de mode sur les plages de format, ni `KSPROPERTY_AUDIOSIGNALPROCESSING_MODES`,
+/// ni mode `RAW`) — et le moteur a bougé : mesuré le 2026-09-10 en VM Hyper-V, il annonce
+/// désormais défaut 480, fondamentale 1, **minimum 96, maximum 480** trames à 48 kHz, et
+/// sert la période qu'on lui demande. Il continue en revanche d'allouer le tampon du pilote
+/// par **scrutation** (`AllocateAudioBuffer`, 4096 trames, aucune notification) : c'est ce
+/// que la mesure dit, la cause n'est pas établie.
 ///
 /// L'entrée est exprimée **en durée** : `samples_per_processing_packet` vaut zéro — « if
 /// this value is 0, the constraint is expressed by the `ProcessingPacketDurationInHns`
@@ -346,19 +394,19 @@ const _: () =
 /// « Low Latency Audio » prévient : « the mode-specific constraints need to be **higher**
 /// than the drivers minimum buffer size, otherwise they're ignored by the audio stack ».
 /// D'où deux valeurs qui ne se suivent plus : [`MIN_PACKET_PERIOD_HNS`] dit ce que le
-/// **transport** sait faire (2 ms, la cadence du minuteur, constante) et
+/// **transport** sait faire (4 ms, la période mesurée, constante) et
 /// [`processing_packet_duration_hns`] ce que le plancher `BufferMs` impose (5 ms pour le
 /// défaut), la seconde restant strictement au-dessus de la première pour **tout**
 /// `buffer_ms` admissible.
 ///
 /// Le pilote annonce donc une période de transport plus courte que la taille de tampon
 /// qu'il alloue vraiment, et c'est déjà son comportement d'aujourd'hui. Un client qui lit
-/// les 2 ms peut demander deux paquets de 2 ms, soit un tampon de 4 ms, sous le plancher
+/// les 4 ms peut demander deux paquets de 4 ms, soit un tampon de 8 ms, sous le plancher
 /// `BufferMs` : `conduit_kmd::stream::allocate_inner` le remonte alors à `BufferMs`
 /// ([`crate::format::buffer_bytes_with_floor`]) et **rend la taille réellement allouée** —
 /// un client WaveRT lit la taille de son tampon, il ne la dicte pas. La période effective
 /// vaut alors `taille réelle / NotificationCount`, c'est-à-dire les 5 ms de
-/// [`processing_packet_duration_hns`] et non les 2 ms demandées. Le pilote ne refuse jamais
+/// [`processing_packet_duration_hns`] et non les 4 ms demandées. Le pilote ne refuse jamais
 /// un paquet qu'il a annoncé : il sert plus long que demandé, en le disant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PacketConstraints {
@@ -401,10 +449,10 @@ impl PacketConstraints {
 
     /// La période minimale annoncée, en **trames** à `sample_rate` hertz.
     ///
-    /// Ce que `IAudioClient3::GetSharedModeEnginePeriod` finira par rendre en
-    /// `minPeriodInFrames`, et donc la seule forme de cette valeur qui se compare aux 480
-    /// trames mesurées. Arrondie **vers le haut** : une période un peu plus longue reste
-    /// servable, une période un peu plus courte ne l'est pas.
+    /// Ce que `IAudioClient3::GetSharedModeEnginePeriod` rend en `minPeriodInFrames`, et donc
+    /// la seule forme de cette valeur qui se compare aux trames mesurées. Arrondie **vers le
+    /// haut** : une période un peu plus longue reste servable, une période un peu plus courte
+    /// ne l'est pas.
     ///
     /// `None` si `sample_rate` est nul (aucune trame ne dure alors quoi que ce soit).
     #[must_use]
@@ -443,8 +491,8 @@ const _: () = assert!(
     "96 kHz × 32 octets × 10 ms"
 );
 const _: () = assert!(
-    MIN_PACKET_PERIOD_HNS == 20_000,
-    "2 ms, le minuteur de 1 ms doublé"
+    MIN_PACKET_PERIOD_HNS == 40_000,
+    "4 ms, la période la plus courte tenue en machine"
 );
 // L'inégalité que « Low Latency Audio » exige, tenue dès le plus petit tampon admissible :
 // en dessous, la contrainte de mode serait ignorée sans le moindre message.
@@ -466,15 +514,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn le_defaut_annonce_deux_millisecondes_de_periode() {
+    fn le_defaut_annonce_quatre_millisecondes_de_periode() {
         let contraintes = PacketConstraints::new(10);
-        assert_eq!(contraintes.min_packet_period_hns, 20_000, "2 ms");
+        assert_eq!(contraintes.min_packet_period_hns, 40_000, "4 ms");
         assert_eq!(contraintes.packet_size_file_alignment, 0);
         assert_eq!(contraintes.max_packet_size_bytes, 30_720);
     }
 
-    /// La période minimale est celle du **minuteur**, pas celle du registre : elle ne bouge
-    /// pour aucun `buffer_ms`, y compris les deux valeurs aberrantes que l'écrêtage rattrape.
+    /// La période minimale est celle que la **mesure** a rendue, pas celle du registre : elle
+    /// ne bouge pour aucun `buffer_ms`, y compris les deux valeurs aberrantes que l'écrêtage
+    /// rattrape.
     #[test]
     fn la_periode_minimale_ne_depend_pas_du_plancher_de_tampon() {
         for buffer_ms in [0, 1, 4, 5, 6, 10, 20, 50, 100, 500, u32::MAX] {
@@ -564,31 +613,31 @@ mod tests {
         assert_eq!(guid.data4, [0xB7, 0xD1, 0x1E, 0xEF, 0x22, 0x8D, 0x2A, 0xF3]);
     }
 
-    /// Sous 6 ms de tampon, la moitié du plancher passerait sous la période minimale (ou
-    /// juste dessus) : c'est la marge qui reprend la main, à 3 ms.
+    /// Sous 10 ms de tampon, la moitié du plancher passerait sous la période minimale (ou
+    /// juste dessus) : c'est la marge qui reprend la main, à 5 ms.
     #[test]
     fn la_marge_tient_la_duree_au_dessus_des_tampons_courts() {
         let plancher = MIN_PACKET_PERIOD_HNS + PROCESSING_DURATION_MARGIN_HNS;
-        assert_eq!(plancher, 30_000, "2 ms + 1 ms");
-        // 1 ms de tampon voudrait 0,5 ms de paquet ; 4 ms en voudrait 2, soit exactement la
-        // période minimale — ignorée. 5 ms en voudrait 2,5, encore trop peu.
-        for buffer_ms in [1, 2, 3, 4, 5] {
+        assert_eq!(plancher, 50_000, "4 ms + 1 ms");
+        // 1 ms de tampon voudrait 0,5 ms de paquet ; 8 ms en voudrait 4, soit exactement la
+        // période minimale — ignorée. 9 ms en voudrait 4,5, encore trop peu.
+        for buffer_ms in [1, 2, 3, 4, 5, 6, 7, 8, 9] {
             assert_eq!(
                 processing_packet_duration_hns(buffer_ms),
                 plancher,
                 "tampon {buffer_ms} ms"
             );
         }
-        // 6 ms : 3 ms de paquet, soit exactement la marge — la première valeur où les deux
-        // bornes coïncident.
-        assert_eq!(processing_packet_duration_hns(6), plancher);
-        // 7 ms : 3,5 ms, le plancher de tampon prend le dessus.
-        assert_eq!(processing_packet_duration_hns(7), 35_000);
+        // 10 ms : 5 ms de paquet, soit exactement la marge — la première valeur où les deux
+        // bornes coïncident, et c'est le défaut du registre.
+        assert_eq!(processing_packet_duration_hns(10), plancher);
+        // 11 ms : 5,5 ms, le plancher de tampon prend le dessus.
+        assert_eq!(processing_packet_duration_hns(11), 55_000);
     }
 
     #[test]
     fn la_duree_annoncee_est_la_moitie_du_plancher_de_tampon() {
-        for buffer_ms in [7, 10, 20, 50, 100, 500] {
+        for buffer_ms in [11, 20, 50, 100, 500] {
             assert_eq!(
                 processing_packet_duration_hns(buffer_ms),
                 buffer_ms * HNS_PER_MS / NOTIFICATION_COUNT,
@@ -636,11 +685,12 @@ mod tests {
     #[test]
     fn la_periode_se_lit_en_trames_comme_le_moteur_audio_la_rendra() {
         let contraintes = PacketConstraints::new(10);
-        // 2 ms à 48 kHz : 96 trames, un cinquième des 480 mesurées.
-        assert_eq!(contraintes.min_period_frames(48_000), Some(96));
-        assert_eq!(contraintes.min_period_frames(96_000), Some(192));
-        // 44,1 kHz : 88,2 trames, arrondies vers le haut.
-        assert_eq!(contraintes.min_period_frames(44_100), Some(89));
+        // 4 ms à 48 kHz : 192 trames, deux cinquièmes des 480 du défaut — et c'est bien la
+        // taille qui a rendu 4/4 passes parfaites en machine.
+        assert_eq!(contraintes.min_period_frames(48_000), Some(192));
+        assert_eq!(contraintes.min_period_frames(96_000), Some(384));
+        // 44,1 kHz : 176,4 trames, arrondies vers le haut.
+        assert_eq!(contraintes.min_period_frames(44_100), Some(177));
         assert_eq!(contraintes.min_period_frames(0), None);
     }
 

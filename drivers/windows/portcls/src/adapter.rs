@@ -684,7 +684,7 @@ mod tests {
     fn les_contraintes_de_paquet_recopient_les_valeurs() {
         let portables = PacketConstraints::new(10);
         let ks = packet_size_constraints(&portables);
-        assert_eq!(ks.MinPacketPeriodInHns, 20_000, "2 ms, le minuteur");
+        assert_eq!(ks.MinPacketPeriodInHns, 40_000, "4 ms, la période mesurée");
         assert_eq!(ks.PacketSizeFileAlignment, 0, "FILE_BYTE_ALIGNMENT");
         assert_eq!(ks.MaxPacketSizeInBytes, 30_720, "10 ms de 96 kHz × 8 × 4");
         assert_eq!(ks.NumProcessingModeConstraints, 1, "l'entrée DEFAULT");
@@ -700,9 +700,9 @@ mod tests {
         assert_eq!(mode.SamplesPerProcessingPacket, 0);
         assert_eq!(mode.ProcessingPacketDurationInHns, 50_000, "5 ms");
         // Un plancher de tampon plus large déplace la **durée de l'entrée** seule : la
-        // période minimale est celle du minuteur, que le registre ne touche pas.
+        // période minimale est celle qu'on a mesurée, que le registre ne touche pas.
         let large = packet_size_constraints(&PacketConstraints::new(40));
-        assert_eq!(large.MinPacketPeriodInHns, 20_000, "inchangée");
+        assert_eq!(large.MinPacketPeriodInHns, 40_000, "inchangée");
         assert_eq!(
             large.ProcessingModeConstraints[0].ProcessingPacketDurationInHns,
             200_000
@@ -720,7 +720,7 @@ mod tests {
     ///
     /// | Octets | Champ | Valeur |
     /// |---|---|---|
-    /// | 0-3 | `MinPacketPeriodInHns` | 20 000 (2 ms) |
+    /// | 0-3 | `MinPacketPeriodInHns` | 40 000 (4 ms) |
     /// | 4-7 | `PacketSizeFileAlignment` | 0 (`FILE_BYTE_ALIGNMENT`) |
     /// | 8-11 | `MaxPacketSizeInBytes` | 30 720 |
     /// | 12-15 | `NumProcessingModeConstraints` | 1 |
@@ -737,7 +737,7 @@ mod tests {
     #[test]
     fn les_contraintes_de_paquet_partent_en_quarante_octets() {
         const ATTENDU: [u8; 40] = [
-            0x20, 0x4E, 0x00, 0x00, // MinPacketPeriodInHns = 20 000
+            0x40, 0x9C, 0x00, 0x00, // MinPacketPeriodInHns = 40 000
             0x00, 0x00, 0x00, 0x00, // PacketSizeFileAlignment = 0
             0x00, 0x78, 0x00, 0x00, // MaxPacketSizeInBytes = 30 720
             0x01, 0x00, 0x00, 0x00, // NumProcessingModeConstraints = 1
