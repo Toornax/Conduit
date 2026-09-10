@@ -742,24 +742,24 @@ Chaque plage porte sa propre entrée d'attributs : le tableau `DataRanges` d'une
 système alterne donc plage, liste, plage, liste, plage, liste — six entrées comptées dans
 `DataRangesCount`, pour trois profondeurs.
 
-**Pourquoi.** C'est la dernière variable, hors mode paquets, qui distinguait Conduit de
-SYSVAD. Le pilote déclare déjà `DEVPKEY_KsAudio_PacketSize_Constraints2` avec une entrée de
-mode `DEFAULT`, le moteur la lit (`IAudioClient3` annonce min 192 trames / 4 ms) et sert les
-périodes courtes en partagé — mais il alloue **toujours** le tampon WaveRT par scrutation
-(`AllocateAudioBuffer`, jamais `AllocateBufferWithNotification`). L'hypothèse testée est que
-le moteur ne considère « mode aware » qu'un pilote qui déclare ses modes sur les broches
-elles-mêmes, et qu'il réserve à ceux-là le chemin par notifications.
+**Pourquoi.** C'était la dernière variable, hors mode paquets, qui distinguait Conduit de
+SYSVAD. Le pilote déclarait déjà `DEVPKEY_KsAudio_PacketSize_Constraints2` avec une entrée
+de mode `DEFAULT`, le moteur la lisait (`IAudioClient3` annonçait min 192 trames / 4 ms) et
+servait les périodes courtes en partagé — mais il allouait **toujours** le tampon WaveRT par
+scrutation (`AllocateAudioBuffer`, jamais `AllocateBufferWithNotification`). L'hypothèse à
+tester était que le moteur ne considère « mode aware » qu'un pilote qui déclare ses modes
+sur les broches elles-mêmes, et qu'il réserve à ceux-là le chemin par notifications.
 
-**L'expérience.** Rien de nouveau dans le relevé KS : la vérification se fait de
-l'extérieur, en machine, après installation.
-
-1. Le moteur passe-t-il à `AllocateBufferWithNotification` pour un flux **partagé** ? C'est
-   le résultat cherché.
-2. `IAudioClient3::GetSharedModeEnginePeriod` annonce-t-il autre chose qu'avant ?
-
-Si les deux répondent « non », la déclaration reste néanmoins juste et conforme, et
-l'hypothèse « mode aware » est écartée : il ne restera plus, entre Conduit et SYSVAD, que
-le mode paquets lui-même.
+**Le résultat (mesuré le 2026-09-10, consigné dans ROADMAP M1b-15).** Non. Modes déclarés
+sur les broches, contraintes de mode lues — le minimum annoncé par `IAudioClient3` passe des
+4 ms bruts à la contrainte de mode elle-même, **240 trames / 5 ms** —, et le moteur partagé
+alloue toujours par scrutation (`AllocateAudioBuffer`). L'hypothèse « mode aware » est donc
+écartée. Toutes les conditions déclaratives de SYSVAD sont désormais remplies : plages avec
+attribut, propriété à `Count = 1` sur la broche de flux et `Count = 0` sur le pont,
+`DEVPKEY_KsAudio_PacketSize_Constraints2` avec entrée de mode. La scrutation en partagé est
+le choix du moteur sur cette machine, pas un manque du pilote : **rien de plus à faire côté
+pilote**. Le mode paquets, lui, est bien servi — et emprunté par les clients exclusifs
+(M1b-16).
 
 **Ce qui pourrait mal tourner, et ce qui le dirait.** Deux pannes seraient parfaitement
 muettes — l'endpoint apparaîtrait, le son passerait, et rien ne signalerait que le mode
