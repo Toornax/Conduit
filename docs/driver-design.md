@@ -572,7 +572,7 @@ publie aussi les filtres wave sous `KSCATEGORY_RENDER`/`KSCATEGORY_CAPTURE` et
 survivrait à un changement de ce paramètre, c'est-à-dire annoncerait une période que le
 pilote ne servirait plus.
 
-**Les trois valeurs**, calculées par `conduit_kmd_core::packetsize` et donc testées sans
+**Les valeurs**, calculées par `conduit_kmd_core::packetsize` et donc testées sans
 machine. Pour le défaut `BufferMs = 10` :
 
 | Champ | Valeur | Pourquoi |
@@ -580,14 +580,44 @@ machine. Pour le défaut `BufferMs = 10` :
 | `MinPacketPeriodInHns` | **50 000** (5 ms) | `max(2 ms, BufferMs / NotificationCount)` : le minuteur du pilote bat à 1 ms, d'où un plancher absolu de 2 ms ; et `stream::allocate` remonte tout tampon à `BufferMs`, or un tampon vaut deux paquets |
 | `PacketSizeFileAlignment` | **0** (`FILE_BYTE_ALIGNMENT`) | le pilote n'impose aucun alignement en octets : sa copie travaille en trames |
 | `MaxPacketSizeInBytes` | **30 720** | 10 ms du plus gros format qu'une broche puisse servir (96 kHz × 8 canaux × 4 octets), ce que la documentation exige au minimum |
-| `NumProcessingModeConstraints` | **0** | documenté comme permis ; une variable à la fois, les modes viendront après la mesure |
+| `NumProcessingModeConstraints` | **1** | l'entrée `AUDIO_SIGNALPROCESSINGMODE_DEFAULT` ci-dessous, à 5 ms ; c'est la **longueur du tableau** portable, jamais un littéral, pour que le compte et le contenu ne divergent pas |
 
-La longueur passée à `IoSetDeviceInterfacePropertyData` est **exactement** 16 octets, le
-décalage de `ProcessingModeConstraints`, et non `sizeof(KSAUDIO_PACKETSIZE_CONSTRAINTS2)` :
-le `ANYSIZE_ARRAY` du WDK vaut 1, donc la structure C mesure toujours une contrainte de mode
-de plus qu'elle n'en porte. Les deux exemples de la documentation le confirment — la variante
-capture de SYSVAD annonce une contrainte et 40 octets (16 + 24), la variante rendu deux et 64
-(16 + 2 × 24).
+**Pourquoi une contrainte de mode, maintenant.** Les trois premières valeurs sont déclarées
+depuis le lot précédent et le moteur audio n'a pas bougé d'une trame : toujours 480 de défaut,
+de fondamentale, de minimum et de maximum, alors que la `DEVPKEY` est bien posée — vérifiée en
+VM, `STATUS_SUCCESS` relu par `KSPROPERTY_CONDUIT_TRANSPORT`. Reste une différence avec
+l'échantillon de la documentation : `SysvadWaveRtPacketSizeConstraintsRender` porte, lui, une
+entrée de mode de traitement, là où nous n'en déclarions aucune. On bouge donc **cette seule
+variable** — une entrée pour le mode par défaut, et rien d'autre : pas d'attribut de mode sur
+les plages de format, pas de `KSPROPERTY_AUDIOSIGNALPROCESSING_MODES`, pas de mode `RAW`, rien
+sur les broches.
+
+Les deux champs de l'entrée ne sont pas cumulatifs, le premier **prime**, et c'est toute la
+raison de la valeur retenue :
+
+| Champ de l'entrée | Valeur | Pourquoi |
+|---|---|---|
+| `ProcessingMode` | `AUDIO_SIGNALPROCESSINGMODE_DEFAULT` (`{C18E2F7E-933D-4965-B7D1-1EEF228D2AF3}`) | le seul mode que le pilote serve, faute d'exposer la moindre liste de modes ; en poser un autre rendrait la contrainte vraie pour un mode que personne n'emprunte |
+| `SamplesPerProcessingPacket` | **0** | « If this value is 0, the constraint is expressed by the `ProcessingPacketDurationInHns` field » — non nul, il primerait et la durée serait ignorée |
+| `ProcessingPacketDurationInHns` | **50 000** (5 ms) | la même valeur que `MinPacketPeriodInHns`, exprimée en durée pour ne pas dépendre de la fréquence : 240 échantillons valent 5 ms à 48 kHz et 2,5 ms à 96 kHz, et la même interface de filtre sert 44,1, 48 **et** 96 kHz |
+
+**La réserve, qui nous vise.** *Low Latency Audio* prévient : « the mode-specific constraints
+need to be **higher** than the drivers minimum buffer size, otherwise they're ignored by the
+audio stack ». Notre durée est **égale** à `MinPacketPeriodInHns`, pas supérieure — le risque
+est donc connu et assumé pour cette expérience. Si la mesure ne bouge toujours pas, c'est
+cette égalité qui est la **variable suivante** : remonter la durée de l'entrée au-dessus de la
+période minimale annoncée, et voir.
+
+La longueur passée à `IoSetDeviceInterfacePropertyData` vaut **40 octets** (16 + 1 × 24) :
+le décalage de `ProcessingModeConstraints` plus les contraintes de mode réellement déclarées,
+et non `sizeof(KSAUDIO_PACKETSIZE_CONSTRAINTS2)` — le `ANYSIZE_ARRAY` du WDK vaut 1, donc la
+structure C mesure toujours une contrainte de mode de plus qu'elle n'en porte, et les deux
+valeurs ne coïncident ici que parce que nous en déclarons exactement une. Les deux exemples de
+la documentation le confirment : la variante capture de SYSVAD annonce une contrainte et 40
+octets (16 + 24), la variante rendu deux et 64 (16 + 2 × 24). Le contenu exact de ces quarante
+octets est figé en dur par `portcls::adapter`, test
+`les_contraintes_de_paquet_partent_en_quarante_octets` : c'est la seule vérification qui
+montre ce que le moteur audio lira réellement.
 
 `PacketSizeFileAlignment` mérite un mot, parce que la valeur intuitive est fausse. Le champ
 est un **masque** (`wdm.h` : `FILE_BYTE_ALIGNMENT` = 0, … `FILE_512_BYTE_ALIGNMENT` = 0x1ff)

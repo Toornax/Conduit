@@ -177,7 +177,12 @@ use crate::status::{STATUS_BUFFER_TOO_SMALL, STATUS_PRIVILEGE_NOT_HELD};
 /// vérifient des deux côtés ; la conversion reste néanmoins **champ par champ**, jamais par
 /// transmutation : c'est la seule forme qu'un renommage de champ ou un changement de type
 /// casse à la compilation plutôt qu'à l'exécution.
-const fn en_guid(guid: &ConfigGuid) -> GUID {
+///
+/// `pub(crate)` et non privée depuis que [`crate::adapter`] convertit lui aussi un
+/// `ConfigGuid` — le mode de traitement de sa contrainte de taille de paquet : deux copies
+/// de la même conversion finiraient par diverger d'un champ, et c'est exactement la panne
+/// muette que l'assertion `const` ci-dessous existe pour empêcher.
+pub(crate) const fn en_guid(guid: &ConfigGuid) -> GUID {
     GUID {
         Data1: guid.data1,
         Data2: guid.data2,

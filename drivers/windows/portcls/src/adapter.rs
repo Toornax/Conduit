@@ -20,11 +20,16 @@
 //! PortCls les déréférence, et seul l'appelant sait qu'ils sont ceux du rappel en cours.
 
 use conduit_com::{ComPtr, ComRef, ComVtable, NtStatus, STATUS_NOT_IMPLEMENTED};
-use conduit_kmd_core::packetsize::PacketConstraints;
+use conduit_kmd_core::packetsize::{
+    AUDIO_SIGNALPROCESSINGMODE_DEFAULT, PROCESSING_MODE_CONSTRAINT_COUNT, PacketConstraints,
+    ProcessingModeConstraint,
+};
 use portcls_sys::{
-    GUID, IPort, IUnknown, KSAUDIO_PACKETSIZE_CONSTRAINTS2, PDEVICE_OBJECT, PIRP, UNICODE_STRING,
+    GUID, IPort, IUnknown, KSAUDIO_PACKETSIZE_CONSTRAINTS2,
+    KSAUDIO_PACKETSIZE_PROCESSINGMODE_CONSTRAINT, PDEVICE_OBJECT, PIRP, UNICODE_STRING,
 };
 
+use crate::config::en_guid;
 use crate::received::ResourceList;
 
 #[cfg(feature = "kernel")]
@@ -218,13 +223,25 @@ pub unsafe fn register_adapter_power_management(
 }
 
 /// La `KSAUDIO_PACKETSIZE_CONSTRAINTS2` que le pilote pose en valeur de
-/// `DEVPKEY_KsAudio_PacketSize_Constraints2`, bâtie depuis les trois valeurs portables de
+/// `DEVPKEY_KsAudio_PacketSize_Constraints2`, bâtie depuis les valeurs portables de
 /// [`PacketConstraints`].
 ///
-/// **Aucune contrainte de mode de traitement** : `NumProcessingModeConstraints` vaut zéro,
-/// ce que la documentation autorise explicitement (« This value can be 0 »), et le tableau
-/// de queue reste à zéro — il ne partira pas, [`set_packet_size_constraints`] ne recopiant
-/// que l'en-tête. Une variable à la fois : les modes viendront s'ils sont nécessaires.
+/// **Une** contrainte de mode de traitement, celle de
+/// [`AUDIO_SIGNALPROCESSINGMODE_DEFAULT`] : `NumProcessingModeConstraints` vaut la
+/// **longueur du tableau portable** ([`PROCESSING_MODE_CONSTRAINT_COUNT`]) et non un
+/// littéral, de sorte que le compte et le contenu ne puissent pas diverger. La valeur posée
+/// mesure donc 40 octets (16 + 1 × 24) et non plus 16 : c'est
+/// [`set_packet_size_constraints`] qui la calcule, depuis ce même champ.
+///
+/// L'hypothèse que cette entrée teste, la sémantique des deux champs de durée et la réserve
+/// « the mode-specific constraints need to be higher than the drivers minimum buffer size,
+/// otherwise they're ignored by the audio stack » — à laquelle nous sommes à égalité, pas
+/// au-dessus — sont écrites sur [`PacketConstraints`], là où les valeurs se calculent.
+///
+/// Le tableau se convertit par `array::map`, donc **entrée par entrée** : le type du champ
+/// du WDK ayant un `ANYSIZE_ARRAY` de 1, cette écriture ne compile que tant que
+/// [`PROCESSING_MODE_CONSTRAINT_COUNT`] vaut 1 lui aussi. C'est le compilateur, et non un
+/// commentaire, qui tient l'égalité.
 ///
 /// Pure et sans noyau : testable en mode utilisateur, comme tout ce qui n'appelle pas
 /// `Pc*`.
@@ -234,10 +251,64 @@ pub fn packet_size_constraints(contraintes: &PacketConstraints) -> KSAUDIO_PACKE
         MinPacketPeriodInHns: contraintes.min_packet_period_hns,
         PacketSizeFileAlignment: contraintes.packet_size_file_alignment,
         MaxPacketSizeInBytes: contraintes.max_packet_size_bytes,
-        NumProcessingModeConstraints: 0,
-        ..Default::default()
+        NumProcessingModeConstraints: MODES_DECLARES,
+        ProcessingModeConstraints: contraintes.processing_modes.map(en_contrainte_de_mode),
     }
 }
+
+/// [`PROCESSING_MODE_CONSTRAINT_COUNT`] dans le type du champ du WDK (`ULONG`).
+///
+/// Converti une fois, en `const` : `u32::try_from` rendrait un `Result` à traiter dans une
+/// fonction qui n'a rien à refuser, et un `as` silencieux tronquerait au lieu d'échouer.
+/// L'assertion garde la conversion honnête si le tableau grandissait un jour au-delà de
+/// 4 milliards d'entrées — ce qui n'arrivera pas, mais se lit en une ligne.
+const MODES_DECLARES: u32 = {
+    assert!(PROCESSING_MODE_CONSTRAINT_COUNT <= u32::MAX as usize);
+    PROCESSING_MODE_CONSTRAINT_COUNT as u32
+};
+
+/// Une entrée portable vers le `KSAUDIO_PACKETSIZE_PROCESSINGMODE_CONSTRAINT` du WDK,
+/// champ par champ.
+///
+/// Jamais par transmutation, bien que les dispositions coïncident (les deux sont vérifiées
+/// contre `layout.golden`) : c'est la seule forme qu'un renommage de champ ou un changement
+/// de type casse à la compilation plutôt qu'en machine. Même règle que
+/// [`crate::config::en_guid`], qu'elle appelle pour le mode.
+fn en_contrainte_de_mode(
+    mode: ProcessingModeConstraint,
+) -> KSAUDIO_PACKETSIZE_PROCESSINGMODE_CONSTRAINT {
+    KSAUDIO_PACKETSIZE_PROCESSINGMODE_CONSTRAINT {
+        ProcessingMode: en_guid(&mode.mode),
+        SamplesPerProcessingPacket: mode.samples_per_processing_packet,
+        ProcessingPacketDurationInHns: mode.processing_packet_duration_hns,
+    }
+}
+
+/// Le mode de traitement portable est **identiquement** celui que bindgen a extrait du
+/// `DEFINE_GUIDSTRUCT` de `ksmedia.h` — les quatre champs, `Data4` octet par octet.
+///
+/// C'est l'assertion qui relie la constante portable de `conduit_kmd_core` à l'en-tête
+/// réel, et elle ferme la chaîne : `portcls-sys/tests/layout.rs` confronte de son côté ce
+/// même `AUDIO_SIGNALPROCESSINGMODE_DEFAULT` à ce que `cl.exe` lit de la macro
+/// `STATIC_AUDIO_SIGNALPROCESSINGMODE_DEFAULT` (`layout.golden`). Sans elle, un chiffre de
+/// travers dans la copie portable poserait la contrainte sur un mode que personne
+/// n'emprunte : rien ne planterait, et la période resterait à 10 ms sans que rien ne le
+/// dise. Exactement le raisonnement de `KSPROPSETID_CONDUIT` (`crate::config`).
+const _: () = {
+    let converti = en_guid(&AUDIO_SIGNALPROCESSINGMODE_DEFAULT);
+    let reference = portcls_sys::AUDIO_SIGNALPROCESSINGMODE_DEFAULT;
+    assert!(converti.Data1 == reference.Data1);
+    assert!(converti.Data2 == reference.Data2);
+    assert!(converti.Data3 == reference.Data3);
+    assert!(converti.Data4[0] == reference.Data4[0]);
+    assert!(converti.Data4[1] == reference.Data4[1]);
+    assert!(converti.Data4[2] == reference.Data4[2]);
+    assert!(converti.Data4[3] == reference.Data4[3]);
+    assert!(converti.Data4[4] == reference.Data4[4]);
+    assert!(converti.Data4[5] == reference.Data4[5]);
+    assert!(converti.Data4[6] == reference.Data4[6]);
+    assert!(converti.Data4[7] == reference.Data4[7]);
+};
 
 /// Unités UTF-16 **avant** le premier NUL d'une chaîne terminée par NUL, telle que
 /// [`utf16z`] et [`utf16z_numbered`] en produisent.
@@ -332,6 +403,14 @@ pub unsafe fn physical_device_object(device: PDEVICE_OBJECT) -> Result<PDEVICE_O
 /// mesurent bien `16 + N × 24`. Une longueur qui déborderait la structure fournie —
 /// c'est-à-dire plus d'une contrainte de mode dans une structure qui n'en loge qu'une — est
 /// refusée sans appel : l'alternative serait de lire hors de l'objet.
+///
+/// Depuis que [`packet_size_constraints`] déclare l'entrée
+/// [`AUDIO_SIGNALPROCESSINGMODE_DEFAULT`], le cas courant n'est plus l'en-tête seul mais
+/// **40 octets** (16 + 1 × 24) — la longueur même de la variante capture de SYSVAD que le
+/// paragraphe précédent cite. La coïncidence avec `size_of` de la structure C n'en est pas
+/// une : les deux valent 40 tant qu'une seule contrainte est déclarée, et le calcul reste
+/// celui de `packet_size_constraints_bytes` pour qu'une seconde entrée n'ait rien à
+/// corriger ici.
 ///
 /// # Catégorie, et une seule
 ///
@@ -587,6 +666,9 @@ const fn pin_name_guids() -> [GUID; CABLE_COUNT] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Hors feature `kernel`, seul le test des quarante octets appelle ce calcul de
+    // longueur : il n'est donc pas dans l'importation du module, qui est gardée.
+    use portcls_sys::packet_size_constraints_bytes;
 
     /// Le nom, coupé au **premier** NUL : les gabarits de [`utf16z_numbered`] sont
     /// remplis de zéros et `split_last` n'en verrait que le dernier.
@@ -595,28 +677,88 @@ mod tests {
         std::string::String::from_utf16(&unites).unwrap_or_default()
     }
 
-    /// Les trois valeurs du contrat portable arrivent aux bons champs, et rien d'autre ne
-    /// part : `NumProcessingModeConstraints` est nul et le tableau de queue est à zéro.
+    /// Les valeurs du contrat portable arrivent aux bons champs, l'unique contrainte de
+    /// mode comprise.
     #[test]
-    fn les_contraintes_de_paquet_recopient_les_trois_valeurs() {
+    fn les_contraintes_de_paquet_recopient_les_valeurs() {
         let portables = PacketConstraints::new(10);
         let ks = packet_size_constraints(&portables);
         assert_eq!(ks.MinPacketPeriodInHns, 50_000, "5 ms");
         assert_eq!(ks.PacketSizeFileAlignment, 0, "FILE_BYTE_ALIGNMENT");
         assert_eq!(ks.MaxPacketSizeInBytes, 30_720, "10 ms de 96 kHz × 8 × 4");
-        assert_eq!(ks.NumProcessingModeConstraints, 0);
-        assert_eq!(
-            ks.ProcessingModeConstraints[0].SamplesPerProcessingPacket,
-            0
-        );
-        assert_eq!(
-            ks.ProcessingModeConstraints[0].ProcessingPacketDurationInHns,
-            0
-        );
-        // Un plancher de tampon plus large déplace la période, et elle seule.
+        assert_eq!(ks.NumProcessingModeConstraints, 1, "l'entrée DEFAULT");
+        let mode = ks.ProcessingModeConstraints[0];
+        // `GUID` du WDK ne dérive pas `PartialEq` : comparaison champ par champ, comme
+        // partout ailleurs dans le crate.
+        let attendu = portcls_sys::AUDIO_SIGNALPROCESSINGMODE_DEFAULT;
+        assert_eq!(mode.ProcessingMode.Data1, attendu.Data1);
+        assert_eq!(mode.ProcessingMode.Data2, attendu.Data2);
+        assert_eq!(mode.ProcessingMode.Data3, attendu.Data3);
+        assert_eq!(mode.ProcessingMode.Data4, attendu.Data4);
+        // Zéro : la contrainte est exprimée par la durée, indépendamment de la fréquence.
+        assert_eq!(mode.SamplesPerProcessingPacket, 0);
+        assert_eq!(mode.ProcessingPacketDurationInHns, 50_000, "5 ms");
+        // Un plancher de tampon plus large déplace la période — et la durée de l'entrée
+        // avec elle, les deux valant `min_packet_period_hns`.
         let large = packet_size_constraints(&PacketConstraints::new(40));
         assert_eq!(large.MinPacketPeriodInHns, 200_000);
+        assert_eq!(
+            large.ProcessingModeConstraints[0].ProcessingPacketDurationInHns,
+            200_000
+        );
         assert_eq!(large.MaxPacketSizeInBytes, ks.MaxPacketSizeInBytes);
+    }
+
+    /// **Les quarante octets** que le moteur audio lira, en dur.
+    ///
+    /// C'est la seule vérification qui montre la valeur *telle qu'elle part* : les
+    /// assertions de champ ci-dessus ne diraient rien d'un champ mal **placé**, la
+    /// disposition venant du WDK et non de nous, ni d'un GUID dont deux moitiés seraient
+    /// interverties — un GUID valide, différent, et une contrainte posée sur un mode que
+    /// personne n'emprunte. Découpage de la valeur attendue :
+    ///
+    /// | Octets | Champ | Valeur |
+    /// |---|---|---|
+    /// | 0-3 | `MinPacketPeriodInHns` | 50 000 (5 ms) |
+    /// | 4-7 | `PacketSizeFileAlignment` | 0 (`FILE_BYTE_ALIGNMENT`) |
+    /// | 8-11 | `MaxPacketSizeInBytes` | 30 720 |
+    /// | 12-15 | `NumProcessingModeConstraints` | 1 |
+    /// | 16-31 | `ProcessingMode` | `{C18E2F7E-933D-4965-B7D1-1EEF228D2AF3}` |
+    /// | 32-35 | `SamplesPerProcessingPacket` | 0 (la contrainte est en durée) |
+    /// | 36-39 | `ProcessingPacketDurationInHns` | 50 000 (5 ms) |
+    ///
+    /// Les trois premiers champs et les deux derniers sont petit-boutistes ; le GUID, lui,
+    /// l'est **par moitié** — ses trois premiers champs entiers le sont, ses huit derniers
+    /// octets sont dans l'ordre du texte. C'est ce mélange que ce test fige.
+    #[test]
+    fn les_contraintes_de_paquet_partent_en_quarante_octets() {
+        const ATTENDU: [u8; 40] = [
+            0x50, 0xC3, 0x00, 0x00, // MinPacketPeriodInHns = 50 000
+            0x00, 0x00, 0x00, 0x00, // PacketSizeFileAlignment = 0
+            0x00, 0x78, 0x00, 0x00, // MaxPacketSizeInBytes = 30 720
+            0x01, 0x00, 0x00, 0x00, // NumProcessingModeConstraints = 1
+            0x7E, 0x2F, 0x8E, 0xC1, // ProcessingMode.Data1 = 0xC18E2F7E
+            0x3D, 0x93, // Data2 = 0x933D
+            0x65, 0x49, // Data3 = 0x4965
+            0xB7, 0xD1, 0x1E, 0xEF, 0x22, 0x8D, 0x2A, 0xF3, // Data4
+            0x00, 0x00, 0x00, 0x00, // SamplesPerProcessingPacket = 0
+            0x50, 0xC3, 0x00, 0x00, // ProcessingPacketDurationInHns = 50 000
+        ];
+
+        let ks = packet_size_constraints(&PacketConstraints::new(10));
+        // La longueur est celle que `set_packet_size_constraints` passera au noyau : 16 + 1
+        // × 24. `unwrap_or(0)` plutôt qu'un `unwrap` interdit par les lints du workspace —
+        // l'assertion qui suit dit la même chose, et le dit mieux.
+        let taille = packet_size_constraints_bytes(ks.NumProcessingModeConstraints).unwrap_or(0);
+        assert_eq!(taille, ATTENDU.len(), "16 + 1 × 24");
+
+        // SAFETY: `ks` est vivant, `repr(C)` et entièrement constituée de `ULONG` et d'un
+        // `GUID` — aucun pointeur, aucun rembourrage implicite (16 + 24 = 40 = `size_of`),
+        // donc chacun de ses octets est initialisé et lisible. `taille` vaut exactement
+        // cette taille, vérifiée juste au-dessus, et la tranche ne survit pas à `ks`.
+        let octets =
+            unsafe { core::slice::from_raw_parts(core::ptr::from_ref(&ks).cast::<u8>(), taille) };
+        assert_eq!(octets, ATTENDU.as_slice());
     }
 
     /// La longueur d'une chaîne de référence s'arrête au **premier** NUL : les gabarits

@@ -11,17 +11,19 @@
 //! nous ne la déclarions nulle part. Sans elle, Windows retombe sur son défaut historique
 //! de 10 ms.
 //!
-//! Ce module ne pose rien — il ne connaît ni le noyau ni PnP : il **calcule les trois
-//! valeurs** que `conduit_kmd::adapter` posera, à partir de ce que le pilote sait
-//! réellement faire. C'est la partie qui se teste sans machine.
+//! Ce module ne pose rien — il ne connaît ni le noyau ni PnP : il **calcule les valeurs**
+//! que `conduit_kmd::adapter` posera, à partir de ce que le pilote sait réellement faire.
+//! C'est la partie qui se teste sans machine.
 //!
-//! # Les trois valeurs, et d'où elles viennent
+//! # Les valeurs, et d'où elles viennent
 //!
 //! | Champ | Valeur | Ce qui la fixe |
 //! |---|---|---|
 //! | `MinPacketPeriodInHns` | [`min_packet_period_hns`] | le plancher `BufferMs` du registre, et le minuteur de 1 ms |
 //! | `PacketSizeFileAlignment` | [`PACKET_SIZE_FILE_ALIGNMENT`] | rien : le pilote n'impose aucun alignement en octets |
 //! | `MaxPacketSizeInBytes` | [`MAX_PACKET_SIZE_BYTES`] | 10 ms du plus gros format qu'une broche puisse servir |
+//! | `NumProcessingModeConstraints` | [`PROCESSING_MODE_CONSTRAINT_COUNT`] | la **longueur** du tableau ci-dessous, jamais un littéral |
+//! | `ProcessingModeConstraints[0]` | [`AUDIO_SIGNALPROCESSINGMODE_DEFAULT`], en durée | la même période que `MinPacketPeriodInHns` (voir [`PacketConstraints`]) |
 //!
 //! # Le lien entre une période et un tampon, et l'hypothèse qu'il porte
 //!
@@ -42,6 +44,7 @@
 //! réellement allouée, mais la période annoncée serait, pour ce client-là, optimiste d'un
 //! facteur deux. Aucun `NotificationCount = 1` n'a été observé à ce jour.
 
+use crate::config::ConfigGuid;
 use crate::format::{MAX_BUFFER_MS, MIN_BUFFER_MS, SAMPLE_DEPTHS, SAMPLE_RATES};
 use crate::ring::FrameLayout;
 
@@ -196,18 +199,123 @@ pub const fn min_packet_period_hns(buffer_ms: u32) -> u32 {
     }
 }
 
-/// Les trois valeurs de `KSAUDIO_PACKETSIZE_CONSTRAINTS2`, dans l'ordre de la structure du
-/// WDK.
+/// `AUDIO_SIGNALPROCESSINGMODE_DEFAULT` (`ksmedia.h` du WDK 26100, l. 8424-8426,
+/// `{C18E2F7E-933D-4965-B7D1-1EEF228D2AF3}`) : le **mode de traitement par défaut**, celui
+/// que le moteur audio applique à tout flux qui n'en demande pas d'autre.
+///
+/// C'est le mode de l'unique contrainte que [`PacketConstraints`] déclare, et le seul qui
+/// ait un sens ici : le pilote n'expose ni `KSPROPERTY_AUDIOSIGNALPROCESSING_MODES` ni le
+/// moindre attribut de mode sur ses plages de format, donc tout ce qu'il sert passe par
+/// `DEFAULT`. Poser la contrainte sur un autre mode — `RAW`, `MOVIE`, `COMMUNICATIONS` — la
+/// rendrait vraie pour un mode que personne n'emprunte : une panne **muette**, dont le seul
+/// symptôme serait la période de 10 ms qu'on essaie précisément de faire descendre.
+///
+/// # La chaîne de confiance, la même que pour `KSPROPSETID_CONDUIT`
+///
+/// La valeur est **recopiée** ici plutôt qu'importée, ce crate étant portable et sans
+/// dépendance (voir [`ConfigGuid`]) ; elle est donc adossée à deux oracles indépendants.
+/// `portcls::adapter` vérifie par assertion `const` que sa conversion en `GUID` est
+/// **identique** au `portcls_sys::AUDIO_SIGNALPROCESSINGMODE_DEFAULT` que bindgen extrait
+/// du `DEFINE_GUIDSTRUCT` de `ksmedia.h`, et `portcls-sys/tests/layout.rs` confronte ce
+/// dernier à ce que `cl.exe` lit de la macro `STATIC_AUDIO_SIGNALPROCESSINGMODE_DEFAULT`
+/// du même en-tête (`layout.golden`). Un chiffre faux ici tombe donc à la compilation du
+/// pilote, jamais en machine.
+pub const AUDIO_SIGNALPROCESSINGMODE_DEFAULT: ConfigGuid = ConfigGuid {
+    data1: 0xC18E_2F7E,
+    data2: 0x933D,
+    data3: 0x4965,
+    data4: [0xB7, 0xD1, 0x1E, 0xEF, 0x22, 0x8D, 0x2A, 0xF3],
+};
+
+/// Nombre de contraintes de mode de traitement que le pilote déclare : **une**, celle de
+/// [`AUDIO_SIGNALPROCESSINGMODE_DEFAULT`].
+///
+/// C'est la longueur du tableau [`PacketConstraints::processing_modes`], et c'est **elle**
+/// que `portcls::adapter` recopie dans `NumProcessingModeConstraints` : un littéral écrit
+/// à la main des deux côtés finirait par diverger du tableau, et le moteur audio lirait
+/// alors une entrée que le pilote n'a pas remplie — ou n'en lirait pas une qu'il a remplie.
+/// Le `ANYSIZE_ARRAY` du WDK vaut lui aussi 1, si bien que la conversion tient dans la
+/// structure C sans allocation de queue.
+pub const PROCESSING_MODE_CONSTRAINT_COUNT: usize = 1;
+
+/// Une entrée du tableau `ProcessingModeConstraints` :
+/// `KSAUDIO_PACKETSIZE_PROCESSINGMODE_CONSTRAINT` du WDK, champ pour champ.
+///
+/// Structure **portable**, comme [`PacketConstraints`] : elle ne mentionne aucun type du
+/// WDK et se teste en mode utilisateur. Elle est néanmoins `#[repr(C)]` et ses décalages
+/// sont vérifiés contre ceux que `cl.exe` a mesurés (`layout.golden`, lignes
+/// `KSAUDIO_PACKETSIZE_PROCESSINGMODE_CONSTRAINT.*` : 24 octets, `ProcessingMode` en 0,
+/// `SamplesPerProcessingPacket` en 16, `ProcessingPacketDurationInHns` en 20) — non parce
+/// que ce crate la sérialise, mais parce qu'une disposition qui divergerait de celle du WDK
+/// rendrait le miroir trompeur.
+///
+/// # Les deux derniers champs ne sont pas cumulatifs : le premier **prime**
+///
+/// La documentation est explicite, et c'est la seule chose à retenir de cette structure :
+/// `SamplesPerProcessingPacket` est « the processing frame size for the processing mode,
+/// expressed in number of samples. **If this value is 0, the constraint is expressed by the
+/// `ProcessingPacketDurationInHns` field** », et `ProcessingPacketDurationInHns` la même
+/// taille « expressed in hundred-nanosecond (HNS) units. **This field is ignored if
+/// `SamplesPerProcessingPacket` is nonzero** ».
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(C)]
+pub struct ProcessingModeConstraint {
+    /// `ProcessingMode: GUID` : le mode de traitement que cette entrée contraint.
+    pub mode: ConfigGuid,
+    /// `SamplesPerProcessingPacket: ULONG` : la taille en **échantillons**, ou zéro pour
+    /// exprimer la contrainte en durée (voir la note de structure).
+    pub samples_per_processing_packet: u32,
+    /// `ProcessingPacketDurationInHns: ULONG` : la taille en **centaines de nanosecondes**,
+    /// ignorée si le champ précédent est non nul.
+    pub processing_packet_duration_hns: u32,
+}
+
+// La disposition est bien celle du WDK : ce sont exactement les nombres que `cl.exe` a
+// mesurés dans `drivers\windows\portcls-sys\tests\layout.golden`.
+const _: () = assert!(size_of::<ProcessingModeConstraint>() == 24);
+const _: () = assert!(align_of::<ProcessingModeConstraint>() == 4);
+const _: () = assert!(core::mem::offset_of!(ProcessingModeConstraint, mode) == 0);
+const _: () =
+    assert!(core::mem::offset_of!(ProcessingModeConstraint, samples_per_processing_packet) == 16);
+const _: () =
+    assert!(core::mem::offset_of!(ProcessingModeConstraint, processing_packet_duration_hns) == 20);
+
+/// Les valeurs de `KSAUDIO_PACKETSIZE_CONSTRAINTS2`, dans l'ordre de la structure du WDK.
 ///
 /// Une structure **portable** : elle ne mentionne aucun type du WDK, ce qui la rend
 /// calculable et testable en mode utilisateur. `portcls::adapter` la recopie dans la vraie
 /// `KSAUDIO_PACKETSIZE_CONSTRAINTS2`, dont la disposition est vérifiée contre `cl.exe`
 /// (`layout.golden`).
 ///
-/// Le quatrième champ du WDK, `NumProcessingModeConstraints`, n'est pas ici : il vaut
-/// **zéro** et la documentation l'autorise (« This value can be 0 »). Une contrainte par
-/// mode de traitement est une variable de plus, qu'on ne bougera qu'après avoir mesuré
-/// l'effet de celle-ci.
+/// # L'hypothèse que la contrainte de mode teste
+///
+/// Les trois premières valeurs sont déclarées depuis le lot précédent, et **le moteur audio
+/// n'a pas bougé** : `IAudioClient3::GetSharedModeEnginePeriod` annonce toujours 480 trames
+/// de défaut, de fondamentale, de minimum et de maximum, alors que la `DEVPKEY` est bien
+/// posée — vérifiée en machine virtuelle, `STATUS_SUCCESS` relu par
+/// `KSPROPERTY_CONDUIT_TRANSPORT`. Reste une différence avec l'exemple de la documentation
+/// Microsoft : `SysvadWaveRtPacketSizeConstraintsRender` porte, lui, une entrée de mode de
+/// traitement, là où nous n'en déclarions aucune. C'est donc **cette seule variable** qu'on
+/// bouge — une à la fois, comme toujours : une entrée pour
+/// [`AUDIO_SIGNALPROCESSINGMODE_DEFAULT`], et rien d'autre (ni attribut de mode sur les
+/// plages de format, ni `KSPROPERTY_AUDIOSIGNALPROCESSING_MODES`, ni mode `RAW`).
+///
+/// L'entrée est exprimée **en durée** : `samples_per_processing_packet` vaut zéro — « if
+/// this value is 0, the constraint is expressed by the `ProcessingPacketDurationInHns`
+/// field » — et `processing_packet_duration_hns` porte [`min_packet_period_hns`]. Une
+/// contrainte en échantillons aurait dû choisir une fréquence, or le pilote sert 44,1, 48
+/// **et** 96 kHz sur la même interface de filtre : 240 échantillons y valent 5 ms à 48 kHz
+/// et 2,5 ms à 96 kHz, c'est-à-dire deux contraintes différentes selon le format réglé. La
+/// durée, elle, est vraie pour les trois.
+///
+/// # La réserve, écrite noir sur blanc parce qu'elle nous vise
+///
+/// « Low Latency Audio » prévient : « the mode-specific constraints need to be **higher**
+/// than the drivers minimum buffer size, otherwise they're ignored by the audio stack ».
+/// Notre durée est **égale** à `MinPacketPeriodInHns`, pas supérieure. Le risque est donc
+/// connu et assumé : cette expérience mesure ce qu'une entrée `DEFAULT` change, et si la
+/// mesure ne bouge pas, c'est **cette égalité** qui est la variable suivante — remonter la
+/// durée de l'entrée au-dessus de la période minimale annoncée, et voir.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PacketConstraints {
     /// `MinPacketPeriodInHns` : la période la plus courte que le pilote accepte de servir.
@@ -216,16 +324,32 @@ pub struct PacketConstraints {
     pub packet_size_file_alignment: u32,
     /// `MaxPacketSizeInBytes` : le plus gros paquet que le pilote accepte de servir.
     pub max_packet_size_bytes: u32,
+    /// `ProcessingModeConstraints` : les contraintes par mode de traitement, une seule ici.
+    ///
+    /// `NumProcessingModeConstraints` n'a **pas** de champ : c'est la longueur de ce
+    /// tableau ([`PROCESSING_MODE_CONSTRAINT_COUNT`]), et l'écrire deux fois serait offrir
+    /// à la structure et à son compte l'occasion de diverger.
+    pub processing_modes: [ProcessingModeConstraint; PROCESSING_MODE_CONSTRAINT_COUNT],
 }
 
 impl PacketConstraints {
     /// Les contraintes du pilote pour un plancher de tampon de `buffer_ms` millisecondes.
+    ///
+    /// L'unique contrainte de mode reprend la période de [`min_packet_period_hns`], en
+    /// durée : les deux valeurs suivent donc `buffer_ms` ensemble, et l'égalité que la note
+    /// de structure signale reste vraie pour tous les `buffer_ms` — c'est voulu, et c'est
+    /// ce que le test `la_contrainte_de_mode_suit_la_periode_minimale` fixe.
     #[must_use]
     pub const fn new(buffer_ms: u32) -> Self {
         Self {
             min_packet_period_hns: min_packet_period_hns(buffer_ms),
             packet_size_file_alignment: PACKET_SIZE_FILE_ALIGNMENT,
             max_packet_size_bytes: MAX_PACKET_SIZE_BYTES,
+            processing_modes: [ProcessingModeConstraint {
+                mode: AUDIO_SIGNALPROCESSINGMODE_DEFAULT,
+                samples_per_processing_packet: 0,
+                processing_packet_duration_hns: min_packet_period_hns(buffer_ms),
+            }; PROCESSING_MODE_CONSTRAINT_COUNT],
         }
     }
 
@@ -294,6 +418,63 @@ mod tests {
         assert_eq!(contraintes.min_packet_period_hns, 50_000);
         assert_eq!(contraintes.packet_size_file_alignment, 0);
         assert_eq!(contraintes.max_packet_size_bytes, 30_720);
+    }
+
+    /// L'unique contrainte de mode vise `DEFAULT`, s'exprime **en durée** (donc
+    /// `samples = 0`) et porte les cinq millisecondes du défaut.
+    #[test]
+    fn le_defaut_porte_une_contrainte_de_mode_par_defaut_en_duree() {
+        let contraintes = PacketConstraints::new(10);
+        assert_eq!(contraintes.processing_modes.len(), 1);
+        assert_eq!(
+            contraintes.processing_modes.len(),
+            PROCESSING_MODE_CONSTRAINT_COUNT,
+            "le compte annoncé est la longueur du tableau"
+        );
+        let entree = contraintes.processing_modes[0];
+        assert_eq!(entree.mode, AUDIO_SIGNALPROCESSINGMODE_DEFAULT);
+        // Zéro : « if this value is 0, the constraint is expressed by the
+        // ProcessingPacketDurationInHns field ». Non nul, il primerait sur la durée.
+        assert_eq!(entree.samples_per_processing_packet, 0);
+        assert_eq!(entree.processing_packet_duration_hns, 50_000, "5 ms");
+    }
+
+    /// La durée de la contrainte de mode suit `min_packet_period_hns`, et lui est **égale**
+    /// pour tous les `buffer_ms` — l'égalité que la documentation de [`PacketConstraints`]
+    /// signale comme le risque assumé de ce lot (« need to be higher … otherwise they're
+    /// ignored »), et la variable suivante si la mesure ne bouge pas.
+    #[test]
+    fn la_contrainte_de_mode_suit_la_periode_minimale() {
+        for buffer_ms in [0, 1, 4, 5, 6, 10, 20, 50, 100, 500, u32::MAX] {
+            let contraintes = PacketConstraints::new(buffer_ms);
+            let entree = contraintes.processing_modes[0];
+            assert_eq!(
+                entree.samples_per_processing_packet, 0,
+                "tampon {buffer_ms} ms"
+            );
+            assert_eq!(
+                entree.processing_packet_duration_hns,
+                min_packet_period_hns(buffer_ms),
+                "tampon {buffer_ms} ms"
+            );
+            assert_eq!(
+                entree.processing_packet_duration_hns, contraintes.min_packet_period_hns,
+                "tampon {buffer_ms} ms : égale, pas supérieure"
+            );
+        }
+    }
+
+    /// `AUDIO_SIGNALPROCESSINGMODE_DEFAULT` vaut bien
+    /// `{C18E2F7E-933D-4965-B7D1-1EEF228D2AF3}`, écrit en toutes lettres et champ par
+    /// champ : un chiffre de travers poserait la contrainte sur un mode que personne
+    /// n'emprunte, sans le moindre message d'erreur.
+    #[test]
+    fn le_mode_par_defaut_est_celui_de_ksmedia() {
+        let guid = AUDIO_SIGNALPROCESSINGMODE_DEFAULT;
+        assert_eq!(guid.data1, 0xC18E_2F7E);
+        assert_eq!(guid.data2, 0x933D);
+        assert_eq!(guid.data3, 0x4965);
+        assert_eq!(guid.data4, [0xB7, 0xD1, 0x1E, 0xEF, 0x22, 0x8D, 0x2A, 0xF3]);
     }
 
     #[test]

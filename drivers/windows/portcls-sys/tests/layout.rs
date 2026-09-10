@@ -267,6 +267,7 @@ guids! {
     KSEVENTSETID_PinCapsChange,
     KSPROPSETID_Audio,
     KSPROPTYPESETID_General,
+    AUDIO_SIGNALPROCESSINGMODE_DEFAULT,
 }
 
 devpropkeys! {

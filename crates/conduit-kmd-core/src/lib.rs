@@ -111,9 +111,10 @@ pub use format::{
 pub use loopback::{CopyOp, Loopback, Plan, SilenceCause, SilenceOp, StreamView, LEAD_MS};
 pub use notify::{align_frames, boundaries_crossed, Notifier};
 pub use packetsize::{
-    min_packet_period_hns, PacketConstraints, HNS_PER_MS, MAX_FRAME_BYTES, MAX_PACKET_MS,
+    min_packet_period_hns, PacketConstraints, ProcessingModeConstraint,
+    AUDIO_SIGNALPROCESSINGMODE_DEFAULT, HNS_PER_MS, MAX_FRAME_BYTES, MAX_PACKET_MS,
     MAX_PACKET_SIZE_BYTES, MIN_PACKET_PERIOD_FLOOR_HNS, NOTIFICATION_COUNT,
-    PACKET_SIZE_FILE_ALIGNMENT,
+    PACKET_SIZE_FILE_ALIGNMENT, PROCESSING_MODE_CONSTRAINT_COUNT,
 };
 pub use params::{
     decode_dword, sanitize, Correction, Fix, Param, Params, RawParams, Report, REG_DWORD,

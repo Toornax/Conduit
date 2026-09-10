@@ -270,6 +270,11 @@ int main(void)
     GUID_KS(KSEVENTSETID_PinCapsChange);
     GUID_KS(KSPROPSETID_Audio);
     GUID_KS(KSPROPTYPESETID_General);
+    /* Le mode de traitement de l'unique contrainte de mode que le pilote déclare dans sa
+     * KSAUDIO_PACKETSIZE_CONSTRAINTS2. Se tromper de GUID poserait la contrainte sur un
+     * mode que personne n'emprunte : rien ne planterait, et la période resterait à 10 ms
+     * sans qu'aucune trace ne le dise — la panne la plus muette de tout ce lot. */
+    GUID_KS(AUDIO_SIGNALPROCESSINGMODE_DEFAULT);
 
     /* DEVPROPKEY : la clé sur laquelle le pilote pose ses contraintes de taille de paquet.
      * Recopiée à la main côté Rust (les DEFINE_DEVPROPKEY sont en liste de blocage de
