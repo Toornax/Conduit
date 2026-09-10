@@ -873,24 +873,54 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   la position de rendu cesse d'être sûre quand la période du moteur descend à 2 ms.
   **Résultat net** : une application faible latence obtient **4 ms** de période sur un câble
   Conduit au lieu de 10, en partagé, aujourd'hui.
-- [ ] **M1b-15** `feat(pilote): faire allouer le moteur partagé avec notifications`
-  *Fait quand* : en partagé, le tampon du pilote est alloué par
-  `AllocateBufferWithNotification` — c'est la définition même du mode paquets.
-  *État au 2026-09-10* : le moteur partagé reste en **scrutation** (`AllocateAudioBuffer`,
-  4096 trames, aucune notification) **alors même que les contraintes sont lues et qu'une
-  période de 2 ms est servie au client** ; la cause n'est pas établie et la documentation ne
-  décrit nulle part cette décision. Dernière variable non testée, **en cours** : les modes
-  de traitement déclarés **sur les broches** (attribut
-  `KSATTRIBUTEID_AUDIOSIGNALPROCESSING_MODE` sur les plages,
-  `KSPROPERTY_AUDIOSIGNALPROCESSING_MODES`).
-- [ ] **M1b-16** `feat(pilote): servir réellement les paquets WaveRT (lot 3)`
+- [x] **M1b-15** `feat(pilote): faire allouer le moteur partagé avec notifications`
+  **Clos le 2026-09-10 sans que le critère soit atteint — et c'est la réponse.**
+  *Fait quand* (le critère d'origine) : en partagé, le tampon du pilote est alloué par
+  `AllocateBufferWithNotification` — c'est la définition même du mode paquets. **Il ne l'est
+  pas, et il n'y a plus de variable à essayer.**
+  *Ce qui a été livré* : les modes de traitement déclarés **sur les broches** de flux
+  (attribut `KSATTRIBUTEID_AUDIOSIGNALPROCESSING_MODE` sur les plages et propriété
+  `KSPROPERTY_AUDIOSIGNALPROCESSING_MODES`, fusion `ed39ea5`), qui étaient la dernière
+  variable non testée — voir [driver-design.md](docs/driver-design.md) §4.4.
+  *Mesuré après la fusion* : le moteur partagé **scrute toujours** (`AllocateAudioBuffer`),
+  modes déclarés **et** contraintes lues — le minimum annoncé est passé à **240 trames /
+  5 ms**, la contrainte de mode gouvernant le minimum. Toutes les conditions déclaratives de
+  SYSVAD sont désormais remplies : plages avec attribut, propriété sur la broche de flux et
+  `Count = 0` sur le pont, `DEVPKEY_KsAudio_PacketSize_Constraints2` avec entrée de mode.
+  **La scrutation en partagé est le comportement du moteur sur cette machine, pas un manque
+  du pilote** ; aucune documentation ne décrit cette décision, et l'hypothèse « mode aware »
+  est écartée.
+  *Conséquence* : **rien à faire de plus côté pilote**. Le mode paquets sert les clients qui
+  le demandent — les exclusifs événementiels (M1b-16) —, et le partagé prend le chemin
+  cyclique, qui fonctionne.
+- [x] **M1b-16** `feat(pilote): servir réellement les paquets WaveRT (lot 3)`
+  Lot 3 (commit `d3c45ac` ; correctif d'avance `7603b7b` ; fusion des modes `ed39ea5` /
+  `8a83094` ; **défaut à 1** dans `e2c06a9`). Les quatre méthodes **servent** au lieu de
+  refuser : `SetWritePacket` valide le numéro et borne la copie, `GetReadPacket` rend le
+  dernier paquet complet de la capture, `GetOutputStreamPresentationPosition` des trames
+  absolues, `GetPacketCount` un compte base 1.
   *Fait quand* : les méthodes du mode paquets servent au lieu de refuser, et une passe
-  `--exclusif` réussit avec `PacketMode = 1`.
+  `--exclusif` réussit avec `PacketMode = 1`. **Les deux sont vérifiés.**
   **Prérequis de tout `PacketMode = 1` livré**, et M1b-13 dit pourquoi : les clients exclusifs
   sont mesurés demandeurs (400 appels par seconde) et cassés par le refus.
-  C'est aussi ce lot qui fera **redescendre la borne des 4 ms** de M1b-14 : la copie saura
-  alors où le rendu en est vraiment, par les paquets servis ou par une avance calculée sur la
-  période effective au lieu d'une constante.
+  *Mesuré le 2026-09-10*, session console, débogueur détaché :
+
+  | Ce qui est mesuré | Résultat |
+  |---|---|
+  | Exclusif servi (`PacketMode = 1`) | la passe qui **mourait au préremplissage** avec les interfaces refusées passe : ~1600 `SetWritePacket` en 20 s, ~3160 `GetReadPacket`, plus `GetPacketCount` et `GetOutputStreamPresentationPosition`, **tous servis, IRQL max 0** |
+  | Correctif d'avance (`7603b7b`) | la mise à zéro des deux côtés donnait **8/10** avec sauts sub-trame ; la dissymétrie (source bornée par `committed`, cible qui garde l'avance) donne **9/10** |
+  | **Contrôle décisif** : exclusif à `PacketMode = 0` | **8/10 aussi**, mêmes sauts sub-trame (~0,02–0,03 rad, zéro trou). Servi et non servi font **jeu égal** : les échecs résiduels sont le bruit du mode exclusif à 5 ms sous Hyper-V, **pas un défaut du mode paquets** |
+  | Partagé avec `PacketMode = 1` | **20/20** — le moteur, qui scrute (M1b-15), n'est pas affecté |
+  | **Driver Verifier `/standard`, 1 h 00, `PacketMode = 1`** | **382 tours** (moitié exclusifs, moitié classiques), **0 incident, 0 redémarrage, 0 vidage**, Verifier actif au début et à la fin ; **936 296 appels de paquets servis à `PASSIVE_LEVEL`** pendant que la DPC du minuteur tenait les mêmes verrous (305 763 `SetWritePacket`, 614 962 `GetReadPacket`, 581 `GetPacketCount`, 14 990 `GetOutputStreamPresentationPosition`). Verifier désarmé ensuite |
+
+  **`PacketMode` est donc à 1 par défaut** depuis `e2c06a9` : c'était la condition écrite
+  partout, la campagne l'a levée. 0 reste, et n'est plus qu'un **repli de diagnostic**.
+  *Ce que ce lot n'a pas fait* : la borne des **4 ms** de M1b-14 n'est pas redescendue
+  (`MIN_PACKET_PERIOD_HNS` vaut toujours 40 000 ; le minimum **annoncé** est même passé à
+  240 trames / 5 ms depuis que la contrainte de mode gouverne, voir M1b-15). La copie sait
+  désormais où le rendu en est par les paquets servis, mais seuls les clients exclusifs les
+  empruntent — le partagé, que cette borne concerne, scrute. Reste donc à calculer l'avance
+  sur la période effective au lieu d'une constante.
 
 ### M1b.B — Service d'assistance
 
