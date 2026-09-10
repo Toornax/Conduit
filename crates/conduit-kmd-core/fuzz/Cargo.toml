@@ -42,6 +42,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "numeros-de-paquet"
+path = "fuzz_targets/numeros-de-paquet.rs"
+test = false
+doc = false
+bench = false
+
 # Ce crate est son propre workspace : logé sous un membre du workspace racine, il ne
 # serait pas affranchi par le seul `exclude` de celui-ci (cargo ne l'y honore pas), et
 # `cargo fuzz` échouerait avant de compiler quoi que ce soit.

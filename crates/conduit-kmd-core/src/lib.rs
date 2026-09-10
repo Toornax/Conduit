@@ -19,6 +19,9 @@
 //! - les périodes de notification ([`notify`]) : quand signaler les événements
 //!   enregistrés par `IMiniportWaveRTStreamNotification`, à partir de la position
 //!   absolue, bouclage compris ;
+//! - la numérotation des paquets WaveRT ([`packetnum`]) : la conversion entre trames
+//!   absolues (`u64`) et numéro de paquet (`ULONG`, comparé **modulo 2³²**), et les
+//!   verdicts de `SetWritePacket` et de `GetReadPacket` ;
 //! - les bornes des paramètres de registre ([`params`]) : réserve de câbles, canaux,
 //!   durée de tampon et mode paquets, écrêtés vers leur borne avec un rapport de ce qui a
 //!   été corrigé, pour qu'un registre aberrant ne fasse jamais échouer le chargement
@@ -82,6 +85,7 @@ pub mod config;
 pub mod format;
 pub mod loopback;
 pub mod notify;
+pub mod packetnum;
 pub mod packetsize;
 pub mod params;
 pub mod position;
@@ -110,6 +114,7 @@ pub use format::{
 };
 pub use loopback::{CopyOp, Loopback, Plan, SilenceCause, SilenceOp, StreamView, LEAD_MS};
 pub use notify::{align_frames, boundaries_crossed, Notifier};
+pub use packetnum::{next_read, resolve, truncate, PacketGeometry, ReadVerdict, WriteVerdict};
 pub use packetsize::{
     processing_packet_duration_hns, PacketConstraints, ProcessingModeConstraint,
     AUDIO_SIGNALPROCESSINGMODE_DEFAULT, HNS_PER_MS, MAX_FRAME_BYTES, MAX_PACKET_MS,

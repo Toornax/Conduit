@@ -221,18 +221,18 @@ pub const KSPROPERTY_CONDUIT_TRANSPORT: u32 = 3;
 /// WASAPI exclusif événementiel. Reste la question qu'aucun relevé ne tranchait : le moteur
 /// scrute-t-il **par politique**, ou parce qu'il ne trouve pas les interfaces de paquets, que
 /// le pilote n'expose pas ? Le paramètre de registre `PacketMode`
-/// ([`crate::params::DEFAULT_PACKET_MODE`]) permet de les **exposer** sur une machine
-/// d'essai — sans les servir —, et cette propriété rend ce qui s'est passé ensuite : les
-/// `QueryInterface` reçus sur les deux IID, ceux auxquels on a répondu, et les appels de
-/// méthode, par sens et par méthode, avec leur IRQL et leur horodatage.
+/// ([`crate::params::DEFAULT_PACKET_MODE`]) permet de les **exposer** — sans les servir aux
+/// lots 1 et 2, en les servant depuis le lot 3 —, et cette propriété rend ce qui s'est passé
+/// ensuite : les `QueryInterface` reçus sur les deux IID, ceux auxquels on a répondu, et les
+/// appels de méthode, par sens et par méthode, avec leur IRQL et leur horodatage.
 ///
 /// # Un sélecteur voisin, et non des champs de plus dans [`CableTransport`]
 ///
 /// Le même raisonnement que celui qui a séparé le transport des compteurs, appliqué une
 /// deuxième fois. [`CableTransport`] décrit le **flux courant** et disparaît avec la broche ;
 /// ce que cette propriété porte est **cumulé depuis le dernier `StartDevice`** et vit sur le
-/// câble, précisément pour survivre au flux qu'on cherche à comprendre — un moteur qui essuie
-/// un `STATUS_NOT_SUPPORTED` n'a aucune obligation de garder sa broche ouverte. Les fondre
+/// câble, précisément pour survivre au flux qu'on cherche à comprendre — rien n'oblige un
+/// moteur audio à garder sa broche ouverte, qu'on l'ait servi ou refusé. Les fondre
 /// ferait en outre grandir une valeur **dont la longueur est refusée dès qu'elle change**,
 /// c'est-à-dire casserait tout client du transport pour une information qui ne le concerne
 /// pas. La justification complète est sur [`CONFIG_VERSION`].
@@ -2073,23 +2073,27 @@ pub const STREAM_PACKETS_BYTES: usize = 80;
 /// # Cumulé sur le câble, pas sur le flux
 ///
 /// Tous les compteurs de ce bloc sauf [`Self::exposure`] vivent sur le **câble**, comme
-/// [`StreamTransport::refused_allocations`] et pour la même raison : un moteur audio qui
-/// essuie un `STATUS_NOT_SUPPORTED` n'a aucune obligation de garder sa broche ouverte, et un
-/// compteur qui mourrait avec le flux serait vide au moment où on le relève. Ils sont remis à
-/// zéro à chaque `StartDevice`, avec les compteurs de la boucle locale.
-/// [`Self::exposure`], elle, décrit le flux **courant** et disparaît avec lui.
+/// [`StreamTransport::refused_allocations`] et pour la même raison : rien n'oblige un moteur
+/// audio à garder sa broche ouverte, et un compteur qui mourrait avec le flux serait vide au
+/// moment où on le relève. Ils sont remis à zéro à chaque `StartDevice`, avec les compteurs
+/// de la boucle locale. [`Self::exposure`], elle, décrit le flux **courant** et disparaît
+/// avec lui.
 ///
 /// # Ce que chaque compteur démontre
 ///
-/// - [`Self::queries`] monte, [`Self::queries_granted`] à zéro : le moteur **demande** le mode
-///   paquets et nous le lui refusons — c'est le relevé attendu à `PacketMode = 0`, et il
-///   répond déjà à la question du lot ;
-/// - `queries` à zéro : le moteur ne demande **jamais** les interfaces sur ce flux. La
-///   scrutation est alors une politique, pas une conséquence de notre silence ;
+/// - [`Self::queries`] monte, [`Self::queries_granted`] à zéro : le moteur demande le mode
+///   paquets et rien n'est exposé. C'est le relevé attendu à `PacketMode = 0` — et la mesure
+///   a montré que ce compte est la **sonde systématique** de PortCls à la création de chaque
+///   flux, deux par flux, quel que soit le client : il ne dit donc rien des intentions du
+///   moteur audio ;
+/// - `queries` à zéro : aucun flux n'a été créé depuis le dernier `StartDevice` ;
 /// - `queries_granted` monte et les quatre compteurs d'appels restent à zéro : le moteur a
-///   obtenu les interfaces et **ne les emprunte pas** ;
-/// - un compteur d'appels non nul : le moteur emprunte une méthode que nous refusons. C'est le
-///   cas qui justifie que ce paramètre ne soit jamais livré à 1.
+///   obtenu les interfaces et **ne les emprunte pas** — le régime du moteur partagé, qui
+///   scrute ;
+/// - un compteur d'appels non nul : le moteur **emprunte** le mode paquets. Depuis le lot 3
+///   ces appels sont servis ; c'est la conformité visée, et non plus le danger que les lots
+///   précédents mesuraient. Le contrat compte des appels, pas des `NTSTATUS` : un refus
+///   légitime (`STATUS_DATA_LATE_ERROR`, `STATUS_DATA_OVERRUN`) ne se distingue pas ici.
 ///
 /// [`Self::irql_max`] et les deux horodatages disent **dans quelles conditions** : le contrat
 /// annonce `PASSIVE_LEVEL` (`portcls.h`, `_IRQL_requires_max_(PASSIVE_LEVEL)`), et un IRQL
@@ -2409,8 +2413,9 @@ impl StreamPackets {
 
     /// Le moteur audio a-t-il **emprunté** le mode paquets sur ce sens ?
     ///
-    /// Vrai dès qu'une des quatre méthodes a été appelée — c'est-à-dire dès qu'un
-    /// `STATUS_NOT_SUPPORTED` a été rendu sur un chemin que le moteur croyait servi.
+    /// Vrai dès qu'une des quatre méthodes a été appelée. Depuis le lot 3 ces appels sont
+    /// **servis** : « emprunté » ne veut plus dire « refusé sur un chemin que le moteur
+    /// croyait servi », mais simplement que le moteur a pris ce chemin-là.
     #[must_use]
     pub const fn emprunte(&self) -> bool {
         self.appels() > 0
@@ -3466,7 +3471,7 @@ mod tests {
         assert_eq!(ignore.queries_granted_total(), 2);
         assert!(!ignore.emprunte());
 
-        // Emprunté : le cas qui justifie de ne jamais livrer `PacketMode = 1`.
+        // Emprunté : le moteur audio a pris le chemin des paquets. Servi depuis le lot 3.
         let emprunte = paquets_temoin();
         assert!(emprunte.emprunte());
         assert_eq!(emprunte.render.appels(), 13 + 17 + 19 + 23);

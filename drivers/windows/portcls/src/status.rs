@@ -40,6 +40,31 @@ pub const STATUS_PRIVILEGE_NOT_HELD: NtStatus = 0xC000_0061_u32 as i32;
 /// propriété adressée à un nœud ou à une instance (canal, câble) inconnus.
 pub const STATUS_NOT_FOUND: NtStatus = 0xC000_0225_u32 as i32;
 
+/// `STATUS_DATA_OVERRUN` (`0xC000003C`) : réponse de
+/// [`set_write_packet`](crate::MiniportWaveRTOutputStream::set_write_packet) à un numéro de
+/// paquet **trop en avance** pour tenir dans le tampon WaveRT.
+///
+/// Le client se recale ensuite par
+/// [`packet_count`](crate::MiniportWaveRTOutputStream::packet_count) : c'est la raison
+/// d'être de cette méthode, et la raison pour laquelle un refus doit porter **ce** code
+/// plutôt qu'un `STATUS_UNSUCCESSFUL` qui ne dirait pas dans quel sens il s'est trompé.
+pub const STATUS_DATA_OVERRUN: NtStatus = 0xC000_003C_u32 as i32;
+
+/// `STATUS_DATA_LATE_ERROR` (`0xC000003D`) : réponse de
+/// [`set_write_packet`](crate::MiniportWaveRTOutputStream::set_write_packet) à un numéro de
+/// paquet **déjà transféré ou en cours de transfert** — le pendant du précédent, dans
+/// l'autre sens.
+pub const STATUS_DATA_LATE_ERROR: NtStatus = 0xC000_003D_u32 as i32;
+
+/// `STATUS_DEVICE_NOT_READY` (`0xC00000A3`) : réponse de
+/// [`read_packet`](crate::MiniportWaveRTInputStream::read_packet) quand **aucun paquet
+/// neuf** n'est disponible.
+///
+/// Ce n'est pas une erreur : c'est le seul refus que la documentation de `GetReadPacket`
+/// prescrive, et il vaut mieux que la seule chose qu'elle interdise — rendre `Ok` sur un
+/// paquet déjà rendu.
+pub const STATUS_DEVICE_NOT_READY: NtStatus = 0xC000_00A3_u32 as i32;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,6 +79,9 @@ mod tests {
         assert_eq!(STATUS_INVALID_DEVICE_REQUEST as u32, 0xC000_0010);
         assert_eq!(STATUS_PRIVILEGE_NOT_HELD as u32, 0xC000_0061);
         assert_eq!(STATUS_NOT_FOUND as u32, 0xC000_0225);
+        assert_eq!(STATUS_DATA_OVERRUN as u32, 0xC000_003C);
+        assert_eq!(STATUS_DATA_LATE_ERROR as u32, 0xC000_003D);
+        assert_eq!(STATUS_DEVICE_NOT_READY as u32, 0xC000_00A3);
         assert!(!nt_success(STATUS_BUFFER_OVERFLOW));
         assert!(!nt_success(STATUS_BUFFER_TOO_SMALL));
         assert!(!nt_success(STATUS_NO_MATCH));
@@ -61,5 +89,8 @@ mod tests {
         assert!(!nt_success(STATUS_INVALID_DEVICE_REQUEST));
         assert!(!nt_success(STATUS_PRIVILEGE_NOT_HELD));
         assert!(!nt_success(STATUS_NOT_FOUND));
+        assert!(!nt_success(STATUS_DATA_OVERRUN));
+        assert!(!nt_success(STATUS_DATA_LATE_ERROR));
+        assert!(!nt_success(STATUS_DEVICE_NOT_READY));
     }
 }

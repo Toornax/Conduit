@@ -524,17 +524,18 @@ pub(crate) unsafe fn read_params(device: PDEVICE_OBJECT, log: EventLog) -> Param
         params.packet_mode,
         params.channels
     );
-    // Un `PacketMode = 1` ne doit exister que sur une machine d'essai : le dire au journal
-    // d'événements est ce qui le fait remarquer sur un poste où il n'aurait rien à faire.
-    // Ce n'est pas une correction — la valeur est dans ses bornes — mais une **expérience en
-    // cours**, et un pilote qui expose des interfaces qu'il ne sert pas doit l'annoncer.
+    // Un `PacketMode = 1` reste un état à remarquer, mais plus pour la même raison : depuis
+    // le lot 3, les quatre méthodes servent. Ce qui n'a pas encore eu lieu est la campagne
+    // Driver Verifier, et un chemin de code neuf qui n'a pas passé Verifier n'a rien à faire
+    // sur un poste en service. Ce n'est pas une correction — la valeur est dans ses bornes —
+    // mais un état de configuration que l'exploitant doit pouvoir lire sans débogueur.
     if params.packet_mode_actif() {
         kmd_event!(
             log,
             code::EXPERIENCE.saturating_add(RANG_PACKET_MODE),
-            "{} ({}) = 1 : les interfaces du mode paquets seront EXPOSÉES sans être servies \
-             (les quatre méthodes refusent). Expérience de mesure, à ne jamais laisser sur un \
-             poste en service — remettre 0 et redémarrer le périphérique",
+            "{} ({}) = 1 : les interfaces du mode paquets seront EXPOSÉES et SERVIES. Le \
+             chemin n'a pas encore passé la campagne Driver Verifier — sur un poste en \
+             service, remettre 0 et redémarrer le périphérique",
             Param::PacketMode.label(),
             Param::PacketMode.value_name()
         );
@@ -591,9 +592,9 @@ static PACKET_MODE: AtomicU32 = AtomicU32::new(params::DEFAULT_PACKET_MODE);
 
 /// Les interfaces du mode paquets doivent-elles être **exposées** sur les nouveaux flux ?
 ///
-/// Faux par défaut et sur tout poste livré. Vrai, elles sont exposées **sans être servies** :
-/// c'est une expérience de mesure, et toute la réserve est écrite sur
-/// [`conduit_kmd_core::params::DEFAULT_PACKET_MODE`].
+/// Faux par défaut, et sur tout poste livré tant que la campagne Driver Verifier du lot 3
+/// n'a pas eu lieu. Vrai, elles sont exposées **et servies** (`stream::WaveStream`) : toute
+/// la réserve est écrite sur [`conduit_kmd_core::params::DEFAULT_PACKET_MODE`].
 ///
 /// IRQL : quelconque.
 #[must_use]

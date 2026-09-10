@@ -45,11 +45,18 @@
 //! `GetPosition` **et** les quatre méthodes sur le même objet (`minwavertstream.h`), ce
 //! qui est exactement ce que l'objet composite ci-dessous permet en Rust.
 //!
-//! La règle n'a **pas** été amendée par le lot 2, qui expose délibérément sans servir : c'est
-//! une **expérience de mesure**, derrière un paramètre de registre à 0 par défaut et jamais
-//! livré à 1, dont l'objet est précisément de quantifier ce que la règle redoute. Voir
-//! `conduit_kmd_core::params::DEFAULT_PACKET_MODE`, qui porte toute la réserve, et
-//! [`PacketInterfaces::None`].
+//! La règle n'a **pas** été amendée par le lot 2, qui exposait délibérément sans servir :
+//! c'était une **expérience de mesure**, derrière un paramètre de registre à 0 par défaut,
+//! dont l'objet était précisément de quantifier ce que la règle redoute. Elle a répondu — le
+//! moteur exclusif événementiel appelle `GetReadPacket` quatre cents fois par seconde dès que
+//! les interfaces existent, et le refus casse son transport.
+//!
+//! **Le lot 3 fait cesser cet état** : `conduit_kmd::stream::WaveStream` sert désormais les
+//! quatre méthodes. Le paramètre `PacketMode` reste à 0 par défaut le temps de la campagne
+//! Driver Verifier ; ce qu'il commande n'est plus « exposer sans servir » mais simplement
+//! « exposer ». Voir `conduit_kmd_core::params::DEFAULT_PACKET_MODE` et
+//! [`PacketInterfaces::None`], qui reste le bon choix pour tout flux dont les méthodes
+//! refuseraient.
 //!
 //! # Quatre interfaces, un seul objet
 //!
@@ -348,12 +355,15 @@ pub enum PacketInterfaces {
     ///
     /// Passer à [`Input`](Self::Input) ou [`Output`](Self::Output) est donc un
     /// changement de contrat observable en machine, pas un réglage : il ne se fait
-    /// qu'avec les méthodes derrière — **ou** à titre d'expérience assumée, sur une machine
-    /// d'essai, pour mesurer ce que le moteur audio en fait. C'est le seul usage du
-    /// paramètre de registre `PacketMode` du pilote
-    /// (`conduit_kmd_core::params::DEFAULT_PACKET_MODE`) : 0 par défaut, jamais livré à 1, et
-    /// les quatre méthodes y refusent en comptant. L'exception ne dilue pas la règle, elle la
-    /// chiffre.
+    /// qu'avec les méthodes derrière. C'est ce que le pilote a fait au lot 3 — les quatre
+    /// méthodes de `conduit_kmd::stream::WaveStream` **servent** —, si bien que le
+    /// paramètre de registre `PacketMode`
+    /// (`conduit_kmd_core::params::DEFAULT_PACKET_MODE`) ne commande plus une expérience
+    /// mais une exposition, encore à 0 le temps de la campagne Driver Verifier.
+    ///
+    /// Cette variante reste le bon choix, et le défaut, pour tout flux dont les quatre
+    /// méthodes s'en tiendraient aux défauts du trait : ceux-ci refusent, et un IID rendu
+    /// est une promesse de service.
     None,
     /// Flux de **capture** : `IMiniportWaveRTInputStream` seule (le moteur lit).
     Input,

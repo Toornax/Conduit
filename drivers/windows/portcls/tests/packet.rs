@@ -48,14 +48,16 @@ use portcls::portcls_sys::{
     IID_IMiniportWaveRTStreamNotification, IMiniportTopologyVtbl, IMiniportWaveRTInputStreamVtbl,
     IMiniportWaveRTOutputStreamVtbl, IMiniportWaveRTStreamNotificationVtbl,
     IMiniportWaveRTStreamVtbl, IUnknown, KSAUDIO_POSITION, KSAUDIO_PRESENTATION_POSITION,
-    KSEVENT_TYPE_ENABLE, KSPROPERTY_TYPE_GET, KSPROPSETID_Jack, KSSTATE, NTSTATUS, PCEVENT_ITEM,
-    PCEVENT_REQUEST, PCEVENT_VERB_SUPPORT, PCFILTER_DESCRIPTOR, PCPROPERTY_ITEM,
+    KSEVENT_TYPE_ENABLE, KSPROPERTY_TYPE_GET, KSPROPSETID_Jack, KSSTATE,
+    KSSTREAM_HEADER_OPTIONSF_DATADISCONTINUITY, KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM, NTSTATUS,
+    PCEVENT_ITEM, PCEVENT_REQUEST, PCEVENT_VERB_SUPPORT, PCFILTER_DESCRIPTOR, PCPROPERTY_ITEM,
     PCPROPERTY_REQUEST, PKEVENT, PKSEVENT_ENTRY, PMDL, ULONG, ULONG64,
 };
 use portcls::{
     AudioBuffer, EventHandler, MiniportTopology, MiniportWaveRTInputStream,
     MiniportWaveRTOutputStream, MiniportWaveRTStream, MiniportWaveRTStreamNotification,
     PacketInterfaces, PacketStreamVtbl, PortTopology, PropertyHandler, ReadPacket, ResourceList,
+    STATUS_DATA_LATE_ERROR, STATUS_DATA_OVERRUN, STATUS_DEVICE_NOT_READY,
     STATUS_INVALID_DEVICE_REQUEST, STATUS_NOT_SUPPORTED, StreamObject, event,
     new_packet_stream_object, new_topology_object, property, try_new_packet_stream_object,
 };
@@ -503,6 +505,190 @@ fn defauts_du_mode_paquets_refusent() {
     release(entree);
     release(sortie);
     assert_eq!(release(this), 0);
+}
+
+/// Un flux qui **sert** le mode paquets et rend, chaque fois, le statut qu'on lui a dicté :
+/// c'est ce que `conduit_kmd::stream::WaveStream` fait depuis le lot 3.
+struct FluxServant {
+    /// Statut à rendre par `SetWritePacket`.
+    write: NtStatus,
+    /// Statut à rendre par `GetReadPacket` (`STATUS_SUCCESS` : un paquet est rendu).
+    read: NtStatus,
+    /// Statut à rendre par `GetPacketCount`.
+    count: NtStatus,
+}
+
+impl MiniportWaveRTStream for FluxServant {
+    fn set_state(&self, _: KSSTATE::Type) -> NtStatus {
+        STATUS_SUCCESS
+    }
+
+    fn position(&self) -> Result<u32, NtStatus> {
+        Ok(0)
+    }
+
+    fn allocate_audio_buffer(&self, _: u32) -> Result<AudioBuffer, NtStatus> {
+        Err(STATUS_INVALID_PARAMETER)
+    }
+
+    fn free_audio_buffer(&self, _: PMDL, _: u32) {}
+}
+
+impl MiniportWaveRTStreamNotification for FluxServant {
+    fn allocate_buffer_with_notification(&self, _: u32, _: u32) -> Result<AudioBuffer, NtStatus> {
+        Err(STATUS_INVALID_PARAMETER)
+    }
+
+    fn free_buffer_with_notification(&self, _: PMDL, _: u32) {}
+
+    fn register_notification_event(&self, _: PKEVENT) -> NtStatus {
+        STATUS_SUCCESS
+    }
+
+    fn unregister_notification_event(&self, _: PKEVENT) -> NtStatus {
+        STATUS_SUCCESS
+    }
+}
+
+impl MiniportWaveRTInputStream for FluxServant {
+    fn read_packet(&self) -> Result<ReadPacket, NtStatus> {
+        if self.read != STATUS_SUCCESS {
+            return Err(self.read);
+        }
+        Ok(ReadPacket {
+            packet_number: 41,
+            // Le trou de capture, tel que le pilote le reporte : c'est la seule information
+            // de discontinuité que la signature générée laisse passer.
+            flags: KSSTREAM_HEADER_OPTIONSF_DATADISCONTINUITY,
+            performance_counter: 0x1234_5678,
+            more_data: false,
+        })
+    }
+}
+
+impl MiniportWaveRTOutputStream for FluxServant {
+    fn set_write_packet(&self, _: u32, _: u32, _: u32) -> NtStatus {
+        self.write
+    }
+
+    fn presentation_position(&self) -> Result<KSAUDIO_PRESENTATION_POSITION, NtStatus> {
+        Ok(KSAUDIO_PRESENTATION_POSITION {
+            u64PositionInBlocks: 96_000,
+            u64QPCPosition: 0xFEDC_BA98,
+        })
+    }
+
+    fn packet_count(&self) -> Result<u32, NtStatus> {
+        if self.count != STATUS_SUCCESS {
+            return Err(self.count);
+        }
+        Ok(200)
+    }
+}
+
+/// **Les statuts du lot 3 traversent les thunks tels quels**, et une sortie n'est écrite
+/// que sur un succès.
+///
+/// Les trois codes que le contrat documente — `STATUS_DATA_LATE_ERROR`,
+/// `STATUS_DATA_OVERRUN`, `STATUS_DEVICE_NOT_READY` — ne sont pas des erreurs génériques :
+/// le moteur audio les traite, et se recale par `GetPacketCount` après les deux premiers.
+/// Un thunk qui les écraserait en `STATUS_UNSUCCESSFUL`, ou qui écrirait ses sorties avant
+/// de les rendre, ferait lire au client un numéro de paquet qui n'a jamais existé.
+#[test]
+fn les_statuts_du_mode_paquets_servi_traversent_les_thunks() {
+    // 1. Le cas servi : les quatre méthodes réussissent et écrivent leurs sorties.
+    let servant = FluxServant {
+        write: STATUS_SUCCESS,
+        read: STATUS_SUCCESS,
+        count: STATUS_SUCCESS,
+    };
+    let this = new_packet_stream_object(servant, PacketInterfaces::Both).into_raw();
+    let entree = qi_ok(this, &iid_entree());
+    let sortie = qi_ok(this, &iid_sortie());
+    let vt = vt_sortie(sortie);
+
+    let (status, numero, flags, qpc, suite) = appel_get_read_packet(entree);
+    assert_eq!(status, STATUS_SUCCESS);
+    assert_eq!(
+        (numero, flags, qpc, suite),
+        (
+            41,
+            KSSTREAM_HEADER_OPTIONSF_DATADISCONTINUITY,
+            0x1234_5678,
+            0
+        ),
+        "le trou de capture et l'horodatage arrivent intacts"
+    );
+    assert_eq!(
+        unsafe { vt.SetWritePacket.unwrap()(sortie, 7, KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM, 240) },
+        STATUS_SUCCESS
+    );
+    let mut position = KSAUDIO_PRESENTATION_POSITION {
+        u64PositionInBlocks: 0,
+        u64QPCPosition: 0,
+    };
+    assert_eq!(
+        unsafe { vt.GetOutputStreamPresentationPosition.unwrap()(sortie, &mut position) },
+        STATUS_SUCCESS
+    );
+    assert_eq!(
+        (position.u64PositionInBlocks, position.u64QPCPosition),
+        (96_000, 0xFEDC_BA98),
+        "des trames absolues et un QPC brut, pas des octets ni des unités de 100 ns"
+    );
+    let mut compte: ULONG = 0xDEAD;
+    assert_eq!(
+        unsafe { vt.GetPacketCount.unwrap()(sortie, &mut compte) },
+        STATUS_SUCCESS
+    );
+    assert_eq!(compte, 200);
+    release(entree);
+    release(sortie);
+    assert_eq!(release(this), 0);
+
+    // 2. Les trois refus documentés : rendus tels quels, sans toucher aux sorties.
+    for (write, read, count) in [
+        (
+            STATUS_DATA_LATE_ERROR,
+            STATUS_DEVICE_NOT_READY,
+            STATUS_DEVICE_NOT_READY,
+        ),
+        (
+            STATUS_DATA_OVERRUN,
+            STATUS_DEVICE_NOT_READY,
+            STATUS_DEVICE_NOT_READY,
+        ),
+        (
+            STATUS_INVALID_PARAMETER,
+            STATUS_DEVICE_NOT_READY,
+            STATUS_DEVICE_NOT_READY,
+        ),
+    ] {
+        let this =
+            new_packet_stream_object(FluxServant { write, read, count }, PacketInterfaces::Both)
+                .into_raw();
+        let entree = qi_ok(this, &iid_entree());
+        let sortie = qi_ok(this, &iid_sortie());
+        let vt = vt_sortie(sortie);
+
+        let (status, numero, ..) = appel_get_read_packet(entree);
+        assert_eq!(status, read);
+        assert_eq!(numero, 0xDEAD, "sortie non touchée par un refus");
+        assert_eq!(
+            unsafe { vt.SetWritePacket.unwrap()(sortie, 3, 0, 0) },
+            write
+        );
+        let mut compte: ULONG = 0xDEAD;
+        assert_eq!(
+            unsafe { vt.GetPacketCount.unwrap()(sortie, &mut compte) },
+            count
+        );
+        assert_eq!(compte, 0xDEAD, "sortie non touchée par un refus");
+
+        release(entree);
+        release(sortie);
+        assert_eq!(release(this), 0);
+    }
 }
 
 /// La délégation de `PacketStream` laisse intacts les quinze slots de flux du principal :

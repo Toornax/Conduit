@@ -1500,13 +1500,17 @@ impl TopologyFilter {
     ///
     /// # Ce que la lecture répond
     ///
-    /// Le paramètre `PacketMode` **effectif** (0 : rien n'est exposé, le pilote livré ; 1 :
-    /// les interfaces sont exposées **sans être servies**, une expérience de mesure), ce que
-    /// le flux courant de chaque sens expose, puis, cumulés depuis le dernier `StartDevice` :
-    /// les `QueryInterface` reçus sur les deux IID de paquets et ceux auxquels le pilote a
-    /// répondu, les appels des quatre méthodes — toutes refusées par `STATUS_NOT_SUPPORTED` —
-    /// par sens et par méthode, l'IRQL du dernier appel et le maximum vu, et les horodatages
-    /// QPC du premier et du dernier appel.
+    /// Le paramètre `PacketMode` **effectif** (0 : rien n'est exposé, le pilote livré tant que
+    /// la campagne Driver Verifier du lot 3 n'a pas eu lieu ; 1 : les interfaces sont
+    /// exposées **et servies**), ce que le flux courant de chaque sens expose, puis, cumulés
+    /// depuis le dernier `StartDevice` : les `QueryInterface` reçus sur les deux IID de
+    /// paquets et ceux auxquels le pilote a répondu, les appels des quatre méthodes par sens
+    /// et par méthode, l'IRQL du dernier appel et le maximum vu, et les horodatages QPC du
+    /// premier et du dernier appel.
+    ///
+    /// Le contrat compte des **appels**, pas des `NTSTATUS` : un refus légitime du mode
+    /// paquets (`STATUS_DATA_LATE_ERROR`, `STATUS_DATA_OVERRUN`) ne se distingue pas ici d'un
+    /// appel servi.
     ///
     /// C'est ce qui tranche la question laissée ouverte par le lot 0 : le moteur audio scrute
     /// **par politique**, ou parce qu'il ne trouve pas les interfaces de paquets ? Le relevé

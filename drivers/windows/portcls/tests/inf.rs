@@ -440,16 +440,18 @@ const ENTETE_PARAMETRES: &str = r#"
 ; bornes, elle est remplacée par le défaut et consignée au journal d'événements. Elles
 ; sont écrites pour que `regedit` montre à l'administrateur ce qu'il peut régler.
 ;
-; PacketMode (lot 2 du mode paquets WaveRT) est une EXPÉRIENCE DE MESURE, pas un réglage, et
-; c'est le seul paramètre de cette section dont la valeur ne doit jamais être changée sur un
-; poste en service. À 1, le pilote EXPOSE les interfaces IMiniportWaveRTInputStream /
-; IMiniportWaveRTOutputStream sur ses flux SANS LES SERVIR : les quatre méthodes rendent
-; STATUS_NOT_SUPPORTED et se contentent de compter, ce que la propriété KS
-; KSPROPERTY_CONDUIT_PACKETS rend lisible. Exposer une interface qu'on ne sert pas est plus
-; dangereux que ne rien exposer — le moteur audio peut basculer sur le chemin des paquets et
-; casser un transport qui marchait. À n'utiliser que sur une machine d'essai, et à remettre
-; à 0 (puis redémarrer le périphérique) ensuite. Le paramètre est lu au StartDevice : une
-; modification ne prend effet qu'au démarrage suivant du périphérique.
+; PacketMode (mode paquets WaveRT) est le seul paramètre TRANSITOIRE de cette section. À 1,
+; le pilote EXPOSE les interfaces IMiniportWaveRTInputStream / IMiniportWaveRTOutputStream
+; sur ses flux, et depuis le lot 3 il les SERT : SetWritePacket valide le numéro de paquet et
+; borne la copie, GetReadPacket rend le dernier paquet complet de la capture,
+; GetOutputStreamPresentationPosition la position en trames absolues, GetPacketCount le
+; nombre de paquets transférés. La propriété KS KSPROPERTY_CONDUIT_PACKETS rend les appels
+; lisibles sans débogueur.
+;
+; Le défaut reste 0 tant que ce chemin n'a pas passé la campagne Driver Verifier : ce qui n'a
+; pas été éprouvé en machine ne se livre pas activé. Il passera à 1 par défaut ensuite, puis
+; le paramètre disparaîtra. Le paramètre est lu au StartDevice : une modification ne prend
+; effet qu'au démarrage suivant du périphérique.
 "#;
 
 /// Commentaire du masque des câbles actifs, qui prolonge la même section.

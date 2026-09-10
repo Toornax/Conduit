@@ -19,9 +19,9 @@
 //!    tampon (scrutation ou notifications) et combien d'allocations nous avons refusées — la
 //!    question du lot 0 du mode paquets WaveRT —, **puis** ce qu'il a fait des interfaces
 //!    du mode paquets : le `PacketMode` effectif, ce que chaque flux expose, les
-//!    `QueryInterface` reçus et rendus, et les appels refusés par méthode, avec leur IRQL
-//!    et leurs horodatages (lot 2). Les deux relevés répondent à la même question et
-//!    sortent ensemble ;
+//!    `QueryInterface` reçus et rendus, et les appels **servis** par méthode, avec leur
+//!    IRQL et leurs horodatages (lot 2 pour le relevé, lot 3 pour ce qu'il compte). Les
+//!    deux relevés répondent à la même question et sortent ensemble ;
 //! 5. `--cable-set` : l'écriture, affichée avant et après ;
 //! 6. `--cable-chrono` : le délai entre l'écriture et l'endpoint MMDevice qui suit ;
 //! 7. `--cable-invalide` : la batterie d'entrées volontairement invalides.
@@ -597,9 +597,12 @@ fn lignes_sens_paquets(sens: StreamSide, bloc: &StreamPackets) -> String {
         "                QueryInterface de paquets : {} reçus, {} rendus",
         bloc.queries, bloc.queries_granted
     );
+    // « appels », et non plus « appels REFUSÉS » : depuis le lot 3 le pilote **sert** les
+    // quatre méthodes, et ce compteur — le même qu'au lot 2 — ne compte plus des refus.
+    // Le libellé du statut est sur la ligne du verdict, qui a l'exposition sous les yeux.
     let _ = writeln!(
         out,
-        "                appels REFUSÉS : SetWritePacket {}, GetReadPacket {}, GetPacketCount \
+        "                appels : SetWritePacket {}, GetReadPacket {}, GetPacketCount \
          {}, GetOutputStreamPresentationPosition {}",
         bloc.set_write_packet, bloc.get_read_packet, bloc.packet_count, bloc.presentation_position
     );
@@ -630,15 +633,43 @@ fn lignes_sens_paquets(sens: StreamSide, bloc: &StreamPackets) -> String {
 /// soit le client, y compris quand le chemin scruté est ensuite pris. Ils comptent des
 /// créations de flux, pas des intentions du moteur audio, et aucune conclusion sur la
 /// scrutation ne peut s'y appuyer. La ligne dit désormais ce qu'elle voit, et rien de plus.
+///
+/// # Et la ligne du lot 2 qui n'est plus vraie
+///
+/// « Le moteur audio EMPRUNTE un chemin que nous ne servons pas » décrivait le lot 2, qui
+/// exposait sans servir. Depuis le lot 3 les quatre méthodes servent : des appels reçus
+/// **par un flux qui expose** sont des appels honorés, et c'est la conformité voulue, pas
+/// un danger. Le verdict distingue donc deux situations que le compteur seul confond :
+///
+/// - des appels alors que **rien n'est exposé** (`PacketMode = 0`) : impossible, PortCls
+///   n'a jamais eu l'adresse des têtes satellites. Un compteur non nul y serait un bogue
+///   d'exposition, et le relevé le dit ainsi plutôt que de le taire ;
+/// - des appels **sur une interface exposée** : servis, avec l'IRQL qui vérifie le
+///   `PASSIVE_LEVEL` que `portcls.h` promet.
+///
+/// Ce que ce relevé ne sait **pas** dire est le détail des statuts rendus : le contrat
+/// d'échange (`conduit_kmd_core::config::StreamPackets`) compte des appels par méthode, pas
+/// des `NTSTATUS` par appel, et le lot 3 ne l'élargit pas. Un `STATUS_DATA_LATE_ERROR` rendu
+/// à un client en retard se lit dans le journal du pilote en debug, pas ici. La ligne le dit
+/// plutôt que de laisser croire que tout appel compté a réussi.
 fn verdict_paquets(paquets: &CablePackets) -> String {
     let demandes = paquets.queries_total();
     let appels = paquets.appels_total();
+    if appels > 0 && !paquets.mode_actif() {
+        return format!(
+            "      → {appels} APPEL(S) alors que RIEN n'est exposé (PacketMode = 0) : \
+             impossible par construction.\n        PortCls n'a jamais eu l'adresse des têtes \
+             satellites ; un compteur non nul ici est un bogue d'exposition du pilote, pas \
+             une mesure. Signalez-le tel quel.\n"
+        );
+    }
     if appels > 0 {
         return format!(
-            "      → {appels} APPEL(S) REFUSÉ(S) par STATUS_NOT_SUPPORTED, IRQL max {} : le \
-             moteur audio EMPRUNTE un chemin que nous ne servons pas.\n        C'est \
-             exactement le danger que `PacketMode` sert à mesurer, et la raison de ne jamais \
-             le livrer à 1. Remettez 0 et redémarrez le périphérique.\n",
+            "      → {appels} APPEL(S) SERVI(S), IRQL max {} (PASSIVE_LEVEL = 0) : le moteur \
+             audio emprunte le mode paquets, et nous le servons.\n        C'est la conformité \
+             visée par le lot 3. Le détail des statuts n'est pas dans ce relevé — le contrat \
+             compte des appels, pas des NTSTATUS : un refus légitime (DATA_LATE_ERROR, \
+             DATA_OVERRUN) se lit dans le journal du pilote en debug.\n",
             paquets.irql_max()
         );
     }
@@ -673,8 +704,10 @@ fn verdict_paquets(paquets: &CablePackets) -> String {
             .to_string();
     }
     format!(
-        "      → interfaces EXPOSÉES, {demandes} QueryInterface dont {} rendus, 0 appel : le \
-         moteur audio les obtient et NE LES EMPRUNTE PAS\n",
+        "      → interfaces EXPOSÉES et SERVIES, {demandes} QueryInterface dont {} rendus, 0 \
+         appel : le moteur audio les obtient et NE LES EMPRUNTE PAS\n        Rien de cassé : \
+         les méthodes servent, personne ne les appelle. Le moteur partagé scrute, c'est le \
+         client exclusif événementiel qui les emprunte.\n",
         paquets.queries_granted_total()
     )
 }
@@ -685,9 +718,10 @@ fn lignes_paquets(paquets: &CablePackets) -> String {
         "    mode paquets : PacketMode = {} ({})\n",
         paquets.packet_mode,
         if paquets.mode_actif() {
-            "interfaces EXPOSÉES sans être servies — expérience, à ne jamais livrer"
+            "interfaces EXPOSÉES et servies — activable pour mesure, 1 par défaut après \
+             la campagne Verifier"
         } else {
-            "rien n'est exposé : le pilote livré"
+            "rien n'est exposé : le pilote livré aujourd'hui"
         }
     );
     for sens in StreamSide::ALL {
@@ -1426,15 +1460,19 @@ mod tests {
         );
     }
 
-    /// Le verdict du relevé de paquets, pour chacune des six situations.
+    /// Le verdict du relevé de paquets, pour chacune des sept situations.
     ///
     /// Les deux premières sont celles que la mesure a corrigées : un `QueryInterface` de
     /// paquets est la **sonde de PortCls** à la création de chaque flux, deux par flux, quel
     /// que soit le client. Le relevé disait « le moteur audio a DEMANDÉ les IID » et « notre
     /// silence est une cause plausible de la scrutation » ; il ne le dit plus, et ce test
     /// interdit que la formule revienne.
+    ///
+    /// La sixième est celle que le **lot 3** a retournée : des appels reçus ne sont plus des
+    /// refus mais des appels servis, et la septième — des appels sans rien d'exposé —
+    /// désigne désormais un bogue du pilote plutôt qu'une mesure.
     #[test]
-    fn le_verdict_des_paquets_distingue_les_six_situations() {
+    fn le_verdict_des_paquets_distingue_les_sept_situations() {
         use conduit_backend_wasapi::cable::PacketExposure;
 
         // 1. Rien d'exposé, aucune sonde reçue : aucun flux n'a été créé, rien de plus.
@@ -1496,7 +1534,9 @@ mod tests {
         assert!(obtenu.contains("EXPOSÉES"), "{obtenu}");
         assert!(obtenu.contains("0 appel"), "{obtenu}");
 
-        // 6. Emprunté : le cas qui justifie de ne jamais livrer `PacketMode = 1`.
+        // 6. Emprunté et **servi** : la conformité que le lot 3 vise. La ligne du lot 2 —
+        //    « EMPRUNTE un chemin que nous ne servons pas » — n'est plus vraie, et ce test
+        //    interdit qu'elle revienne.
         let emprunte = verdict_paquets(&CablePackets {
             packet_mode: 1,
             render: StreamPackets {
@@ -1509,12 +1549,36 @@ mod tests {
             },
             ..CablePackets::new(0)
         });
-        assert!(emprunte.contains("9 APPEL(S) REFUSÉ(S)"), "{emprunte}");
+        assert!(emprunte.contains("9 APPEL(S) SERVI(S)"), "{emprunte}");
         assert!(emprunte.contains("IRQL max 0"), "{emprunte}");
+        for interdit in ["REFUSÉ", "STATUS_NOT_SUPPORTED", "que nous ne servons pas"] {
+            assert!(
+                !emprunte.contains(interdit),
+                "« {interdit} » a reparu dans :\n{emprunte}"
+            );
+        }
 
-        // Les six verdicts sont distincts : deux situations différentes ne doivent pas se
+        // 7. Des appels alors que rien n'est exposé : impossible par construction, donc un
+        //    bogue du pilote — et le relevé le dit au lieu de conclure sur le moteur audio.
+        let impossible = verdict_paquets(&CablePackets {
+            render: StreamPackets {
+                exposure: PacketExposure::NotExposed.code(),
+                get_read_packet: 3,
+                ..StreamPackets::new()
+            },
+            ..CablePackets::new(0)
+        });
+        assert!(
+            impossible.contains("impossible par construction"),
+            "{impossible}"
+        );
+        assert!(impossible.contains("bogue d'exposition"), "{impossible}");
+
+        // Les sept verdicts sont distincts : deux situations différentes ne doivent pas se
         // lire pareil.
-        let tous = [politique, demande, trop_tot, ignore, obtenu, emprunte];
+        let tous = [
+            politique, demande, trop_tot, ignore, obtenu, emprunte, impossible,
+        ];
         for (rang, texte) in tous.iter().enumerate() {
             assert!(!texte.is_empty());
             assert!(

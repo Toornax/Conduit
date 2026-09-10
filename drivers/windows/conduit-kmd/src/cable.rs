@@ -44,16 +44,32 @@
 //!   des emplacements a donc la garantie que le flux qu'elle désigne ne sera pas détruit
 //!   avant qu'il la relâche. C'est aussi ce qui remplace le `KeFlushQueuedDpcs` de
 //!   M1a-07 : au retour de `detach`, aucun tick ne détient plus le pointeur ;
-//! - tout lecteur ([`Cable::on_tick`]) doit **tenir la garde des emplacements pendant
+//! - tout lecteur ([`Cable::executer`]) doit **tenir la garde des emplacements pendant
 //!   tout son usage du pointeur**, y compris pendant qu'il prend le verrou du flux.
 //!   Ordre de verrouillage, fixe : **câble puis flux** ; jamais l'inverse (le `Drop` du
 //!   flux ne tient pas son propre verrou en prenant celui du câble, et `set_state`
 //!   relâche le sien avant [`Cable::refresh_timer`]). Entre les deux flux, l'ordre est
-//!   rendu puis capture ; seul `on_tick` prend les deux.
+//!   rendu puis capture ; seul le corps de la boucle prend les deux.
 //!
 //! Les sections critiques du câble sont courtes (lecture de deux pointeurs, calcul de
 //! position, copie d'une avance de 2 ms) : `GetPosition` d'un flux ne prend que le verrou
 //! du flux, pas celui du câble.
+//!
+//! # Deux déclencheurs, un seul corps (lot 3)
+//!
+//! Le corps de la boucle a **deux** appelants depuis que le mode paquets est servi : le
+//! tick du minuteur ([`Cable::on_tick`], `DISPATCH_LEVEL`) et l'annonce du client
+//! ([`Cable::on_write_packet`], `PASSIVE_LEVEL`). Ils exécutent le **même**
+//! [`Cable::executer`], sous les mêmes verrous et dans le même ordre ; le second ne
+//! remplace pas le premier et ne le désarme pas — `SetWritePacket` est un *hint*, et
+//! `portcls::packet` dit pourquoi le minuteur reste une obligation contractuelle.
+//!
+//! Que les deux niveaux d'IRQL prennent les mêmes verrous est sûr, et pour une raison
+//! précise : [`crate::sync::SpinLock::lock`] appelle `KeAcquireSpinLockRaiseToDpc`, donc le
+//! fil `PASSIVE_LEVEL` est **lui-même élevé à `DISPATCH_LEVEL`** pendant qu'il tient le
+//! verrou. Sa propre DPC ne peut pas le préempter sur ce processeur, et l'interblocage
+//! classique — un fil à IRQL bas tenant un verrou que sa DPC réclame — n'existe pas ici. Un
+//! spin lock qui n'élèverait pas l'IRQL le rendrait immédiat.
 //!
 //! Le câble porte un **second** spin lock, celui des destinataires d'événement
 //! ([`Cable::attach_jack_events`]) : il n'entre dans aucun ordre de verrouillage, parce
@@ -115,12 +131,16 @@ use conduit_kmd_core::config::{
     self, ACTIVE_CABLES_DEFAULT, AllocationMode, CableCounters, CablePackets, CableTransport,
     KsRunState, PacketExposure, StreamPackets, StreamTransport,
 };
+use conduit_kmd_core::packetnum::{PacketGeometry, ReadVerdict, WriteVerdict, next_read};
 use conduit_kmd_core::{
-    FrameLayout, Loopback, Notifier, SilenceCause, StreamPosition, StreamView, VirtualClock,
+    FrameLayout, Loopback, Notifier, Plan, SilenceCause, StreamPosition, StreamView, VirtualClock,
     byte_offset, copy_frames, silence,
 };
-use portcls::conduit_com::{NtStatus, STATUS_INSUFFICIENT_RESOURCES};
-use portcls::{JackTarget, JackTargets, PortEvents, VOLUME_MAX};
+use portcls::conduit_com::{NtStatus, STATUS_INSUFFICIENT_RESOURCES, STATUS_SUCCESS};
+use portcls::{
+    JackTarget, JackTargets, PortEvents, STATUS_DATA_LATE_ERROR, STATUS_DATA_OVERRUN,
+    STATUS_DEVICE_NOT_READY, STATUS_INVALID_DEVICE_REQUEST, VOLUME_MAX,
+};
 use portcls_sys::{KSSTATE, PDEVICE_OBJECT, PMDL};
 use wdk_sys::ntddk::KeSetEvent;
 use wdk_sys::{KEVENT, PEX_TIMER, PVOID};
@@ -130,12 +150,6 @@ use crate::eventlog::EventLog;
 use crate::registry;
 use crate::sync::{SpinLock, SpinLockGuard};
 use crate::timer::ExTimer;
-
-/// `STATUS_DEVICE_NOT_READY` (`0xC00000A3`) : le câble n'a pas encore vu de `StartDevice`,
-/// donc il n'a pas d'objet de périphérique et rien à persister. Ne devrait pas se produire
-/// (une propriété KS suppose un sous-périphérique enregistré), mais un statut nommé vaut
-/// mieux qu'un pointeur nul déréférencé.
-const STATUS_DEVICE_NOT_READY: NtStatus = 0xC000_00A3_u32 as NtStatus;
 
 /// Nombre maximal d'événements de notification par flux
 /// (`RegisterNotificationEvent`) : PortCls n'en enregistre qu'un par client, deux
@@ -209,6 +223,43 @@ pub struct StreamState {
     /// la seule information du relevé de paquets qui décrive le flux courant et non le cycle
     /// de périphérique : tout le reste est cumulé sur le câble ([`PacketCounters`]).
     pub packet_exposure: PacketExposure,
+    /// Dernier numéro de paquet **absolu** accepté par `SetWritePacket`, `None` avant le
+    /// premier et après un `KSSTATE_STOP` ([`StreamState::reset_packets`]).
+    ///
+    /// Absolu, c'est-à-dire sur 64 bits : le `ULONG` que le moteur audio envoie n'en est
+    /// que les bits de poids faible, et `conduit_kmd_core::packetnum::resolve` fait le pont
+    /// entre les deux. Le garder tronqué obligerait à comparer modulo à chaque usage, ce
+    /// qui est précisément le genre de détail qu'on oublie une fois sur deux.
+    pub last_write_packet: Option<u64>,
+    /// Compteur de performance du dernier `SetWritePacket` **accepté**, 0 s'il n'y en a
+    /// pas eu.
+    ///
+    /// Le pilote ne s'en sert pas pour décider : il sert au diagnostic — l'écart avec la
+    /// position dit si le client valide en avance ou au dernier moment, ce que le seul
+    /// numéro de paquet ne dit pas.
+    pub last_write_qpc: u64,
+    /// Première trame absolue que le client **n'a pas** validée, `None` tant qu'il n'a rien
+    /// validé : c'est ce que [`StreamState::view`] passe à `Loopback::plan`.
+    ///
+    /// Normalement la fin du dernier paquet accepté. En fin de flux
+    /// (`KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM`), c'est le début de ce paquet plus les
+    /// trames **utiles** que le client annonce : au-delà, le tampon contient ce qu'il
+    /// contenait avant, et le recopier serait recopier du bruit.
+    pub committed_frames: Option<u64>,
+    /// Paquets entièrement transférés du tampon vers le « matériel », en **base 1** : ce
+    /// que `GetPacketCount` rend, remis à zéro en `KSSTATE_STOP`.
+    ///
+    /// Tenu comme un **plancher monotone** plutôt que recalculé à chaque lecture : la
+    /// position, elle, se fige en `KSSTATE_PAUSE` et repart de zéro en `KSSTATE_STOP`, et
+    /// un compte qui reculerait ferait resynchroniser le client dans le mauvais sens.
+    /// [`StreamState::packets_transferred`] le fait avancer.
+    pub packet_count: u64,
+    /// Dernier numéro de paquet **absolu** rendu par `GetReadPacket`, `None` avant le
+    /// premier.
+    ///
+    /// C'est le seul état qui empêche `GetReadPacket` de rendre `Ok` deux fois sur le même
+    /// paquet — la seule chose que sa documentation interdise explicitement.
+    pub last_read_packet: Option<u64>,
 }
 
 // SAFETY: les pointeurs (`Buffer::mdl`, `Buffer::base`, `events`) désignent de la
@@ -235,6 +286,135 @@ impl StreamState {
             notification_count: 0,
             events: [None; MAX_NOTIFICATION_EVENTS],
             packet_exposure,
+            last_write_packet: None,
+            last_write_qpc: 0,
+            committed_frames: None,
+            packet_count: 0,
+            last_read_packet: None,
+        }
+    }
+
+    /// Oublie tout l'état du mode paquets : à `KSSTATE_STOP`, quand la position repart de
+    /// zéro.
+    ///
+    /// C'est la remise à zéro que les quatre méthodes documentent, et elle est faite d'un
+    /// seul geste pour la raison qui a fait envelopper `WaveStream::allocate` : cinq champs
+    /// remis à zéro à cinq endroits finiraient par ne plus l'être qu'à quatre.
+    ///
+    /// **Le client repart aussi de zéro**, et c'est ce qui rend la remise à zéro sûre : le
+    /// numéro de paquet se compare modulo 2³² autour d'une ancre, et l'ancre du premier
+    /// `SetWritePacket` d'après le `STOP` est la position — nulle elle aussi.
+    ///
+    /// IRQL : `<= DISPATCH_LEVEL` (sous le verrou du flux).
+    pub fn reset_packets(&mut self) {
+        self.last_write_packet = None;
+        self.last_write_qpc = 0;
+        self.committed_frames = None;
+        self.packet_count = 0;
+        self.last_read_packet = None;
+    }
+
+    /// La géométrie de paquets du flux, ou `None` s'il n'en a pas.
+    ///
+    /// Un paquet n'existe **que** sur un tampon alloué par
+    /// `AllocateBufferWithNotification` : sans notifieur, il n'y a ni taille de paquet ni
+    /// nombre de paquets, et c'est ce `None` qui fait refuser les quatre méthodes sans
+    /// qu'aucune ait à se demander pourquoi.
+    ///
+    /// IRQL : `<= DISPATCH_LEVEL` (sous le verrou du flux).
+    pub fn packet_geometry(&self) -> Option<PacketGeometry> {
+        let notifier = self.notifier?;
+        PacketGeometry::new(notifier.period_frames(), u64::from(self.notification_count))
+    }
+
+    /// Valide et enregistre un `SetWritePacket` : rend le `NTSTATUS` à rendre au moteur
+    /// audio.
+    ///
+    /// `eos_bytes` porte le nombre d'octets **utiles** du dernier paquet quand le client a
+    /// posé `KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM`, `None` sinon (le champ est alors ignoré,
+    /// comme le contrat le demande). Toute l'arithmétique — le pont entre le `ULONG` du
+    /// moteur et notre compteur 64 bits, et les deux refus — est dans
+    /// `conduit_kmd_core::packetnum`, testée sans noyau.
+    ///
+    /// Un refus ne change **rien** : ni le dernier numéro, ni la borne, ni l'horodatage.
+    /// C'est ce qui permet au client de se recaler par `GetPacketCount` et de réessayer.
+    ///
+    /// IRQL : `<= DISPATCH_LEVEL` (sous le verrou du flux ; appelée depuis `PASSIVE_LEVEL`).
+    pub fn note_write_packet(
+        &mut self,
+        packet_number: u32,
+        eos_bytes: Option<u32>,
+        qpc_now: u64,
+    ) -> NtStatus {
+        let Some(geo) = self.packet_geometry() else {
+            // Pas de tampon à notifications : il n'existe aucun paquet à valider. Ce n'est
+            // pas un refus du mode paquets, c'est une requête qui n'a pas de sens ici.
+            return STATUS_INVALID_DEVICE_REQUEST;
+        };
+        let position = self.frames_at(qpc_now);
+        match conduit_kmd_core::packetnum::validate_write(
+            &geo,
+            position,
+            self.last_write_packet,
+            packet_number,
+        ) {
+            WriteVerdict::Late => STATUS_DATA_LATE_ERROR,
+            WriteVerdict::Overrun => STATUS_DATA_OVERRUN,
+            WriteVerdict::Accepted(absolu) => {
+                self.last_write_packet = Some(absolu);
+                self.last_write_qpc = qpc_now;
+                self.committed_frames = Some(match eos_bytes {
+                    None => geo.end_frame_of(absolu),
+                    // Fin de flux : seules les trames utiles comptent. Zéro est une valeur
+                    // valide — le client annonce alors un paquet vide, donc une borne qui
+                    // s'arrête au début de ce paquet.
+                    Some(octets) => {
+                        // `frame_bytes ≠ 0` (disposition valide) : jamais `None`.
+                        let trames = u64::from(octets.checked_div(self.frame_bytes()).unwrap_or(0));
+                        geo.first_frame_of(absolu).saturating_add(trames)
+                    }
+                });
+                STATUS_SUCCESS
+            }
+        }
+    }
+
+    /// Fait avancer le compte de paquets transférés et le rend, ou `None` sans géométrie de
+    /// paquets.
+    ///
+    /// Le compte suit la position — pour un pont logiciel la latence matérielle est nulle,
+    /// donc « transféré vers le matériel » et « joué » sont le même instant — mais il ne
+    /// **recule jamais** : voir [`StreamState::packet_count`].
+    ///
+    /// IRQL : `<= DISPATCH_LEVEL` (sous le verrou du flux).
+    pub fn packets_transferred(&mut self, qpc_now: u64) -> Option<u64> {
+        let geo = self.packet_geometry()?;
+        let complets = geo.complete_at(self.frames_at(qpc_now));
+        self.packet_count = self.packet_count.max(complets);
+        Some(self.packet_count)
+    }
+
+    /// Le prochain paquet de capture à rendre par `GetReadPacket` : son numéro **absolu** et
+    /// un booléen qui dit si des paquets complets ont été sautés depuis le dernier rendu.
+    ///
+    /// `None` — donc `STATUS_DEVICE_NOT_READY` — quand le flux ne tourne pas, n'a pas de
+    /// tampon à notifications, ou n'a rien de neuf. Ne bloque jamais : c'est un *pull*, et
+    /// ce qui réveille le client reste l'événement de `RegisterNotificationEvent`.
+    ///
+    /// Mémorise le paquet rendu : deux appels de suite ne peuvent pas rendre le même.
+    ///
+    /// IRQL : `<= DISPATCH_LEVEL` (sous le verrou du flux).
+    pub fn take_read_packet(&mut self, qpc_now: u64) -> Option<(u64, bool)> {
+        if !self.is_live() {
+            return None;
+        }
+        let geo = self.packet_geometry()?;
+        match next_read(&geo, self.frames_at(qpc_now), self.last_read_packet) {
+            ReadVerdict::NotReady => None,
+            ReadVerdict::Ready { packet, gap } => {
+                self.last_read_packet = Some(packet);
+                Some((packet, gap))
+            }
         }
     }
 
@@ -313,6 +493,11 @@ impl StreamState {
     /// Vue du flux pour [`conduit_kmd_core::loopback`] à l'instant `qpc_now` : `None`
     /// s'il ne tourne pas, n'a pas de tampon, ou si le tampon ne fait pas au moins une
     /// trame entière (impossible : il est alloué en multiple de la trame).
+    ///
+    /// [`StreamView::committed`] ne vaut `Some` que sur un flux de **rendu** dont le client
+    /// valide ses paquets : une capture ne reçoit jamais de `SetWritePacket`, et un rendu
+    /// scruté non plus. La vue est donc la même qu'avant pour tout le monde sauf le seul cas
+    /// où l'on sait quelque chose de plus.
     fn view(&self, qpc_now: u64) -> Option<StreamView> {
         let buffer = self.buffer?;
         if !self.is_running() {
@@ -322,6 +507,7 @@ impl StreamState {
         (buffer_frames > 0).then(|| StreamView {
             frames: self.frames_at(qpc_now),
             buffer_frames: u64::from(buffer_frames),
+            committed: self.committed_frames,
         })
     }
 
@@ -770,12 +956,12 @@ pub enum PacketMethod {
 ///
 /// # Sur le câble, pas sur le flux, et pour la raison d'[`AllocRefusals`]
 ///
-/// Les quatre méthodes **refusent** (`STATUS_NOT_SUPPORTED`, voir `stream::WaveStream`), et
-/// rien n'oblige le moteur audio à garder sa broche ouverte après un refus. Un compteur logé
-/// dans le [`StreamState`] mourrait donc avec le flux qu'on cherche à comprendre, et le relevé
-/// fait une seconde plus tard montrerait un câble au repos sans la moindre trace de l'appel.
-/// Seule l'**exposition** vit dans le flux, parce qu'elle décrit le flux courant et rien
-/// d'autre.
+/// Rien n'oblige le moteur audio à garder sa broche ouverte : un compteur logé dans le
+/// [`StreamState`] mourrait avec le flux qu'on cherche à comprendre, et le relevé fait une
+/// seconde plus tard montrerait un câble au repos sans la moindre trace de l'appel. C'était
+/// vrai quand les quatre méthodes refusaient (lot 2) et ça l'est resté depuis qu'elles
+/// servent (lot 3) — un flux se ferme aussi bien après un service qu'après un refus. Seule
+/// l'**exposition** vit dans le flux, parce qu'elle décrit le flux courant et rien d'autre.
 ///
 /// Remis à zéro par [`Cable::start`], comme les [`Counters`] de la boucle locale et les
 /// [`AllocRefusals`], et pour la même raison : un compteur qui cumulerait les cycles de
@@ -955,6 +1141,36 @@ impl PacketCounters {
         self.render.reset();
         self.capture.reset();
     }
+}
+
+/// Une annonce `SetWritePacket` à enregistrer avant de rejouer le corps du tick.
+///
+/// Les drapeaux n'y figurent pas : `stream::WaveStream` les a déjà validés — un seul est
+/// défini — et n'en transmet que la conséquence, `eos_bytes`. Ce qui traverse le verrou
+/// est ce que l'état du flux doit savoir, pas ce que le contrat a envoyé.
+#[derive(Debug, Clone, Copy)]
+struct Annonce {
+    /// Numéro de paquet annoncé, sur 32 bits comme le contrat l'échange.
+    packet_number: u32,
+    /// Octets **utiles** du dernier paquet en fin de flux, `None` hors fin de flux.
+    eos_bytes: Option<u32>,
+}
+
+/// Ce qu'un tour de boucle a produit, une fois tous les verrous rendus.
+///
+/// Sépare le travail sous verrou ([`Cable::executer`]) de sa comptabilité
+/// ([`Cable::compter`]) : c'est la même frontière qu'avant le lot 3, seulement nommée.
+#[derive(Debug)]
+struct Tour {
+    /// Le plan calculé par la boucle locale.
+    plan: Plan,
+    /// Trames effectivement copiées.
+    copied: u64,
+    /// Trames effectivement mises à zéro.
+    silenced: u64,
+    /// `NTSTATUS` de l'annonce `SetWritePacket` qui a déclenché ce tour, `STATUS_SUCCESS`
+    /// pour un tick du minuteur (personne ne le lit alors).
+    write: NtStatus,
 }
 
 /// Erreur de [`Cable::attach`] : un flux est déjà ouvert dans ce sens.
@@ -1233,7 +1449,9 @@ impl Cable {
     /// `Err(STATUS_DEVICE_NOT_READY)` si le câble n'a pas encore vu de `StartDevice` : il
     /// n'y a alors aucun objet de périphérique, donc aucune clé à ouvrir. Ce cas ne devrait
     /// pas se produire — une propriété KS suppose un sous-périphérique enregistré — mais il
-    /// vaut mieux un statut nommé qu'un déréférencement de pointeur nul.
+    /// vaut mieux un statut nommé qu'un déréférencement de pointeur nul. C'est le même code
+    /// que `GetReadPacket` rend faute de paquet neuf : « le périphérique n'est pas prêt »
+    /// couvre les deux, et `portcls::status` le définit une seule fois.
     fn persist_active_mask(&self) -> Result<(), NtStatus> {
         let device = self.device.load(Ordering::Relaxed);
         if device.is_null() {
@@ -1510,13 +1728,91 @@ impl Cable {
         }
     }
 
-    /// Un tick du timer (driver-design.md §5.3, étapes 1 à 5) : plan de copie
-    /// ([`conduit_kmd_core::loopback`]), exécution (copie, silence, ou rien), puis
-    /// notifications des deux flux.
+    /// Un tick du timer (driver-design.md §5.3, étapes 1 à 5).
+    ///
+    /// Le travail est dans [`Cable::executer`] : le tick n'est plus le seul à le
+    /// déclencher depuis le lot 3, et deux corps de boucle qui devraient rester identiques
+    /// finiraient par ne plus l'être.
     ///
     /// IRQL : `DISPATCH_LEVEL` (rappel `EXT_CALLBACK`). Aucune allocation, aucune
     /// attente, aucune mémoire paginée.
     fn on_tick(&self, qpc_now: u64) {
+        let tour = self.executer(qpc_now, None);
+        self.compter(tour);
+    }
+
+    /// **Le second déclencheur de la boucle** : le moteur audio vient d'écrire le paquet
+    /// `packet_number` dans le tampon de rendu (`SetWritePacket`, lot 3).
+    ///
+    /// Rend le `NTSTATUS` de l'annonce : `STATUS_SUCCESS`, ou l'un des deux refus
+    /// documentés que `conduit_kmd_core::packetnum` décide
+    /// (`STATUS_DATA_LATE_ERROR`, `STATUS_DATA_OVERRUN`).
+    ///
+    /// `eos_bytes` porte le nombre d'octets utiles du dernier paquet quand le client a posé
+    /// `KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM` ; `stream::WaveStream` a déjà refusé tout
+    /// autre drapeau avant d'arriver ici.
+    ///
+    /// # Ce que ce déclencheur ne fait pas
+    ///
+    /// Il **n'exempte de rien**. La documentation de `SetWritePacket` est catégorique — le
+    /// pilote « reste obligé d'incrémenter son compteur interne de paquets et de signaler
+    /// les événements de notification à une cadence temps réel nominale » — et le minuteur
+    /// de 1 ms tourne donc exactement comme avant, sans une ligne de changement. Ce qui est
+    /// gagné n'est pas un réveil, c'est une **certitude** : la copie sait désormais jusqu'où
+    /// le client a écrit, au lieu de le supposer (voir `StreamView::committed`).
+    ///
+    /// # Le corps du tick est rejoué, refus compris
+    ///
+    /// L'annonce est validée **sous les mêmes verrous et dans le même ordre** que le tick —
+    /// câble, puis rendu, puis capture —, puis le corps du tick est rejoué tel quel, que
+    /// l'annonce ait été retenue ou non. Rejouer après un refus est délibéré : c'est
+    /// précisément ce que le minuteur aurait fait une milliseconde plus tard, et brancher
+    /// là-dessus ferait deux chemins là où le contrat n'en connaît qu'un.
+    ///
+    /// # IRQL
+    ///
+    /// `PASSIVE_LEVEL` (contrat de `portcls.h`), et les verrous pris ici sont les mêmes que
+    /// ceux que la DPC du minuteur prend à `DISPATCH_LEVEL`. C'est sûr parce que
+    /// [`crate::sync::SpinLock::lock`] appelle `KeAcquireSpinLockRaiseToDpc` : le fil qui
+    /// tient le verrou est **lui-même** à `DISPATCH_LEVEL` pendant la section critique, donc
+    /// sa propre DPC ne peut pas le préempter sur ce processeur. Un verrou qui n'élèverait
+    /// pas l'IRQL — un spin lock maison, par exemple — ferait ici un interblocage franc.
+    pub fn on_write_packet(
+        &self,
+        direction: Direction,
+        packet_number: u32,
+        eos_bytes: Option<u32>,
+        qpc_now: u64,
+    ) -> NtStatus {
+        if direction != Direction::Render {
+            // `IMiniportWaveRTOutputStream` n'est exposée que sur un flux de rendu : y
+            // arriver depuis une capture serait un bogue d'exposition, pas une requête.
+            return STATUS_INVALID_DEVICE_REQUEST;
+        }
+        let tour = self.executer(
+            qpc_now,
+            Some(Annonce {
+                packet_number,
+                eos_bytes,
+            }),
+        );
+        let status = tour.write;
+        self.compter(tour);
+        status
+    }
+
+    /// Le corps de la boucle locale, commun au tick du minuteur et à `SetWritePacket` :
+    /// plan de copie ([`conduit_kmd_core::loopback`]), exécution (copie, silence, ou rien),
+    /// puis notifications des deux flux.
+    ///
+    /// Prend le verrou du câble, puis celui du rendu, puis celui de la capture — l'ordre du
+    /// module, et le seul endroit du pilote qui prenne les deux verrous de flux. Les rend
+    /// tous avant de sortir : les compteurs et le journal sont l'affaire de
+    /// [`Cable::compter`], hors de toute section critique.
+    ///
+    /// IRQL : `<= DISPATCH_LEVEL`. Aucune allocation, aucune attente, aucune mémoire
+    /// paginée.
+    fn executer(&self, qpc_now: u64, annonce: Option<Annonce>) -> Tour {
         let mut cable = self.state();
         // SAFETY: les pointeurs des emplacements désignent le `SpinLock<StreamState>` de
         // flux vivants tant que cette garde est détenue : un flux se retire de son
@@ -1529,10 +1825,20 @@ impl Cable {
         let capture_lock = cable
             .get(Direction::Capture)
             .map(|shared| unsafe { shared.as_ref() });
-        // Ordre de verrouillage interne au câble : rendu puis capture (seul ce tick prend
-        // les deux verrous de flux).
+        // Ordre de verrouillage interne au câble : rendu puis capture (ce corps est le seul
+        // du pilote à prendre les deux verrous de flux, et ses deux déclencheurs y passent).
         let mut render = render_lock.map(SpinLock::lock);
         let mut capture = capture_lock.map(SpinLock::lock);
+
+        // Étape 0, mode paquets seulement : enregistrer ce que le client vient de valider,
+        // **avant** de calculer le plan — c'est tout l'intérêt du déclencheur, la copie qui
+        // suit voit la frontière neuve. Un emplacement vide veut dire que le flux s'est
+        // retiré du câble entre son appel et ici (`Drop` en cours) : la requête n'a plus de
+        // cible.
+        let write = annonce.map(|a| match render.as_deref_mut() {
+            Some(state) => state.note_write_packet(a.packet_number, a.eos_bytes, qpc_now),
+            None => STATUS_INVALID_DEVICE_REQUEST,
+        });
 
         let render_view = render.as_deref().and_then(|s| s.view(qpc_now));
         let capture_view = capture.as_deref().and_then(|s| s.view(qpc_now));
@@ -1604,23 +1910,47 @@ impl Cable {
         drop(render);
         drop(cable);
 
+        Tour {
+            plan,
+            copied,
+            silenced,
+            // `STATUS_SUCCESS` quand ce tour est un simple tick : la valeur n'est alors
+            // lue par personne, et `on_write_packet` est le seul à s'en servir.
+            write: write.unwrap_or(STATUS_SUCCESS),
+        }
+    }
+
+    /// Additionne aux compteurs du câble ce qu'un tour de boucle a produit, et journalise.
+    ///
+    /// Hors de tout verrou, et **après** que [`Cable::executer`] les a tous rendus : c'est
+    /// la moitié du tick qui n'a pas besoin d'être protégée, séparée pour que la section
+    /// critique reste courte.
+    ///
+    /// Un tour compte pour un tick, qu'il vienne du minuteur ou de `SetWritePacket` : les
+    /// deux ont fait le même travail, et un compteur qui n'additionnerait que le minuteur
+    /// laisserait croire que la boucle tourne moins souvent qu'en réalité.
+    ///
+    /// IRQL : `<= DISPATCH_LEVEL`, hors de tout verrou.
+    fn compter(&self, tour: Tour) {
         let ticks = self.counters.ticks.fetch_add(1, Ordering::Relaxed);
-        if copied > 0 {
-            self.counters.copied.fetch_add(copied, Ordering::Relaxed);
+        if tour.copied > 0 {
+            self.counters
+                .copied
+                .fetch_add(tour.copied, Ordering::Relaxed);
         }
         // Le silence est compté sous **sa** cause : le plan la porte, `ring::silence` n'en
         // a que faire, et un compteur unique ne démontrerait ni l'une ni l'autre.
-        if let Some(op) = plan.silence
-            && silenced > 0
+        if let Some(op) = tour.plan.silence
+            && tour.silenced > 0
         {
-            self.counters.add_silence(op.cause, silenced);
+            self.counters.add_silence(op.cause, tour.silenced);
         }
-        if plan.overrun {
+        if tour.plan.overrun {
             self.counters.overruns.fetch_add(1, Ordering::Relaxed);
         }
         // Rendu sans capture : le seul cas où le tick n'écrit rien **et** n'est pas au
         // repos. Sans ce compteur, la non-accumulation ne se lirait nulle part.
-        if plan.discarded {
+        if tour.plan.discarded {
             self.counters
                 .discarded_ticks
                 .fetch_add(1, Ordering::Relaxed);
@@ -1804,10 +2134,10 @@ impl Cable {
     /// Compte un appel d'une méthode du **mode paquets** dans le sens `direction`, avec son
     /// IRQL et son horodatage QPC.
     ///
-    /// Appelée par les quatre méthodes de `stream::WaveStream`, **qui refusent toutes** : ce
-    /// compteur mesure donc des refus rendus depuis une interface que le moteur audio avait
-    /// légitimement obtenue, c'est-à-dire exactement le risque que `portcls::packet` décrit et
-    /// que l'expérience du lot 2 sert à quantifier.
+    /// Appelée par les quatre méthodes de `stream::WaveStream`. Depuis le lot 3 elles
+    /// **servent** : ce compteur mesure donc des appels honorés, et non plus les refus que
+    /// l'expérience du lot 2 quantifiait. Le compteur n'a pas changé — c'est ce qu'il compte
+    /// qui a changé, et `conduit-looptest` le dit désormais autrement.
     ///
     /// Le compteur vit sur le câble et non sur le flux : voir [`SidePackets`].
     ///

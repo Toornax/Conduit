@@ -35,14 +35,14 @@
 //! défaut décrit, et qui laisse le moteur audio parcourir une liste jusqu'à épuisement.
 //!
 //! L'objet rendu par `NewStream` est un **flux composite** (`portcls::packet`) : une seule
-//! allocation, un seul compteur de références, plusieurs têtes de vtable. Il est construit
-//! avec `PacketInterfaces::None`, donc **sans exposer une interface de plus** qu'un flux
-//! ordinaire : le mode paquets n'est pas servi, et un pilote n'annonce pas ce qu'il ne
-//! sert pas. Voir `open_stream` et la documentation de `PacketInterfaces::None`.
+//! allocation, un seul compteur de références, plusieurs têtes de vtable. Le paramètre de
+//! registre `PacketMode` décide de ce qu'il expose, et rien d'autre ne le décide.
 //!
-//! La seule exception est le paramètre de registre `PacketMode` à 1, qui expose les
-//! interfaces du sens du flux **sans les servir** : une expérience de mesure, jamais livrée,
-//! décrite sur `conduit_kmd_core::params::DEFAULT_PACKET_MODE` et lue par `open_stream`.
+//! À 1, il expose l'interface de paquets du sens du flux, que `stream::WaveStream`
+//! **sert** depuis le lot 3. À 0 — le défaut, le temps de la campagne Driver Verifier — il
+//! est construit avec `PacketInterfaces::None`, donc sans exposer une interface de plus
+//! qu'un flux ordinaire. Voir `open_stream` et
+//! `conduit_kmd_core::params::DEFAULT_PACKET_MODE`.
 //!
 //! # Lecture du format
 //!
@@ -219,17 +219,14 @@ fn open_stream(
     let name = direction.stream_name();
     // Mode paquets. Par défaut l'objet est composite mais n'expose RIEN :
     // `PacketInterfaces::None` fait répondre son `QueryInterface` exactement comme celui
-    // d'un flux ordinaire — aucun IID de plus. C'est le pilote livré, et c'est délibéré :
-    // les quatre méthodes ne servent rien, et exposer une interface qu'on ne sert pas
-    // laisserait le moteur audio basculer sur un chemin qui lui répondrait
-    // `STATUS_NOT_SUPPORTED`, au risque de casser un transport qui fonctionne.
+    // d'un flux ordinaire — aucun IID de plus.
     //
-    // Le paramètre de registre `PacketMode`, à 1, expose quand même — et sans rien servir.
-    // C'est une EXPÉRIENCE, décrite en entier sur
-    // `conduit_kmd_core::params::DEFAULT_PACKET_MODE` : elle sert à mesurer ce que le moteur
-    // audio fait d'interfaces disponibles (les demande-t-il ? les emprunte-t-il ? à quel
-    // IRQL ?), sur une machine d'essai, et elle ne se livre jamais. Le relevé
-    // `KSPROPERTY_CONDUIT_PACKETS` en rend le résultat.
+    // Ce n'est plus faute de savoir servir : depuis le lot 3, les quatre méthodes de
+    // `stream::WaveStream` servent. C'est faute d'avoir passé la campagne Driver Verifier —
+    // ce qui n'a pas été éprouvé en machine ne se livre pas activé. Le paramètre de registre
+    // `PacketMode`, à 1, expose donc des interfaces réellement servies, et il passera à 1 par
+    // défaut après la campagne (voir `conduit_kmd_core::params::DEFAULT_PACKET_MODE`). Le
+    // relevé `KSPROPERTY_CONDUIT_PACKETS` dit ce que le moteur audio en fait.
     //
     // Le paramètre est lu au `StartDevice` et déposé dans un atomique
     // (`registry::packet_mode`) : ce n'est pas une lecture de registre par flux, et une

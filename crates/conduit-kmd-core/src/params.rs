@@ -58,9 +58,10 @@
 //!   d'installateur (une valeur d'INF qui disparaît laisse une clé sur les postes déjà
 //!   installés), pas de ce module ; jusque-là, mieux vaut le dire ici que le laisser
 //!   croire.
-//! - **Mode paquets** : effectif depuis le lot 2 du mode paquets WaveRT, et c'est le seul
-//!   paramètre dont l'effet soit une **expérience** et non un réglage. Voir
-//!   [`DEFAULT_PACKET_MODE`], qui porte la réserve en entier.
+//! - **Mode paquets** : effectif depuis le lot 2 du mode paquets WaveRT, et le seul
+//!   paramètre **transitoire** du lot — il commande l'exposition d'interfaces désormais
+//!   servies (lot 3), à 0 le temps de la campagne Driver Verifier, et il disparaîtra.
+//!   Voir [`DEFAULT_PACKET_MODE`].
 //!
 //! Tout ici est sans allocation ni panique ; l'appel a lieu à `PASSIVE_LEVEL`
 //! (`StartDevice`), mais rien n'interdit un appel à `DISPATCH_LEVEL`.
@@ -154,40 +155,44 @@ pub const DEFAULT_BUFFER_MS: u32 = 10;
 /// Valeur minimale du mode paquets : 0, « n'expose rien ».
 pub const MIN_PACKET_MODE: u32 = 0;
 
-/// Valeur maximale du mode paquets : 1, « expose sans servir ».
+/// Valeur maximale du mode paquets : 1, « expose les interfaces du mode paquets ».
 ///
 /// Un booléen, et volontairement pas une énumération de modes : il n'y a que deux états à
-/// distinguer, et le second n'est pas un mode de fonctionnement mais une **expérience**
-/// (voir [`DEFAULT_PACKET_MODE`]). Un domaine plus large inviterait à en ajouter un
-/// troisième sans passer par la mesure.
+/// distinguer — exposer ou non —, et le paramètre est de toute façon transitoire (voir
+/// [`DEFAULT_PACKET_MODE`]). Un domaine plus large inviterait à inventer des demi-modes.
 pub const MAX_PACKET_MODE: u32 = 1;
 
-/// Mode paquets par défaut : **0**, et il n'est jamais livré autrement.
+/// Mode paquets par défaut : **0** pour l'instant, 1 après la campagne Driver Verifier.
 ///
 /// # Ce que ce paramètre fait, exactement
 ///
 /// À 1, `conduit_kmd::wave::open_stream` construit le flux composite avec les interfaces
 /// de paquets du sens du flux ([`crate::config::PacketExposure`]) au lieu de
-/// `PacketInterfaces::None` : PortCls obtient donc l'adresse des têtes satellites si le
+/// `PacketInterfaces::None` : PortCls obtient donc l'adresse des têtes satellites quand le
 /// moteur audio les demande par `QueryInterface`, et les quatre méthodes deviennent
-/// **atteignables**. Elles refusent toutes (`STATUS_NOT_SUPPORTED`) et se contentent de
-/// **compter** — appels par sens et par méthode, IRQL, horodatage QPC — que
-/// [`crate::config::KSPROPERTY_CONDUIT_PACKETS`] rend lisible sans débogueur.
+/// atteignables. Depuis le lot 3 elles sont **exposées et servies** —
+/// `SetWritePacket` valide le numéro et borne la copie, `GetReadPacket` rend le dernier
+/// paquet complet de la capture, `GetOutputStreamPresentationPosition` des trames absolues
+/// et un QPC brut, `GetPacketCount` un compte base 1. Elles comptent toujours leurs appels
+/// (par sens, par méthode, avec l'IRQL et l'horodatage QPC), que
+/// [`crate::config::KSPROPERTY_CONDUIT_PACKETS`] rend lisibles sans débogueur.
 ///
-/// # Une expérience, pas un réglage : ne jamais livrer à 1
+/// # Ce qu'il n'est plus, et ce qu'il est devenu
 ///
-/// La règle du mode paquets est écrite en tête de `portcls::packet` et elle n'est pas
-/// amendée ici : **exposer une interface qu'on ne sert pas est plus dangereux que ne rien
-/// exposer**. Un moteur audio qui bascule sur le chemin des paquets et se fait répondre
-/// `STATUS_NOT_SUPPORTED` peut casser un transport qui marchait. Ce paramètre existe pour
-/// **mesurer** ce que le moteur fait d'interfaces exposées — les demande-t-il ? les
-/// emprunte-t-il ? à quel IRQL ? — sur une machine d'essai où casser le son est sans
-/// conséquence, et pour rien d'autre.
+/// Aux lots 1 et 2, ce paramètre exposait les interfaces **sans les servir** : une
+/// expérience de mesure, à ne jamais livrer, dont l'objet était de chiffrer ce que la règle
+/// de `portcls::packet` redoute — « exposer une interface qu'on ne sert pas est plus
+/// dangereux que ne rien exposer ». La mesure a répondu : le moteur audio d'un client
+/// WASAPI exclusif événementiel appelle `GetReadPacket` quatre cents fois par seconde dès
+/// que l'interface existe, et le refus casse son transport.
 ///
-/// Il n'active donc **rien qui soit servi**, son défaut est 0, l'INF écrit 0, et aucun
-/// poste livré ne doit porter 1. Le jour où les quatre méthodes seront réellement
-/// implémentées, ce paramètre disparaîtra — ce ne sera plus une expérience mais le
-/// comportement du pilote.
+/// Le lot 3 sert les quatre méthodes, et le paramètre n'est donc plus une expérience :
+/// c'est **activable pour mesure**, et il passera à 1 par défaut après la campagne Driver
+/// Verifier du lot 3, dans un commit dédié. Il disparaîtra ensuite — un pilote n'a pas à
+/// rendre optionnelle la conformité qu'il tient.
+///
+/// Jusque-là, le défaut reste 0 et l'INF écrit 0 : ce qui n'a pas passé Verifier ne se
+/// livre pas activé, même quand le code est écrit.
 pub const DEFAULT_PACKET_MODE: u32 = 0;
 
 // Cohérences que le compilateur peut vérifier : le défaut est dans ses bornes, et le
@@ -441,8 +446,9 @@ pub struct Params {
     pub buffer_ms: u32,
     /// Mode paquets, dans `MIN_PACKET_MODE..=MAX_PACKET_MODE` — c'est-à-dire 0 ou 1.
     ///
-    /// **Une expérience, pas un réglage**, et jamais livrée à 1 : toute la réserve est
-    /// écrite sur [`DEFAULT_PACKET_MODE`].
+    /// **Transitoire** : à 1 il expose des interfaces désormais servies, et il passera à 1
+    /// par défaut après la campagne Driver Verifier du lot 3. Voir
+    /// [`DEFAULT_PACKET_MODE`].
     pub packet_mode: u8,
 }
 
@@ -689,13 +695,13 @@ mod tests {
 
     #[test]
     fn packet_mode_table() {
-        // Bornes : 0 à 1, défaut 0. Le défaut n'expose rien, et c'est le seul état
-        // livrable : le paramètre est une expérience (voir `DEFAULT_PACKET_MODE`).
+        // Bornes : 0 à 1, défaut 0 le temps de la campagne Driver Verifier du lot 3 (voir
+        // `DEFAULT_PACKET_MODE`).
         let cases: [(Option<u32>, u8, Option<Fix>); 5] = [
             // Absente : rien n'est exposé, sans correction (installation neuve).
             (None, 0, None),
             (Some(0), 0, None),
-            // L'expérience, telle qu'on la demande en machine d'essai : dans les bornes,
+            // L'exposition, telle qu'on la demande en machine de mesure : dans les bornes,
             // donc aucune correction à journaliser.
             (Some(1), 1, None),
             // Un de trop : écrêté à 1, comme les autres paramètres — un `2` reste une
@@ -714,7 +720,9 @@ mod tests {
             );
         }
         // Le défaut du contrat est bien « rien d'exposé » : c'est ce que l'INF écrit et ce
-        // qu'un poste livré doit porter.
+        // qu'un poste livré porte tant que la campagne Verifier n'a pas eu lieu. Le commit
+        // qui le passera à 1 fera tomber cette assertion, et c'est voulu — le changement
+        // doit être un acte.
         assert_eq!(DEFAULT_PACKET_MODE, 0);
         assert!(!Params::DEFAULT.packet_mode_actif());
     }

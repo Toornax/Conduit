@@ -69,6 +69,27 @@
 //! Aucun des deux ne change ce que le tick écrit : ce sont des **témoins**, que
 //! `conduit_kmd::cable::Counters` additionne séparément.
 //!
+//! # Une frontière certaine : [`StreamView::committed`]
+//!
+//! Tout ce qui précède raisonne sur une **supposition** : le lecteur a écrit devant `R`,
+//! donc lire jusqu'à `R + avance` est sûr. Le mode paquets remplace cette supposition par
+//! une frontière que le client **déclare** — `SetWritePacket` dit « j'ai écrit le paquet
+//! *n* », donc les trames `[n × taille, (n+1) × taille)` et rien au-delà (voir
+//! [`crate::packetnum`]).
+//!
+//! Quand cette frontière existe, deux choses changent, et deux seulement :
+//!
+//! 1. **la copie ne lit jamais au-delà** : `src_start + count ≤ committed`, quitte à
+//!    tronquer le bloc du tick. Lire plus loin serait lire un emplacement que le client
+//!    n'a pas encore rempli — précisément ce que l'avance suppose sans le savoir ;
+//! 2. **l'avance tombe à zéro** : elle n'existait que pour couvrir l'incertitude sur `R`,
+//!    et une marge de sécurité par-dessus une certitude n'est plus une marge, c'est un
+//!    décalage. La fenêtre écrite devient `[curseur, C)`.
+//!
+//! Le curseur, le lien, les causes de silence, le témoin de rejet et le débordement sont
+//! **inchangés** : la frontière borne ce qu'on lit, elle ne change pas la façon dont on
+//! avance ni la façon dont on rattrape.
+//!
 //! IRQL : tout ici est appelable à `DISPATCH_LEVEL` : aucune allocation, aucune panique.
 
 /// Avance de la copie sur les positions, en millisecondes : deux ticks du timer
@@ -82,6 +103,33 @@ pub struct StreamView {
     pub frames: u64,
     /// Taille du tampon cyclique en trames (≥ 1).
     pub buffer_frames: u64,
+    /// Première trame absolue que le client **n'a pas** validée, `None` s'il ne valide
+    /// rien (voir « Une frontière certaine » en tête de module).
+    ///
+    /// Renseignée uniquement sur la vue du **rendu**, et uniquement en mode paquets :
+    /// c'est `(dernier paquet accepté + 1) × taille_de_paquet`, en trames absolues. Une
+    /// capture ne reçoit jamais de `SetWritePacket` et garde donc `None`.
+    pub committed: Option<u64>,
+}
+
+impl StreamView {
+    /// Vue d'un flux sans frontière validée : le régime ordinaire, où la copie s'appuie
+    /// sur la position et sur l'avance.
+    pub const fn new(frames: u64, buffer_frames: u64) -> Self {
+        Self {
+            frames,
+            buffer_frames,
+            committed: None,
+        }
+    }
+
+    /// La même vue, bornée par les trames que le client a validées.
+    pub const fn with_committed(self, committed: u64) -> Self {
+        Self {
+            committed: Some(committed),
+            ..self
+        }
+    }
 }
 
 /// Copie de `count` trames du rendu (à partir de la trame absolue `src_start`) vers
@@ -223,6 +271,11 @@ impl Loopback {
             plan.discarded = render.is_some();
             return plan;
         };
+        // La frontière validée par le client, s'il en déclare une. Elle **remplace**
+        // l'avance : celle-ci ne couvrait que l'incertitude sur la position du rendu (voir
+        // « Une frontière certaine » en tête de module).
+        let committed = render.and_then(|r| r.committed);
+        let lead = if committed.is_some() { 0 } else { lead };
         let target = capture.frames.saturating_add(lead);
         let mut start = match self.cursor {
             Some(cursor) if cursor <= target => cursor,
@@ -269,7 +322,7 @@ impl Loopback {
         let src_start = i128::from(start)
             .saturating_sub(i128::from(link.capture))
             .saturating_add(i128::from(link.render));
-        let (src_start, dst_start, count) = if src_start < 0 {
+        let (src_start, dst_start, mut count) = if src_start < 0 {
             // Trames de rendu « d'avant le départ » du flux : silence, puis copie du
             // reste à partir de la trame 0.
             let missing = u64::try_from(src_start.saturating_neg())
@@ -288,6 +341,18 @@ impl Loopback {
         } else {
             (u64::try_from(src_start).unwrap_or(u64::MAX), start, count)
         };
+        // La borne du client, appliquée en dernier : le bloc est tronqué à ce qu'il a
+        // réellement écrit, jamais étendu.
+        //
+        // Le curseur, lui, a déjà avancé à `target` : une troncature laisse donc un trou,
+        // comme un débordement. C'est délibéré et c'est le seul comportement honnête — les
+        // trames manquantes n'existent pas encore côté rendu, et rien ne les fera exister
+        // en les attendant. En régime normal la troncature ne se produit pas : le client
+        // valide un paquet **d'avance** sur la position, donc `committed` dépasse toujours
+        // la fin du bloc, que l'avance vaut zéro depuis qu'il valide.
+        if let Some(committed) = committed {
+            count = count.min(committed.saturating_sub(src_start));
+        }
         if count > 0 {
             plan.copy = Some(CopyOp {
                 src_start,
@@ -315,10 +380,12 @@ mod tests {
     const LEAD: u64 = 96; // 2 ms à 48 kHz
 
     fn view(frames: u64, buffer_frames: u64) -> Option<StreamView> {
-        Some(StreamView {
-            frames,
-            buffer_frames,
-        })
+        Some(StreamView::new(frames, buffer_frames))
+    }
+
+    /// La même vue, bornée par ce que le client a validé (mode paquets).
+    fn view_committed(frames: u64, buffer_frames: u64, committed: u64) -> Option<StreamView> {
+        Some(StreamView::new(frames, buffer_frames).with_committed(committed))
     }
 
     /// Un plan qui ne demande rien et ne jette rien : le câble au repos.
@@ -760,7 +827,140 @@ mod tests {
         v
     }
 
+    // -----------------------------------------------------------------------------
+    // Lot 3 : la frontière validée par le client (`SetWritePacket`).
+    // -----------------------------------------------------------------------------
+
+    /// **La borne, en table** : ce que le client a validé décide de ce que la copie lit,
+    /// et l'avance tombe à zéro dès que la borne existe.
+    #[test]
+    fn la_borne_validee_remplace_l_avance() {
+        let mut lb = Loopback::new();
+        // Premier tick sans borne : régime ordinaire, la copie lit jusqu'à R + avance.
+        let p = lb.plan(view(1_000, 480), view(500, 960), LEAD);
+        assert_eq!(
+            p.copy,
+            Some(CopyOp {
+                src_start: 1_000,
+                dst_start: 500,
+                count: LEAD
+            })
+        );
+        // Le client se met à valider, avec une borne large : la copie n'est pas tronquée,
+        // mais l'avance disparaît. La cible devient C (548) au lieu de C + avance (644) ;
+        // le curseur, laissé à 596 par le tick précédent, la dépasse — ce tick n'écrit donc
+        // rien, et c'est exactement le décalage que l'avance couvrait.
+        let p = lb.plan(view_committed(1_048, 480, 10_000), view(548, 960), LEAD);
+        assert!(
+            p.copy.is_none() && p.silence.is_none() && !p.overrun,
+            "l'avance tombée à zéro laisse un tick à vide : {p:?}"
+        );
+        // Le régime s'établit ensuite sans trou : cible C, curseur C précédent.
+        let p = lb.plan(view_committed(1_096, 480, 10_000), view(596, 960), LEAD);
+        assert_eq!(
+            p.copy,
+            Some(CopyOp {
+                src_start: 1_048,
+                dst_start: 548,
+                count: 48
+            })
+        );
+    }
+
+    /// La borne **tronque** : la copie ne lit jamais au-delà de ce que le client a validé,
+    /// même quand le curseur demanderait davantage.
+    #[test]
+    fn la_borne_tronque_la_copie() {
+        let mut lb = Loopback::new();
+        // Un curseur pris d'avance par deux ticks sans rendu : 500 → 596 → 644.
+        lb.plan(None, view(500, 960), LEAD);
+        lb.plan(None, view(548, 960), LEAD);
+        // Le rendu arrive, avec une borne serrée : lien R0 = 10 000, C0 = 596, curseur 644,
+        // cible 644 (avance nulle) → rien. Le tick suivant, cible 692.
+        let p = lb.plan(view_committed(10_000, 480, 10_050), view(596, 960), LEAD);
+        assert!(p.linked && p.copy.is_none());
+        // Bloc [596, 692) ↔ rendu [10 000, 10 096) ; borne 10 050 : la copie s'arrête à
+        // cinquante trames au lieu de quatre-vingt-seize.
+        let p = lb.plan(view_committed(10_096, 480, 10_050), view(692, 960), LEAD);
+        assert_eq!(
+            p.copy,
+            Some(CopyOp {
+                src_start: 10_000,
+                dst_start: 596,
+                count: 50
+            })
+        );
+        // Borne atteinte : plus rien à copier tant que le client ne valide pas.
+        let p = lb.plan(view_committed(10_144, 480, 10_050), view(740, 960), LEAD);
+        assert!(p.copy.is_none() && p.silence.is_none() && !p.overrun);
+        // Le client valide la suite : la copie repart du curseur, pas de la borne.
+        let p = lb.plan(view_committed(10_192, 480, 11_000), view(788, 960), LEAD);
+        assert_eq!(
+            p.copy,
+            Some(CopyOp {
+                src_start: 10_144,
+                dst_start: 740,
+                count: 48
+            })
+        );
+    }
+
+    /// Une borne sur la **capture** n'existe pas : seule celle du rendu compte, parce que
+    /// c'est le rendu qu'on lit. Une capture bornée par distraction ne doit rien changer.
+    #[test]
+    fn seule_la_borne_du_rendu_agit() {
+        let mut lb = Loopback::new();
+        let p = lb.plan(view(1_000, 480), view_committed(500, 960, 0), LEAD);
+        assert_eq!(
+            p.copy,
+            Some(CopyOp {
+                src_start: 1_000,
+                dst_start: 500,
+                count: LEAD
+            })
+        );
+    }
+
     proptest! {
+        /// **L'invariant du lot 3** : quelle que soit la séquence, la copie ne lit jamais
+        /// au-delà de ce que le client a validé — `src_start + count ≤ committed`.
+        #[test]
+        fn la_copie_ne_depasse_jamais_la_borne(
+            r0 in 0u64..1 << 40,
+            c0 in 0u64..1 << 40,
+            render_buf in 96u64..=4_800,
+            capture_buf in 96u64..=4_800,
+            lead in 1u64..=96,
+            deltas in proptest::collection::vec(0u64..=200, 1..=60),
+            avances in proptest::collection::vec(0u64..=600, 60),
+        ) {
+            let mut lb = Loopback::new();
+            let (mut r, mut c) = (r0, c0);
+            let mut committed = r0;
+            for (i, &d) in deltas.iter().enumerate() {
+                r += d;
+                c += d;
+                // Le client valide par à-coups, parfois en retard sur la position, parfois
+                // en avance : les deux régimes doivent tenir l'invariant.
+                committed = committed.saturating_add(avances[i]);
+                let render = StreamView::new(r, render_buf).with_committed(committed);
+                let plan = lb.plan(Some(render), view(c, capture_buf), lead);
+                if let Some(copy) = plan.copy {
+                    prop_assert!(
+                        copy.src_start.saturating_add(copy.count) <= committed,
+                        "copie {copy:?} au-delà de la borne {committed}"
+                    );
+                    prop_assert!(copy.count >= 1);
+                    prop_assert!(copy.count <= render_buf.min(capture_buf));
+                }
+                // La borne ne fabrique ni silence sans cause ni débordement.
+                if let Some(s) = plan.silence {
+                    prop_assert_eq!(s.cause, SilenceCause::BeforeRenderStart);
+                }
+                prop_assert!(!plan.discarded);
+            }
+        }
+
         /// Régime normal (pas de retard supérieur au plus petit tampon) : les blocs
         /// écrits se suivent exactement, de `C0` à `C_n + avance`, sans trou ni
         /// recouvrement ; la copie garde un décalage constant et finit à `R + avance`.
@@ -783,7 +983,7 @@ mod tests {
                 c += d;
                 let with_render = render_present[i];
                 let cap = if with_render { render_buf.min(capture_buf) } else { capture_buf };
-                let render = with_render.then_some(StreamView { frames: r, buffer_frames: render_buf });
+                let render = with_render.then_some(StreamView::new(r, render_buf));
                 let plan = lb.plan(render, view(c, capture_buf), lead);
                 let start = expected_next.unwrap_or(c);
                 let count = c + lead - start;
@@ -856,8 +1056,8 @@ mod tests {
             if let Some(seed) = cursor_seed {
                 lb.plan(None, view(seed, 1), lead);
             }
-            let rv = render.map(|(f, b)| StreamView { frames: f, buffer_frames: b });
-            let cv = capture.map(|(f, b)| StreamView { frames: f, buffer_frames: b });
+            let rv = render.map(|(f, b)| StreamView::new(f, b));
+            let cv = capture.map(|(f, b)| StreamView::new(f, b));
             let plan = lb.plan(rv, cv, lead);
             let cap = match (rv, cv) {
                 (Some(r), Some(c)) => r.buffer_frames.min(c.buffer_frames),

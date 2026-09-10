@@ -4,23 +4,31 @@
 //! notifications (§5.3, étape 5). Implémente `portcls::MiniportWaveRTStreamNotification`,
 //! donc aussi `MiniportWaveRTStream`.
 //!
-//! # Mode paquets : pas servi, exposé seulement sous `PacketMode = 1`
+//! # Mode paquets : servi (lot 3), exposé sous `PacketMode = 1`
 //!
 //! Le flux implémente `MiniportWaveRTInputStream` et `MiniportWaveRTOutputStream`
-//! (`portcls::packet`), mais **aucune des quatre méthodes ne sert quoi que ce soit** : elles
-//! rendent toutes le `STATUS_NOT_SUPPORTED` que rendaient les défauts du trait, et se
-//! contentent de **compter** (voir la section suivante). Elles sont écrites plutôt que laissées
-//! aux défauts pour cette seule raison : un défaut ne peut pas compter.
+//! (`portcls::packet`), et **les quatre méthodes servent** :
 //!
-//! Le pilote livré construit tous ses flux avec `PacketInterfaces::None` (`wave::open_stream`),
-//! si bien que ces méthodes restent **inatteignables** — PortCls n'obtient jamais l'adresse des
-//! têtes satellites. Le paramètre de registre `PacketMode`, à 1, les expose : c'est
-//! l'**expérience** du lot 2, décrite en entier sur
-//! `conduit_kmd_core::params::DEFAULT_PACKET_MODE`, et elle ne se livre jamais. Un IID rendu
-//! reste une promesse de service ; ce qui est mesuré ici est précisément le coût de ne pas la
-//! tenir.
+//! | Méthode | Ce que le flux répond |
+//! |---|---|
+//! | `SetWritePacket` | valide le numéro et **pose la frontière** de la copie ; déclenche un tour de boucle ([`Cable::on_write_packet`]) |
+//! | `GetReadPacket` | le dernier paquet **complet** de la capture, son horodatage, et le trou s'il y en a eu |
+//! | `GetOutputStreamPresentationPosition` | la position en **trames absolues** et le QPC brut, ceux de `GetPosition` |
+//! | `GetPacketCount` | les paquets entièrement transférés, en **base 1**, remis à zéro en `KSSTATE_STOP` |
 //!
-//! # Ce que les quatre méthodes comptent, et pourquoi elles refusent quand même
+//! Toute l'arithmétique est dans `conduit_kmd_core::packetnum` — la conversion entre le
+//! `ULONG` du contrat et notre compteur 64 bits, la comparaison **modulo 2³²**, et les deux
+//! refus documentés — parce que c'est la partie qu'on peut éprouver sans machine virtuelle,
+//! au proptest et au fuzzer. Ce qui reste ici est l'accès à l'état, sous le verrou du flux.
+//!
+//! Le lot 2 exposait ces interfaces **sans les servir**, derrière `PacketMode = 1`, pour
+//! mesurer ce que le moteur audio en faisait. La mesure a répondu : un client WASAPI exclusif
+//! événementiel appelle `GetReadPacket` quatre cents fois par seconde dès qu'elles existent,
+//! et le refus casse son transport. C'est cet état — exposer sans servir — que le lot 3 fait
+//! cesser. `PacketMode` reste à 0 par défaut le temps de la campagne Driver Verifier ; il ne
+//! commande plus une expérience, seulement l'exposition.
+//!
+//! # Ce que les quatre méthodes comptent
 //!
 //! Chaque appel note, dans le [`Cable`] — pas dans le flux, qui peut se fermer aussitôt
 //! après — : la méthode et le sens, l'IRQL courant (`KeGetCurrentIrql`, pour **vérifier** le
@@ -28,14 +36,24 @@
 //! premier et le dernier sont retenus. Les `QueryInterface` sur les deux IID de paquets sont
 //! comptés de la même façon, **exposés ou non** (`portcls::packet`, points d'observation).
 //!
-//! Le statut rendu est celui des défauts du trait, à dessein : `STATUS_NOT_SUPPORTED`. En
-//! changer ferait mesurer autre chose que ce que le pilote livré ferait s'il exposait par
-//! accident, et c'est bien ce risque-là qu'on quantifie.
+//! Les compteurs sont ceux du lot 2, inchangés : c'est ce qu'ils comptent qui a changé — des
+//! appels servis, non plus des refus —, et `conduit-looptest` le dit désormais autrement.
+//!
+//! # IRQL, verrous et pagination
+//!
+//! Les quatre méthodes arrivent à `PASSIVE_LEVEL` et prennent le verrou du flux (les trois
+//! premières) ou celui du câble puis du flux (`SetWritePacket`), c'est-à-dire les **mêmes**
+//! verrous que la DPC du minuteur prend à `DISPATCH_LEVEL`. C'est sûr parce que
+//! [`crate::sync::SpinLock::lock`] appelle `KeAcquireSpinLockRaiseToDpc` : le fil qui tient le
+//! verrou est lui-même à `DISPATCH_LEVEL`, sa propre DPC ne peut donc pas le préempter sur ce
+//! processeur. Un verrou qui n'élèverait pas l'IRQL ferait ici un interblocage franc — c'est
+//! le point qu'il fallait vérifier avant d'écrire une ligne de ce lot.
 //!
 //! **Rien de paginé dans ces quatre méthodes** : elles sont à `PASSIVE_LEVEL` par contrat mais
 //! sur le chemin du flux, et SYSVAD les marque explicitement non paginées. Ce workspace n'a
-//! aucune section paginée — c'est à ne pas casser, pas à faire —, et ce qu'elles exécutent se
-//! réduit à des atomiques et un `KeQueryPerformanceCounter`.
+//! aucune section paginée — aucun `#[link_section]`, aucun segment `PAGE` : tout le binaire est
+//! résident, c'est à ne pas casser, pas à faire —, et ce qu'elles exécutent se réduit à des
+//! atomiques, à un `KeQueryPerformanceCounter` et à de l'arithmétique entière `no_std`.
 //!
 //! Un seul type pour les deux sens : rendu et capture ne diffèrent que par leur
 //! [`Direction`] — l'emplacement du câble qu'ils occupent, et le rôle que la boucle
@@ -90,6 +108,7 @@
 use core::ptr::{self, NonNull};
 
 use conduit_kmd_core::config::PacketExposure;
+use conduit_kmd_core::packetnum;
 use conduit_kmd_core::{
     Notifier, SupportedFormat, buffer_bytes_for_notifications_with_floor, buffer_bytes_with_floor,
 };
@@ -99,11 +118,12 @@ use portcls::conduit_com::{
 };
 use portcls::{
     AudioBuffer, MiniportWaveRTInputStream, MiniportWaveRTOutputStream, MiniportWaveRTStream,
-    MiniportWaveRTStreamNotification, PortWaveRTStream, ReadPacket, STATUS_NOT_SUPPORTED,
+    MiniportWaveRTStreamNotification, PortWaveRTStream, ReadPacket, STATUS_DEVICE_NOT_READY,
     physical_address,
 };
 use portcls_sys::{
-    _MEMORY_CACHING_TYPE, KSAUDIO_PRESENTATION_POSITION, KSRTAUDIO_HWLATENCY, KSSTATE, PKEVENT,
+    _MEMORY_CACHING_TYPE, KSAUDIO_PRESENTATION_POSITION, KSRTAUDIO_HWLATENCY, KSSTATE,
+    KSSTREAM_HEADER_OPTIONSF_DATADISCONTINUITY, KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM, PKEVENT,
     PMDL,
 };
 use wdk_sys::ntddk::KeGetCurrentIrql;
@@ -179,30 +199,26 @@ impl WaveStream {
         })
     }
 
-    /// Note un appel d'une méthode du mode paquets, puis rend le statut qui le **refuse**.
+    /// Note l'entrée dans une méthode du mode paquets et rend l'IRQL relevé.
     ///
-    /// Un seul point de passage pour les quatre méthodes : le relevé d'IRQL, l'horodatage et
-    /// le statut rendu y sont écrits une fois, et aucune des quatre ne peut diverger des
-    /// autres par distraction. C'est la même raison qui a fait envelopper
-    /// [`Self::allocate_inner`] — un compteur qui rate un cas est pire qu'aucun compteur.
+    /// Un seul point de passage pour les quatre méthodes : le relevé d'IRQL et l'horodatage y
+    /// sont écrits une fois, et aucune des quatre ne peut diverger des autres par
+    /// distraction. C'est la même raison qui a fait envelopper [`Self::allocate_inner`] — un
+    /// compteur qui rate un cas est pire qu'aucun compteur.
     ///
     /// L'IRQL est relevé **ici**, au plus près de l'appel : le mesurer plus loin donnerait
     /// l'IRQL de notre propre code, qui ne l'a pas changé mais qui n'est plus la réponse à la
-    /// question posée.
+    /// question posée. Il est rendu à l'appelant pour que sa trace le porte sans le relire —
+    /// une seconde lecture donnerait une seconde valeur, et ce n'est pas celle-là qu'on
+    /// mesure.
     ///
     /// IRQL : `PASSIVE_LEVEL` par contrat (`portcls.h`), et rien ici n'exige mieux ; code non
     /// paginé, sans allocation ni verrou.
-    fn refuser_paquet(&self, methode: PacketMethod) -> NtStatus {
+    fn noter_paquet(&self, methode: PacketMethod) -> u32 {
         // SAFETY: `KeGetCurrentIrql` n'a aucune précondition et n'a pas de paramètre.
         let irql = u32::from(unsafe { KeGetCurrentIrql() });
         self.cable.note_packet_call(self.direction, methode, irql);
-        kmd_log!(
-            "{}{}::{methode:?} REFUSÉ ({STATUS_NOT_SUPPORTED:#010x}, IRQL {irql}) : le mode \
-             paquets est exposé et non servi (PacketMode = 1)",
-            self.name(),
-            self.n
-        );
-        STATUS_NOT_SUPPORTED
+        irql
     }
 
     /// Nom du flux pour la journalisation (`RenderStream` ou `CaptureStream`).
@@ -396,6 +412,9 @@ impl WaveStream {
             // Ce que le moteur audio a **demandé**, pour que la propriété de transport le
             // rende tel quel : 0 quand il n'a rien demandé.
             state.notification_count = notification_count.unwrap_or(0);
+            // Nouveau tampon, nouvelle géométrie de paquets : un numéro hérité de
+            // l'allocation précédente ne désignerait plus les mêmes trames.
+            state.reset_packets();
         }
         // Hors du verrou du flux : `refresh_timer` prend celui du câble, qui le précède.
         self.cable.refresh_timer();
@@ -461,6 +480,9 @@ impl WaveStream {
             let taken = state.buffer.take();
             state.notifier = None;
             state.notification_count = 0;
+            // Sans tampon il n'y a plus de paquet : la géométrie disparaît avec la MDL, et
+            // les quatre méthodes refuseront jusqu'à la prochaine allocation.
+            state.reset_packets();
             (taken, state.state)
         };
         // Hors du verrou du flux (ordre câble puis flux).
@@ -520,6 +542,7 @@ impl Drop for WaveStream {
             let mut state = self.shared.lock();
             state.notifier = None;
             state.notification_count = 0;
+            state.reset_packets();
             state.buffer.take()
         };
         if let Some(buffer) = leftover {
@@ -567,6 +590,11 @@ impl MiniportWaveRTStream for WaveStream {
                     if let Some(notifier) = shared.notifier.as_mut() {
                         notifier.reset();
                     }
+                    // Le mode paquets repart de zéro avec la position : les quatre méthodes
+                    // documentent toutes cette remise à zéro, et le client recommence sa
+                    // numérotation. Un dernier numéro survivant à l'arrêt ferait refuser
+                    // en `STATUS_DATA_LATE_ERROR` le premier paquet du flux suivant.
+                    shared.reset_packets();
                 }
                 // PAUSE ou ACQUIRE : depuis RUN, accumuler ; sinon sans effet.
                 _ => shared.position.pause(&clock, now),
@@ -683,24 +711,68 @@ impl MiniportWaveRTStreamNotification for WaveStream {
 }
 
 // ---------------------------------------------------------------------------------
-// Mode paquets : les quatre méthodes **refusent** et **comptent** (lot 2).
+// Mode paquets : les quatre méthodes **servent** et **comptent** (lot 3).
 //
-// Elles rendent exactement ce que rendaient les défauts du trait — `STATUS_NOT_SUPPORTED` —
-// et n'existent que pour compter, ce qu'un défaut ne sait pas faire. Elles ne sont
-// atteignables que sous `PacketMode = 1`, qui expose les interfaces sans les servir : c'est
-// l'expérience du lot, décrite sur `conduit_kmd_core::params::DEFAULT_PACKET_MODE`, et elle
-// ne se livre jamais. Les servir, c'est le jour où on saura, par la mesure, que le moteur
-// les emprunte — c'est précisément ce que ces compteurs vont dire.
+// Elles ne sont atteignables que sous `PacketMode = 1`, qui expose les interfaces du sens du
+// flux ; à 0, PortCls n'obtient jamais l'adresse des têtes satellites et rien de ce qui suit
+// ne tourne. Ce que le paramètre commande n'est plus une expérience — exposer sans servir —
+// mais l'exposition seule, en attendant la campagne Driver Verifier.
 //
-// Aucune n'écrit dans l'état du flux, aucune ne prend de verrou, aucune n'alloue : ce qui
-// s'exécute sous PortCls se réduit à des atomiques du câble et à un
-// `KeQueryPerformanceCounter`. Rien de paginé (voir l'en-tête de module).
+// Elles prennent le verrou du flux (les trois premières) ou celui du câble puis du flux
+// (`SetWritePacket`), n'allouent rien et n'attendent rien. Rien de paginé (voir l'en-tête de
+// module). L'arithmétique est dans `conduit_kmd_core::packetnum`, éprouvée sans noyau.
 // ---------------------------------------------------------------------------------
 
 impl MiniportWaveRTInputStream for WaveStream {
-    // IRQL: PASSIVE_LEVEL (contrat), code non paginé.
+    /// Le dernier paquet **complet** que la boucle locale a écrit dans le tampon de capture.
+    ///
+    /// C'est un *pull* : rien n'est déclenché ici, rien n'attend, et ce qui réveille le
+    /// client reste l'événement de `RegisterNotificationEvent`. Le numéro est monotone et
+    /// jamais rendu deux fois ; son adresse dans le tampon n'a pas de paramètre de sortie
+    /// dans la vtable générée — le moteur audio la calcule lui-même par
+    /// `(numéro % NotificationCount) × taille_de_paquet`, la formule que
+    /// `PacketGeometry::ring_offset_frames` écrit de notre côté.
+    ///
+    /// Un trou — des paquets complets écrasés avant que le moteur ne vienne les chercher —
+    /// se dit par `KSSTREAM_HEADER_OPTIONSF_DATADISCONTINUITY` : c'est la seule information
+    /// de trou que la signature laisse passer, et la taire serait mentir.
+    ///
+    /// `more_data` est **toujours faux** : nous rendons le paquet le plus récent, il n'y a
+    /// donc rien après lui. Le champ existe pour un pilote qui rendrait le plus ancien non
+    /// lu ; le nôtre suit la documentation, qui autorise à supposer que l'OS a fini de lire
+    /// tous les paquets précédents.
+    ///
+    /// IRQL: PASSIVE_LEVEL (contrat), code non paginé.
     fn read_packet(&self) -> Result<ReadPacket, NtStatus> {
-        Err(self.refuser_paquet(PacketMethod::GetReadPacket))
+        let _ = self.noter_paquet(PacketMethod::GetReadPacket);
+        let now = clock::now();
+        let paquet = {
+            let mut state = self.shared.lock();
+            state.take_read_packet(now)
+        };
+        let Some((numero, trou)) = paquet else {
+            // Pas d'erreur : le seul refus que `GetReadPacket` documente, et il vaut mieux
+            // que la seule chose qu'elle interdise — un `Ok` sur un paquet déjà rendu.
+            return Err(STATUS_DEVICE_NOT_READY);
+        };
+        if trou {
+            kmd_log!(
+                "{}{}::GetReadPacket paquet {numero} : discontinuité (des paquets complets \
+                 ont été écrasés avant d'être lus)",
+                self.name(),
+                self.n
+            );
+        }
+        Ok(ReadPacket {
+            packet_number: packetnum::truncate(numero),
+            flags: if trou {
+                KSSTREAM_HEADER_OPTIONSF_DATADISCONTINUITY
+            } else {
+                0
+            },
+            performance_counter: now,
+            more_data: false,
+        })
     }
 
     // IRQL: <= DISPATCH_LEVEL (celui de `QueryInterface`) — deux `fetch_add`.
@@ -710,23 +782,100 @@ impl MiniportWaveRTInputStream for WaveStream {
 }
 
 impl MiniportWaveRTOutputStream for WaveStream {
-    // IRQL: PASSIVE_LEVEL (contrat), code non paginé.
+    /// Le moteur audio vient d'écrire le paquet `packet_number` dans le tampon de rendu.
+    ///
+    /// Un **hint**, pas un déclencheur exclusif : il n'exempte pas le pilote du minuteur, et
+    /// celui-ci n'a pas changé d'une ligne. Ce qu'il apporte est une frontière **certaine**
+    /// là où la boucle supposait — la copie ne lira pas au-delà de ce paquet
+    /// (`StreamView::committed`) — et un second déclencheur du même corps de boucle,
+    /// [`Cable::on_write_packet`], qui prend les mêmes verrous dans le même ordre.
+    ///
+    /// `KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM` (`ks.h`, `0x200`) est le **seul** drapeau
+    /// défini : tout autre bit vaut `STATUS_INVALID_PARAMETER`, comme le contrat l'exige. Le
+    /// refus des drapeaux se fait ici, hors de tout verrou — il ne dépend d'aucun état.
+    ///
+    /// IRQL: PASSIVE_LEVEL (contrat), code non paginé.
     fn set_write_packet(&self, packet_number: u32, flags: u32, eos_packet_length: u32) -> NtStatus {
-        // Les trois arguments ne sont pas lus : ce serait prétendre traiter le paquet. Le
-        // refus est le même quel que soit ce que le moteur audio annonce, et c'est ce refus
-        // qu'on mesure.
-        let _ = (packet_number, flags, eos_packet_length);
-        self.refuser_paquet(PacketMethod::SetWritePacket)
+        let irql = self.noter_paquet(PacketMethod::SetWritePacket);
+        if flags & !KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM != 0 {
+            kmd_log!(
+                "{}{}::SetWritePacket({packet_number}) : drapeaux {flags:#010x} inconnus \
+                 (seul ENDOFSTREAM est défini)",
+                self.name(),
+                self.n
+            );
+            return STATUS_INVALID_PARAMETER;
+        }
+        // Le champ n'a de sens qu'avec le drapeau ; sans lui, le contrat dit de l'ignorer.
+        let eos_bytes =
+            (flags & KSSTREAM_HEADER_OPTIONSF_ENDOFSTREAM != 0).then_some(eos_packet_length);
+        let status =
+            self.cable
+                .on_write_packet(self.direction, packet_number, eos_bytes, clock::now());
+        if status != STATUS_SUCCESS {
+            kmd_log!(
+                "{}{}::SetWritePacket({packet_number}) : {status:#010x} (IRQL {irql}) — le \
+                 client se recalera par GetPacketCount",
+                self.name(),
+                self.n
+            );
+        }
+        status
     }
 
-    // IRQL: PASSIVE_LEVEL (contrat), code non paginé.
+    /// La position de présentation : des **trames absolues** depuis le début du flux et la
+    /// valeur **brute** du compteur de performance.
+    ///
+    /// Ni octets ni unités de 100 ns — c'est l'erreur que `KSAUDIO_PRESENTATION_POSITION`
+    /// invite à faire — et c'est exactement ce que `crate::clock` et
+    /// `conduit_kmd_core::position` calculent déjà pour `GetPosition`, sans arrondi
+    /// supplémentaire : les deux méthodes lisent la même position, l'une en octets
+    /// cycliques, l'autre en trames absolues.
+    ///
+    /// L'écart avec [`packet_count`](Self::packet_count) est la latence matérielle : nulle
+    /// par construction pour un pont logiciel, ce qui fait coïncider les deux ici.
+    ///
+    /// IRQL: PASSIVE_LEVEL (contrat), code non paginé.
     fn presentation_position(&self) -> Result<KSAUDIO_PRESENTATION_POSITION, NtStatus> {
-        Err(self.refuser_paquet(PacketMethod::PresentationPosition))
+        let _ = self.noter_paquet(PacketMethod::PresentationPosition);
+        let now = clock::now();
+        let frames = {
+            let state = self.shared.lock();
+            state.frames_at(now)
+        };
+        Ok(KSAUDIO_PRESENTATION_POSITION {
+            u64PositionInBlocks: frames,
+            u64QPCPosition: now,
+        })
     }
 
-    // IRQL: PASSIVE_LEVEL (contrat), code non paginé.
+    /// Le nombre de paquets **entièrement** transférés, en base 1.
+    ///
+    /// « If the packet count is 5, then 5 packets have completely transferred. That is,
+    /// packets 0-4 have completely transferred. » C'est le mécanisme de resynchronisation
+    /// du client, et surtout ce qu'il interroge après un `STATUS_DATA_LATE_ERROR` ou un
+    /// `STATUS_DATA_OVERRUN` : un événement de notification ne dit pas quel paquet il
+    /// concerne, ce compte si.
+    ///
+    /// `STATUS_DEVICE_NOT_READY` sans tampon à notifications : il n'existe alors aucun
+    /// paquet à compter, et rendre zéro laisserait croire à un flux qui vient de démarrer.
+    ///
+    /// Le compte ne recule jamais, même quand la position se fige (`KSSTATE_PAUSE`) ; il
+    /// repart de zéro au `KSSTATE_STOP`, comme le contrat l'exige. Tronqué à 32 bits comme
+    /// le `ULONG` du contrat : c'est le même domaine que les numéros de paquet, et
+    /// `packetnum` les compare modulo.
+    ///
+    /// IRQL: PASSIVE_LEVEL (contrat), code non paginé.
     fn packet_count(&self) -> Result<u32, NtStatus> {
-        Err(self.refuser_paquet(PacketMethod::PacketCount))
+        let _ = self.noter_paquet(PacketMethod::PacketCount);
+        let now = clock::now();
+        let compte = {
+            let mut state = self.shared.lock();
+            state.packets_transferred(now)
+        };
+        compte
+            .map(packetnum::truncate)
+            .ok_or(STATUS_DEVICE_NOT_READY)
     }
 
     // IRQL: <= DISPATCH_LEVEL (celui de `QueryInterface`) — deux `fetch_add`.
