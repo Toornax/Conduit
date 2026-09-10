@@ -108,6 +108,15 @@ int main(void)
     TAILLE(KSEVENTDATA);
     TAILLE(KSEVENT_ENTRY);
 
+    /* M1b-22, mode de traitement du signal. Le pilote BÂTIT ces deux structures-ci dans
+     * sa section de données (descriptors.rs) et en donne l'adresse à KS par le tableau
+     * DataRanges d'une broche de flux : leurs tailles sont donc du même ordre de
+     * criticité que celles des descripteurs de filtre. KSATTRIBUTE::Size, en particulier,
+     * est le champ par lequel KS avance dans une liste d'attributs. */
+    TAILLE(KSATTRIBUTE);
+    TAILLE(KSATTRIBUTE_LIST);
+    TAILLE(KSATTRIBUTE_AUDIOSIGNALPROCESSING_MODE);
+
     /* Vtables COM plates : slots × 8. */
     TAILLE(IUnknownVtbl);
     TAILLE(IMiniportVtbl);
@@ -171,6 +180,12 @@ int main(void)
     DECALAGE(KSJACK_DESCRIPTION, IsConnected);
     DECALAGE(KSP_PIN, Property);
     DECALAGE(KSP_PIN, PinId);
+    /* M1b-22 : la liste d'attributs que porte chaque plage d'une broche de flux. */
+    DECALAGE(KSATTRIBUTE, Size);
+    DECALAGE(KSATTRIBUTE, Flags);
+    DECALAGE(KSATTRIBUTE, Attribute);
+    DECALAGE(KSATTRIBUTE_LIST, Count);
+    DECALAGE(KSATTRIBUTE_LIST, Attributes);
     DECALAGE(PCNODE_DESCRIPTOR, Flags);
     DECALAGE(PCNODE_DESCRIPTOR, AutomationTable);
     DECALAGE(PCNODE_DESCRIPTOR, Type);
@@ -234,5 +249,13 @@ int main(void)
     GUID_KS(KSEVENTSETID_PinCapsChange);
     GUID_KS(KSPROPSETID_Audio);
     GUID_KS(KSPROPTYPESETID_General);
+    /* M1b-22 : le jeu de propriétés des modes, l'identifiant d'attribut que portent les
+     * plages des broches de flux, et le seul mode que Conduit sert. RAW est mesuré à
+     * côté de DEFAULT parce que les deux se ressemblent à la relecture et que déclarer
+     * l'un pour l'autre serait parfaitement muet. */
+    GUID_KS(KSPROPSETID_AudioSignalProcessing);
+    GUID_KS(KSATTRIBUTEID_AUDIOSIGNALPROCESSING_MODE);
+    GUID_KS(AUDIO_SIGNALPROCESSINGMODE_DEFAULT);
+    GUID_KS(AUDIO_SIGNALPROCESSINGMODE_RAW);
     return 0;
 }

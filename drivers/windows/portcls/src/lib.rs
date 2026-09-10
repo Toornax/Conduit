@@ -21,6 +21,7 @@
 //! | [`property`] | trait [`PropertyHandler`] ↔ `PCPROPERTY_ITEM`/`PCPROPERTY_REQUEST` : les propriétés KS d'un miniport |
 //! | [`audio`] | sémantique des nœuds volume/sourdine au-dessus de [`property`] : trait [`AudioNodes`], gestionnaires [`Volume`] et [`Mute`], échelle en 1/65536 dB |
 //! | [`jack`] | `KSPROPERTY_JACK_DESCRIPTION` au-dessus de [`property`] : trait [`JackInfo`], gestionnaire [`JackDescription`] — une propriété du **filtre** qui décrit une **broche** |
+//! | [`modes`] | `KSPROPERTY_AUDIOSIGNALPROCESSING_MODES` au-dessus de [`property`] : trait [`SignalModes`], gestionnaire [`SignalProcessingModes`] — les modes de traitement du signal des broches de **flux** wave, `DEFAULT` et lui seul (M1b-22) |
 //! | [`config`] | jeu de propriétés **privé** `KSPROPSETID_Conduit` au-dessus de [`property`] : trait [`CableConfig`], gestionnaires [`ConduitCableState`], [`ConduitVersion`] et [`ConduitCounters`] — la surface de contrôle du démon (M1b-04) et le relevé de la boucle locale sans débogueur (M1b-21) ; toute la validation vit dans `conduit_kmd_core::config`, pour être fuzzable |
 //! | [`event`] | événements KS : trait [`EventHandler`] ↔ `PCEVENT_ITEM`/`PCEVENT_REQUEST`, enveloppe [`PortEvents`] (`IPortEvents`) et `KSEVENT_PINCAPS_JACKINFOCHANGE`, la notification sans laquelle Windows ne relit jamais le jack ; [`JackTargets`], les deux filtres de topologie d'un câble et le signalement des deux |
 //! | [`adapter`] | côté adaptateur : `PcNewPort`, `IPort::Init`, `PcRegisterSubdevice`, `PcRegisterPhysicalConnection` (feature `kernel`), noms des sous-périphériques et GUID de nom de broche partagés avec l'INF |
@@ -92,6 +93,7 @@ pub mod config;
 pub mod event;
 pub mod jack;
 pub mod miniport;
+pub mod modes;
 pub mod power;
 pub mod property;
 pub mod received;
@@ -131,6 +133,10 @@ pub use event::{
 pub use jack::{
     JACK_ACCESS_FLAGS, JACK_COLOR, JACK_CONNECTION_TYPE, JACK_GEN_LOCATION, JACK_GEO_LOCATION,
     JACK_PORT_CONNECTION, JackDescription, JackInfo, JackTrace, Pin, jack_description_item,
+};
+pub use modes::{
+    MODES_ACCESS_FLAGS, ModePin, ModesTrace, SignalModes, SignalProcessingModes,
+    signal_processing_modes_item,
 };
 pub use power::{
     AdapterPowerManagement, PowerObject, PowerVtbl, is_powered, new_power_object,

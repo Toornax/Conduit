@@ -110,6 +110,9 @@ tailles! {
     KSP_PIN => KSP_PIN,
     KSEVENTDATA => KSEVENTDATA,
     KSEVENT_ENTRY => KSEVENT_ENTRY,
+    KSATTRIBUTE => KSATTRIBUTE,
+    KSATTRIBUTE_LIST => KSATTRIBUTE_LIST,
+    KSATTRIBUTE_AUDIOSIGNALPROCESSING_MODE => KSATTRIBUTE_AUDIOSIGNALPROCESSING_MODE,
     IUnknownVtbl => IUnknownVtbl,
     IMiniportVtbl => IMiniportVtbl,
     IMiniportWaveRTVtbl => IMiniportWaveRTVtbl,
@@ -173,6 +176,15 @@ decalages! {
         Property,
         PinId,
     },
+    KSATTRIBUTE {
+        Size,
+        Flags,
+        Attribute,
+    },
+    KSATTRIBUTE_LIST {
+        Count,
+        Attributes,
+    },
     PCNODE_DESCRIPTOR {
         Flags,
         AutomationTable,
@@ -235,6 +247,10 @@ guids! {
     KSEVENTSETID_PinCapsChange,
     KSPROPSETID_Audio,
     KSPROPTYPESETID_General,
+    KSPROPSETID_AudioSignalProcessing,
+    KSATTRIBUTEID_AUDIOSIGNALPROCESSING_MODE,
+    AUDIO_SIGNALPROCESSINGMODE_DEFAULT,
+    AUDIO_SIGNALPROCESSINGMODE_RAW,
 }
 
 /// Même format que le probe : `XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX` en majuscules.

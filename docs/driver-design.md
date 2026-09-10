@@ -535,6 +535,73 @@ Sources : *Audio Endpoint Builder Algorithm*, *Friendly Names for Audio Endpoint
 *PKEY_DeviceInterface_FriendlyName* (Core Audio), *General Guidelines for INF Files*, plus
 `%SystemRoot%\INF\ks.inf` et le registre du poste pour les noms de catégorie constatés.
 
+### 4.3 Modes de traitement du signal (M1b-22)
+
+**Ce qu'on déclare.** Les broches de **flux** des filtres wave — celles que le moteur audio
+ouvre, jamais les ponts ni les broches des filtres de topologie — annoncent
+`AUDIO_SIGNALPROCESSINGMODE_DEFAULT`, et lui seul. La documentation (*Audio Signal
+Processing Modes*, *KSPROPERTY_AUDIOSIGNALPROCESSING_MODES*) demande **deux** déclarations,
+qu'il ne faut pas confondre :
+
+| Où | Quoi | Chez nous |
+|---|---|---|
+| plages de la broche | drapeau `KSDATARANGE_ATTRIBUTES` sur la `KSDATARANGE`, et l'entrée **suivante** du tableau `DataRanges` est une `KSATTRIBUTE_LIST` d'un seul `KSATTRIBUTE` dont l'`Attribute` vaut `KSATTRIBUTEID_AUDIOSIGNALPROCESSING_MODE` | `conduit-kmd/src/descriptors.rs` (`audio_range`, `MODE_ATTRIBUTE_ENTRY`) |
+| filtre | propriété `KSPROPERTY_AUDIOSIGNALPROCESSING_MODES` (jeu `KSPROPSETID_AudioSignalProcessing`), cible « pin factory via filter instance », descripteur `KSP_PIN`, réponse `KSMULTIPLE_ITEM` + N GUID | `portcls/src/modes.rs` (`SignalModes`, `signal_processing_modes_item`) |
+
+L'attribut posé sur les plages **ne nomme aucun mode** : il dit seulement « cette broche
+sait qu'un mode existe » — c'est exactement ce que fait SYSVAD, et la documentation est
+formelle (« *This list has a single element in it, which is a KSATTRIBUTE. The Attribute
+member […] is set to KSATTRIBUTEID_AUDIOSIGNALPROCESSING_MODE.* »). C'est la **propriété**
+qui énumère : `Count = 1`, `DEFAULT`, sur la broche de flux ; `Count = 0` sur la broche de
+pont, comme le prescrit la même page pour les broches de bouclage et de pont. Une broche
+inexistante reste `STATUS_NOT_SUPPORTED`/`STATUS_INVALID_PARAMETER`.
+
+Chaque plage porte sa propre entrée d'attributs : le tableau `DataRanges` d'une broche
+système alterne donc plage, liste, plage, liste, plage, liste — six entrées comptées dans
+`DataRangesCount`, pour trois profondeurs.
+
+**Pourquoi.** C'est la dernière variable, hors mode paquets, qui distinguait Conduit de
+SYSVAD. Le pilote déclare déjà `DEVPKEY_KsAudio_PacketSize_Constraints2` avec une entrée de
+mode `DEFAULT`, le moteur la lit (`IAudioClient3` annonce min 192 trames / 4 ms) et sert les
+périodes courtes en partagé — mais il alloue **toujours** le tampon WaveRT par scrutation
+(`AllocateAudioBuffer`, jamais `AllocateBufferWithNotification`). L'hypothèse testée est que
+le moteur ne considère « mode aware » qu'un pilote qui déclare ses modes sur les broches
+elles-mêmes, et qu'il réserve à ceux-là le chemin par notifications.
+
+**L'expérience.** Rien de nouveau dans le relevé KS : la vérification se fait de
+l'extérieur, en machine, après installation.
+
+1. Le moteur passe-t-il à `AllocateBufferWithNotification` pour un flux **partagé** ? C'est
+   le résultat cherché.
+2. `IAudioClient3::GetSharedModeEnginePeriod` annonce-t-il autre chose qu'avant ?
+
+Si les deux répondent « non », la déclaration reste néanmoins juste et conforme, et
+l'hypothèse « mode aware » est écartée : il ne restera plus, entre Conduit et SYSVAD, que
+le mode paquets lui-même.
+
+**Ce qui pourrait mal tourner, et ce qui le dirait.** Deux pannes seraient parfaitement
+muettes — l'endpoint apparaîtrait, le son passerait, et rien ne signalerait que le mode
+n'est pas déclaré :
+
+- un tableau `DataRanges` mal bâti (entrée d'attributs absente, mal placée, drapeau
+  oublié) : `descriptors::check_cable_pins` le traverse au démarrage, **par les pointeurs
+  que PortCls suivra**, et une divergence part au journal d'événements
+  (`PinMismatch::SansAttribut`) ;
+- une table d'automatisation de filtre wave qui perdrait sa propriété : assertions `const`
+  de fin de `descriptors.rs`, plus `portcls/tests/modes.rs` (faux PortCls).
+
+Enfin, notre gestionnaire d'intersection maison (`conduit-kmd/src/intersect.rs`) reçoit les
+plages de ces broches. PortCls ne lui présente jamais l'entrée d'attributs — SYSVAD, qui a
+la même construction *et* un gestionnaire maison, le démontre —, mais « ne devrait jamais »
+n'est pas « ne peut pas » : l'entrée est logée dans une structure rembourrée à la taille
+d'une `KSDATARANGE_AUDIO` (`descriptors::AttributeListEntry`), pour qu'une lecture d'en-tête
+faite par erreur reste définie et se solde par un `STATUS_NO_MATCH` plutôt que par une
+lecture hors objet.
+
+Sources : *Audio Signal Processing Modes*, *KSPROPERTY_AUDIOSIGNALPROCESSING_MODES*,
+*KSDATARANGE* (membre `Flags`), *KSATTRIBUTE* / *KSATTRIBUTE_LIST* (WDK), et
+`speakerwavtable.h` / `minwavert.cpp` de SYSVAD.
+
 ## 5. Horloge, positions, boucle locale
 
 ### 5.1 Horloge

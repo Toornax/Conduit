@@ -16,8 +16,11 @@
 //! SYSVAD). Au-delà, les deux formes de filtre diffèrent :
 //!
 //! - **forme wave** ([`wave_filter`]), pour `WaveRender` et `WaveCapture` : aucun nœud, une
-//!   connexion directe broche 0 → broche 1 (`PCFILTER_NODE`, [`DIRECT_CONNECTION`]), table
-//!   d'automatisation vide (PortCls gère `KSPROPSETID_Pin` et `KSPROPSETID_Topology`) ;
+//!   connexion directe broche 0 → broche 1 (`PCFILTER_NODE`, [`DIRECT_CONNECTION`]), et une
+//!   table d'automatisation qui ne porte, depuis M1b-22, qu'une seule propriété —
+//!   `KSPROPERTY_AUDIOSIGNALPROCESSING_MODES` ([`WAVE_RENDER_FILTER_ITEMS`],
+//!   [`WAVE_CAPTURE_FILTER_ITEMS`]) ; tout le reste (`KSPROPSETID_Pin`,
+//!   `KSPROPSETID_Topology`) demeure servi par PortCls ;
 //! - **forme topologie** ([`topo_filter`]), pour `TopoRender` et `TopoCapture` : deux nœuds
 //!   — index [`NODE_VOLUME`] `KSNODETYPE_VOLUME`, index [`NODE_MUTE`] `KSNODETYPE_MUTE` —
 //!   chacun avec sa table d'automatisation d'une propriété, et trois connexions
@@ -73,6 +76,23 @@
 //!   eux aussi des tables — [`WAVE_RENDER_FILTERS`], [`WAVE_CAPTURE_FILTERS`] — mais
 //!   indexées par variante et non par câble : deux câbles réglés pareil partagent la même
 //!   rangée, et c'est ce qui garde la table à 24 entrées au lieu de 16.
+//!
+//! # Le mode de traitement du signal (M1b-22, driver-design.md §4.3)
+//!
+//! Les broches de **flux** wave — celles-là seules, jamais les ponts ni les topologies —
+//! déclarent le mode `AUDIO_SIGNALPROCESSINGMODE_DEFAULT`, et lui seul, en **deux**
+//! endroits que la documentation Microsoft sépare nettement :
+//!
+//! - chacune de leurs plages porte le drapeau `KSDATARANGE_ATTRIBUTES` ([`audio_range`]) et
+//!   est **suivie**, dans le tableau `DataRanges`, d'une entrée qui n'est pas une plage
+//!   mais une `KSATTRIBUTE_LIST` d'un seul élément ([`MODE_ATTRIBUTE_ENTRY`]). Cet attribut
+//!   ne nomme aucun mode : il dit « cette broche sait qu'un mode existe ». D'où
+//!   [`ENTRIES_PER_SYSTEM_PIN`] = 2 × [`RANGES_PER_SYSTEM_PIN`] ;
+//! - la propriété `KSPROPERTY_AUDIOSIGNALPROCESSING_MODES`, sur la table d'automatisation
+//!   du **filtre** wave, énumère les modes servis (`portcls::modes`).
+//!
+//! C'est la dernière condition, hors mode paquets, qui distinguait Conduit de SYSVAD ;
+//! l'expérience qu'elle sert est décrite dans driver-design.md §4.3.
 //!
 //! Un câble ne change **jamais** de variante en cours de route : `Shared<T>` est `Sync`
 //! *parce que* son contenu ne change jamais, et PortCls conserve le pointeur rendu par
@@ -140,22 +160,26 @@ use conduit_kmd_core::{
 };
 use portcls::{
     CABLE_COUNT, CABLE_STATE_ACCESS_FLAGS, COUNTERS_ACCESS_FLAGS, JACK_ACCESS_FLAGS,
-    JACK_EVENT_FLAGS, JACK_INFO_CHANGE_ID, PIN_NAME_GUIDS, VERSION_ACCESS_FLAGS, cable_state_item,
-    counters_item, jack_description_item, jack_info_change_item, mute_item, version_item,
-    volume_item, with_events,
+    JACK_EVENT_FLAGS, JACK_INFO_CHANGE_ID, MODES_ACCESS_FLAGS, PIN_NAME_GUIDS,
+    VERSION_ACCESS_FLAGS, cable_state_item, counters_item, jack_description_item,
+    jack_info_change_item, mute_item, signal_processing_modes_item, version_item, volume_item,
+    with_events,
 };
 use portcls_sys::{
-    GUID, IMiniportTopologyVtbl, KSCATEGORY_AUDIO, KSDATAFORMAT, KSDATAFORMAT__bindgen_ty_1,
-    KSDATAFORMAT_SPECIFIER_NONE, KSDATAFORMAT_SPECIFIER_WAVEFORMATEX, KSDATAFORMAT_SUBTYPE_ANALOG,
-    KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, KSDATAFORMAT_SUBTYPE_PCM, KSDATAFORMAT_TYPE_AUDIO,
-    KSDATARANGE, KSDATARANGE_AUDIO, KSNODEPIN_STANDARD_IN, KSNODEPIN_STANDARD_OUT,
-    KSNODETYPE_LINE_CONNECTOR, KSNODETYPE_MUTE, KSNODETYPE_SPEAKER, KSNODETYPE_VOLUME,
-    KSPIN_COMMUNICATION, KSPIN_DATAFLOW, KSPIN_DESCRIPTOR, KSPIN_DESCRIPTOR__bindgen_ty_1,
-    PCAUTOMATION_TABLE, PCCONNECTION_DESCRIPTOR, PCEVENT_ITEM, PCFILTER_DESCRIPTOR, PCFILTER_NODE,
-    PCMETHOD_ITEM, PCNODE_DESCRIPTOR, PCPIN_DESCRIPTOR, PCPROPERTY_ITEM, PKSDATARANGE, ULONG,
+    GUID, IMiniportTopologyVtbl, IMiniportWaveRTVtbl, KSATTRIBUTE, KSATTRIBUTE_LIST,
+    KSATTRIBUTEID_AUDIOSIGNALPROCESSING_MODE, KSCATEGORY_AUDIO, KSDATAFORMAT,
+    KSDATAFORMAT__bindgen_ty_1, KSDATAFORMAT_SPECIFIER_NONE, KSDATAFORMAT_SPECIFIER_WAVEFORMATEX,
+    KSDATAFORMAT_SUBTYPE_ANALOG, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, KSDATAFORMAT_SUBTYPE_PCM,
+    KSDATAFORMAT_TYPE_AUDIO, KSDATARANGE, KSDATARANGE_ATTRIBUTES, KSDATARANGE_AUDIO,
+    KSNODEPIN_STANDARD_IN, KSNODEPIN_STANDARD_OUT, KSNODETYPE_LINE_CONNECTOR, KSNODETYPE_MUTE,
+    KSNODETYPE_SPEAKER, KSNODETYPE_VOLUME, KSPIN_COMMUNICATION, KSPIN_DATAFLOW, KSPIN_DESCRIPTOR,
+    KSPIN_DESCRIPTOR__bindgen_ty_1, PCAUTOMATION_TABLE, PCCONNECTION_DESCRIPTOR, PCEVENT_ITEM,
+    PCFILTER_DESCRIPTOR, PCFILTER_NODE, PCMETHOD_ITEM, PCNODE_DESCRIPTOR, PCPIN_DESCRIPTOR,
+    PCPROPERTY_ITEM, PKSATTRIBUTE, PKSDATARANGE, ULONG,
 };
 
 use crate::topo::{TopoCapture, TopoRender};
+use crate::wave::{WaveCapture, WaveRender};
 
 // ---------------------------------------------------------------------------------
 // Numéros de broche (§4.1), du type que `PcRegisterPhysicalConnection` et les
@@ -224,6 +248,15 @@ pub const RATE_COUNT: usize = SAMPLE_RATES.len();
 
 /// Nombre de plages système par broche : une par profondeur.
 pub const RANGES_PER_SYSTEM_PIN: usize = FORMATS_PER_CABLE;
+
+/// Nombre d'**entrées** du tableau `DataRanges` d'une broche système : deux par plage
+/// depuis M1b-22 — la plage, puis la `KSATTRIBUTE_LIST` qu'elle annonce.
+///
+/// `DataRangesCount` compte les deux : le tableau est un tableau de `PKSDATARANGE`, et une
+/// entrée d'attributs y occupe une case comme une plage (voir [`MODE_ATTRIBUTE_ENTRY`] et
+/// la documentation de `KSDATARANGE::Flags`). Confondre les deux comptes est exactement la
+/// faute que [`wave_pins_are_well_formed`] attrape.
+pub const ENTRIES_PER_SYSTEM_PIN: usize = RANGES_PER_SYSTEM_PIN * 2;
 
 /// L'index de variante du format par défaut (48 kHz, 2 canaux) : le repli de toutes les
 /// fonctions de sélection, et le seul index dont on puisse prouver l'existence en `const`.
@@ -321,13 +354,18 @@ const _: () = {
     assert!(size_of::<PCPROPERTY_ITEM>() == 24);
 };
 
-/// En-tête `KSDATAFORMAT` d'une plage audio : `FormatSize = size`, aucune option, type
+/// En-tête `KSDATAFORMAT` d'une plage audio : `FormatSize = size`, `Flags = flags`, type
 /// majeur `KSDATAFORMAT_TYPE_AUDIO`.
-const fn data_format(size: ULONG, subtype: GUID, specifier: GUID) -> KSDATAFORMAT {
+///
+/// `flags` ne prend que deux valeurs dans ce module : 0 pour la plage analogique des
+/// broches bridge, [`KSDATARANGE_ATTRIBUTES`] pour les plages système, qui annoncent ainsi
+/// la liste d'attributs logée juste derrière elles dans le tableau `DataRanges` (voir
+/// [`MODE_ATTRIBUTE_ENTRY`]).
+const fn data_format(size: ULONG, flags: ULONG, subtype: GUID, specifier: GUID) -> KSDATAFORMAT {
     KSDATAFORMAT {
         __bindgen_anon_1: KSDATAFORMAT__bindgen_ty_1 {
             FormatSize: size,
-            Flags: 0,
+            Flags: flags,
             SampleSize: 0,
             Reserved: 0,
             MajorFormat: KSDATAFORMAT_TYPE_AUDIO,
@@ -352,6 +390,15 @@ const fn data_format(size: ULONG, subtype: GUID, specifier: GUID) -> KSDATAFORMA
 /// une `KSDATARANGE_AUDIO` n'a pas de minimum, donc cette plage dit littéralement « un à
 /// `channels` canaux » alors que le câble n'en sert qu'un nombre. C'est le gestionnaire qui
 /// referme l'écart, en n'acceptant que le compte exact.
+///
+/// # `KSDATARANGE_ATTRIBUTES` (M1b-22)
+///
+/// Le `Flags` de l'en-tête ne vaut plus 0 : il porte `KSDATARANGE_ATTRIBUTES`, qui annonce
+/// que l'**entrée suivante** du tableau `DataRanges` n'est pas une plage mais une
+/// `KSATTRIBUTE_LIST` — celle de [`MODE_ATTRIBUTE_ENTRY`], qui déclare la broche « mode
+/// aware » (voir l'en-tête de `portcls::modes`). C'est littéralement ce que dit la
+/// documentation de `KSDATARANGE::Flags` : « *Set Flags to KSDATARANGE_ATTRIBUTES (0x2) to
+/// indicate that the following KSDATARANGE is to be interpreted as an attribute list* ».
 pub const fn audio_range(
     subtype: GUID,
     bits: ULONG,
@@ -361,6 +408,7 @@ pub const fn audio_range(
     KSDATARANGE_AUDIO {
         DataRange: data_format(
             KSDATARANGE_AUDIO_SIZE,
+            KSDATARANGE_ATTRIBUTES,
             subtype,
             KSDATAFORMAT_SPECIFIER_WAVEFORMATEX,
         ),
@@ -419,9 +467,15 @@ const fn all_variant_ranges() -> [[KSDATARANGE_AUDIO; RANGES_PER_SYSTEM_PIN]; VA
 
 /// Plage « analogique » des broches bridge : `KSDATARANGE` simple, sous-type
 /// `KSDATAFORMAT_SUBTYPE_ANALOG`, spécificateur `KSDATAFORMAT_SPECIFIER_NONE`.
+///
+/// `Flags` à **0** : une broche bridge n'a pas de format, donc pas de mode de traitement du
+/// signal, donc aucune liste d'attributs derrière elle. C'est aussi ce que fait SYSVAD
+/// (`SpeakerPinDataRangesBridge`), et la différence est voulue : le mode se déclare sur les
+/// broches de flux, et sur elles seules.
 pub const fn analog_range() -> KSDATARANGE {
     data_format(
         KSDATARANGE_SIZE,
+        0,
         KSDATAFORMAT_SUBTYPE_ANALOG,
         KSDATAFORMAT_SPECIFIER_NONE,
     )
@@ -433,6 +487,89 @@ pub const fn analog_range() -> KSDATARANGE {
 /// les plages.
 const fn range_ptr<T>(range: &'static T) -> PKSDATARANGE {
     ptr::from_ref(range).cast::<KSDATARANGE>().cast_mut()
+}
+
+// ---------------------------------------------------------------------------------
+// La liste d'attributs des broches de flux (M1b-22, driver-design.md §4.3).
+//
+// SYSVAD attache à chaque plage de ses broches de flux un `KSATTRIBUTE_LIST` d'un seul
+// élément, dont l'`Attribute` est `KSATTRIBUTEID_AUDIOSIGNALPROCESSING_MODE`. L'attribut ne
+// nomme **pas** de mode : il dit « cette broche sait qu'un mode existe », et c'est la
+// propriété `KSPROPERTY_AUDIOSIGNALPROCESSING_MODES` (`portcls::modes`) qui énumère les
+// modes servis. La documentation « Audio Signal Processing Modes » le dit mot pour mot :
+// « *This list has a single element in it, which is a KSATTRIBUTE. The Attribute member of
+// the KSATTRIBUTE structure is set to KSATTRIBUTEID_AUDIOSIGNALPROCESSING_MODE.* »
+// ---------------------------------------------------------------------------------
+
+/// L'unique attribut : en-tête `KSATTRIBUTE` de 24 octets, aucun drapeau, l'identifiant du
+/// mode de traitement du signal.
+///
+/// `Flags` à 0 et non `KSATTRIBUTE_REQUIRED` : un attribut « requis » obligerait tout
+/// client à en fournir la valeur dans sa requête d'intersection. SYSVAD le laisse à 0, et
+/// notre gestionnaire d'intersection ([`crate::intersect`]) ne lit aucun attribut — exiger
+/// ce que personne ne lit ne ferait que refuser des clients.
+/// Doublet `const` puis `static` : les assertions de fin de fichier lisent la `const`
+/// (l'évaluation `const` ne lit pas les `static`), et c'est elle que la `static` enveloppe.
+const MODE_ATTRIBUTE_VALUE: KSATTRIBUTE = KSATTRIBUTE {
+    Size: size_of::<KSATTRIBUTE>() as ULONG,
+    Flags: 0,
+    Attribute: KSATTRIBUTEID_AUDIOSIGNALPROCESSING_MODE,
+};
+static MODE_ATTRIBUTE: Shared<KSATTRIBUTE> = Shared(MODE_ATTRIBUTE_VALUE);
+
+/// Le tableau de pointeurs que `KSATTRIBUTE_LIST::Attributes` conserve : un seul élément.
+static MODE_ATTRIBUTE_POINTERS: Shared<[PKSATTRIBUTE; 1]> =
+    Shared([ptr::from_ref(&MODE_ATTRIBUTE)
+        .cast::<KSATTRIBUTE>()
+        .cast_mut()]);
+
+/// Entrée de `DataRanges` portant la `KSATTRIBUTE_LIST` : la liste **et un remplissage**
+/// qui la porte à la taille d'une `KSDATARANGE_AUDIO`.
+///
+/// # Pourquoi ce remplissage existe
+///
+/// Une entrée d'attributs occupe une case du tableau `DataRanges`, typée `PKSDATARANGE`.
+/// KS et PortCls savent la reconnaître au drapeau `KSDATARANGE_ATTRIBUTES` de la plage qui
+/// la précède, et ne la présentent jamais à `DataRangeIntersection` — SYSVAD, qui a
+/// exactement cette construction *et* un gestionnaire d'intersection maison, le démontre.
+///
+/// Mais « ne devrait jamais » n'est pas « ne peut pas ». Si un jour PortCls nous tendait
+/// cette entrée comme une plage, `intersect::read_our_range` lirait un en-tête de 64 octets
+/// au bout d'un objet qui n'en fait que 16 : une lecture **hors objet**, comportement
+/// indéfini en Rust, là où x64 ne bronche pas. Les 72 octets de remplissage transforment
+/// cette lecture en lecture parfaitement définie — elle rendrait `FormatSize == 1` (le
+/// `Count` de la liste), que `read_our_range` refuse déjà par `STATUS_NO_MATCH`.
+///
+/// 72 octets dans la section de données, une fois pour tout le pilote (la liste est
+/// **partagée** par les 24 variantes et les 144 entrées), contre un comportement indéfini
+/// dépendant d'une garantie non écrite : le compte est vite fait.
+#[repr(C, align(8))]
+pub struct AttributeListEntry {
+    /// La liste elle-même, à l'offset 0 : c'est cette adresse que le tableau conserve.
+    list: KSATTRIBUTE_LIST,
+    /// Remplissage jusqu'à `sizeof(KSDATARANGE_AUDIO)`. **Jamais lu par KS**, qui s'arrête
+    /// à `Count` et `Attributes` ; il n'est là que pour rendre définie une lecture d'en-tête
+    /// de plage faite par erreur (voir la documentation du type).
+    _reserve: [u8; KSDATARANGE_AUDIO_SIZE as usize - size_of::<KSATTRIBUTE_LIST>()],
+}
+
+/// L'entrée d'attributs, unique et partagée par toutes les plages système de toutes les
+/// variantes.
+static MODE_ATTRIBUTE_ENTRY: Shared<AttributeListEntry> = Shared(AttributeListEntry {
+    list: KSATTRIBUTE_LIST {
+        Count: 1,
+        Attributes: ptr::from_ref(&MODE_ATTRIBUTE_POINTERS)
+            .cast::<PKSATTRIBUTE>()
+            .cast_mut(),
+    },
+    _reserve: [0; KSDATARANGE_AUDIO_SIZE as usize - size_of::<KSATTRIBUTE_LIST>()],
+});
+
+/// Le pointeur `PKSDATARANGE` de l'entrée d'attributs, tel que le tableau `DataRanges` le
+/// porte (voir [`AttributeListEntry`] : la liste est à l'offset 0, et [`Shared`] est
+/// `repr(transparent)`).
+const fn mode_attribute_ptr() -> PKSDATARANGE {
+    range_ptr(&MODE_ATTRIBUTE_ENTRY)
 }
 
 /// Broche de filtre : `flow`/`comm` (§4.1), catégorie `category`, nom `name` (§4.2 :
@@ -585,15 +722,21 @@ const fn filter<const P: usize, const N: usize, const C: usize>(
     }
 }
 
-/// **Forme wave** : filtre WaveRT sans nœud, table d'automatisation de filtre vide.
+/// **Forme wave** : filtre WaveRT sans nœud.
 ///
 /// Le signal traverse le filtre WaveRT sans traitement ; les nœuds audio sont sur le filtre
 /// de topologie du même sens ([`topo_filter`]).
+///
+/// `automation` n'est plus vide depuis M1b-22 : elle porte
+/// `KSPROPERTY_AUDIOSIGNALPROCESSING_MODES`, propriété du **filtre** qui décrit une broche
+/// (voir l'en-tête de `portcls::modes`), et se dédouble par **sens** — le gestionnaire est
+/// monomorphisé sur `WaveRender` ou `WaveCapture`.
 const fn wave_filter<const P: usize, const C: usize>(
+    automation: &'static Shared<PCAUTOMATION_TABLE>,
     pins: &'static [PCPIN_DESCRIPTOR; P],
     connections: &'static Shared<[PCCONNECTION_DESCRIPTOR; C]>,
 ) -> PCFILTER_DESCRIPTOR {
-    filter::<P, 0, C>(&EMPTY_AUTOMATION, pins, &NO_NODES, connections)
+    filter::<P, 0, C>(automation, pins, &NO_NODES, connections)
 }
 
 /// **Forme topologie** : filtre de topologie avec ses nœuds.
@@ -726,20 +869,34 @@ static BRIDGE_RANGES: Shared<[PKSDATARANGE; 1]> = Shared([range_ptr(&RANGE_ANALO
 static SYSTEM_RANGE_VALUES: Shared<[[KSDATARANGE_AUDIO; RANGES_PER_SYSTEM_PIN]; VARIANT_COUNT]> =
     Shared(all_variant_ranges());
 
-/// Les trois pointeurs de plage de la variante `variant`, visant la rangée correspondante
-/// de `table`.
+/// Les entrées `DataRanges` de la variante `variant` : chacune des trois plages de la
+/// rangée correspondante de `table`, **suivie** de l'entrée d'attributs partagée.
+///
+/// L'alternance est le contrat de `KSDATARANGE_ATTRIBUTES` : la liste d'attributs vaut pour
+/// la plage qui la précède immédiatement, donc chacune des trois profondeurs porte la
+/// sienne. Une seule entrée d'attributs en fin de tableau ne qualifierait que la dernière
+/// plage — panne muette de plus : le pilote resterait « mode aware » sur une profondeur
+/// et pas sur les deux autres.
 #[allow(clippy::indexing_slicing)] // évalué à la compilation, `variant < VARIANT_COUNT`
 const fn system_range_ptrs(
     table: &'static Shared<[[KSDATARANGE_AUDIO; RANGES_PER_SYSTEM_PIN]; VARIANT_COUNT]>,
     variant: usize,
-) -> [PKSDATARANGE; RANGES_PER_SYSTEM_PIN] {
+) -> [PKSDATARANGE; ENTRIES_PER_SYSTEM_PIN] {
     let [f32_, pcm24, i16_] = &table.get()[variant];
-    [range_ptr(f32_), range_ptr(pcm24), range_ptr(i16_)]
+    let attributs = mode_attribute_ptr();
+    [
+        range_ptr(f32_),
+        attributs,
+        range_ptr(pcm24),
+        attributs,
+        range_ptr(i16_),
+        attributs,
+    ]
 }
 
 /// Les [`VARIANT_COUNT`] tableaux de pointeurs `DataRanges`, un par variante.
 #[allow(clippy::indexing_slicing)] // évalué à la compilation
-const fn all_system_range_ptrs() -> [[PKSDATARANGE; RANGES_PER_SYSTEM_PIN]; VARIANT_COUNT] {
+const fn all_system_range_ptrs() -> [[PKSDATARANGE; ENTRIES_PER_SYSTEM_PIN]; VARIANT_COUNT] {
     let mut out = [const { system_range_ptrs(&SYSTEM_RANGE_VALUES, 0) }; VARIANT_COUNT];
     let mut i = 0;
     while i < VARIANT_COUNT {
@@ -751,38 +908,65 @@ const fn all_system_range_ptrs() -> [[PKSDATARANGE; RANGES_PER_SYSTEM_PIN]; VARI
 
 /// Plages des broches système (`DataRanges` : tableau de pointeurs), **une rangée par
 /// variante de format**.
-static SYSTEM_RANGES_TABLE: Shared<[[PKSDATARANGE; RANGES_PER_SYSTEM_PIN]; VARIANT_COUNT]> =
+static SYSTEM_RANGES_TABLE: Shared<[[PKSDATARANGE; ENTRIES_PER_SYSTEM_PIN]; VARIANT_COUNT]> =
     Shared(all_system_range_ptrs());
 
 /// La rangée de plages de la variante `variant` : c'est son adresse que
 /// `KSPIN_DESCRIPTOR::DataRanges` conserve.
 #[allow(clippy::indexing_slicing)] // évalué à la compilation, `variant < VARIANT_COUNT`
 const fn ranges_row(
-    table: &'static Shared<[[PKSDATARANGE; RANGES_PER_SYSTEM_PIN]; VARIANT_COUNT]>,
+    table: &'static Shared<[[PKSDATARANGE; ENTRIES_PER_SYSTEM_PIN]; VARIANT_COUNT]>,
     variant: usize,
-) -> &'static [PKSDATARANGE; RANGES_PER_SYSTEM_PIN] {
+) -> &'static [PKSDATARANGE; ENTRIES_PER_SYSTEM_PIN] {
     &table.get()[variant]
 }
 
-/// Table d'automatisation vide : tailles d'élément renseignées, aucun élément.
+/// Nombre de propriétés portées par un filtre **wave** : les modes de traitement du signal,
+/// et rien d'autre.
 ///
-/// C'est celle des **quatre** filtres : les filtres WaveRT n'ont aucune propriété propre,
-/// et sur les filtres topologie les propriétés sont portées par les nœuds. `const` séparée
-/// de la `static` pour que les assertions ci-dessous puissent la lire (l'évaluation `const`
-/// ne lit pas les `static`).
-const EMPTY_AUTOMATION_TABLE: PCAUTOMATION_TABLE = PCAUTOMATION_TABLE {
-    PropertyItemSize: size_of::<PCPROPERTY_ITEM>() as ULONG,
-    PropertyCount: 0,
-    Properties: ptr::null(),
-    MethodItemSize: size_of::<PCMETHOD_ITEM>() as ULONG,
-    MethodCount: 0,
-    Methods: ptr::null(),
-    EventItemSize: size_of::<PCEVENT_ITEM>() as ULONG,
-    EventCount: 0,
-    Events: ptr::null(),
-    Reserved: 0,
-};
-static EMPTY_AUTOMATION: Shared<PCAUTOMATION_TABLE> = Shared(EMPTY_AUTOMATION_TABLE);
+/// Le reste de ce que PortCls sert sur un filtre WaveRT (`KSPROPSETID_Pin`,
+/// `KSPROPSETID_Topology`) reste à PortCls : la table ne porte que ce que lui seul ne sait
+/// pas répondre.
+const WAVE_FILTER_PROPERTY_COUNT: usize = 1;
+
+/// `KSPROPERTY_AUDIOSIGNALPROCESSING_MODES` du filtre `WaveRender<n>` (M1b-22).
+///
+/// Monomorphisé sur `WaveRender` comme les propriétés de topologie le sont sur `TopoRender`
+/// et pour la même raison : la garde de vtable du thunk compare l'adresse de `T::VTBL`,
+/// et une table commune aux deux sens rendrait le pilote muet d'un côté.
+const WAVE_RENDER_FILTER_ITEMS: [PCPROPERTY_ITEM; WAVE_FILTER_PROPERTY_COUNT] =
+    [signal_processing_modes_item::<
+        IMiniportWaveRTVtbl,
+        WaveRender,
+    >()];
+/// La même propriété sur le filtre `WaveCapture<n>`, monomorphisée sur son type.
+const WAVE_CAPTURE_FILTER_ITEMS: [PCPROPERTY_ITEM; WAVE_FILTER_PROPERTY_COUNT] =
+    [signal_processing_modes_item::<
+        IMiniportWaveRTVtbl,
+        WaveCapture,
+    >()];
+
+static WAVE_RENDER_FILTER_PROPERTIES: Shared<[PCPROPERTY_ITEM; WAVE_FILTER_PROPERTY_COUNT]> =
+    Shared(WAVE_RENDER_FILTER_ITEMS);
+static WAVE_CAPTURE_FILTER_PROPERTIES: Shared<[PCPROPERTY_ITEM; WAVE_FILTER_PROPERTY_COUNT]> =
+    Shared(WAVE_CAPTURE_FILTER_ITEMS);
+
+/// Table d'automatisation du filtre `WaveRender<n>`.
+///
+/// Doublet `const` puis `static`, comme pour les filtres de topologie : c'est **cette**
+/// valeur que les assertions de fin de fichier lisent (l'évaluation `const` ne lit pas les
+/// `static`), et c'est elle que la `static` enveloppe. Une table de filtre wave qui
+/// perdrait sa propriété passerait autrement la compilation sans un mot, et le symptôme
+/// serait un pilote qui n'a jamais l'air « mode aware » — exactement la panne que M1b-22
+/// cherche à écarter.
+const WAVE_RENDER_AUTOMATION_TABLE: PCAUTOMATION_TABLE =
+    property_automation(&WAVE_RENDER_FILTER_PROPERTIES);
+/// Le même doublet pour le sens capture.
+const WAVE_CAPTURE_AUTOMATION_TABLE: PCAUTOMATION_TABLE =
+    property_automation(&WAVE_CAPTURE_FILTER_PROPERTIES);
+
+static WAVE_RENDER_AUTOMATION: Shared<PCAUTOMATION_TABLE> = Shared(WAVE_RENDER_AUTOMATION_TABLE);
+static WAVE_CAPTURE_AUTOMATION: Shared<PCAUTOMATION_TABLE> = Shared(WAVE_CAPTURE_AUTOMATION_TABLE);
 
 /// Aucun nœud : le tableau vide que la forme wave passe à [`filter`], qui met alors
 /// `Nodes` à nul. Jamais déréférencé.
@@ -1129,6 +1313,7 @@ const fn topo_filters(rendu: bool) -> [PCFILTER_DESCRIPTOR; CABLE_COUNT] {
 /// Descripteur du filtre `WaveRender` de la variante `variant`.
 const fn wave_render_filter_of(variant: usize) -> PCFILTER_DESCRIPTOR {
     wave_filter(
+        &WAVE_RENDER_AUTOMATION,
         pins_row(&WAVE_RENDER_PINS_TABLE, variant),
         &DIRECT_CONNECTION_TABLE,
     )
@@ -1137,6 +1322,7 @@ const fn wave_render_filter_of(variant: usize) -> PCFILTER_DESCRIPTOR {
 /// Descripteur du filtre `WaveCapture` de la variante `variant`.
 const fn wave_capture_filter_of(variant: usize) -> PCFILTER_DESCRIPTOR {
     wave_filter(
+        &WAVE_CAPTURE_AUTOMATION,
         pins_row(&WAVE_CAPTURE_PINS_TABLE, variant),
         &DIRECT_CONNECTION_TABLE,
     )
@@ -1345,6 +1531,9 @@ pub enum PinMismatch {
     SansFiltre(usize),
     /// Le descripteur est là, mais sa broche système ne porte aucune plage audio lisible.
     SansPlage(usize),
+    /// Les plages de la broche système ne portent pas la liste d'attributs de mode de
+    /// traitement du signal, ou pas là où KS la cherche (M1b-22).
+    SansAttribut(usize),
     /// La broche déclare `(fréquence, canaux)` là où la clé annonce autre chose.
     Plage {
         /// Ce que la broche déclare : fréquence en Hz, nombre de canaux.
@@ -1370,6 +1559,12 @@ impl fmt::Display for PinMismatch {
                 f,
                 "la broche système de la variante {variant} ne porte aucune plage audio"
             ),
+            Self::SansAttribut(variant) => write!(
+                f,
+                "la broche système de la variante {variant} ne déclare pas le mode de \
+                 traitement du signal (KSDATARANGE_ATTRIBUTES et sa KSATTRIBUTE_LIST) : \
+                 le pilote n'apparaîtra pas « mode aware »"
+            ),
             Self::Plage {
                 declares: (hz, canaux),
                 attendus: (hz_attendu, canaux_attendus),
@@ -1386,6 +1581,39 @@ impl fmt::Display for PinMismatch {
 /// **réellement**, lus au bout des pointeurs que PortCls suivra ; `None` si cette broche
 /// n'existe pas ou ne porte pas de plage audio (une broche bridge, par exemple).
 fn declared_by_pin(filter: &'static PCFILTER_DESCRIPTOR, pin: ULONG) -> Option<(ULONG, ULONG)> {
+    // La **première** entrée du tableau : depuis M1b-22 une entrée sur deux est une liste
+    // d'attributs, mais la première reste toujours une plage.
+    let first = range_entry(filter, pin, 0)?;
+    // SAFETY: lecture du membre nommé de l'union `KSDATAFORMAT` — le préfixe commun aux
+    // deux formes de plage de ce module. Lire l'en-tête est légitime avant de savoir
+    // laquelle des deux on tient.
+    let header = unsafe { first.__bindgen_anon_1 };
+    if header.FormatSize != KSDATARANGE_AUDIO_SIZE {
+        // Plage analogique (64 octets) : ce n'est pas une broche système. C'est ce
+        // contrôle qui rend l'élargissement ci-dessous sûr, plutôt qu'une convention.
+        return None;
+    }
+    // SAFETY: `FormatSize` annonce les 88 octets d'une `KSDATARANGE_AUDIO`, et toutes les
+    // plages de cette taille de ce module sont bâties par `audio_range` puis logées dans
+    // `SYSTEM_RANGE_VALUES` : l'élargissement du type ne dépasse pas l'objet.
+    let audio = unsafe { &*ptr::from_ref(first).cast::<KSDATARANGE_AUDIO>() };
+    Some((audio.MinimumSampleFrequency, audio.MaximumChannels))
+}
+
+/// Le nombre d'entrées d'un tableau `DataRanges`, et un accès borné à la `n`-ième.
+///
+/// Facteur commun de [`declared_by_pin`] et [`mode_attributes_declared`] : les deux
+/// traversent le **même** tableau, celui que PortCls suivra, et une seconde copie de cette
+/// arithmétique de pointeurs serait exactement le genre de divergence qu'on cherche à
+/// éviter.
+///
+/// `None` si la broche n'existe pas, si le tableau est nul, ou si `n` est au-delà du
+/// compte déclaré.
+fn range_entry(
+    filter: &'static PCFILTER_DESCRIPTOR,
+    pin: ULONG,
+    n: usize,
+) -> Option<&'static KSDATARANGE> {
     let index = usize::try_from(pin).ok()?;
     let count = usize::try_from(filter.PinCount).ok()?;
     if index >= count || filter.Pins.is_null() {
@@ -1396,30 +1624,78 @@ fn declared_by_pin(filter: &'static PCFILTER_DESCRIPTOR, pin: ULONG) -> Option<(
     // module, immuable et jamais libéré. `index < count`, donc le décalage reste dedans.
     let descriptor = unsafe { &*filter.Pins.add(index) };
     let ranges = descriptor.KsPinDescriptor.DataRanges;
-    if ranges.is_null() || descriptor.KsPinDescriptor.DataRangesCount == 0 {
+    let entries = usize::try_from(descriptor.KsPinDescriptor.DataRangesCount).ok()?;
+    if ranges.is_null() || n >= entries {
         return None;
     }
-    // SAFETY: `DataRanges` vise un tableau de `DataRangesCount` pointeurs de plage logé
-    // dans `SYSTEM_RANGES_TABLE` ou dans `BRIDGE_RANGES` ; le compte est non nul, donc la
-    // première entrée existe.
-    let first = unsafe { *ranges };
-    if first.is_null() {
+    // SAFETY: `DataRanges` vise un tableau de `DataRangesCount` pointeurs logé dans
+    // `SYSTEM_RANGES_TABLE` ou dans `BRIDGE_RANGES` ; `n < entries`, le décalage reste
+    // dedans.
+    let entry = unsafe { *ranges.add(n) };
+    if entry.is_null() {
         return None;
     }
-    // SAFETY: `first` vise une `KSDATARANGE` — le préfixe commun aux deux formes de plage
-    // de ce module —, logée dans une `static` immuable. Lire l'en-tête est donc légitime
-    // avant de savoir laquelle des deux formes on tient.
-    let header = unsafe { (*first).__bindgen_anon_1 };
-    if header.FormatSize != KSDATARANGE_AUDIO_SIZE {
-        // Plage analogique (64 octets) : ce n'est pas une broche système. C'est ce
-        // contrôle qui rend l'élargissement ci-dessous sûr, plutôt qu'une convention.
-        return None;
+    // SAFETY: toute entrée de ces tableaux vise une `static` immuable de ce module d'au
+    // moins `sizeof(KSDATARANGE)` octets — une `KSDATARANGE_AUDIO` (88), la plage
+    // analogique (64, la taille exacte du type rendu) ou un [`AttributeListEntry`], dont le
+    // remplissage existe précisément pour que cette lecture reste dans l'objet.
+    Some(unsafe { &*entry })
+}
+
+/// Vrai si la broche `pin` de `filter` déclare bien le mode de traitement du signal :
+/// chaque plage porte `KSDATARANGE_ATTRIBUTES` et l'entrée qui la suit **est** la liste
+/// d'attributs à un élément (M1b-22).
+///
+/// C'est le pendant, du côté des attributs, de ce que [`declared_by_pin`] fait du côté du
+/// format : les assertions `const` vérifient que les tables sont bien bâties, celle-ci
+/// vérifie ce que PortCls lira **au bout des pointeurs**. La panne qu'elle attrape est
+/// muette entre toutes : une entrée d'attributs manquante ou mal placée, et le pilote
+/// reste exactement aussi peu « mode aware » qu'avant M1b-22 — mêmes endpoints, même son,
+/// même allocation par scrutation, et rien nulle part pour le dire.
+fn mode_attributes_declared(filter: &'static PCFILTER_DESCRIPTOR, pin: ULONG) -> bool {
+    let mut n = 0;
+    while n < ENTRIES_PER_SYSTEM_PIN {
+        let Some(plage) = range_entry(filter, pin, n) else {
+            return false;
+        };
+        // SAFETY: lecture du membre nommé de l'union `KSDATAFORMAT` : c'est celui que
+        // `data_format` écrit, et la `KSATTRIBUTE_LIST` d'une entrée impaire est traitée
+        // plus bas, sans passer par cet en-tête.
+        let header = unsafe { plage.__bindgen_anon_1 };
+        if n % 2 == 0 {
+            // Entrée paire : une plage audio, drapeau compris.
+            if header.FormatSize != KSDATARANGE_AUDIO_SIZE || header.Flags != KSDATARANGE_ATTRIBUTES
+            {
+                return false;
+            }
+        } else {
+            // Entrée impaire : la liste d'attributs. Comparer les **adresses** est ce qui
+            // dit qu'on a bien l'entrée partagée et pas une plage prise pour elle.
+            let attendu: *const KSDATARANGE = mode_attribute_ptr().cast_const();
+            if !ptr::eq(ptr::from_ref(plage), attendu) {
+                return false;
+            }
+        }
+        n = n.wrapping_add(1);
     }
-    // SAFETY: `FormatSize` annonce les 88 octets d'une `KSDATARANGE_AUDIO`, et toutes les
-    // plages de cette taille de ce module sont bâties par `audio_range` puis logées dans
-    // `SYSTEM_RANGE_VALUES` : l'élargissement du type ne dépasse pas l'objet.
-    let audio = unsafe { &*first.cast::<KSDATARANGE_AUDIO>() };
-    Some((audio.MinimumSampleFrequency, audio.MaximumChannels))
+    // Et la liste elle-même : un attribut, celui du mode de traitement du signal.
+    let liste = MODE_ATTRIBUTE_ENTRY.get();
+    if liste.list.Count != 1 || liste.list.Attributes.is_null() {
+        return false;
+    }
+    // SAFETY: `Attributes` vise `MODE_ATTRIBUTE_POINTERS`, un tableau `static` d'un seul
+    // pointeur, immuable et jamais libéré ; `Count` vaut 1 (vérifié).
+    let premier = unsafe { *liste.list.Attributes };
+    if premier.is_null() {
+        return false;
+    }
+    // SAFETY: `premier` vise `MODE_ATTRIBUTE`, une `static` immuable de ce module.
+    let attribut = unsafe { &*premier };
+    attribut.Size == size_of::<KSATTRIBUTE>() as ULONG
+        && crate::intersect::guid_eq(
+            &attribut.Attribute,
+            &KSATTRIBUTEID_AUDIOSIGNALPROCESSING_MODE,
+        )
 }
 
 /// Vérifie que les **deux** broches système du câble `cable` déclareront bien la fréquence
@@ -1459,6 +1735,11 @@ pub fn check_cable_pins(cable: u32) -> Result<(), PinMismatch> {
         let declares = declared_by_pin(filtre, broche).ok_or(PinMismatch::SansPlage(variant))?;
         if declares != attendus {
             return Err(PinMismatch::Plage { declares, attendus });
+        }
+        // La condition SYSVAD de M1b-22, vérifiée là où PortCls la lira : chaque plage
+        // porte son drapeau, et l'entrée qui la suit **est** la liste d'attributs.
+        if !mode_attributes_declared(filtre, broche) {
+            return Err(PinMismatch::SansAttribut(variant));
         }
     }
     Ok(())
@@ -1583,8 +1864,11 @@ const fn wave_pins_are_well_formed(
         ) {
             return false;
         }
-        // Trois plages système (une par profondeur), une plage analogique sur le bridge.
-        if systeme.KsPinDescriptor.DataRangesCount as usize != RANGES_PER_SYSTEM_PIN
+        // Trois plages système (une par profondeur) **et leurs trois entrées
+        // d'attributs**, une plage analogique sur le bridge. Compter `RANGES_*` plutôt que
+        // `ENTRIES_*` ferait lire à KS la moitié du tableau : deux profondeurs perdues, et
+        // la troisième sans son attribut.
+        if systeme.KsPinDescriptor.DataRangesCount as usize != ENTRIES_PER_SYSTEM_PIN
             || bridge.KsPinDescriptor.DataRangesCount != 1
         {
             return false;
@@ -1676,7 +1960,12 @@ const fn range_is(
         && range.MinimumSampleFrequency == rate
         && range.MaximumSampleFrequency == rate
         && header.FormatSize == KSDATARANGE_AUDIO_SIZE
-        && header.Flags == 0
+        // `KSDATARANGE_ATTRIBUTES` et lui seul (M1b-22) : sans ce drapeau, KS ignorerait
+        // purement et simplement l'entrée d'attributs qui suit la plage, et la broche ne
+        // serait pas « mode aware ». Avec `KSDATARANGE_REQUIRED_ATTRIBUTES` en plus, elle
+        // exigerait de chaque client qu'il fournisse le mode — ce que le moteur ne fait pas
+        // toujours.
+        && header.Flags == KSDATARANGE_ATTRIBUTES
         && guid_eq(&header.MajorFormat, &KSDATAFORMAT_TYPE_AUDIO)
         && guid_eq(&header.SubFormat, subtype)
         && guid_eq(&header.Specifier, &KSDATAFORMAT_SPECIFIER_WAVEFORMATEX)
@@ -1734,10 +2023,34 @@ const _: () = {
             .DataRange
             .__bindgen_anon_1
     };
-    assert!(header.FormatSize == 88 && header.Flags == 0);
+    assert!(header.FormatSize == 88 && header.Flags == KSDATARANGE_ATTRIBUTES);
+    assert!(KSDATARANGE_ATTRIBUTES == 2, "(1 << 1), ks.h");
     // SAFETY: idem.
     let analog = unsafe { analog_range().__bindgen_anon_1 };
-    assert!(analog.FormatSize == 64);
+    // La plage analogique reste à `Flags = 0` : une broche bridge n'a pas de mode. C'est
+    // la seule différence de forme entre les deux plages, et la confondre déclarerait une
+    // liste d'attributs qui n'existe pas — KS lirait l'entrée suivante du tableau, qui est
+    // une plage, comme une `KSATTRIBUTE_LIST`.
+    assert!(analog.FormatSize == 64 && analog.Flags == 0);
+
+    // La liste d'attributs : un seul élément, l'identifiant du mode de traitement du
+    // signal, et un en-tête à la taille exacte d'un `KSATTRIBUTE`. `Size` est le seul champ
+    // que KS relit pour avancer dans la liste : une valeur fausse ferait dérailler son
+    // parcours, en silence.
+    assert!(size_of::<KSATTRIBUTE>() == 24 && size_of::<KSATTRIBUTE_LIST>() == 16);
+    assert!(MODE_ATTRIBUTE_VALUE.Size == size_of::<KSATTRIBUTE>() as ULONG);
+    assert!(MODE_ATTRIBUTE_VALUE.Flags == 0);
+    assert!(guid_eq(
+        &MODE_ATTRIBUTE_VALUE.Attribute,
+        &KSATTRIBUTEID_AUDIOSIGNALPROCESSING_MODE
+    ));
+    // L'entrée d'attributs occupe au moins autant qu'une `KSDATARANGE_AUDIO` : c'est ce qui
+    // rend définie la lecture d'en-tête que ferait `intersect::read_our_range` si PortCls
+    // nous la tendait un jour comme une plage (voir `AttributeListEntry`).
+    assert!(size_of::<AttributeListEntry>() == KSDATARANGE_AUDIO_SIZE as usize);
+    // Et les entrées d'attributs sont bien comptées dans `DataRanges` : deux entrées par
+    // profondeur, ni une de plus ni une de moins.
+    assert!(ENTRIES_PER_SYSTEM_PIN == 6 && ENTRIES_PER_SYSTEM_PIN == RANGES_PER_SYSTEM_PIN * 2);
 
     // Nom de broche (§4.2) : seules les deux broches endpoint des filtres topologie en
     // portent un (vérifié rangée par rangée ci-dessus) ; comparer les adresses ici est
@@ -2004,9 +2317,26 @@ const fn automation_is_well_formed(
 }
 
 const _: () = {
-    // La table des filtres **wave**, vide : c'est PortCls qui répond à `KSPROPSETID_Pin` et
-    // `KSPROPSETID_Topology`.
-    assert!(automation_is_well_formed(&EMPTY_AUTOMATION_TABLE, 0, 0));
+    // Les deux tables de filtre **wave** (M1b-22) : une propriété — les modes de traitement
+    // du signal —, aucun événement. Le reste (`KSPROPSETID_Pin`, `KSPROPSETID_Topology`)
+    // reste servi par PortCls.
+    assert!(automation_is_well_formed(
+        &WAVE_RENDER_AUTOMATION_TABLE,
+        WAVE_FILTER_PROPERTY_COUNT,
+        0
+    ));
+    assert!(automation_is_well_formed(
+        &WAVE_CAPTURE_AUTOMATION_TABLE,
+        WAVE_FILTER_PROPERTY_COUNT,
+        0
+    ));
+    assert!(property_items_are_well_formed(&WAVE_RENDER_FILTER_ITEMS));
+    assert!(property_items_are_well_formed(&WAVE_CAPTURE_FILTER_ITEMS));
+    // `GET | BASICSUPPORT`, et surtout **pas** `SET` : les modes servis sont un fait du
+    // pilote, pas un réglage (« Get: Yes, Set: No »).
+    assert!(WAVE_RENDER_FILTER_ITEMS[0].Flags == MODES_ACCESS_FLAGS);
+    assert!(WAVE_CAPTURE_FILTER_ITEMS[0].Flags == MODES_ACCESS_FLAGS);
+    assert!(MODES_ACCESS_FLAGS & portcls_sys::KSPROPERTY_TYPE_SET == 0);
 
     // Les deux tables de filtre **topologie**, celles-là mêmes que les `static` livrent
     // (doublet `const` puis `static`) : le jack, l'état, la version et les compteurs,
