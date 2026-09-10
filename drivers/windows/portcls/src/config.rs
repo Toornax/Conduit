@@ -20,7 +20,7 @@
 //! | [`KSPROPERTY_CONDUIT_CABLE_STATE`] | GET, SET, BASICSUPPORT | [`CableState`], 16 octets |
 //! | [`KSPROPERTY_CONDUIT_VERSION`] | GET, BASICSUPPORT | un `ULONG` |
 //! | [`KSPROPERTY_CONDUIT_COUNTERS`] | GET, BASICSUPPORT | [`CableCounters`], 56 octets |
-//! | [`KSPROPERTY_CONDUIT_TRANSPORT`] | GET, BASICSUPPORT | [`CableTransport`], 72 octets |
+//! | [`KSPROPERTY_CONDUIT_TRANSPORT`] | GET, BASICSUPPORT | [`CableTransport`], 80 octets |
 //! | [`KSPROPERTY_CONDUIT_PACKETS`] | GET, BASICSUPPORT | [`CablePackets`], 168 octets |
 //!
 //! Une seule est modifiable, et c'est la première : la version est celle du binaire chargé,
@@ -152,8 +152,9 @@ use conduit_kmd_core::config::{
     OS_KS_STATE, OS_MODE, OS_NOTIFICATION_COUNT, OS_NOTIFICATION_EVENTS, OS_REFUSED_ALLOCATIONS,
     OSP_EXPOSURE, OSP_FIRST_QPC, OSP_GET_READ_PACKET, OSP_IRQL_LAST, OSP_IRQL_MAX, OSP_LAST_QPC,
     OSP_PACKET_COUNT, OSP_PRESENTATION_POSITION, OSP_QUERIES, OSP_QUERIES_GRANTED, OSP_RESERVED,
-    OSP_SET_WRITE_PACKET, OT_CABLE, OT_CAPTURE, OT_RENDER, OT_RESERVED, STREAM_PACKETS_BYTES,
-    STREAM_TRANSPORT_BYTES, StreamPackets, StreamTransport,
+    OSP_SET_WRITE_PACKET, OT_CABLE, OT_CAPTURE, OT_CONSTRAINTS_CAPTURE, OT_CONSTRAINTS_RENDER,
+    OT_RENDER, OT_RESERVED, STREAM_PACKETS_BYTES, STREAM_TRANSPORT_BYTES, StreamPackets,
+    StreamTransport,
 };
 use portcls_sys::{
     GUID, GUID_NULL, KSPROPERTY_TYPE_BASICSUPPORT, KSPROPERTY_TYPE_GET, KSPROPERTY_TYPE_SET,
@@ -269,11 +270,12 @@ const _: () = assert!(OC_SILENCED_BEFORE_RENDER == 32 && OC_DISCARDED_TICKS == 4
 const _: () = assert!(OC_OVERRUNS == 48 && OC_OVERRUNS + 8 == CABLE_COUNTERS_BYTES);
 const _: () = assert!(TRANSPORT_ACCESS_FLAGS == 513);
 const _: () = assert!(TRANSPORT_ACCESS_FLAGS & KSPROPERTY_TYPE_SET == 0);
-// Idem pour le transport : deux `ULONG` puis deux blocs de sens de 32 octets, chacun aligné
-// sur huit ; dans un bloc, six `ULONG` puis un `ULONGLONG`.
-const _: () = assert!(CABLE_TRANSPORT_BYTES == 72 && STREAM_TRANSPORT_BYTES == 32);
+// Idem pour le transport : quatre `ULONG` puis deux blocs de sens de 32 octets, chacun
+// aligné sur huit ; dans un bloc, six `ULONG` puis un `ULONGLONG`.
+const _: () = assert!(CABLE_TRANSPORT_BYTES == 80 && STREAM_TRANSPORT_BYTES == 32);
 const _: () = assert!(OT_CABLE == 0 && OT_RESERVED == 4);
-const _: () = assert!(OT_RENDER == 8 && OT_CAPTURE == 40);
+const _: () = assert!(OT_CONSTRAINTS_RENDER == 8 && OT_CONSTRAINTS_CAPTURE == 12);
+const _: () = assert!(OT_RENDER == 16 && OT_CAPTURE == 48);
 const _: () = assert!(OT_CAPTURE + STREAM_TRANSPORT_BYTES == CABLE_TRANSPORT_BYTES);
 const _: () = assert!(OS_MODE == 0 && OS_NOTIFICATION_COUNT == 4 && OS_BUFFER_BYTES == 8);
 const _: () = assert!(OS_BUFFER_FRAMES == 12 && OS_NOTIFICATION_EVENTS == 16);
@@ -565,6 +567,11 @@ fn ecrire_transport(value: &mut [u8], transport: &CableTransport) {
     champs.u32(OT_CABLE, transport.cable);
     // Toujours zéro : rien de la mémoire du noyau ne transite par le champ réservé.
     champs.u32(OT_RESERVED, transport.reserved);
+    // Les deux `NTSTATUS` de la pose des contraintes de taille de paquet : ils datent du
+    // dernier `StartDevice`, pas du flux courant, et c'est bien pour cela qu'ils sont sur le
+    // câble et non dans un bloc de sens.
+    champs.u32(OT_CONSTRAINTS_RENDER, transport.constraints_render);
+    champs.u32(OT_CONSTRAINTS_CAPTURE, transport.constraints_capture);
     ecrire_sens(&mut champs, OT_RENDER, &transport.render);
     ecrire_sens(&mut champs, OT_CAPTURE, &transport.capture);
 }
@@ -925,7 +932,7 @@ impl<T: CableConfig> PropertyHandler<T> for ConduitCounters {
 /// [`KSPROPERTY_CONDUIT_TRANSPORT`] : ce que le moteur audio a demandé au câble, sens par
 /// sens (lot 0 du mode paquets WaveRT).
 ///
-/// Une [`CableTransport`] de 72 octets, en **lecture seule** et **sans contrôle de
+/// Une [`CableTransport`] de 80 octets, en **lecture seule** et **sans contrôle de
 /// privilège**, comme les compteurs et pour les mêmes raisons. Elle répond à une question
 /// qu'aucune ligne de journal ne sait poser en release : le tampon courant a-t-il été alloué
 /// par `AllocateAudioBuffer` (scrutation) ou par `AllocateBufferWithNotification` — seul mode
@@ -1205,7 +1212,7 @@ mod tests {
         assert_eq!(CABLE_STATE_BYTES, 16);
         assert_eq!(TAILLE_VERSION, 4);
         assert_eq!(CABLE_COUNTERS_BYTES, 56);
-        assert_eq!(CABLE_TRANSPORT_BYTES, 72);
+        assert_eq!(CABLE_TRANSPORT_BYTES, 80);
         assert_eq!(CABLE_PACKETS_BYTES, 168);
         // Les cinq longueurs sont distinctes : un client qui allouerait la mauvaise se
         // fait refuser au lieu de lire une structure pour une autre.
@@ -1591,6 +1598,9 @@ mod tests {
         CableTransport {
             cable: 3,
             reserved: 0,
+            // Posée d'un côté, refusée de l'autre : une inversion des deux sens se voit.
+            constraints_render: 0,
+            constraints_capture: 0xC000_000D,
             render: StreamTransport {
                 mode: AllocationMode::Notifications.code(),
                 notification_count: 2,

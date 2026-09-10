@@ -115,12 +115,13 @@ pub use portcls_sys;
 
 pub use adapter::{
     CABLE_COUNT, CAPTURE_NAME_LEN, PIN_NAME_GUIDS, RENDER_NAME_LEN, TOPO_CAPTURE_NAMES,
-    TOPO_RENDER_NAMES, WAVE_CAPTURE_NAMES, WAVE_RENDER_NAMES, as_unknown, pin_name_guid, port_init,
-    ref_as_unknown, subdevice_names, utf16z, utf16z_numbered,
+    TOPO_RENDER_NAMES, WAVE_CAPTURE_NAMES, WAVE_RENDER_NAMES, as_unknown, packet_size_constraints,
+    pin_name_guid, port_init, ref_as_unknown, subdevice_names, utf16z, utf16z_numbered,
 };
 #[cfg(feature = "kernel")]
 pub use adapter::{
-    new_port, register_adapter_power_management, register_physical_connection, register_subdevice,
+    new_port, physical_device_object, register_adapter_power_management,
+    register_physical_connection, register_subdevice, set_packet_size_constraints,
 };
 pub use audio::{
     ACCESS_FLAGS, AudioNodes, Channel, Mute, Trace, VOLUME_DELTA, VOLUME_MAX, VOLUME_MIN, Volume,

@@ -11,6 +11,7 @@
  *   sizeof<TAB>Nom<TAB>octets
  *   offset<TAB>Nom.Champ<TAB>octets
  *   guid<TAB>Nom<TAB>XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
+ *   devpropkey<TAB>Nom<TAB>XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX,pid
  * Les sizeof des vtables (`IXxxVtbl`) valent nombre de slots × 8.
  */
 #define PUT_GUIDS_HERE
@@ -51,6 +52,19 @@ static void guid(const char *nom, const GUID *g)
 #define GUID_KS(nom) do { static const GUID g_ = { STATIC_##nom }; guid(#nom, &g_); } while (0)
 /* GUID PortCls (DEFINE_GUID) : définis dans cette unité par initguid.h. */
 #define GUID_PC(nom) guid(#nom, &nom)
+
+/* DEVPROPKEY : GUID **et** pid. Les DEFINE_DEVPROPKEY de ksmedia.h ne produisent une
+ * définition que sous INITGUID, que PUT_GUIDS_HERE arme en tête de ce fichier ; côté
+ * Rust, ils sont en liste de blocage et recopiés à la main (src/fixups.rs), d'où l'oracle. */
+static void devpropkey(const char *nom, const DEVPROPKEY *k)
+{
+    printf("devpropkey\t%s\t%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X,%u\n", nom,
+           (unsigned long)k->fmtid.Data1, (unsigned)k->fmtid.Data2, (unsigned)k->fmtid.Data3,
+           k->fmtid.Data4[0], k->fmtid.Data4[1], k->fmtid.Data4[2], k->fmtid.Data4[3],
+           k->fmtid.Data4[4], k->fmtid.Data4[5], k->fmtid.Data4[6], k->fmtid.Data4[7],
+           (unsigned)k->pid);
+}
+#define DEVPROPKEY_(nom) devpropkey(#nom, &nom)
 
 int main(void)
 {
@@ -107,6 +121,17 @@ int main(void)
      * l'écrit pas non plus, on la mesure pour la même raison. */
     TAILLE(KSEVENTDATA);
     TAILLE(KSEVENT_ENTRY);
+
+    /* Contraintes de taille de paquet WaveRT : la structure que le pilote pose en valeur
+     * de DEVPKEY_KsAudio_PacketSize_Constraints2, et l'entrée de son tableau de queue.
+     * Elle est écrite par le pilote et lue par le moteur audio : une divergence de
+     * disposition ferait annoncer la période minimale à la place de l'alignement. Attention
+     * à sizeof(KSAUDIO_PACKETSIZE_CONSTRAINTS2) : le ANYSIZE_ARRAY du WDK vaut 1, donc la
+     * structure C mesure TOUJOURS une contrainte de mode de plus qu'elle n'en porte — c'est
+     * le DÉCALAGE de ProcessingModeConstraints, et non cette taille, qui donne la longueur
+     * à passer quand NumProcessingModeConstraints vaut zéro. */
+    TAILLE(KSAUDIO_PACKETSIZE_CONSTRAINTS2);
+    TAILLE(KSAUDIO_PACKETSIZE_PROCESSINGMODE_CONSTRAINT);
 
     /* Vtables COM plates : slots × 8. */
     TAILLE(IUnknownVtbl);
@@ -212,6 +237,17 @@ int main(void)
     /* KSEVENTDATA : seul NotificationType est nommable des deux côtés (le reste est une
      * union anonyme, que offset_of! ne sait pas désigner en Rust). */
     DECALAGE(KSEVENTDATA, NotificationType);
+    /* Les cinq champs des contraintes de paquet, et les trois d'une contrainte de mode.
+     * Le décalage de ProcessingModeConstraints est celui qui compte le plus : c'est la
+     * longueur exacte de la valeur quand NumProcessingModeConstraints vaut zéro. */
+    DECALAGE(KSAUDIO_PACKETSIZE_CONSTRAINTS2, MinPacketPeriodInHns);
+    DECALAGE(KSAUDIO_PACKETSIZE_CONSTRAINTS2, PacketSizeFileAlignment);
+    DECALAGE(KSAUDIO_PACKETSIZE_CONSTRAINTS2, MaxPacketSizeInBytes);
+    DECALAGE(KSAUDIO_PACKETSIZE_CONSTRAINTS2, NumProcessingModeConstraints);
+    DECALAGE(KSAUDIO_PACKETSIZE_CONSTRAINTS2, ProcessingModeConstraints);
+    DECALAGE(KSAUDIO_PACKETSIZE_PROCESSINGMODE_CONSTRAINT, ProcessingMode);
+    DECALAGE(KSAUDIO_PACKETSIZE_PROCESSINGMODE_CONSTRAINT, SamplesPerProcessingPacket);
+    DECALAGE(KSAUDIO_PACKETSIZE_PROCESSINGMODE_CONSTRAINT, ProcessingPacketDurationInHns);
 
     /* GUID. */
     GUID_PC(IID_IUnknown);
@@ -234,5 +270,11 @@ int main(void)
     GUID_KS(KSEVENTSETID_PinCapsChange);
     GUID_KS(KSPROPSETID_Audio);
     GUID_KS(KSPROPTYPESETID_General);
+
+    /* DEVPROPKEY : la clé sur laquelle le pilote pose ses contraintes de taille de paquet.
+     * Recopiée à la main côté Rust (les DEFINE_DEVPROPKEY sont en liste de blocage de
+     * bindgen, faute de définition sans INITGUID) : c'est donc la seule vérification qui
+     * existe, GUID ET pid. */
+    DEVPROPKEY_(DEVPKEY_KsAudio_PacketSize_Constraints2);
     return 0;
 }

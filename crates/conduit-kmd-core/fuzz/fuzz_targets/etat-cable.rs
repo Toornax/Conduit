@@ -16,23 +16,68 @@
 //! - **le rendu des refus** : `Display` d'une `ConfigError` part dans le journal du
 //!   service, il ne doit pas paniquer non plus.
 //!
-//! # Deux parseurs, la même entrée
+//! # Trois parseurs, la même entrée
 //!
 //! Depuis le lot 2 du mode paquets, les mêmes octets partent aussi dans
-//! `CablePackets::from_bytes` (`KSPROPERTY_CONDUIT_PACKETS`, 168 octets). Les deux
-//! longueurs exigées étant différentes, une entrée donnée n'en intéresse qu'un seul à la
-//! fois — c'est voulu : le fuzzer explore les deux domaines sans qu'on ait à deviner
-//! lequel il vise, et un préfixe valide de l'un ne doit être accepté par aucun des deux.
+//! `CablePackets::from_bytes` (`KSPROPERTY_CONDUIT_PACKETS`, 168 octets), et depuis la
+//! déclaration des contraintes de taille de paquet dans `CableTransport::from_bytes`
+//! (`KSPROPERTY_CONDUIT_TRANSPORT`, 80 octets). Les trois longueurs exigées étant
+//! différentes, une entrée donnée n'en intéresse qu'un seul à la fois — c'est voulu : le
+//! fuzzer explore les trois domaines sans qu'on ait à deviner lequel il vise, et un préfixe
+//! valide de l'un ne doit être accepté par aucun des trois.
 //!
 //! `cargo +nightly fuzz run etat-cable` depuis `crates/conduit-kmd-core`.
 #![no_main]
 
 use conduit_kmd_core::config::{
-    CablePackets, CableState, StreamSide, CABLE_MAX, CABLE_PACKETS_BYTES, CABLE_STATE_BYTES,
+    CablePackets, CableState, CableTransport, StreamSide, ALLOCATION_MODE_MAX, CABLE_MAX,
+    CABLE_PACKETS_BYTES, CABLE_STATE_BYTES, CABLE_TRANSPORT_BYTES, KS_RUN_STATE_MAX,
     PACKET_EXPOSURE_MAX, PACKET_IRQL_MAX,
 };
 use conduit_kmd_core::params::{MAX_CHANNELS, MAX_PACKET_MODE, MIN_CHANNELS};
 use libfuzzer_sys::fuzz_target;
+
+/// L'état du transport : mêmes exigences que l'état, sur ses propres domaines.
+///
+/// Les deux `NTSTATUS` de pose des contraintes de taille de paquet n'ont **aucun** domaine
+/// — il n'existe pas de liste fermée de `NTSTATUS` —, et c'est justement ce que
+/// l'aller-retour éprouve : ils doivent traverser le parseur à l'octet près, quelle que
+/// soit leur valeur, sans jamais faire refuser une valeur par ailleurs correcte.
+fn eprouver_transport(data: &[u8]) {
+    match CableTransport::from_bytes(data) {
+        Ok(transport) => {
+            let octets = transport.to_bytes();
+            assert_eq!(data.len(), CABLE_TRANSPORT_BYTES);
+            assert_eq!(octets.as_slice(), data, "aller-retour infidèle");
+            assert_eq!(
+                CableTransport::from_bytes(&octets),
+                Ok(transport),
+                "relecture infidèle"
+            );
+
+            // Les domaines fermés que le relevé tient pour acquis.
+            assert!(transport.cable < CABLE_MAX, "câble hors bornes");
+            assert_eq!(transport.reserved, 0, "rembourrage non nul accepté");
+            for sens in StreamSide::ALL {
+                let bloc = transport.side(sens);
+                assert!(bloc.mode <= ALLOCATION_MODE_MAX, "mode hors bornes");
+                assert!(bloc.mode().is_some(), "mode sans nom");
+                assert!(bloc.ks_state <= KS_RUN_STATE_MAX, "état KS hors bornes");
+                assert!(bloc.ks_state().is_some(), "état KS sans nom");
+                // Le libellé de la pose part dans le relevé : le rendre ne doit rien casser.
+                assert!(!transport.constraints_label(sens).is_empty());
+            }
+            assert_eq!(
+                transport.contraintes_declarees(),
+                transport.constraints_render == 0 && transport.constraints_capture == 0
+            );
+        }
+        Err(cause) => {
+            // Cette cause part dans le relevé : la rendre ne doit pas paniquer.
+            assert!(!cause.to_string().is_empty());
+        }
+    }
+}
 
 /// Le relevé de paquets : mêmes exigences que l'état, sur ses propres domaines.
 fn eprouver_paquets(data: &[u8]) {
@@ -77,6 +122,7 @@ fn eprouver_paquets(data: &[u8]) {
 
 fuzz_target!(|data: &[u8]| {
     eprouver_paquets(data);
+    eprouver_transport(data);
 
     match CableState::from_bytes(data) {
         Ok(etat) => {

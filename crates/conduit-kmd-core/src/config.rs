@@ -355,7 +355,33 @@ pub const PID_MARQUE_CABLE: u32 = 1;
 /// dernier `StartDevice`** et survivent au flux qu'on cherche à comprendre.
 ///
 /// Le passage de 4 à 5 est **additif**, comme les deux précédents.
-pub const CONFIG_VERSION: u32 = 5;
+///
+/// # Pourquoi 6 : deux champs de plus, et cette fois la longueur bouge
+///
+/// La déclaration des contraintes de taille de paquet
+/// (`DEVPKEY_KsAudio_PacketSize_Constraints2`) ajoute **deux `ULONG`** à
+/// [`CableTransport`] — [`CableTransport::constraints_render`] et
+/// [`CableTransport::constraints_capture`] —, qui passe de 72 à 80 octets. C'est le premier
+/// changement de ce contrat qui ne se contente pas d'ajouter un sélecteur : la longueur de
+/// la valeur de [`KSPROPERTY_CONDUIT_TRANSPORT`] change, et **tout client v5 se verra
+/// refuser sa lecture** par le contrôle de longueur exacte — la panne que ce numéro existe
+/// pour nommer.
+///
+/// Le sélecteur voisin, préféré trois fois de suite jusqu'ici, a été écarté **cette fois**
+/// pour une raison de fond : ce que les deux champs portent est la réponse à *la* question
+/// que [`KSPROPERTY_CONDUIT_TRANSPORT`] pose déjà. Le relevé montre un moteur audio qui
+/// alloue 4096 trames par scrutation et n'a jamais que des périodes de 10 ms ; savoir si
+/// nous lui avons dit, au démarrage, que nous savions faire plus court se lit **à côté** de
+/// ce constat ou ne se lit pas. Une cinquième propriété aurait obligé à recoller deux
+/// sorties pour tirer une seule conclusion, et le relevé de `conduit-looptest` est
+/// précisément fait pour qu'on n'ait pas à le faire.
+///
+/// Le passage de 5 à 6 reste **additif** au sens sémantique — rien de ce qu'un client v5
+/// savait lire n'a changé de sens, et les champs existants sont aux mêmes décalages —, mais
+/// il n'est **pas** compatible en longueur. Le message d'inadéquation de `conduit-looptest`
+/// est déjà rédigé pour ce cas : il rapporte deux millésimes sans prétendre savoir ce qui
+/// diffère, et c'est exactement ce qu'il faut dire ici.
+pub const CONFIG_VERSION: u32 = 6;
 
 /// Nombre de câbles que le contrat sait adresser : le plafond de la réserve
 /// ([`crate::params::MAX_RESERVE`], SPEC F-06).
@@ -1298,16 +1324,36 @@ pub struct StreamTransport {
 pub const OT_CABLE: usize = 0;
 /// `CableTransport::reserved` (`ULONG`) : décalage 4.
 pub const OT_RESERVED: usize = 4;
-/// `CableTransport::render` ([`StreamTransport`]) : décalage 8.
-pub const OT_RENDER: usize = 8;
-/// `CableTransport::capture` ([`StreamTransport`]) : décalage 40.
-pub const OT_CAPTURE: usize = 40;
+/// `CableTransport::constraints_render` (`ULONG`) : décalage 8.
+pub const OT_CONSTRAINTS_RENDER: usize = 8;
+/// `CableTransport::constraints_capture` (`ULONG`) : décalage 12.
+pub const OT_CONSTRAINTS_CAPTURE: usize = 12;
+/// `CableTransport::render` ([`StreamTransport`]) : décalage 16.
+pub const OT_RENDER: usize = 16;
+/// `CableTransport::capture` ([`StreamTransport`]) : décalage 48.
+pub const OT_CAPTURE: usize = 48;
 
-/// Taille de la valeur de [`KSPROPERTY_CONDUIT_TRANSPORT`], en octets : **72**.
+/// Taille de la valeur de [`KSPROPERTY_CONDUIT_TRANSPORT`], en octets : **80**.
 ///
 /// Fixe et vérifiée par assertion `const` contre `size_of::<CableTransport>()`, comme
 /// [`CABLE_STATE_BYTES`] et [`CABLE_COUNTERS_BYTES`].
-pub const CABLE_TRANSPORT_BYTES: usize = 72;
+pub const CABLE_TRANSPORT_BYTES: usize = 80;
+
+/// `NTSTATUS` de facilité que portent [`CableTransport::constraints_render`] et
+/// [`CableTransport::constraints_capture`] tant que la pose des contraintes de taille de
+/// paquet n'a **pas été tentée** : `0xE0000001`.
+///
+/// # Pourquoi une sentinelle plutôt que zéro
+///
+/// Zéro est `STATUS_SUCCESS` : un câble tout juste construit, ou un pilote antérieur à
+/// cette version, annoncerait « contraintes posées » sans que rien n'ait été posé — le
+/// genre de relevé qui ment, et ce dépôt a déjà écrit ailleurs qu'un diagnostic qui ment
+/// coûte plus cher qu'un diagnostic absent.
+///
+/// La valeur est dans l'espace **« customer »** des `NTSTATUS` (bit 29 armé, sévérité
+/// « erreur ») : le noyau n'en rend jamais de tels, la sentinelle ne peut donc pas être
+/// confondue avec un vrai code d'échec de `IoSetDeviceInterfacePropertyData`.
+pub const CONSTRAINTS_NON_TENTEE: u32 = 0xE000_0001;
 
 /// L'état du transport des **deux** sens d'un câble, tel qu'il traverse
 /// `IOCTL_KS_PROPERTY`.
@@ -1332,7 +1378,23 @@ pub const CABLE_TRANSPORT_BYTES: usize = 72;
 /// lisent l'un après l'autre sans qu'aucune conclusion ne dépende de leur simultanéité.
 ///
 /// Le détail est écrit sur `conduit_kmd::cable::Cable::transport_snapshot`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+///
+/// # Deux `NTSTATUS` de démarrage dans une valeur qui décrit un flux
+///
+/// [`Self::constraints_render`] et [`Self::constraints_capture`] ne décrivent pas le flux
+/// courant : ils disent ce qu'a donné, au dernier `StartDevice`, la pose de
+/// `DEVPKEY_KsAudio_PacketSize_Constraints2` sur l'interface du filtre wave de ce sens. Ils
+/// vivent ici, et non dans un sélecteur de plus, parce que c'est **la même question** que
+/// celle du reste de la structure : le moteur audio n'a-t-il que des périodes de 10 ms
+/// parce qu'il le veut, ou parce que nous ne lui avons jamais dit qu'on savait faire plus
+/// court ? Lire la réponse à côté du mode d'allocation et de la taille de tampon obtenue est
+/// exactement ce qu'un relevé doit permettre ; l'aller chercher dans une seconde requête
+/// obligerait à recoller deux sorties.
+///
+/// Ils sont sur le **câble**, pas sur le bloc de sens : un bloc de sens est un instantané du
+/// flux et retombe à zéro quand la broche se ferme, alors que la pose date du démarrage du
+/// périphérique et doit lui survivre.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(C)]
 pub struct CableTransport {
     /// Numéro du câble, de 0 à [`CABLE_MAX`] − 1.
@@ -1348,10 +1410,39 @@ pub struct CableTransport {
     /// implicite. Le `GET` l'écrit toujours à zéro et [`CableTransport::from_bytes`] le
     /// refuse non nul — c'est ce refus qui garde la place réellement libre.
     pub reserved: u32,
+    /// `NTSTATUS` de la pose de `DEVPKEY_KsAudio_PacketSize_Constraints2` sur l'interface
+    /// du filtre `WaveRender<n>`, au dernier `StartDevice`.
+    ///
+    /// `STATUS_SUCCESS` (0) : les contraintes sont déclarées, le moteur audio peut demander
+    /// une période plus courte que 10 ms. [`CONSTRAINTS_NON_TENTEE`] : rien n'a encore été
+    /// tenté. Toute autre valeur est le code rendu par `IoRegisterDeviceInterface` ou
+    /// `IoSetDeviceInterfacePropertyData` — un échec **n'empêche pas** le pilote de
+    /// démarrer, l'endpoint existe et fonctionne, il reste seulement bloqué à 10 ms.
+    ///
+    /// **Aucun domaine n'est vérifié** : c'est un `NTSTATUS`, et il n'en existe pas de
+    /// liste fermée. Le refuser hors d'une liste que nous aurions inventée ferait
+    /// disparaître du relevé le seul code qui expliquerait la panne.
+    pub constraints_render: u32,
+    /// Le même `NTSTATUS`, pour l'interface du filtre `WaveCapture<n>`.
+    ///
+    /// Deux champs et non un : les deux filtres sont deux interfaces PnP distinctes, posées
+    /// l'une après l'autre, et rien ne garantit qu'elles échouent ensemble.
+    pub constraints_capture: u32,
     /// Le sens rendu : ce que le lecteur a demandé.
     pub render: StreamTransport,
     /// Le sens capture : ce que l'enregistreur a demandé.
     pub capture: StreamTransport,
+}
+
+impl Default for CableTransport {
+    /// Le câble 0 au repos, **contraintes non tentées**.
+    ///
+    /// Écrit à la main plutôt que dérivé : un `Default` dérivé mettrait les deux `NTSTATUS`
+    /// à zéro, c'est-à-dire à `STATUS_SUCCESS`, et annoncerait des contraintes posées là où
+    /// rien ne l'a été. Voir [`CONSTRAINTS_NON_TENTEE`].
+    fn default() -> Self {
+        Self::new(0)
+    }
 }
 
 // La taille annoncée est celle des structures, et chaque décalage nommé est celui que
@@ -1381,22 +1472,31 @@ const _: () = assert!(size_of::<CableTransport>() == CABLE_TRANSPORT_BYTES);
 const _: () = assert!(align_of::<CableTransport>() == 8);
 const _: () = assert!(core::mem::offset_of!(CableTransport, cable) == OT_CABLE);
 const _: () = assert!(core::mem::offset_of!(CableTransport, reserved) == OT_RESERVED);
+const _: () =
+    assert!(core::mem::offset_of!(CableTransport, constraints_render) == OT_CONSTRAINTS_RENDER);
+const _: () =
+    assert!(core::mem::offset_of!(CableTransport, constraints_capture) == OT_CONSTRAINTS_CAPTURE);
 const _: () = assert!(core::mem::offset_of!(CableTransport, render) == OT_RENDER);
 const _: () = assert!(core::mem::offset_of!(CableTransport, capture) == OT_CAPTURE);
-// Les deux `ULONG` de tête pavent les huit premiers octets, puis les deux blocs de sens se
-// suivent sans trou : les deux sont alignés sur huit et la structure s'arrête net.
-const _: () = assert!(OT_RESERVED.saturating_add(TAILLE_MOT) == OT_RENDER);
+// Les quatre `ULONG` de tête pavent les seize premiers octets, puis les deux blocs de sens
+// se suivent sans trou : les deux sont alignés sur huit et la structure s'arrête net.
+const _: () = assert!(OT_RESERVED.saturating_add(TAILLE_MOT) == OT_CONSTRAINTS_RENDER);
+const _: () = assert!(OT_CONSTRAINTS_RENDER.saturating_add(TAILLE_MOT) == OT_CONSTRAINTS_CAPTURE);
+const _: () = assert!(OT_CONSTRAINTS_CAPTURE.saturating_add(TAILLE_MOT) == OT_RENDER);
 const _: () = assert!(OT_RENDER.saturating_add(STREAM_TRANSPORT_BYTES) == OT_CAPTURE);
 const _: () = assert!(OT_CAPTURE.saturating_add(STREAM_TRANSPORT_BYTES) == CABLE_TRANSPORT_BYTES);
-// Les deux blocs tombent sur un multiple de huit : 8 = 1 × 8 et 40 = 5 × 8.
-const _: () = assert!(OT_RENDER == TAILLE_MOT_LONG);
-const _: () = assert!(OT_CAPTURE == TAILLE_MOT_LONG.saturating_mul(5));
+// Les deux blocs tombent sur un multiple de huit : 16 = 2 × 8 et 48 = 6 × 8.
+const _: () = assert!(OT_RENDER == TAILLE_MOT_LONG.saturating_mul(2));
+const _: () = assert!(OT_CAPTURE == TAILLE_MOT_LONG.saturating_mul(6));
+// La sentinelle de pose non tentée n'est pas un succès : un relevé ne doit jamais la lire
+// comme « contraintes déclarées ».
+const _: () = assert!(CONSTRAINTS_NON_TENTEE != 0);
 
 /// Ce qui a fait refuser une [`CableTransport`] : un cas, une cause, une ligne de journal.
 ///
 /// Distinct de [`ConfigError`] et de [`CountersError`] pour la même raison qu'elles le sont
 /// l'une de l'autre : les longueurs attendues diffèrent, et un message qui annoncerait
-/// « 56 attendus » pour une structure de 72 octets serait un diagnostic faux.
+/// « 56 attendus » pour une structure de 80 octets serait un diagnostic faux.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TransportError {
     /// Longueur du tampon différente de [`CABLE_TRANSPORT_BYTES`] — plus courte **ou** plus
@@ -1598,12 +1698,15 @@ impl StreamTransport {
 }
 
 impl CableTransport {
-    /// L'état d'un câble dont aucun sens n'est ouvert : tout à zéro, sauf le numéro.
+    /// L'état d'un câble dont aucun sens n'est ouvert : tout à zéro, sauf le numéro et les
+    /// deux `NTSTATUS` de pose, qui valent [`CONSTRAINTS_NON_TENTEE`].
     #[must_use]
     pub const fn new(cable: u32) -> Self {
         Self {
             cable,
             reserved: 0,
+            constraints_render: CONSTRAINTS_NON_TENTEE,
+            constraints_capture: CONSTRAINTS_NON_TENTEE,
             render: StreamTransport::new(),
             capture: StreamTransport::new(),
         }
@@ -1616,6 +1719,37 @@ impl CableTransport {
             StreamSide::Render => &self.render,
             StreamSide::Capture => &self.capture,
         }
+    }
+
+    /// Le `NTSTATUS` de la pose des contraintes de taille de paquet du sens `sens`.
+    #[must_use]
+    pub const fn constraints(&self, sens: StreamSide) -> u32 {
+        match sens {
+            StreamSide::Render => self.constraints_render,
+            StreamSide::Capture => self.constraints_capture,
+        }
+    }
+
+    /// La pose des contraintes du sens `sens` en toutes lettres, pour un relevé.
+    ///
+    /// Trois cas et pas un de plus : posée, jamais tentée, échouée — le code de l'échec est
+    /// dans [`Self::constraints`], et c'est à l'appelant de l'écrire à côté.
+    #[must_use]
+    pub const fn constraints_label(&self, sens: StreamSide) -> &'static str {
+        match self.constraints(sens) {
+            0 => "contraintes de paquet DÉCLARÉES",
+            CONSTRAINTS_NON_TENTEE => "contraintes de paquet non tentées",
+            _ => "contraintes de paquet REFUSÉES",
+        }
+    }
+
+    /// Les contraintes ont-elles été déclarées **des deux côtés** ?
+    ///
+    /// La question du lot en une ligne : tant que c'est faux, `GetSharedModeEnginePeriod`
+    /// n'a aucune raison d'annoncer autre chose que les 10 ms du défaut de Windows.
+    #[must_use]
+    pub const fn contraintes_declarees(&self) -> bool {
+        self.constraints_render == 0 && self.constraints_capture == 0
     }
 
     /// Le moteur audio a-t-il obtenu un tampon **avec notifications** d'au moins un côté ?
@@ -1639,7 +1773,7 @@ impl CableTransport {
             .saturating_add(self.capture.refused_allocations)
     }
 
-    /// Sérialise l'état en [`CABLE_TRANSPORT_BYTES`] octets : deux `ULONG`, puis les deux
+    /// Sérialise l'état en [`CABLE_TRANSPORT_BYTES`] octets : quatre `ULONG`, puis les deux
     /// blocs de sens à [`OT_RENDER`] et [`OT_CAPTURE`].
     ///
     /// Le pilote n'utilise pas cette fonction pour répondre à un `GET` — il écrit
@@ -1650,6 +1784,8 @@ impl CableTransport {
     pub const fn to_bytes(&self) -> [u8; CABLE_TRANSPORT_BYTES] {
         let cable = self.cable.to_ne_bytes();
         let reserved = self.reserved.to_ne_bytes();
+        let kr = self.constraints_render.to_ne_bytes();
+        let kc = self.constraints_capture.to_ne_bytes();
         let r = self.render.to_bytes();
         let c = self.capture.to_bytes();
         [
@@ -1661,6 +1797,14 @@ impl CableTransport {
             reserved[1],
             reserved[2],
             reserved[3],
+            kr[0],
+            kr[1],
+            kr[2],
+            kr[3],
+            kc[0],
+            kc[1],
+            kc[2],
+            kc[3],
             r[0],
             r[1],
             r[2],
@@ -1743,6 +1887,11 @@ impl CableTransport {
     /// [`StreamTransport::ks_state`] sont des **énumérations fermées** de ce contrat, et un
     /// code hors domaine dit que le pilote et le client ne parlent pas de la même chose.
     ///
+    /// [`Self::constraints_render`] et [`Self::constraints_capture`] ne le sont pas : ce
+    /// sont des `NTSTATUS`, dont il n'existe aucune liste fermée. Les refuser hors d'une
+    /// liste que nous aurions inventée ferait disparaître du relevé le seul code qui
+    /// expliquerait pourquoi la pose a échoué.
+    ///
     /// Le reste ne l'est pas, et surtout pas la **cohérence entre champs** : un mode
     /// [`AllocationMode::NoStream`] accompagné d'une taille de tampon non nulle a l'air
     /// impossible, mais l'instantané n'est pas pris d'un seul coup (voir la note de
@@ -1763,6 +1912,8 @@ impl CableTransport {
         let longueur = || TransportError::Longueur { recus: data.len() };
         let cable = mot(data, OT_CABLE).ok_or_else(longueur)?;
         let reserved = mot(data, OT_RESERVED).ok_or_else(longueur)?;
+        let constraints_render = mot(data, OT_CONSTRAINTS_RENDER).ok_or_else(longueur)?;
+        let constraints_capture = mot(data, OT_CONSTRAINTS_CAPTURE).ok_or_else(longueur)?;
         let render = StreamTransport::lire(data, OT_RENDER).ok_or_else(longueur)?;
         let capture = StreamTransport::lire(data, OT_CAPTURE).ok_or_else(longueur)?;
 
@@ -1781,6 +1932,8 @@ impl CableTransport {
         Ok(Self {
             cable,
             reserved,
+            constraints_render,
+            constraints_capture,
             render,
             capture,
         })
@@ -3035,8 +3188,9 @@ mod tests {
         }
         // Une propriété qui apparaît est un changement observable du jeu, et ce numéro en
         // est la seule voie (voir sa documentation) : 3 avec les compteurs, 4 avec le
-        // transport, 5 avec le relevé de paquets.
-        assert_eq!(CONFIG_VERSION, 5);
+        // transport, 5 avec le relevé de paquets, 6 avec les deux `NTSTATUS` de pose des
+        // contraintes de taille de paquet — le premier changement qui allonge une valeur.
+        assert_eq!(CONFIG_VERSION, 6);
     }
 
     /// Le `pid` de la marque : celui qu'écrit le service et celui que lit le dorsal.
@@ -3135,14 +3289,17 @@ mod tests {
 
     /// Un état de transport dont **aucune** valeur ne se confond avec une autre.
     ///
-    /// Quatorze champs dont dix pourraient valoir la même chose : deux blocs de sens
+    /// Seize champs dont douze pourraient valoir la même chose : deux blocs de sens
     /// intervertis, ou deux `ULONG` écrits l'un à la place de l'autre, passeraient un
     /// aller-retour sur des zéros sans que rien ne le signale. C'est ce que ce jeu de
-    /// valeurs, toutes différentes, empêche.
+    /// valeurs, toutes différentes, empêche. Les deux `NTSTATUS` de pose en font partie :
+    /// l'un réussi, l'autre échoué, pour qu'une inversion des deux sens se voie.
     fn transport_temoin() -> CableTransport {
         CableTransport {
             cable: 3,
             reserved: 0,
+            constraints_render: 0,
+            constraints_capture: 0xC000_000D,
             render: StreamTransport {
                 mode: AllocationMode::Notifications.code(),
                 notification_count: 2,
@@ -3347,21 +3504,23 @@ mod tests {
         assert!(!inconnu.exposee());
     }
 
-    /// La disposition du transport : 72 octets, deux `ULONG` puis deux blocs de 32, aucun
+    /// La disposition du transport : 80 octets, quatre `ULONG` puis deux blocs de 32, aucun
     /// trou — et chaque champ se relit **à son décalage nommé**.
     #[test]
     fn la_disposition_du_transport_est_celle_des_decalages_nommes() {
-        assert_eq!(CABLE_TRANSPORT_BYTES, 72);
+        assert_eq!(CABLE_TRANSPORT_BYTES, 80);
         assert_eq!(STREAM_TRANSPORT_BYTES, 32);
         assert_eq!(size_of::<CableTransport>(), CABLE_TRANSPORT_BYTES);
         assert_eq!(size_of::<StreamTransport>(), STREAM_TRANSPORT_BYTES);
         assert_eq!(align_of::<CableTransport>(), 8);
         assert_eq!(align_of::<StreamTransport>(), 8);
 
-        // Deux `ULONG` de tête, puis deux blocs contigus, chacun aligné sur huit.
+        // Quatre `ULONG` de tête, puis deux blocs contigus, chacun aligné sur huit.
         assert_eq!(OT_CABLE, 0);
         assert_eq!(OT_RESERVED, TAILLE_MOT);
-        assert_eq!(OT_RENDER, TAILLE_MOT * 2);
+        assert_eq!(OT_CONSTRAINTS_RENDER, TAILLE_MOT * 2);
+        assert_eq!(OT_CONSTRAINTS_CAPTURE, TAILLE_MOT * 3);
+        assert_eq!(OT_RENDER, TAILLE_MOT * 4);
         assert_eq!(OT_CAPTURE, OT_RENDER + STREAM_TRANSPORT_BYTES);
         assert_eq!(OT_CAPTURE + STREAM_TRANSPORT_BYTES, CABLE_TRANSPORT_BYTES);
         assert_eq!(OT_RENDER % TAILLE_MOT_LONG, 0);
@@ -3601,10 +3760,16 @@ mod tests {
                 assert_ne!(gauche, droite);
             }
         }
-        // Et l'état par défaut d'un câble au repos est bien tout à zéro.
+        // Et l'état par défaut d'un câble au repos est bien tout à zéro — sauf les deux
+        // `NTSTATUS` de pose, qui disent « non tentée » et non « réussie ».
         assert_eq!(AllocationMode::default(), AllocationMode::NoStream);
         assert_eq!(KsRunState::default(), KsRunState::Stop);
-        assert_eq!(CableTransport::new(2).to_bytes()[8..], [0u8; 64]);
+        let repos = CableTransport::new(2);
+        assert_eq!(repos.constraints_render, CONSTRAINTS_NON_TENTEE);
+        assert_eq!(repos.constraints_capture, CONSTRAINTS_NON_TENTEE);
+        assert!(!repos.contraintes_declarees());
+        assert_eq!(repos.to_bytes()[OT_RENDER..], [0u8; 64]);
+        assert_eq!(CableTransport::default(), CableTransport::new(0));
     }
 
     /// Les lectures que le lot 0 demande : le mode en toutes lettres, le total des refus, et
@@ -3621,6 +3786,27 @@ mod tests {
             AllocationMode::Notifications.label()
         );
         assert_eq!(transport.capture.ks_state_label(), "PAUSE");
+
+        // La pose des contraintes de paquet : réussie d'un côté, refusée de l'autre, donc
+        // pas « déclarées ». Les trois libellés se distinguent.
+        assert_eq!(transport.constraints(StreamSide::Render), 0);
+        assert_eq!(transport.constraints(StreamSide::Capture), 0xC000_000D);
+        assert!(!transport.contraintes_declarees());
+        assert!(transport
+            .constraints_label(StreamSide::Render)
+            .contains("DÉCLARÉES"));
+        assert!(transport
+            .constraints_label(StreamSide::Capture)
+            .contains("REFUSÉES"));
+        let posees = CableTransport {
+            constraints_render: 0,
+            constraints_capture: 0,
+            ..CableTransport::new(0)
+        };
+        assert!(posees.contraintes_declarees());
+        assert!(CableTransport::new(0)
+            .constraints_label(StreamSide::Render)
+            .contains("non tentées"));
 
         // Un câble entièrement scruté : la réponse est « non », et les refus disent si
         // c'est parce que le moteur n'a rien demandé ou parce qu'on a dit non.
@@ -4436,8 +4622,8 @@ mod tests {
         }
 
         /// Sur tout le domaine : accepté si et seulement si l'écho, le champ réservé et les
-        /// deux énumérations de chaque sens sont dans leurs bornes. Les tailles, les comptes
-        /// et les refus n'en ont **aucune**.
+        /// deux énumérations de chaque sens sont dans leurs bornes. Les tailles, les comptes,
+        /// les refus et les deux `NTSTATUS` de pose n'en ont **aucune**.
         #[test]
         fn le_transport_accepte_exactement_les_quatre_domaines(
             cable in any::<u32>(),
@@ -4448,10 +4634,14 @@ mod tests {
             etat_capture in any::<u32>(),
             octets_tampon in any::<u32>(),
             refus in any::<u64>(),
+            pose_rendu in any::<u32>(),
+            pose_capture in any::<u32>(),
         ) {
             let transport = CableTransport {
                 cable,
                 reserved,
+                constraints_render: pose_rendu,
+                constraints_capture: pose_capture,
                 render: StreamTransport {
                     mode: mode_rendu,
                     notification_count: u32::MAX,

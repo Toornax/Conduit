@@ -26,6 +26,10 @@
 //! - le contrat du jeu de propriétés KS privé de configuration ([`config`]) : le GUID du
 //!   jeu, la structure d'échange et **tout** son parseur, plus le masque de bits qui
 //!   persiste l'état actif des câbles (M1b-04, M1b-08) ;
+//! - les contraintes de taille de paquet WaveRT ([`packetsize`]) : les trois valeurs de
+//!   `KSAUDIO_PACKETSIZE_CONSTRAINTS2` que le pilote déclare sur l'interface de chaque
+//!   filtre wave, calculées depuis le plancher `BufferMs` et le plus gros format qu'une
+//!   broche puisse servir ;
 //! - le plan de copie de la boucle locale ([`loopback`]) : à chaque tick du timer du
 //!   câble, quelles trames de rendu écrire à quelles trames de capture, quand écrire
 //!   du silence, et quand le tick est trop en retard pour rattraper.
@@ -78,6 +82,7 @@ pub mod config;
 pub mod format;
 pub mod loopback;
 pub mod notify;
+pub mod packetsize;
 pub mod params;
 pub mod position;
 pub mod ring;
@@ -91,10 +96,10 @@ pub use config::{
     ACTIVE_CABLES_LABEL, ACTIVE_CABLES_MASK, ACTIVE_CABLES_VALUE_NAME, ALLOCATION_MODE_MAX,
     CABLE_COUNTERS_BYTES, CABLE_FORMAT_DEFAULT, CABLE_FORMAT_LABEL, CABLE_FORMAT_VALUE_NAMES,
     CABLE_MAX, CABLE_PACKETS_BYTES, CABLE_STATE_BYTES, CABLE_TRANSPORT_BYTES, CONFIG_VERSION,
-    KSPROPERTY_CONDUIT_CABLE_STATE, KSPROPERTY_CONDUIT_COUNTERS, KSPROPERTY_CONDUIT_PACKETS,
-    KSPROPERTY_CONDUIT_TRANSPORT, KSPROPERTY_CONDUIT_VERSION, KSPROPSETID_CONDUIT,
-    KS_RUN_STATE_MAX, PACKET_EXPOSURE_MAX, PACKET_IRQL_MAX, STREAM_PACKETS_BYTES,
-    STREAM_TRANSPORT_BYTES,
+    CONSTRAINTS_NON_TENTEE, KSPROPERTY_CONDUIT_CABLE_STATE, KSPROPERTY_CONDUIT_COUNTERS,
+    KSPROPERTY_CONDUIT_PACKETS, KSPROPERTY_CONDUIT_TRANSPORT, KSPROPERTY_CONDUIT_VERSION,
+    KSPROPSETID_CONDUIT, KS_RUN_STATE_MAX, PACKET_EXPOSURE_MAX, PACKET_IRQL_MAX,
+    STREAM_PACKETS_BYTES, STREAM_TRANSPORT_BYTES,
 };
 pub use format::{
     buffer_bytes, buffer_bytes_for_notifications, buffer_bytes_for_notifications_with_floor,
@@ -105,6 +110,11 @@ pub use format::{
 };
 pub use loopback::{CopyOp, Loopback, Plan, SilenceCause, SilenceOp, StreamView, LEAD_MS};
 pub use notify::{align_frames, boundaries_crossed, Notifier};
+pub use packetsize::{
+    min_packet_period_hns, PacketConstraints, HNS_PER_MS, MAX_FRAME_BYTES, MAX_PACKET_MS,
+    MAX_PACKET_SIZE_BYTES, MIN_PACKET_PERIOD_FLOOR_HNS, NOTIFICATION_COUNT,
+    PACKET_SIZE_FILE_ALIGNMENT,
+};
 pub use params::{
     decode_dword, sanitize, Correction, Fix, Param, Params, RawParams, Report, REG_DWORD,
     REG_DWORD_BYTES,

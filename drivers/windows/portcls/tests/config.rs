@@ -132,6 +132,10 @@ const TAILLE_TRANSPORT: usize = CABLE_TRANSPORT_BYTES;
 const TRANSPORT: CableTransport = CableTransport {
     cable: CABLE,
     reserved: 0,
+    // Posée d'un côté, refusée de l'autre : les deux `NTSTATUS` de la déclaration des
+    // contraintes de taille de paquet ne se confondent ni entre eux ni avec le reste.
+    constraints_render: 0,
+    constraints_capture: 0xC000_000D,
     render: StreamTransport {
         mode: AllocationMode::Notifications.code(),
         notification_count: 2,
@@ -1199,7 +1203,7 @@ fn le_transport_se_lit_sans_privilege_et_ne_s_ecrit_pas() {
 /// La garde de vtable de `property.rs` protège aussi le gestionnaire du transport.
 ///
 /// Comme pour les compteurs, le cas compte : c'est une propriété qu'un appelant **non
-/// privilégié** peut atteindre en présentant son propre tampon de 72 octets. Sans la garde,
+/// privilégié** peut atteindre en présentant son propre tampon de 80 octets. Sans la garde,
 /// un `MajorTarget` étranger ferait lire un état de flux à une adresse quelconque.
 #[test]
 fn un_major_target_etranger_est_refuse_sur_le_transport() {

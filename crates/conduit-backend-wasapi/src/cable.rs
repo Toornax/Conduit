@@ -66,7 +66,7 @@ use conduit_backend::CableId;
 /// câbles **ici**, sans dépendre du crate du pilote ni en recopier quoi que ce soit.
 pub use conduit_kmd_core::config::{
     AllocationMode, CableCounters, CablePackets, CableState, CableTransport, KsRunState,
-    PacketExposure, StreamPackets, StreamSide, StreamTransport, CABLE_MAX,
+    PacketExposure, StreamPackets, StreamSide, StreamTransport, CABLE_MAX, CONSTRAINTS_NON_TENTEE,
 };
 use conduit_kmd_core::config::{
     ConfigError, ConfigGuid, CountersError, PacketsError, TransportError, CABLE_COUNTERS_BYTES,

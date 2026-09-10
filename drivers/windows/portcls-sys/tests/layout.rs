@@ -72,6 +72,24 @@ macro_rules! guids {
     };
 }
 
+/// Table `nom → DEVPROPKEY écrite à la main`.
+///
+/// Genre de mesure à part, parce qu'une `DEVPROPKEY` n'est pas un GUID : elle porte **en
+/// plus** un `pid`, et se tromper de `pid` sur le bon GUID poserait la propriété sur une
+/// autre clé du même vendeur — une panne parfaitement muette. Les deux valeurs voyagent
+/// donc ensemble dans le golden, séparées par une virgule.
+macro_rules! devpropkeys {
+    ($($nom:ident),* $(,)?) => {
+        const NOMS_DEVPROPKEYS: &[&str] = &[$(stringify!($nom)),*];
+        fn devpropkey(nom: &str) -> Option<DEVPROPKEY> {
+            match nom {
+                $(stringify!($nom) => Some($nom),)*
+                _ => None,
+            }
+        }
+    };
+}
+
 tailles! {
     GUID => GUID,
     KSDATAFORMAT => KSDATAFORMAT,
@@ -110,6 +128,8 @@ tailles! {
     KSP_PIN => KSP_PIN,
     KSEVENTDATA => KSEVENTDATA,
     KSEVENT_ENTRY => KSEVENT_ENTRY,
+    KSAUDIO_PACKETSIZE_CONSTRAINTS2 => KSAUDIO_PACKETSIZE_CONSTRAINTS2,
+    KSAUDIO_PACKETSIZE_PROCESSINGMODE_CONSTRAINT => KSAUDIO_PACKETSIZE_PROCESSINGMODE_CONSTRAINT,
     IUnknownVtbl => IUnknownVtbl,
     IMiniportVtbl => IMiniportVtbl,
     IMiniportWaveRTVtbl => IMiniportWaveRTVtbl,
@@ -215,6 +235,18 @@ decalages! {
     KSEVENTDATA {
         NotificationType,
     },
+    KSAUDIO_PACKETSIZE_CONSTRAINTS2 {
+        MinPacketPeriodInHns,
+        PacketSizeFileAlignment,
+        MaxPacketSizeInBytes,
+        NumProcessingModeConstraints,
+        ProcessingModeConstraints,
+    },
+    KSAUDIO_PACKETSIZE_PROCESSINGMODE_CONSTRAINT {
+        ProcessingMode,
+        SamplesPerProcessingPacket,
+        ProcessingPacketDurationInHns,
+    },
 }
 
 guids! {
@@ -237,6 +269,10 @@ guids! {
     KSPROPTYPESETID_General,
 }
 
+devpropkeys! {
+    DEVPKEY_KsAudio_PacketSize_Constraints2,
+}
+
 /// Même format que le probe : `XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX` en majuscules.
 fn guid_texte(g: &GUID) -> String {
     let d = g.Data4;
@@ -244,6 +280,11 @@ fn guid_texte(g: &GUID) -> String {
         "{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
         g.Data1, g.Data2, g.Data3, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]
     )
+}
+
+/// Même format que le probe : le GUID, une virgule, le `pid` en décimal.
+fn devpropkey_texte(k: &DEVPROPKEY) -> String {
+    format!("{},{}", guid_texte(&k.fmtid), k.pid)
 }
 
 fn lignes_golden() -> impl Iterator<Item = (&'static str, &'static str, &'static str)> {
@@ -291,6 +332,15 @@ fn tailles_et_guids_conformes_au_golden() {
                     "GUID {nom} : Rust {obtenu}, cl.exe {attendu}"
                 );
             }
+            "devpropkey" => {
+                let obtenu = devpropkey(nom)
+                    .unwrap_or_else(|| panic!("{nom} absent de la table `devpropkeys!`"));
+                let obtenu = devpropkey_texte(&obtenu);
+                assert_eq!(
+                    obtenu, attendu,
+                    "DEVPROPKEY {nom} : Rust {obtenu}, cl.exe {attendu}"
+                );
+            }
             autre => panic!("genre de mesure inconnu dans le golden : {autre:?}"),
         }
     }
@@ -311,9 +361,14 @@ fn golden_et_tables_couvrent_les_memes_noms() {
         .filter(|(g, _, _)| *g == "guid")
         .map(|(_, n, _)| n)
         .collect();
+    let golden_devpropkeys: BTreeSet<&str> = lignes_golden()
+        .filter(|(g, _, _)| *g == "devpropkey")
+        .map(|(_, n, _)| n)
+        .collect();
     let tables_tailles: BTreeSet<&str> = NOMS_TAILLES.iter().copied().collect();
     let tables_decalages: BTreeSet<&str> = NOMS_DECALAGES.iter().copied().collect();
     let tables_guids: BTreeSet<&str> = NOMS_GUIDS.iter().copied().collect();
+    let tables_devpropkeys: BTreeSet<&str> = NOMS_DEVPROPKEYS.iter().copied().collect();
     assert_eq!(
         golden_tailles, tables_tailles,
         "sizeof : golden ≠ table `tailles!`"
@@ -323,6 +378,56 @@ fn golden_et_tables_couvrent_les_memes_noms() {
         "offset : golden ≠ table `decalages!`"
     );
     assert_eq!(golden_guids, tables_guids, "guid : golden ≠ table `guids!`");
+    assert_eq!(
+        golden_devpropkeys, tables_devpropkeys,
+        "devpropkey : golden ≠ table `devpropkeys!`"
+    );
+}
+
+/// La longueur d'une valeur `DEVPKEY_KsAudio_PacketSize_Constraints2` est **exactement**
+/// l'en-tête plus les contraintes de mode déclarées — jamais `size_of` de la structure C.
+///
+/// Le `ANYSIZE_ARRAY` du WDK vaut 1 : `size_of::<KSAUDIO_PACKETSIZE_CONSTRAINTS2>()` compte
+/// donc toujours une contrainte de mode, même quand on n'en déclare aucune. Les deux
+/// exemples de la documentation Microsoft mesurent exactement ce que cette fonction rend —
+/// 16 + 1 × 24 = 40 pour la variante capture de SYSVAD, 16 + 2 × 24 = 64 pour la variante
+/// rendu —, ce qui est la preuve que le moteur audio attend cette longueur-là et pas une
+/// autre.
+#[test]
+fn la_longueur_des_contraintes_de_paquet_ne_compte_que_ce_qui_est_declare() {
+    assert_eq!(PACKET_SIZE_CONSTRAINTS2_HEADER_BYTES, 16);
+    assert_eq!(
+        size_of::<KSAUDIO_PACKETSIZE_PROCESSINGMODE_CONSTRAINT>(),
+        24
+    );
+    assert_eq!(packet_size_constraints_bytes(0), Some(16));
+    assert_eq!(packet_size_constraints_bytes(1), Some(40));
+    assert_eq!(packet_size_constraints_bytes(2), Some(64));
+    // La structure C, elle, en mesure toujours une de plus : c'est le piège que l'en-tête
+    // nommé évite.
+    assert_eq!(size_of::<KSAUDIO_PACKETSIZE_CONSTRAINTS2>(), 40);
+    // Le compte est un `ULONG` et l'arithmétique se fait en `usize` : sur x64 le produit ne
+    // déborde jamais, et le `checked_mul` de la fonction est une ceinture, pas un chemin.
+    assert_eq!(
+        packet_size_constraints_bytes(u32::MAX),
+        Some(16 + 24 * (u32::MAX as usize))
+    );
+}
+
+/// La clé recopiée à la main désigne bien la propriété de contraintes de paquet.
+///
+/// Le golden la vérifie déjà contre `cl.exe` ; ce test écrit la valeur **en toutes
+/// lettres**, pour qu'une relecture du code n'ait pas à ouvrir `ksmedia.h`.
+#[test]
+fn la_cle_des_contraintes_de_paquet_est_celle_de_ksmedia() {
+    assert_eq!(
+        devpropkey_texte(&DEVPKEY_KsAudio_PacketSize_Constraints2),
+        "9404F781-7191-409B-8B0B-80BF6EC229AE,2"
+    );
+    // Le type de la valeur : un tableau d'octets de longueur libre.
+    assert_eq!(DEVPROP_TYPE_BINARY, 0x1003);
+    // Et la locale des propriétés sans texte traduisible.
+    assert_eq!(LOCALE_NEUTRAL, 0);
 }
 
 /// Les vtables sont des tableaux de pointeurs de fonction : taille multiple de 8, jamais

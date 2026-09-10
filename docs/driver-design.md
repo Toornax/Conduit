@@ -541,6 +541,87 @@ Sources : *Audio Endpoint Builder Algorithm*, *Friendly Names for Audio Endpoint
 *PKEY_DeviceInterface_FriendlyName* (Core Audio), *General Guidelines for INF Files*, plus
 `%SystemRoot%\INF\ks.inf` et le registre du poste pour les noms de catégorie constatés.
 
+### 4.3 Contraintes de taille de paquet (`DEVPKEY_KsAudio_PacketSize_Constraints2`)
+
+**Le fait mesuré.** `IAudioClient3::GetSharedModeEnginePeriod` annonce, sur nos endpoints :
+défaut 480 trames, fondamentale 480, **minimum 480, maximum 480** — 10 ms, et rien d'autre.
+Aucune application ne peut demander plus court, et le moteur audio alloue par scrutation
+(`AllocateAudioBuffer`, 4096 trames, aucune notification). Ce n'est pas une limite du
+moteur : un client exclusif obtient, lui, `AllocateBufferWithNotification` 2 × 240 trames,
+donc l'interface de notification du pilote est saine. La page *Low Latency Audio* classe la
+déclaration de `DEVPKEY_KsAudio_PacketSize_Constraints2` parmi les **obligations** du pilote
+(« Declare the minimum buffer size », `[Mandatory]`), et le pilote ne la déclarait nulle
+part : Windows retombait sur son défaut historique de 10 ms.
+
+**Où, et quand.** `adapter::start_device` pose la propriété sur l'interface
+`KSCATEGORY_AUDIO` de chacun des deux filtres **wave** de chaque câble — chaîne de référence
+`WaveRender<n>` et `WaveCapture<n>`, celle-là même que `PcRegisterSubdevice` reçoit —,
+**avant** l'appel à `PcRegisterSubdevice` correspondant. La documentation de la structure
+l'exige (« The driver sets this property before calling `PcRegisterSubdevice` or otherwise
+enabling its KS filter interface for its streaming pins ») et SYSVAD le fait ainsi
+(`CAdapterCommon::InstallSubdevice` appelle `CreateAudioInterfaceWithProperties` avant même
+`PcNewPort`) : après, la pose courrait contre l'activation de l'interface par PnP, que le
+constructeur d'endpoints observe. L'interface existe déjà — l'INF la publie —, si bien que
+`IoRegisterDeviceInterface` sur la même catégorie et la même chaîne de référence rend le
+lien symbolique **existant** au lieu d'en créer un second ; c'est le seul chemin vers le nom
+d'une interface qu'on n'a pas créée soi-même. Le lien est libéré par
+`RtlFreeUnicodeString`, succès ou échec. Une seule catégorie, comme SYSVAD, alors que l'INF
+publie aussi les filtres wave sous `KSCATEGORY_RENDER`/`KSCATEGORY_CAPTURE` et
+`KSCATEGORY_REALTIME`. Les drapeaux valent **0** (propriété volatile) et non
+`PLUGPLAY_PROPERTY_PERSISTENT` : la valeur dépend de `BufferMs`, et une copie persistée
+survivrait à un changement de ce paramètre, c'est-à-dire annoncerait une période que le
+pilote ne servirait plus.
+
+**Les trois valeurs**, calculées par `conduit_kmd_core::packetsize` et donc testées sans
+machine. Pour le défaut `BufferMs = 10` :
+
+| Champ | Valeur | Pourquoi |
+|---|---|---|
+| `MinPacketPeriodInHns` | **50 000** (5 ms) | `max(2 ms, BufferMs / NotificationCount)` : le minuteur du pilote bat à 1 ms, d'où un plancher absolu de 2 ms ; et `stream::allocate` remonte tout tampon à `BufferMs`, or un tampon vaut deux paquets |
+| `PacketSizeFileAlignment` | **0** (`FILE_BYTE_ALIGNMENT`) | le pilote n'impose aucun alignement en octets : sa copie travaille en trames |
+| `MaxPacketSizeInBytes` | **30 720** | 10 ms du plus gros format qu'une broche puisse servir (96 kHz × 8 canaux × 4 octets), ce que la documentation exige au minimum |
+| `NumProcessingModeConstraints` | **0** | documenté comme permis ; une variable à la fois, les modes viendront après la mesure |
+
+La longueur passée à `IoSetDeviceInterfacePropertyData` est **exactement** 16 octets, le
+décalage de `ProcessingModeConstraints`, et non `sizeof(KSAUDIO_PACKETSIZE_CONSTRAINTS2)` :
+le `ANYSIZE_ARRAY` du WDK vaut 1, donc la structure C mesure toujours une contrainte de mode
+de plus qu'elle n'en porte. Les deux exemples de la documentation le confirment — la variante
+capture de SYSVAD annonce une contrainte et 40 octets (16 + 24), la variante rendu deux et 64
+(16 + 2 × 24).
+
+`PacketSizeFileAlignment` mérite un mot, parce que la valeur intuitive est fausse. Le champ
+est un **masque** (`wdm.h` : `FILE_BYTE_ALIGNMENT` = 0, … `FILE_512_BYTE_ALIGNMENT` = 0x1ff)
+et la taille d'un paquet doit être un multiple de `masque + 1` ; la documentation énumère les
+dix valeurs admises, dont la plus grande vaut 512 octets. Déclarer une page (4096) n'en fait
+donc pas partie, et surtout **interdirait** ce qu'on vient chercher : à 48 kHz sur deux canaux
+en flottant, le plus petit paquet multiple de 4096 octets ferait 512 trames, soit 10,67 ms —
+plus long que les 10 ms qu'on essaie de faire descendre.
+
+**Ce que l'échec coûte, et où il se lit.** Il est journalisé et **non fatal**, comme celui de
+l'alimentation : le câble s'enregistre, l'endpoint apparaît et transporte l'audio ; seule la
+latence reste bloquée à 10 ms. Un échec muet serait pire, parce que rien ne distinguerait
+alors « Windows ne veut pas de période courte » de « nous ne lui avons jamais dit qu'on savait
+en servir » — la symétrie exacte de l'erreur que le compteur d'allocations refusées évitait
+déjà (§5.5). D'où deux traces : le journal d'événements *Système*
+(`registry::code::CONTRAINTES_RENDU` / `_CAPTURE`, lisible sans débogueur) et le
+`NTSTATUS` lui-même, porté par `KSPROPERTY_CONDUIT_TRANSPORT` (§6) et affiché par
+`conduit-looptest --cable-transport`.
+
+**Une hypothèse à surveiller.** `MinPacketPeriodInHns` suppose deux paquets par tampon
+(« Several WaveRT packets (typically 2) are concatenated to form the WaveRT buffer », et
+2 × 240 trames mesurés en exclusif). `AllocateBufferWithNotification` accepte aussi
+`NotificationCount = 1` : dans ce cas le tampon vaut une période, et une période de
+`BufferMs / 2` produirait un tampon sous le plancher — que `buffer_bytes_with_floor`
+remonterait à `BufferMs`, rendant au client un tampon **plus grand** que demandé. Le pilote
+sait déjà le faire et le client WaveRT lit la taille réellement allouée, mais la période
+annoncée serait alors optimiste d'un facteur deux. Aucun `NotificationCount = 1` n'a été
+observé à ce jour.
+
+Sources : *Low Latency Audio* (section « Driver improvements »),
+*KSAUDIO_PACKETSIZE_CONSTRAINTS2*, *KSAUDIO_PACKETSIZE_PROCESSINGMODE_CONSTRAINT*,
+*IoRegisterDeviceInterface*, *IoSetDeviceInterfacePropertyData* (WDK), et l'échantillon
+SYSVAD (`common.cpp`, `minipairs.h`), jamais copié.
+
 ## 5. Horloge, positions, boucle locale
 
 ### 5.1 Horloge
@@ -798,12 +879,21 @@ verrou du câble à `PASSIVE_LEVEL` sérialiserait la boucle locale avec un diag
 alors qu'on ne lit que **quels** compteurs bougent.
 
 `KSPROPERTY_CONDUIT_TRANSPORT` (lot 0 du mode paquets WaveRT) rend une `CableTransport`
-de 72 octets : deux `ULONG` d'en-tête puis un bloc de 32 octets **par sens**, avec le mode
+de 80 octets : quatre `ULONG` d'en-tête puis un bloc de 32 octets **par sens**, avec le mode
 d'allocation du flux courant (aucun flux / flux sans tampon / `AllocateAudioBuffer`,
 c'est-à-dire scrutation / `AllocateBufferWithNotification`), le `NotificationCount`
 demandé, la taille du tampon en octets **et** en trames, le nombre d'événements
 `RegisterNotificationEvent` enregistrés, l'état KS courant, et un compteur **cumulé**
 d'allocations refusées.
+
+Deux des quatre `ULONG` d'en-tête sont les `NTSTATUS` de la déclaration des contraintes de
+taille de paquet (§4.3), un par filtre wave, tels que le dernier `StartDevice` les a obtenus
+— `STATUS_SUCCESS`, `CONSTRAINTS_NON_TENTEE` (`0xE0000001`, dans l'espace « customer », donc
+jamais rendu par le noyau) ou le code de l'échec. Ils datent du démarrage du périphérique et
+non du flux, mais ils vivent ici parce qu'ils répondent à **la** question que cette propriété
+pose : un moteur audio qui n'a jamais eu que des périodes de 10 ms n'a pas forcément choisi,
+il peut n'avoir jamais rien su. Le lire à côté du mode d'allocation ou ne pas le lire du tout
+— une cinquième propriété aurait obligé à recoller deux sorties pour une seule conclusion.
 
 Ce dernier champ est la raison d'être de la propriété. Un paquet WaveRT n'existe que sur
 un tampon alloué avec notifications ; tous les journaux du dépôt montrent le moteur audio
@@ -863,6 +953,14 @@ tampons est refusée dès qu'elle change, ce numéro est donc la seule voie de v
 jeu. Un changement additif y est indiscernable d'un changement de forme, d'où la règle sur les
 messages : un outil qui constate une inadéquation dit que les millésimes diffèrent, jamais
 **ce qui** diffère.
+
+5 → 6 est le premier passage qui **allonge** une valeur plutôt que d'ajouter un sélecteur :
+les deux `NTSTATUS` de pose des contraintes portent `CableTransport` de 72 à 80 octets, et
+tout client v5 se verra donc refuser la lecture du transport. Le choix est assumé et sa raison
+est écrite au paragraphe du transport : l'information répond à la question que cette
+propriété-là pose, et un cinquième sélecteur aurait coûté une seconde requête à recoller.
+Sémantiquement, le changement reste additif — les champs existants sont aux mêmes décalages et
+gardent leur sens.
 
 Contrôle d'accès : le gestionnaire de propriété s'exécute dans le contexte du thread
 appelant ; toute écriture exige `SeSinglePrivilegeCheck(SE_LOAD_DRIVER_PRIVILEGE)`

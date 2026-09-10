@@ -31,6 +31,28 @@
 //! lui-même). Refuser de démarrer pour cela échangerait un service dégradé contre aucun
 //! service.
 //!
+//! # Contraintes de taille de paquet (`DEVPKEY_KsAudio_PacketSize_Constraints2`)
+//!
+//! Avant chacun des deux `PcRegisterSubdevice` de filtre **wave** d'un câble,
+//! [`declare_packet_constraints`] pose sur l'interface `KSCATEGORY_AUDIO` de ce filtre la
+//! `KSAUDIO_PACKETSIZE_CONSTRAINTS2` du pilote (`conduit_kmd_core::packetsize`) : période
+//! minimale, alignement, taille de paquet maximale. Sans elle,
+//! `IAudioClient3::GetSharedModeEnginePeriod` n'annonce que les 10 ms du défaut de Windows
+//! — mesuré : défaut 480 trames, fondamentale 480, minimum 480, maximum 480.
+//!
+//! **Avant** et non après : la documentation de la structure l'écrit (« The driver sets this
+//! property before calling `PcRegisterSubdevice` or otherwise enabling its KS filter
+//! interface for its streaming pins ») et SYSVAD le fait ainsi. L'interface existe déjà —
+//! l'INF la publie —, si bien que `IoRegisterDeviceInterface` sur la même catégorie et la
+//! même chaîne de référence rend le lien symbolique **existant** au lieu d'en créer un
+//! second : c'est par lui qu'on atteint une interface que PortCls créera.
+//!
+//! L'échec est **journalisé et non fatal**, comme celui de l'alimentation : l'endpoint
+//! apparaît et transporte l'audio, il reste seulement bloqué à 10 ms. Il se lit dans le
+//! journal d'événements (`registry::code::CONTRAINTES_RENDU` / `_CAPTURE`) et, avec son
+//! `NTSTATUS`, dans `KSPROPERTY_CONDUIT_TRANSPORT` — donc dans
+//! `conduit-looptest --cable-transport`.
+//!
 //! IRQL : `PASSIVE_LEVEL` partout (contexte de `IRP_MN_START_DEVICE`).
 
 use core::sync::atomic::AtomicBool;
@@ -39,13 +61,15 @@ use portcls::conduit_com::{
     ComRef, NtStatus, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
     nt_success,
 };
+use portcls::conduit_kmd_core::packetsize::PacketConstraints;
 use portcls::{
-    ResourceList, as_unknown, new_port, port_init, ref_as_unknown, register_physical_connection,
-    register_subdevice, subdevice_names, try_new_topology_object, try_new_wavert_object,
+    ResourceList, as_unknown, new_port, packet_size_constraints, physical_device_object, port_init,
+    ref_as_unknown, register_physical_connection, register_subdevice, set_packet_size_constraints,
+    subdevice_names, try_new_topology_object, try_new_wavert_object,
 };
 use portcls_sys::{
-    CLSID_PortTopology, CLSID_PortWaveRT, GUID, IUnknown, NTSTATUS, PDEVICE_OBJECT, PIRP,
-    PRESOURCELIST,
+    CLSID_PortTopology, CLSID_PortWaveRT, GUID, IUnknown, KSAUDIO_PACKETSIZE_CONSTRAINTS2,
+    NTSTATUS, PDEVICE_OBJECT, PIRP, PRESOURCELIST,
 };
 
 use crate::cable;
@@ -109,6 +133,74 @@ unsafe fn install_subdevice(
     Ok(port)
 }
 
+/// Déclare les contraintes de taille de paquet sur l'interface `KSCATEGORY_AUDIO` du filtre
+/// wave nommé `name`, et mémorise le `NTSTATUS` obtenu dans le câble.
+///
+/// # Non fatale, et pourquoi
+///
+/// Un échec n'interrompt rien : le câble s'enregistre, l'endpoint apparaît et transporte
+/// l'audio exactement comme avant. Ce qu'on perd est la **latence** — sans cette propriété,
+/// `IAudioClient3::GetSharedModeEnginePeriod` reste bloqué sur les 10 ms du défaut de
+/// Windows. Refuser de démarrer pour cela échangerait un service dégradé contre aucun
+/// service, la règle déjà appliquée à l'alimentation et aux vérifications de format.
+///
+/// Mais un échec **muet** serait pire : rien, dans le panneau de son, ne distinguerait
+/// « Windows ne veut pas de période courte » de « nous ne lui avons jamais dit qu'on savait
+/// en servir ». D'où les deux traces : le journal d'événements
+/// ([`registry::code::CONTRAINTES_RENDU`], lisible sans débogueur) et le relevé
+/// `KSPROPERTY_CONDUIT_TRANSPORT`, qui porte le `NTSTATUS` lui-même.
+///
+/// # Safety
+///
+/// `pdo` est l'objet de périphérique **physique** du pilote, valide le temps de l'appel ;
+/// `name` est un nom de sous-périphérique de `portcls::adapter` (UTF-16 terminé par NUL,
+/// `static` promu).
+unsafe fn declare_packet_constraints(
+    pdo: Result<PDEVICE_OBJECT, NtStatus>,
+    contraintes: &KSAUDIO_PACKETSIZE_CONSTRAINTS2,
+    cable: &'static cable::Cable,
+    n: u32,
+    direction: cable::Direction,
+    name: &[u16],
+    log: EventLog,
+) {
+    let status = match pdo {
+        // SAFETY: `pdo` est le PDO du pilote (contrat) ; `name` est un `static` promu
+        // terminé par NUL ; `contraintes` est vivant le temps de l'appel ; `StartDevice`
+        // s'exécute à `PASSIVE_LEVEL`, ce qu'exigent les trois appels de l'enveloppe.
+        Ok(pdo) => unsafe { set_packet_size_constraints(pdo, name, contraintes) },
+        // Sans PDO, la pose n'a même pas pu être tentée : c'est ce code-là qu'il faut
+        // rendre, pas une sentinelle qui ferait croire à un oubli.
+        Err(status) => status,
+    };
+    cable.note_constraints(direction, status);
+    if nt_success(status) {
+        kmd_log!(
+            "StartDevice : câble {n} {} — contraintes de paquet déclarées ({} hns, {} octets)",
+            direction.stream_name(),
+            contraintes.MinPacketPeriodInHns,
+            contraintes.MaxPacketSizeInBytes
+        );
+        return;
+    }
+    let code = match direction {
+        cable::Direction::Render => registry::code::CONTRAINTES_RENDU,
+        cable::Direction::Capture => registry::code::CONTRAINTES_CAPTURE,
+    };
+    kmd_log!(
+        "StartDevice : câble {n} {} — contraintes de paquet refusées : {status:#010x}",
+        direction.stream_name()
+    );
+    kmd_event!(
+        log,
+        code.saturating_add(registry::RANG_FORMAT).saturating_add(n),
+        "câble {n} ({}) : la déclaration des contraintes de taille de paquet a échoué \
+         ({status:#010x}). L'endpoint apparaîtra et transportera l'audio, mais le moteur \
+         audio restera bloqué sur une période de 10 ms.",
+        direction.stream_name()
+    );
+}
+
 /// Enregistre les quatre sous-périphériques du câble `n` et leurs deux connexions
 /// physiques.
 ///
@@ -126,6 +218,8 @@ unsafe fn install_cable(
     resources: &ResourceList,
     n: u32,
     log: EventLog,
+    pdo: Result<PDEVICE_OBJECT, NtStatus>,
+    contraintes: &KSAUDIO_PACKETSIZE_CONSTRAINTS2,
 ) -> Result<(), NtStatus> {
     let Some(cable) = cable::cable(n) else {
         return fail("câble inconnu", STATUS_INVALID_PARAMETER);
@@ -153,7 +247,25 @@ unsafe fn install_cable(
         return fail("démarrage du câble (timer haute résolution)", status);
     }
 
-    // 1. WaveRender<n>.
+    // 1. WaveRender<n>. Les contraintes de taille de paquet se posent **avant**
+    // `PcRegisterSubdevice`, comme la documentation l'exige (« The driver sets this property
+    // before calling PcRegisterSubdevice or otherwise enabling its KS filter interface for
+    // its streaming pins ») et comme SYSVAD le fait (`CAdapterCommon::InstallSubdevice`
+    // appelle `CreateAudioInterfaceWithProperties` avant même `PcNewPort`). Après, l'ordre
+    // serait une course avec l'activation de l'interface par PnP, que le constructeur
+    // d'endpoints observe.
+    // SAFETY: contrat de la fonction relayé ; le nom est un `static` promu de `portcls`.
+    unsafe {
+        declare_packet_constraints(
+            pdo,
+            contraintes,
+            cable,
+            n,
+            cable::Direction::Render,
+            wave_render_name,
+            log,
+        );
+    }
     let mini = try_new_wavert_object(WaveRender {
         n,
         cable,
@@ -192,7 +304,21 @@ unsafe fn install_cable(
     }?;
     drop(mini);
 
-    // 3. WaveCapture<n> et TopoCapture<n>.
+    // 3. WaveCapture<n> et TopoCapture<n>. Mêmes contraintes, même moment (avant
+    // `PcRegisterSubdevice`), autre interface : les deux filtres wave d'un câble sont deux
+    // interfaces PnP distinctes.
+    // SAFETY: contrat de la fonction relayé ; le nom est un `static` promu de `portcls`.
+    unsafe {
+        declare_packet_constraints(
+            pdo,
+            contraintes,
+            cable,
+            n,
+            cable::Direction::Capture,
+            wave_capture_name,
+            log,
+        );
+    }
     let mini = try_new_wavert_object(WaveCapture {
         n,
         cable,
@@ -381,9 +507,27 @@ pub unsafe fn start_device(
         }
     }
 
+    // Contraintes de taille de paquet (`DEVPKEY_KsAudio_PacketSize_Constraints2`) : les
+    // trois valeurs sont les mêmes pour les trente-deux filtres wave — elles décrivent ce que
+    // *le pilote* sait faire, pas ce qu'un câble sert aujourd'hui —, donc calculées une fois
+    // ici. Le plancher vient du registre : c'est `BufferMs` qui commande la période minimale
+    // annoncée (voir `conduit_kmd_core::packetsize`).
+    let contraintes = packet_size_constraints(&PacketConstraints::new(params.buffer_ms));
+    // Le PDO, une fois lui aussi : `IoRegisterDeviceInterface` le veut, et `StartDevice` ne
+    // reçoit que le FDO. Son échec n'arrête rien — il devient le `NTSTATUS` que chaque pose
+    // enregistrera, et le relevé le rendra tel quel.
+    // SAFETY: `device` est celui de `StartDevice` (contrat) ; `PcGetPhysicalDeviceObject`
+    // exige `PASSIVE_LEVEL`, ce qu'est le contexte de `IRP_MN_START_DEVICE`.
+    let pdo = unsafe { physical_device_object(device) };
+    if let Err(status) = pdo {
+        kmd_log!("StartDevice : PcGetPhysicalDeviceObject a échoué : {status:#010x}");
+    }
+
     for n in 0..reserve {
-        // SAFETY: contrat de la fonction relayé.
-        if let Err(status) = unsafe { install_cable(device, irp, &resources, n, log) } {
+        // SAFETY: contrat de la fonction relayé ; `pdo` vient de `physical_device_object`
+        // sur ce même `device`, et `contraintes` est vivante jusqu'à la fin de la boucle.
+        let installe = unsafe { install_cable(device, irp, &resources, n, log, pdo, &contraintes) };
+        if let Err(status) = installe {
             return status;
         }
     }

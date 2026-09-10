@@ -700,6 +700,55 @@ impl AllocRefusals {
     }
 }
 
+/// Le `NTSTATUS` de la pose de `DEVPKEY_KsAudio_PacketSize_Constraints2` sur l'interface du
+/// filtre wave de chaque sens, au dernier `StartDevice`.
+///
+/// # Pourquoi sur le câble, et hors verrou
+///
+/// La pose date du **démarrage du périphérique**, pas du flux : elle survit à l'ouverture
+/// et à la fermeture des broches, exactement comme les refus d'allocation d'[`AllocRefusals`]
+/// et pour la même raison — un état qui mourrait avec la broche ne serait jamais lu par le
+/// relevé qu'on fait ensuite. Deux `AtomicU32`, donc, lus et écrits sans verrou : ils sont
+/// écrits une fois par `StartDevice`, à `PASSIVE_LEVEL`, avant qu'aucun endpoint n'existe, et
+/// relus par un gestionnaire de propriété. Aucune relation d'ordre à établir avec un autre
+/// champ, d'où `Relaxed`.
+#[derive(Debug)]
+struct PacketConstraintsStatus {
+    /// Pose sur l'interface du filtre `WaveRender<n>`.
+    render: AtomicU32,
+    /// Pose sur l'interface du filtre `WaveCapture<n>`.
+    capture: AtomicU32,
+}
+
+impl PacketConstraintsStatus {
+    /// Les deux sens à [`config::CONSTRAINTS_NON_TENTEE`] : rien n'a encore été posé.
+    const fn new() -> Self {
+        Self {
+            render: AtomicU32::new(config::CONSTRAINTS_NON_TENTEE),
+            capture: AtomicU32::new(config::CONSTRAINTS_NON_TENTEE),
+        }
+    }
+
+    /// Le `NTSTATUS` du sens `direction`.
+    const fn slot(&self, direction: Direction) -> &AtomicU32 {
+        match direction {
+            Direction::Render => &self.render,
+            Direction::Capture => &self.capture,
+        }
+    }
+
+    /// Remet les deux sens à « non tentée » (nouveau cycle de périphérique).
+    ///
+    /// Sans cette remise à zéro, un `StopDevice` suivi d'un `StartDevice` qui échouerait
+    /// **avant** la pose laisserait le succès du cycle précédent dans le relevé.
+    fn reset(&self) {
+        self.render
+            .store(config::CONSTRAINTS_NON_TENTEE, Ordering::Relaxed);
+        self.capture
+            .store(config::CONSTRAINTS_NON_TENTEE, Ordering::Relaxed);
+    }
+}
+
 /// Laquelle des quatre méthodes du mode paquets le moteur audio vient d'appeler.
 ///
 /// Les noms sont ceux de `portcls::packet`, pas ceux de `portcls.h` : c'est la méthode Rust
@@ -928,6 +977,9 @@ pub struct Cable {
     alloc_refusals: AllocRefusals,
     /// Ce que le mode paquets a produit, par sens (hors verrou, [`PacketCounters`]).
     packets: PacketCounters,
+    /// `NTSTATUS` de la déclaration des contraintes de taille de paquet, par sens (hors
+    /// verrou, [`PacketConstraintsStatus`]).
+    constraints: PacketConstraintsStatus,
     /// Nœuds volume et sourdine du filtre `TopoRender<n>` (hors verrou, [`NodeState`]).
     render_nodes: NodeState,
     /// Nœuds volume et sourdine du filtre `TopoCapture<n>`.
@@ -1013,6 +1065,7 @@ impl Cable {
             counters: Counters::new(),
             alloc_refusals: AllocRefusals::new(),
             packets: PacketCounters::new(),
+            constraints: PacketConstraintsStatus::new(),
             render_nodes: NodeState::new(),
             capture_nodes: NodeState::new(),
             jack_events: SpinLock::new(ManuallyDrop::new(JackTargets::new())),
@@ -1274,6 +1327,11 @@ impl Cable {
             self.counters.reset();
             self.alloc_refusals.reset();
             self.packets.reset();
+            // La pose des contraintes de taille de paquet appartient au cycle qui commence :
+            // `adapter::install_cable` la fera juste après ce `start`, filtre par filtre.
+            // Sans cette remise à « non tentée », un démarrage qui échouerait avant la pose
+            // laisserait le succès du cycle précédent dans le relevé.
+            self.constraints.reset();
         }
         // Les cibles d'événement ne sont **pas** effacées : elles sont posées par les
         // `Init` des miniports de topologie, qui suivent ce `start`, et retirées par leur
@@ -1716,9 +1774,31 @@ impl Cable {
         CableTransport {
             cable: self.index,
             reserved: 0,
+            constraints_render: self
+                .constraints
+                .slot(Direction::Render)
+                .load(Ordering::Relaxed),
+            constraints_capture: self
+                .constraints
+                .slot(Direction::Capture)
+                .load(Ordering::Relaxed),
             render,
             capture,
         }
+    }
+
+    /// Mémorise le `NTSTATUS` de la pose des contraintes de taille de paquet du sens
+    /// `direction`, pour que `KSPROPERTY_CONDUIT_TRANSPORT` le rende.
+    ///
+    /// Appelée une fois par sens et par `StartDevice`, depuis `adapter::install_cable`,
+    /// juste après la tentative de pose — succès **comme** échec : un relevé qui ne
+    /// montrerait que les succès ne dirait rien du cas qu'on cherche.
+    ///
+    /// IRQL : `PASSIVE_LEVEL` (contexte de `StartDevice`) ; un seul `store`.
+    pub fn note_constraints(&self, direction: Direction, status: NtStatus) {
+        self.constraints
+            .slot(direction)
+            .store(status as u32, Ordering::Relaxed);
     }
 
     /// Compte un appel d'une méthode du **mode paquets** dans le sens `direction`, avec son

@@ -13,8 +13,10 @@
 //! 2. `--cable-etat` : l'état des seize câbles, plus la version du contrat servi ;
 //! 3. `--cable-compteurs` : les compteurs de la boucle locale, et le régime qu'ils
 //!    démontrent — la lecture de M1b-07 que seul le débogueur savait faire (M1b-21) ;
-//! 4. `--cable-transport` : par sens, comment le moteur audio a alloué le tampon
-//!    (scrutation ou notifications) et combien d'allocations nous avons refusées — la
+//! 4. `--cable-transport` : par sens, si le pilote a **déclaré ses contraintes de taille de
+//!    paquet** au démarrage (`DEVPKEY_KsAudio_PacketSize_Constraints2` — sans elles, aucune
+//!    période plus courte que 10 ms n'est demandable), comment le moteur audio a alloué le
+//!    tampon (scrutation ou notifications) et combien d'allocations nous avons refusées — la
 //!    question du lot 0 du mode paquets WaveRT —, **puis** ce qu'il a fait des interfaces
 //!    du mode paquets : le `PacketMode` effectif, ce que chaque flux expose, les
 //!    `QueryInterface` reçus et rendus, et les appels refusés par méthode, avec leur IRQL
@@ -50,6 +52,7 @@ use conduit_backend_wasapi::cable::{
     armer_privilege, contract_version, etat_privilege, topology_interfaces, Armement, BadInput,
     CableConfigError, CableCounters, CablePackets, CableState, CableTransport, EtatPrivilege,
     FilterSide, StreamPackets, StreamSide, StreamTransport, TopologyFilter, CABLE_MAX,
+    CONSTRAINTS_NON_TENTEE,
 };
 use conduit_backend_wasapi::WasapiBackend;
 
@@ -484,6 +487,30 @@ fn lignes_sens(sens: StreamSide, bloc: &StreamTransport) -> String {
 /// le premier cas, le repli en scrutation peut être **notre** fait ; dans le second, le
 /// moteur audio n'a jamais rien demandé d'autre.
 fn verdict(transport: &CableTransport) -> String {
+    let mut out = verdict_allocation(transport);
+    // Et, dans tous les cas, ce que le pilote a déclaré savoir faire. Cette ligne est ce qui
+    // distingue « le moteur audio ne veut pas de période courte » de « on ne lui a jamais
+    // dit qu'on en servait » : tant que les contraintes ne sont pas déclarées,
+    // `IAudioClient3::GetSharedModeEnginePeriod` n'a aucune raison d'annoncer autre chose que
+    // les 10 ms du défaut de Windows, et aucune conclusion sur la latence ne tient.
+    if transport.contraintes_declarees() {
+        out.push_str(
+            "      → contraintes de taille de paquet DÉCLARÉES des deux côtés : une période \
+             plus courte que 10 ms est demandable\n",
+        );
+    } else {
+        out.push_str(
+            "      → contraintes de taille de paquet NON déclarées des deux côtés : le \
+             moteur audio ne peut annoncer que 10 ms\n        Ne concluez rien sur la \
+             latence avant d'avoir regardé pourquoi la pose a échoué (lignes ci-dessus, et \
+             journal Système sous la source conduit_kmd).\n",
+        );
+    }
+    out
+}
+
+/// Ce que le **mode d'allocation** du câble démontre : les quatre cas du lot 0.
+fn verdict_allocation(transport: &CableTransport) -> String {
     let refus = transport.refused_total();
     if transport.notifications_obtenues() {
         let sens = if transport.render.notifie() {
@@ -524,9 +551,33 @@ fn verdict(transport: &CableTransport) -> String {
     }
 }
 
-/// L'état du transport d'un câble : deux sens, puis le verdict.
+/// La ligne des contraintes de taille de paquet d'un sens : ce que la pose de
+/// `DEVPKEY_KsAudio_PacketSize_Constraints2` a donné au dernier démarrage du périphérique.
+///
+/// Pure. Elle **précède** le mode d'allocation dans le relevé, parce qu'elle en est la
+/// cause possible : un moteur audio qui n'a jamais eu que des périodes de 10 ms n'a pas
+/// forcément choisi, il peut n'avoir jamais rien su.
+///
+/// Le `NTSTATUS` n'est écrit que quand il désigne un échec : ni un succès (zéro) ni une pose
+/// non tentée n'apprennent rien de plus que leur libellé.
+fn ligne_contraintes(sens: StreamSide, transport: &CableTransport) -> String {
+    let status = transport.constraints(sens);
+    let libelle = transport.constraints_label(sens);
+    if status == 0 || status == CONSTRAINTS_NON_TENTEE {
+        format!("      {:<8}: {libelle}\n", sens.label())
+    } else {
+        format!("      {:<8}: {libelle} ({status:#010x})\n", sens.label())
+    }
+}
+
+/// L'état du transport d'un câble : la pose des contraintes, deux sens, puis le verdict.
 fn lignes_transport(cable: CableId, index: u32, transport: &CableTransport) -> String {
     let mut out = format!("  Conduit {:>2} (index pilote {index})\n", cable.0);
+    out.push_str("    contraintes de taille de paquet (posées au démarrage du périphérique)\n");
+    for sens in StreamSide::ALL {
+        out.push_str(&ligne_contraintes(sens, transport));
+    }
+    out.push_str("    transport du flux courant\n");
     for sens in StreamSide::ALL {
         out.push_str(&lignes_sens(sens, transport.side(sens)));
     }
@@ -566,9 +617,19 @@ fn lignes_sens_paquets(sens: StreamSide, bloc: &StreamPackets) -> String {
 /// Ce que le relevé de paquets d'un câble **démontre**, en français.
 ///
 /// Pure, et c'est ici qu'est écrit ce que le lot 2 cherche à savoir : le moteur audio
-/// scrute-t-il par politique, ou parce qu'il ne trouve pas les interfaces de paquets ? Les
-/// six cas ne se confondent pas, et deux d'entre eux tranchent la question — le deuxième
-/// (rien d'exposé, mais le moteur demande) et le cinquième (exposé, obtenu, jamais emprunté).
+/// emprunte-t-il les interfaces du mode paquets quand on les lui expose ? Les six cas ne se
+/// confondent pas, et c'est le premier (un appel reçu) et le cinquième (exposé, obtenu,
+/// jamais emprunté) qui tranchent.
+///
+/// # Ce que les `QueryInterface` ne prouvent pas, et la ligne qui le disait de travers
+///
+/// Le relevé du lot 2 affirmait, à `PacketMode = 0` avec des demandes non nulles, que « le
+/// moteur audio a DEMANDÉ les IID de paquets » et que « notre silence est une cause plausible
+/// de la scrutation ». **La mesure l'a réfuté.** Les `QueryInterface` sur les deux IID sont
+/// la sonde **systématique** de PortCls à la création de tout flux — deux par flux, quel que
+/// soit le client, y compris quand le chemin scruté est ensuite pris. Ils comptent des
+/// créations de flux, pas des intentions du moteur audio, et aucune conclusion sur la
+/// scrutation ne peut s'y appuyer. La ligne dit désormais ce qu'elle voit, et rien de plus.
 fn verdict_paquets(paquets: &CablePackets) -> String {
     let demandes = paquets.queries_total();
     let appels = paquets.appels_total();
@@ -583,16 +644,20 @@ fn verdict_paquets(paquets: &CablePackets) -> String {
     }
     if !paquets.mode_actif() {
         if demandes == 0 {
-            return "      → rien n'est exposé (PacketMode = 0) et le moteur audio n'a JAMAIS \
-                    demandé les IID de paquets\n        Sa scrutation n'est donc pas la \
-                    conséquence de notre silence : c'est une politique.\n"
+            return "      → rien n'est exposé (PacketMode = 0) et 0 QueryInterface reçu : \
+                    aucun flux n'a été créé depuis le dernier démarrage du \
+                    périphérique\n        PortCls sonde les deux IID de paquets à la \
+                    création de chaque flux, deux par flux : leur absence dit qu'il n'y a \
+                    pas eu de flux, rien de plus. Relancez ce relevé pendant qu'une passe \
+                    tourne.\n"
                 .to_string();
         }
         return format!(
-            "      → rien n'est exposé (PacketMode = 0) mais le moteur audio a DEMANDÉ les IID \
-             de paquets {demandes} fois\n        Notre silence est une cause plausible de la \
-             scrutation. Pour trancher, posez PacketMode = 1 sur une machine d'essai, \
-             redémarrez le périphérique, et relisez ce relevé.\n"
+            "      → rien n'est exposé (PacketMode = 0) et {demandes} QueryInterface reçus : \
+             sonde de PortCls à la création de chaque flux, deux par flux\n        Ce compte \
+             ne dit rien du moteur audio — PortCls interroge les deux IID de paquets sur tout \
+             flux qu'il crée, quel que soit le client et quel que soit le chemin ensuite \
+             pris. Mesuré : le chemin scruté les produit aussi.\n"
         );
     }
     if !paquets.exposition_courante() {
@@ -684,7 +749,9 @@ fn transport_des_cables(paths: &[String], side: FilterSide, vise: Option<u32>) -
                             out,
                             "  Conduit {:>2} (index pilote {index}) : lecture refusée — {e}\n      \
                              Un pilote antérieur au lot 0 du mode paquets n'a pas cette \
-                             propriété : vérifiez la version avec --cable-etat.",
+                             propriété, et un pilote antérieur aux contraintes de taille de \
+                             paquet la rend plus courte de huit octets : vérifiez la version \
+                             avec --cable-etat.",
                             cable.0
                         );
                     }
@@ -1258,6 +1325,62 @@ mod tests {
         }
     }
 
+    /// Le verdict dit **toujours** si les contraintes de taille de paquet ont été déclarées.
+    ///
+    /// Sans cette ligne, un relevé « scrutation, aucun refus » laisserait conclure que
+    /// Windows ne veut pas de période courte, alors qu'il se peut qu'on ne lui ait jamais dit
+    /// qu'on savait en servir — l'exacte symétrie de l'erreur que le compteur de refus
+    /// évitait déjà pour les notifications.
+    #[test]
+    fn le_verdict_dit_si_les_contraintes_de_paquet_sont_declarees() {
+        // Un câble tout neuf : pose non tentée, donc « NON déclarées ».
+        let jamais = verdict(&CableTransport::new(0));
+        assert!(jamais.contains("NON déclarées"), "{jamais}");
+        assert!(jamais.contains("que 10 ms"), "{jamais}");
+
+        // Les deux sens posés : la période courte est demandable.
+        let posees = verdict(&CableTransport {
+            constraints_render: 0,
+            constraints_capture: 0,
+            ..transport_mixte()
+        });
+        assert!(posees.contains("DÉCLARÉES des deux côtés"), "{posees}");
+
+        // Un seul côté posé ne suffit pas : l'autre filtre reste à 10 ms.
+        let moitie = verdict(&CableTransport {
+            constraints_render: 0,
+            constraints_capture: 0xC000_000D,
+            ..transport_mixte()
+        });
+        assert!(moitie.contains("NON déclarées"), "{moitie}");
+    }
+
+    /// Les deux lignes de pose : le libellé de chaque sens, et le `NTSTATUS` **seulement**
+    /// quand il désigne un échec.
+    #[test]
+    fn les_lignes_de_contraintes_portent_le_status_du_seul_echec() {
+        let transport = CableTransport {
+            constraints_render: 0,
+            constraints_capture: 0xC000_000D,
+            ..transport_mixte()
+        };
+        let rendu = ligne_contraintes(StreamSide::Render, &transport);
+        assert!(rendu.contains("DÉCLARÉES"), "{rendu}");
+        assert!(!rendu.contains("0x"), "un succès n'a pas de code : {rendu}");
+
+        let capture = ligne_contraintes(StreamSide::Capture, &transport);
+        assert!(capture.contains("REFUSÉES"), "{capture}");
+        assert!(capture.contains("0xc000000d"), "{capture}");
+
+        // Une pose non tentée se lit comme telle, et sans code : la sentinelle n'est pas un
+        // `NTSTATUS` du noyau et l'afficher n'apprendrait rien.
+        let neuf = CableTransport::new(0);
+        assert_eq!(neuf.constraints(StreamSide::Render), CONSTRAINTS_NON_TENTEE);
+        let ligne = ligne_contraintes(StreamSide::Render, &neuf);
+        assert!(ligne.contains("non tentées"), "{ligne}");
+        assert!(!ligne.contains("0x"), "{ligne}");
+    }
+
     /// Le relevé imprime, pour chaque sens, le mode **en toutes lettres**, les cinq valeurs
     /// et le compte de refus.
     #[test]
@@ -1303,20 +1426,24 @@ mod tests {
         );
     }
 
-    /// Le verdict du relevé de paquets, pour chacune des six situations — et surtout la
-    /// différence entre « le moteur ne demande jamais » et « il demande et nous refusons »,
-    /// qui est exactement la question du lot 2.
+    /// Le verdict du relevé de paquets, pour chacune des six situations.
+    ///
+    /// Les deux premières sont celles que la mesure a corrigées : un `QueryInterface` de
+    /// paquets est la **sonde de PortCls** à la création de chaque flux, deux par flux, quel
+    /// que soit le client. Le relevé disait « le moteur audio a DEMANDÉ les IID » et « notre
+    /// silence est une cause plausible de la scrutation » ; il ne le dit plus, et ce test
+    /// interdit que la formule revienne.
     #[test]
     fn le_verdict_des_paquets_distingue_les_six_situations() {
         use conduit_backend_wasapi::cable::PacketExposure;
 
-        // 1. Rien d'exposé, rien de demandé : le moteur scrute par politique.
+        // 1. Rien d'exposé, aucune sonde reçue : aucun flux n'a été créé, rien de plus.
         let politique = verdict_paquets(&CablePackets::new(0));
-        assert!(politique.contains("JAMAIS"), "{politique}");
-        assert!(politique.contains("politique"), "{politique}");
+        assert!(politique.contains("0 QueryInterface reçu"), "{politique}");
+        assert!(politique.contains("aucun flux"), "{politique}");
 
-        // 2. Rien d'exposé, mais le moteur demande : notre silence est en cause. C'est le
-        //    verdict qui vaut à lui seul le lot, et il ne coûte aucune exposition.
+        // 2. Rien d'exposé, des sondes reçues : un constat neutre, aucune conclusion sur le
+        //    moteur audio.
         let demande = verdict_paquets(&CablePackets {
             render: StreamPackets {
                 exposure: PacketExposure::NotExposed.code(),
@@ -1325,8 +1452,16 @@ mod tests {
             },
             ..CablePackets::new(0)
         });
-        assert!(demande.contains("DEMANDÉ"), "{demande}");
-        assert!(demande.contains("PacketMode = 1"), "{demande}");
+        assert!(demande.contains("4 QueryInterface reçus"), "{demande}");
+        assert!(demande.contains("sonde de PortCls"), "{demande}");
+        assert!(demande.contains("deux par flux"), "{demande}");
+        // La conclusion réfutée par la mesure ne doit revenir sous aucune forme.
+        for interdit in ["DEMANDÉ", "cause plausible", "PacketMode = 1"] {
+            assert!(
+                !demande.contains(interdit),
+                "« {interdit} » a reparu dans :\n{demande}"
+            );
+        }
 
         // 3. Mode actif mais aucun flux n'expose : le relevé le dit au lieu de laisser
         //    conclure.

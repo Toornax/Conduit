@@ -20,7 +20,10 @@
 //! PortCls les déréférence, et seul l'appelant sait qu'ils sont ceux du rappel en cours.
 
 use conduit_com::{ComPtr, ComRef, ComVtable, NtStatus, STATUS_NOT_IMPLEMENTED};
-use portcls_sys::{GUID, IPort, IUnknown, PDEVICE_OBJECT, PIRP};
+use conduit_kmd_core::packetsize::PacketConstraints;
+use portcls_sys::{
+    GUID, IPort, IUnknown, KSAUDIO_PACKETSIZE_CONSTRAINTS2, PDEVICE_OBJECT, PIRP, UNICODE_STRING,
+};
 
 use crate::received::ResourceList;
 
@@ -28,8 +31,11 @@ use crate::received::ResourceList;
 use conduit_com::{STATUS_INVALID_PARAMETER, nt_success};
 #[cfg(feature = "kernel")]
 use portcls_sys::{
-    PPORT, PcNewPort, PcRegisterAdapterPowerManagement, PcRegisterPhysicalConnection,
-    PcRegisterSubdevice,
+    DEVPKEY_KsAudio_PacketSize_Constraints2, DEVPROP_TYPE_BINARY, IoRegisterDeviceInterface,
+    IoSetDeviceInterfacePropertyData, KSCATEGORY_AUDIO, LOCALE_NEUTRAL, PPORT,
+    PcGetPhysicalDeviceObject, PcNewPort, PcRegisterAdapterPowerManagement,
+    PcRegisterPhysicalConnection, PcRegisterSubdevice, RtlFreeUnicodeString,
+    packet_size_constraints_bytes,
 };
 
 /// Référence `IUnknown` sur un objet COM du pilote (`AddRef`) : la forme sous laquelle
@@ -211,6 +217,203 @@ pub unsafe fn register_adapter_power_management(
     unsafe { PcRegisterAdapterPowerManagement(unknown.as_ptr(), device.cast()) }
 }
 
+/// La `KSAUDIO_PACKETSIZE_CONSTRAINTS2` que le pilote pose en valeur de
+/// `DEVPKEY_KsAudio_PacketSize_Constraints2`, bâtie depuis les trois valeurs portables de
+/// [`PacketConstraints`].
+///
+/// **Aucune contrainte de mode de traitement** : `NumProcessingModeConstraints` vaut zéro,
+/// ce que la documentation autorise explicitement (« This value can be 0 »), et le tableau
+/// de queue reste à zéro — il ne partira pas, [`set_packet_size_constraints`] ne recopiant
+/// que l'en-tête. Une variable à la fois : les modes viendront s'ils sont nécessaires.
+///
+/// Pure et sans noyau : testable en mode utilisateur, comme tout ce qui n'appelle pas
+/// `Pc*`.
+#[must_use]
+pub fn packet_size_constraints(contraintes: &PacketConstraints) -> KSAUDIO_PACKETSIZE_CONSTRAINTS2 {
+    KSAUDIO_PACKETSIZE_CONSTRAINTS2 {
+        MinPacketPeriodInHns: contraintes.min_packet_period_hns,
+        PacketSizeFileAlignment: contraintes.packet_size_file_alignment,
+        MaxPacketSizeInBytes: contraintes.max_packet_size_bytes,
+        NumProcessingModeConstraints: 0,
+        ..Default::default()
+    }
+}
+
+/// Unités UTF-16 **avant** le premier NUL d'une chaîne terminée par NUL, telle que
+/// [`utf16z`] et [`utf16z_numbered`] en produisent.
+///
+/// Le premier NUL, et non le dernier : les noms numérotés sont des gabarits remplis de
+/// zéros (« WaveRender0 » dans treize unités), et compter jusqu'au dernier ferait décrire à
+/// l'`UNICODE_STRING` une chaîne avec un NUL au milieu — que PnP ne reconnaîtrait comme la
+/// chaîne de référence d'aucune interface.
+///
+/// `None` si la tranche n'a pas de NUL, ou si la longueur ne tient pas dans le `USHORT`
+/// d'une `UNICODE_STRING` (32 767 unités au plus, terminateur compris).
+// Hors feature `kernel` et hors test, personne ne l'appelle : le seul consommateur est
+// `set_packet_size_constraints`, qui n'existe que dans le pilote. Elle reste compilée et
+// testée en mode utilisateur — c'est tout l'intérêt de l'avoir sortie de la partie noyau.
+#[cfg_attr(not(feature = "kernel"), allow(dead_code))]
+fn longueur_utf16z(nom: &[u16]) -> Option<u16> {
+    let unites = nom.iter().position(|u| *u == 0)?;
+    // Le tampon décrit compte une unité de plus (le NUL) : c'est `MaximumLength`.
+    let octets = unites.checked_add(1)?.checked_mul(2)?;
+    if octets > u16::MAX as usize {
+        return None;
+    }
+    u16::try_from(unites).ok()
+}
+
+/// `UNICODE_STRING` décrivant `nom` (UTF-16 terminé par NUL) **sans le copier**.
+///
+/// `Length` compte les octets utiles, `MaximumLength` y ajoute le terminateur : c'est la
+/// forme qu'attendent `IoRegisterDeviceInterface` et le reste de l'API NT. La structure
+/// rendue **emprunte** le tampon de `nom` — elle ne doit pas lui survivre, ce que la durée
+/// de vie du paramètre ne peut pas dire (`UNICODE_STRING` porte un pointeur nu) : les seuls
+/// appelants passent des `static` promus.
+// Même raison que [`longueur_utf16z`] pour l'`allow`.
+#[cfg_attr(not(feature = "kernel"), allow(dead_code))]
+fn unicode_string_from_utf16z(nom: &[u16]) -> Option<UNICODE_STRING> {
+    let unites = longueur_utf16z(nom)?;
+    Some(UNICODE_STRING {
+        Length: unites.saturating_mul(2),
+        MaximumLength: unites.saturating_add(1).saturating_mul(2),
+        Buffer: nom.as_ptr().cast_mut(),
+    })
+}
+
+/// `PcGetPhysicalDeviceObject` : l'objet de périphérique **physique** (PDO) que PortCls a
+/// reçu à `PcAddAdapterDevice`, à partir de l'objet fonctionnel (FDO) de `StartDevice`.
+///
+/// C'est le PDO — et non le FDO — que `IoRegisterDeviceInterface` attend : les interfaces
+/// de périphérique appartiennent au nœud PnP, pas à la pile de fonction.
+///
+/// IRQL : `PASSIVE_LEVEL`.
+///
+/// # Safety
+///
+/// `device` est l'objet de périphérique fonctionnel remis à `StartDevice` (PortCls le
+/// déréférence pour retrouver son extension).
+#[cfg(feature = "kernel")]
+pub unsafe fn physical_device_object(device: PDEVICE_OBJECT) -> Result<PDEVICE_OBJECT, NtStatus> {
+    let mut pdo: PDEVICE_OBJECT = core::ptr::null_mut();
+    // SAFETY: `device` est celui de `StartDevice` (contrat) ; `pdo` est une variable locale.
+    let status = unsafe { PcGetPhysicalDeviceObject(device, &mut pdo) };
+    if !nt_success(status) {
+        return Err(status);
+    }
+    if pdo.is_null() {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    Ok(pdo)
+}
+
+/// Déclare `contraintes` en valeur de `DEVPKEY_KsAudio_PacketSize_Constraints2` sur
+/// l'interface `KSCATEGORY_AUDIO` de chaîne de référence `reference` du périphérique
+/// physique `physical_device`.
+///
+/// # Ce que la fonction fait, dans l'ordre de SYSVAD
+///
+/// 1. `IoRegisterDeviceInterface(pdo, KSCATEGORY_AUDIO, reference, &lien)` — l'interface
+///    existe déjà (l'INF la publie, PortCls l'enregistre), et rappeler la fonction sur la
+///    même catégorie et la même chaîne de référence **rend le lien symbolique existant**
+///    plutôt que d'en créer un second. C'est le seul moyen d'obtenir ce nom depuis un
+///    pilote qui n'a pas créé l'interface lui-même ;
+/// 2. `IoSetDeviceInterfacePropertyData(lien, DEVPKEY…, LOCALE_NEUTRAL, 0,
+///    DEVPROP_TYPE_BINARY, taille, contraintes)` ;
+/// 3. `RtlFreeUnicodeString(&lien)` — **toujours**, succès ou échec : le tampon du lien est
+///    alloué par le noyau et nous en devenons propriétaires.
+///
+/// # La longueur passée
+///
+/// Exactement l'en-tête plus les contraintes de mode déclarées
+/// (`packet_size_constraints_bytes`), **jamais** `size_of` de la structure : le
+/// `ANYSIZE_ARRAY` du WDK vaut 1, donc la structure C mesure toujours une contrainte de
+/// mode de plus qu'elle n'en porte, et les deux exemples de la documentation Microsoft
+/// mesurent bien `16 + N × 24`. Une longueur qui déborderait la structure fournie —
+/// c'est-à-dire plus d'une contrainte de mode dans une structure qui n'en loge qu'une — est
+/// refusée sans appel : l'alternative serait de lire hors de l'objet.
+///
+/// # Catégorie, et une seule
+///
+/// `KSCATEGORY_AUDIO`, comme SYSVAD, alors que l'INF publie aussi chaque filtre wave sous
+/// `KSCATEGORY_RENDER`/`KSCATEGORY_CAPTURE` et `KSCATEGORY_REALTIME`. La documentation
+/// désigne « the PnP interface of the KS filter that has the streaming pins » sans
+/// distinguer les catégories, et l'échantillon Microsoft n'en pose qu'une : poser la même
+/// valeur sur trois interfaces multiplierait les chemins d'échec sans rien ajouter de
+/// mesurable.
+///
+/// # Flags à zéro : une propriété volatile
+///
+/// SYSVAD passe `PLUGPLAY_PROPERTY_PERSISTENT` ; nous passons **0**. La valeur est
+/// recalculée à chaque `StartDevice` depuis le registre (`BufferMs` la commande), et une
+/// copie persistante survivrait à un changement de ce paramètre — c'est-à-dire annoncerait
+/// au moteur audio une période que le pilote ne servirait plus. Volatile, elle est reposée
+/// à chaque démarrage du périphérique et disparaît avec lui.
+///
+/// IRQL : `PASSIVE_LEVEL` (les trois appels l'exigent).
+///
+/// # Safety
+///
+/// `physical_device` est l'objet de périphérique **physique** du pilote (par
+/// [`physical_device_object`]), valide le temps de l'appel ; `reference` est une chaîne
+/// UTF-16 terminée par NUL dont le tampon reste valide pendant l'appel.
+#[cfg(feature = "kernel")]
+pub unsafe fn set_packet_size_constraints(
+    physical_device: PDEVICE_OBJECT,
+    reference: &[u16],
+    contraintes: &KSAUDIO_PACKETSIZE_CONSTRAINTS2,
+) -> NtStatus {
+    let Some(mut reference) = unicode_string_from_utf16z(reference) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    let Some(taille) = packet_size_constraints_bytes(contraintes.NumProcessingModeConstraints)
+    else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    // La valeur est lue **dans** la structure fournie : une longueur qui la dépasserait
+    // ferait lire hors de l'objet.
+    if taille > size_of::<KSAUDIO_PACKETSIZE_CONSTRAINTS2>() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let Ok(taille) = u32::try_from(taille) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+
+    let mut lien = UNICODE_STRING::default();
+    // SAFETY: `physical_device` est le PDO du pilote (contrat) ; `KSCATEGORY_AUDIO` est une
+    // constante lisible ; `reference` décrit un tampon vivant le temps de l'appel ; `lien`
+    // est une variable locale que la fonction remplit.
+    let status = unsafe {
+        IoRegisterDeviceInterface(
+            physical_device,
+            &KSCATEGORY_AUDIO,
+            &mut reference,
+            &mut lien,
+        )
+    };
+    if !nt_success(status) {
+        return status;
+    }
+    // SAFETY: `lien` a été rempli par l'appel qui précède ; la clé est une constante
+    // lisible ; `contraintes` est vivant et `taille` ne dépasse pas sa taille (vérifié).
+    let status = unsafe {
+        IoSetDeviceInterfacePropertyData(
+            &mut lien,
+            &DEVPKEY_KsAudio_PacketSize_Constraints2,
+            LOCALE_NEUTRAL,
+            0,
+            DEVPROP_TYPE_BINARY,
+            taille,
+            core::ptr::from_ref(contraintes).cast_mut().cast(),
+        )
+    };
+    // SAFETY: `lien` porte un tampon alloué par `IoRegisterDeviceInterface`, dont nous
+    // sommes propriétaires ; il n'est plus lu après cet appel. Libéré même en cas d'échec
+    // de la pose : le lien a bien été rendu, c'est la propriété qui n'a pas pris.
+    unsafe { RtlFreeUnicodeString(&mut lien) };
+    status
+}
+
 /// Nombre de câbles servis par le pilote (M1b-02, driver-design.md §2.1).
 ///
 /// Tout ce qui est *par câble* s'y dimensionne : noms de sous-périphériques et GUID de
@@ -390,6 +593,64 @@ mod tests {
     fn texte(nom: &[u16]) -> std::string::String {
         let unites: std::vec::Vec<u16> = nom.iter().copied().take_while(|u| *u != 0).collect();
         std::string::String::from_utf16(&unites).unwrap_or_default()
+    }
+
+    /// Les trois valeurs du contrat portable arrivent aux bons champs, et rien d'autre ne
+    /// part : `NumProcessingModeConstraints` est nul et le tableau de queue est à zéro.
+    #[test]
+    fn les_contraintes_de_paquet_recopient_les_trois_valeurs() {
+        let portables = PacketConstraints::new(10);
+        let ks = packet_size_constraints(&portables);
+        assert_eq!(ks.MinPacketPeriodInHns, 50_000, "5 ms");
+        assert_eq!(ks.PacketSizeFileAlignment, 0, "FILE_BYTE_ALIGNMENT");
+        assert_eq!(ks.MaxPacketSizeInBytes, 30_720, "10 ms de 96 kHz × 8 × 4");
+        assert_eq!(ks.NumProcessingModeConstraints, 0);
+        assert_eq!(
+            ks.ProcessingModeConstraints[0].SamplesPerProcessingPacket,
+            0
+        );
+        assert_eq!(
+            ks.ProcessingModeConstraints[0].ProcessingPacketDurationInHns,
+            0
+        );
+        // Un plancher de tampon plus large déplace la période, et elle seule.
+        let large = packet_size_constraints(&PacketConstraints::new(40));
+        assert_eq!(large.MinPacketPeriodInHns, 200_000);
+        assert_eq!(large.MaxPacketSizeInBytes, ks.MaxPacketSizeInBytes);
+    }
+
+    /// La longueur d'une chaîne de référence s'arrête au **premier** NUL : les gabarits
+    /// numérotés sont remplis de zéros, et compter jusqu'au dernier décrirait une chaîne
+    /// avec un NUL au milieu.
+    #[test]
+    fn la_chaine_de_reference_s_arrete_au_premier_nul() {
+        // « WaveRender0 » : onze unités utiles dans un gabarit de treize.
+        let nom = WAVE_RENDER_NAMES[0];
+        assert_eq!(nom.len(), RENDER_NAME_LEN);
+        assert_eq!(longueur_utf16z(&nom), Some(11));
+        // « WaveCapture15 » : treize unités utiles dans un gabarit de quatorze.
+        let nom = WAVE_CAPTURE_NAMES[CABLE_COUNT - 1];
+        assert_eq!(longueur_utf16z(&nom), Some(13));
+        // Sans NUL, aucune longueur : mieux vaut refuser que décrire un tampon qui déborde.
+        assert_eq!(longueur_utf16z(&[b'A' as u16, b'B' as u16]), None);
+        // Une chaîne vide est une chaîne : zéro unité utile, un NUL.
+        assert_eq!(longueur_utf16z(&[0]), Some(0));
+    }
+
+    /// L'`UNICODE_STRING` bâtie décrit bien le tampon : octets utiles, terminateur compris
+    /// dans `MaximumLength`, et le pointeur est celui de la tranche.
+    #[test]
+    fn l_unicode_string_decrit_le_tampon_sans_le_copier() {
+        let nom = WAVE_RENDER_NAMES[3];
+        // `unwrap_or_default` plutôt qu'`expect` (interdit par les lints du workspace) : une
+        // `UNICODE_STRING` par défaut est toute à zéro, et les assertions de longueur qui
+        // suivent l'attrapent aussi sûrement qu'une panique.
+        let chaine = unicode_string_from_utf16z(&nom).unwrap_or_default();
+        assert_eq!(chaine.Length, 22, "onze unités utiles");
+        assert_eq!(chaine.MaximumLength, 24, "plus le terminateur");
+        assert!(core::ptr::eq(chaine.Buffer.cast_const(), nom.as_ptr()));
+        assert_eq!(texte(&nom), "WaveRender3");
+        assert!(unicode_string_from_utf16z(&[b'X' as u16]).is_none());
     }
 
     #[test]

@@ -213,6 +213,19 @@ pub(crate) mod code {
     /// donne « aucun format » dans le panneau de son, et sans cette entrée rien n'en
     /// resterait. Un seul par miniport et par démarrage.
     pub(crate) const INTERSECTION: u32 = 0x000A_0000;
+    /// La déclaration de `DEVPKEY_KsAudio_PacketSize_Constraints2` sur l'interface du filtre
+    /// `WaveRender<n>` a échoué (`adapter::install_cable`).
+    ///
+    /// Se compose comme [`DESCRIPTEUR`], avec [`super::RANG_FORMAT`] et le numéro du câble.
+    /// L'échec n'empêche **pas** le pilote de démarrer : l'endpoint apparaît et fonctionne,
+    /// il reste seulement bloqué à la période de 10 ms du défaut de Windows — une panne de
+    /// latence, muette, que rien d'autre ne signalerait.
+    pub(crate) const CONTRAINTES_RENDU: u32 = 0x000C_0000;
+    /// Le pendant de [`CONTRAINTES_RENDU`] pour le filtre `WaveCapture<n>`.
+    ///
+    /// Deux codes et non un : les deux filtres sont deux interfaces PnP distinctes, et une
+    /// entrée de journal doit dire **laquelle** a refusé, même privée de son texte.
+    pub(crate) const CONTRAINTES_CAPTURE: u32 = 0x000D_0000;
 }
 
 /// Rang du paramètre dans [`Param::ALL`], pour composer un `UniqueErrorValue`.
