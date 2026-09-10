@@ -233,10 +233,11 @@ pub unsafe fn register_adapter_power_management(
 /// mesure donc 40 octets (16 + 1 × 24) et non plus 16 : c'est
 /// [`set_packet_size_constraints`] qui la calcule, depuis ce même champ.
 ///
-/// L'hypothèse que cette entrée teste, la sémantique des deux champs de durée et la réserve
+/// L'hypothèse que cette entrée teste, la sémantique des deux champs de durée et l'inégalité
 /// « the mode-specific constraints need to be higher than the drivers minimum buffer size,
-/// otherwise they're ignored by the audio stack » — à laquelle nous sommes à égalité, pas
-/// au-dessus — sont écrites sur [`PacketConstraints`], là où les valeurs se calculent.
+/// otherwise they're ignored by the audio stack » — que la durée de l'entrée tient
+/// **strictement**, la période minimale étant désormais la constante de 2 ms du minuteur —
+/// sont écrites sur [`PacketConstraints`], là où les valeurs se calculent.
 ///
 /// Le tableau se convertit par `array::map`, donc **entrée par entrée** : le type du champ
 /// du WDK ayant un `ANYSIZE_ARRAY` de 1, cette écriture ne compile que tant que
@@ -683,7 +684,7 @@ mod tests {
     fn les_contraintes_de_paquet_recopient_les_valeurs() {
         let portables = PacketConstraints::new(10);
         let ks = packet_size_constraints(&portables);
-        assert_eq!(ks.MinPacketPeriodInHns, 50_000, "5 ms");
+        assert_eq!(ks.MinPacketPeriodInHns, 20_000, "2 ms, le minuteur");
         assert_eq!(ks.PacketSizeFileAlignment, 0, "FILE_BYTE_ALIGNMENT");
         assert_eq!(ks.MaxPacketSizeInBytes, 30_720, "10 ms de 96 kHz × 8 × 4");
         assert_eq!(ks.NumProcessingModeConstraints, 1, "l'entrée DEFAULT");
@@ -698,10 +699,10 @@ mod tests {
         // Zéro : la contrainte est exprimée par la durée, indépendamment de la fréquence.
         assert_eq!(mode.SamplesPerProcessingPacket, 0);
         assert_eq!(mode.ProcessingPacketDurationInHns, 50_000, "5 ms");
-        // Un plancher de tampon plus large déplace la période — et la durée de l'entrée
-        // avec elle, les deux valant `min_packet_period_hns`.
+        // Un plancher de tampon plus large déplace la **durée de l'entrée** seule : la
+        // période minimale est celle du minuteur, que le registre ne touche pas.
         let large = packet_size_constraints(&PacketConstraints::new(40));
-        assert_eq!(large.MinPacketPeriodInHns, 200_000);
+        assert_eq!(large.MinPacketPeriodInHns, 20_000, "inchangée");
         assert_eq!(
             large.ProcessingModeConstraints[0].ProcessingPacketDurationInHns,
             200_000
@@ -719,7 +720,7 @@ mod tests {
     ///
     /// | Octets | Champ | Valeur |
     /// |---|---|---|
-    /// | 0-3 | `MinPacketPeriodInHns` | 50 000 (5 ms) |
+    /// | 0-3 | `MinPacketPeriodInHns` | 20 000 (2 ms) |
     /// | 4-7 | `PacketSizeFileAlignment` | 0 (`FILE_BYTE_ALIGNMENT`) |
     /// | 8-11 | `MaxPacketSizeInBytes` | 30 720 |
     /// | 12-15 | `NumProcessingModeConstraints` | 1 |
@@ -727,13 +728,16 @@ mod tests {
     /// | 32-35 | `SamplesPerProcessingPacket` | 0 (la contrainte est en durée) |
     /// | 36-39 | `ProcessingPacketDurationInHns` | 50 000 (5 ms) |
     ///
+    /// Les deux durées **diffèrent**, et c'est le point : la seconde doit dépasser la
+    /// première, sans quoi la pile audio ignore l'entrée de mode (voir `PacketConstraints`).
+    ///
     /// Les trois premiers champs et les deux derniers sont petit-boutistes ; le GUID, lui,
     /// l'est **par moitié** — ses trois premiers champs entiers le sont, ses huit derniers
     /// octets sont dans l'ordre du texte. C'est ce mélange que ce test fige.
     #[test]
     fn les_contraintes_de_paquet_partent_en_quarante_octets() {
         const ATTENDU: [u8; 40] = [
-            0x50, 0xC3, 0x00, 0x00, // MinPacketPeriodInHns = 50 000
+            0x20, 0x4E, 0x00, 0x00, // MinPacketPeriodInHns = 20 000
             0x00, 0x00, 0x00, 0x00, // PacketSizeFileAlignment = 0
             0x00, 0x78, 0x00, 0x00, // MaxPacketSizeInBytes = 30 720
             0x01, 0x00, 0x00, 0x00, // NumProcessingModeConstraints = 1

@@ -577,7 +577,7 @@ machine. Pour le défaut `BufferMs = 10` :
 
 | Champ | Valeur | Pourquoi |
 |---|---|---|
-| `MinPacketPeriodInHns` | **50 000** (5 ms) | `max(2 ms, BufferMs / NotificationCount)` : le minuteur du pilote bat à 1 ms, d'où un plancher absolu de 2 ms ; et `stream::allocate` remonte tout tampon à `BufferMs`, or un tampon vaut deux paquets |
+| `MinPacketPeriodInHns` | **20 000** (2 ms) | une **constante** : le minuteur du pilote bat à 1 ms, donc 2 ms laissent un tick de marge et une période de 1 ms serait à la merci d'un seul tick en retard. C'est aussi ce que déclare l'exemple `SysvadWaveRtPacketSizeConstraintsRender`. `BufferMs` n'entre pas ici |
 | `PacketSizeFileAlignment` | **0** (`FILE_BYTE_ALIGNMENT`) | le pilote n'impose aucun alignement en octets : sa copie travaille en trames |
 | `MaxPacketSizeInBytes` | **30 720** | 10 ms du plus gros format qu'une broche puisse servir (96 kHz × 8 canaux × 4 octets), ce que la documentation exige au minimum |
 | `NumProcessingModeConstraints` | **1** | l'entrée `AUDIO_SIGNALPROCESSINGMODE_DEFAULT` ci-dessous, à 5 ms ; c'est la **longueur du tableau** portable, jamais un littéral, pour que le compte et le contenu ne divergent pas |
@@ -599,14 +599,35 @@ raison de la valeur retenue :
 |---|---|---|
 | `ProcessingMode` | `AUDIO_SIGNALPROCESSINGMODE_DEFAULT` (`{C18E2F7E-933D-4965-B7D1-1EEF228D2AF3}`) | le seul mode que le pilote serve, faute d'exposer la moindre liste de modes ; en poser un autre rendrait la contrainte vraie pour un mode que personne n'emprunte |
 | `SamplesPerProcessingPacket` | **0** | « If this value is 0, the constraint is expressed by the `ProcessingPacketDurationInHns` field » — non nul, il primerait et la durée serait ignorée |
-| `ProcessingPacketDurationInHns` | **50 000** (5 ms) | la même valeur que `MinPacketPeriodInHns`, exprimée en durée pour ne pas dépendre de la fréquence : 240 échantillons valent 5 ms à 48 kHz et 2,5 ms à 96 kHz, et la même interface de filtre sert 44,1, 48 **et** 96 kHz |
+| `ProcessingPacketDurationInHns` | **50 000** (5 ms) | `max(BufferMs / NotificationCount, MinPacketPeriodInHns + 1 ms)` : `stream::allocate` remonte tout tampon à `BufferMs`, or un tampon vaut deux paquets — c'est donc la taille de paquet que le moteur audio obtiendra vraiment. Exprimée en durée pour ne pas dépendre de la fréquence : 240 échantillons valent 5 ms à 48 kHz et 2,5 ms à 96 kHz, et la même interface de filtre sert 44,1, 48 **et** 96 kHz |
 
-**La réserve, qui nous vise.** *Low Latency Audio* prévient : « the mode-specific constraints
-need to be **higher** than the drivers minimum buffer size, otherwise they're ignored by the
-audio stack ». Notre durée est **égale** à `MinPacketPeriodInHns`, pas supérieure — le risque
-est donc connu et assumé pour cette expérience. Si la mesure ne bouge toujours pas, c'est
-cette égalité qui est la **variable suivante** : remonter la durée de l'entrée au-dessus de la
-période minimale annoncée, et voir.
+**L'inégalité stricte, qui nous visait.** *Low Latency Audio* prévient : « the mode-specific
+constraints need to be **higher** than the drivers minimum buffer size, otherwise they're
+ignored by the audio stack ». *Higher* : l'égalité ne compte pas, et une contrainte ignorée
+ne laisse aucune trace — le seul symptôme serait la période de 10 ms qu'on essaie précisément
+de faire descendre. Le lot précédent posait pourtant les deux champs à la **même** valeur, un
+même `max(2 ms, BufferMs / 2)` calculé deux fois : quel que soit `BufferMs`, ils montaient
+ensemble et restaient éternellement égaux.
+
+Ils répondent maintenant chacun à leur question. `MinPacketPeriodInHns` dit à quelle cadence
+le **transport** sait rendre un paquet — le minuteur, 2 ms, une constante que le registre ne
+touche pas. `ProcessingPacketDurationInHns` dit la taille de paquet du mode de traitement —
+le plancher `BufferMs` divisé par deux, 5 ms pour le défaut. Le `+ 1 ms` de la formule ne
+sert à rien pour `BufferMs = 10` (5 ms dépassent 2 ms de loin) : il tient l'inégalité pour
+les tampons **courts**, où `BufferMs / 2` retomberait sur les 2 ms ou en dessous, c'est-à-dire
+pour tout `BufferMs` inférieur à 6 ms. Le test pur
+`la_contrainte_de_mode_depasse_toujours_la_periode_minimale` balaie
+`MIN_BUFFER_MS..=MAX_BUFFER_MS` et fige l'inégalité sur toute la plage.
+
+**Ce que l'écart entre les deux valeurs laisse au pilote à faire.** Annoncer 2 ms de période
+alors qu'on alloue par tranches de 5 ms n'ouvre pas un trou : c'est déjà le comportement
+d'aujourd'hui. Un client qui lit les 2 ms peut demander deux paquets de 2 ms, soit un tampon
+de 4 ms, sous le plancher `BufferMs` ; `stream::allocate_inner` le remonte alors à `BufferMs`
+(`buffer_bytes_with_floor`) et **rend la taille réellement allouée** — un client WaveRT lit la
+taille de son tampon, il ne la dicte pas. La période effective vaut alors `taille réelle /
+NotificationCount`, c'est-à-dire les 5 ms de `ProcessingPacketDurationInHns` et non les 2 ms
+demandées. Le pilote ne refuse donc jamais un paquet qu'il a annoncé : il sert plus long que
+demandé, en le disant.
 
 La longueur passée à `IoSetDeviceInterfacePropertyData` vaut **40 octets** (16 + 1 × 24) :
 le décalage de `ProcessingModeConstraints` plus les contraintes de mode réellement déclarées,
@@ -637,15 +658,13 @@ déjà (§5.5). D'où deux traces : le journal d'événements *Système*
 `NTSTATUS` lui-même, porté par `KSPROPERTY_CONDUIT_TRANSPORT` (§6) et affiché par
 `conduit-looptest --cable-transport`.
 
-**Une hypothèse à surveiller.** `MinPacketPeriodInHns` suppose deux paquets par tampon
-(« Several WaveRT packets (typically 2) are concatenated to form the WaveRT buffer », et
-2 × 240 trames mesurés en exclusif). `AllocateBufferWithNotification` accepte aussi
-`NotificationCount = 1` : dans ce cas le tampon vaut une période, et une période de
-`BufferMs / 2` produirait un tampon sous le plancher — que `buffer_bytes_with_floor`
-remonterait à `BufferMs`, rendant au client un tampon **plus grand** que demandé. Le pilote
-sait déjà le faire et le client WaveRT lit la taille réellement allouée, mais la période
-annoncée serait alors optimiste d'un facteur deux. Aucun `NotificationCount = 1` n'a été
-observé à ce jour.
+**Une hypothèse à surveiller.** `ProcessingPacketDurationInHns` suppose deux paquets par
+tampon (« Several WaveRT packets (typically 2) are concatenated to form the WaveRT buffer »,
+et 2 × 240 trames mesurés en exclusif). `AllocateBufferWithNotification` accepte aussi
+`NotificationCount = 1` : dans ce cas le tampon vaut une période, et la durée annoncée
+décrirait un tampon de 5 ms là où le pilote en alloue 10 — optimiste d'un facteur deux, dans
+le même sens que l'écart déjà décrit ci-dessus, et corrigé de la même façon : le client lit
+la taille réellement allouée. Aucun `NotificationCount = 1` n'a été observé à ce jour.
 
 Sources : *Low Latency Audio* (section « Driver improvements »),
 *KSAUDIO_PACKETSIZE_CONSTRAINTS2*, *KSAUDIO_PACKETSIZE_PROCESSINGMODE_CONSTRAINT*,
