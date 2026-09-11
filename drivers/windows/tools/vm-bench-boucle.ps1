@@ -20,6 +20,16 @@
   target-feature=+crt-static, et un --target-dir séparé pour ne pas reconstruire tout le
   workspace au prochain changement de RUSTFLAGS.
 
+  LE SERVICE TIENT SON PROPRE BINAIRE. Quand « ConduitHelper » tourne dans l'invité, la
+  copie de conduit-helper.exe échoue — mesuré, « en cours d'utilisation par un autre
+  processus ». L'étape 3 arrête donc le service avant de copier et le redémarre après ; le
+  bloc finally le redémarre aussi quand le banc s'interrompt entre les deux. L'autre remède
+  envisagé — sauter la copie quand les SHA-256 local et distant coïncident — ne règle que
+  le cas où le binaire n'a PAS changé, c'est-à-dire celui où la copie n'a aucune
+  importance : dès qu'une construction modifie conduit-helper.exe, le fichier est toujours
+  tenu et la copie échoue toujours. L'arrêt/redémarrage est plus simple et juste dans tous
+  les cas.
+
   PIÈGE À NE JAMAIS REFAIRE : ne PAS combiner -Path et -RemoteExecutable dans l'appel à
   vm-run-console.ps1. Quand -Path est donné, la destination de la copie est CALCULÉE
   depuis -RemoteExecutable ; avec -RemoteExecutable pointant sur powershell.exe, la copie
@@ -87,6 +97,8 @@ $targetDir = Join-Path $repoRoot "target\static"
 $binaires = @("conduitd.exe", "conduitctl.exe", "conduit-helper.exe")
 $banc = Join-Path $PSScriptRoot "bench-boucle.ps1"
 $artefacts = @("serie.jsonl", "recapitulatif.txt", "conduitd.log", "conduitd.err")
+# conduit-helper::scm::NOM_SERVICE — le nom que « sc query » et le MSI emploient.
+$serviceHelper = "ConduitHelper"
 
 if (-not $Sortie) { $Sortie = Join-Path $workspace "target\bench" }
 if (-not (Test-Path -LiteralPath $banc -PathType Leaf)) {
@@ -142,6 +154,9 @@ $aCopier += $banc
 $session = $null
 $dossierLocal = $null
 $codeBanc = 1
+# Armé quand l'étape 3 a arrêté le service : le finally doit le rendre à l'invité tel
+# qu'il l'a trouvé, même si le banc s'interrompt entre la copie et le redémarrage.
+$helperARedemarrer = $false
 try {
   Write-Host "Connexion à « $Name » par PowerShell Direct…"
   $session = New-GuestSession -Name $Name -Credential $Credential
@@ -157,10 +172,39 @@ try {
     }
   } | Out-Null
 
+  # Le service tient conduit-helper.exe ouvert : il descend le temps du dépôt. Voir le
+  # paragraphe « LE SERVICE TIENT SON PROPRE BINAIRE » en tête de fichier pour le choix.
+  $helperARedemarrer = [bool](Invoke-Command -Session $session -ArgumentList @($serviceHelper) -ScriptBlock {
+      param([string]$Service)
+      Set-StrictMode -Version Latest
+      $ErrorActionPreference = "Stop"
+      $svc = Get-Service -Name $Service -ErrorAction SilentlyContinue
+      # Service absent (helper jamais installé) ou déjà arrêté : rien à restaurer ensuite.
+      if ($null -eq $svc -or $svc.Status -eq "Stopped") { return $false }
+      Stop-Service -Name $Service -Force
+      (Get-Service -Name $Service).WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
+      return $true
+    })
+  if ($helperARedemarrer) {
+    Write-Host "Service « $serviceHelper » arrêté le temps de la copie (il tient conduit-helper.exe)."
+  }
+
   foreach ($fichier in $aCopier) {
     $destination = Join-Path $RemoteDirectory (Split-Path -Leaf $fichier)
     Write-Host "Copie de $fichier vers $destination"
     Copy-Item -ToSession $session -Path $fichier -Destination $destination -Force
+  }
+
+  if ($helperARedemarrer) {
+    Invoke-Command -Session $session -ArgumentList @($serviceHelper) -ScriptBlock {
+      param([string]$Service)
+      Set-StrictMode -Version Latest
+      $ErrorActionPreference = "Stop"
+      Start-Service -Name $Service
+      (Get-Service -Name $Service).WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
+    } | Out-Null
+    $helperARedemarrer = $false
+    Write-Host "Service « $serviceHelper » redémarré."
   }
 
   # --- 4. Exécution dans la session console ---------------------------------------------
@@ -203,6 +247,30 @@ try {
     Copy-Item -FromSession $session -Path $source -Destination (Join-Path $dossierLocal $artefact) -Force
   }
 } finally {
+  # Le banc s'est arrêté entre l'arrêt du service et son redémarrage : l'invité ne doit pas
+  # rester sans service d'assistance, sans quoi la mesure suivante échouerait au §2 de
+  # bench-boucle.ps1 sans qu'on sache pourquoi.
+  if ($helperARedemarrer) {
+    try {
+      if ($null -eq $session -or $session.State -ne "Opened") {
+        if ($session) { Remove-PSSession $session -ErrorAction SilentlyContinue }
+        $session = New-GuestSession -Name $Name -Credential $Credential
+      }
+      Invoke-Command -Session $session -ArgumentList @($serviceHelper) -ScriptBlock {
+        param([string]$Service)
+        Set-StrictMode -Version Latest
+        $ErrorActionPreference = "Stop"
+        Start-Service -Name $Service
+        (Get-Service -Name $Service).WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
+      } | Out-Null
+      Write-Host "Service « $serviceHelper » redémarré."
+    } catch {
+      $Host.UI.WriteErrorLine(
+        "RESTAURATION INCOMPLÈTE : le service « $serviceHelper » est resté ARRÊTÉ dans " +
+        "l'invité ($_). Le relancer depuis une invite ÉLEVÉE de l'invité : " +
+        "Start-Service $serviceHelper")
+    }
+  }
   if ($session) { Remove-PSSession $session -ErrorAction SilentlyContinue }
 }
 

@@ -31,6 +31,17 @@
      routage se fait par les DeviceId relevés dans « cable list --json » (champs render
      et capture), qui sont aussi la clé de rapprochement avec status.devices[].id.
 
+  Isolation de la mesure. Sur une racine vierge, conduitd applique la configuration par
+  DÉFAUT de la SPEC — deux câbles — et active donc « Conduit 2 » en plus du câble mesuré.
+  Ses deux endpoints tournent à vide dans le graphe et alimentent le compteur GLOBAL de
+  xruns du moteur, celui-là même que lit le verdict : mesuré, 32 à 42 des xruns d'une passe
+  venaient de là. Avant de démarrer le démon, le banc écrit donc dans
+  <Racine>\config\conduit.toml — le nom exact vient de Paths::in_dirs,
+  crates/conduitd/src/paths.rs — une configuration qui ne contient QUE le câble mesuré. Le
+  fichier n'est écrit que s'il est ABSENT : une configuration déposée exprès pour une
+  campagne (quantum, pilote, format) n'est jamais écrasée. La configuration par défaut du
+  PRODUIT reste à deux câbles ; c'est le banc qui isole, pas le produit qui change.
+
   Série temporelle. Toutes les -Intervalle secondes, l'état complet est ajouté à
   serie.jsonl. Elle date un xrun, attrape un démon mort en cours de route et montre la
   dérive du ratio de rééchantillonnage — ce qu'un unique relevé final ne dit pas. Le
@@ -420,6 +431,42 @@ try {
   # session de l'utilisateur.
   foreach ($vestige in @($journal, $journalErreur, $serie, $recapitulatif)) {
     if (Test-Path -LiteralPath $vestige) { Remove-Item -LiteralPath $vestige -Force }
+  }
+
+  # Isolation : sans ce fichier, le démon créerait AUSSI « Conduit 2 », dont les endpoints
+  # à vide alimentent le compteur global de xruns du verdict (voir .DESCRIPTION). Le numéro
+  # du câble se lit dans son nom canonique — CableId s'affiche « Conduit <n> »,
+  # crates/conduit-backend/src/cable.rs ; un alias ne le donne pas, et le banc préfère le
+  # dire plutôt qu'isoler le mauvais câble.
+  $configBanc = Join-Path (Join-Path $Racine "config") "conduit.toml"
+  $idConfig = $null
+  if ($Cable -match '^\s*Conduit\s+(\d+)\s*$') { $idConfig = [int]$Matches[1] }
+  if (Test-Path -LiteralPath $configBanc -PathType Leaf) {
+    Write-Host "Configuration présente, laissée intacte : $configBanc"
+  } elseif ($null -eq $idConfig) {
+    Write-Warning (@(
+        "« $Cable » n'est pas un nom canonique « Conduit <n> » : le banc ne sait pas quel"
+        "[[cable]] écrire et laisse la configuration par défaut s'appliquer — DEUX câbles,"
+        "dont le second tourne à vide et gonfle le compteur global de xruns du verdict."
+        "Relancer avec -Cable « Conduit <n> », ou déposer $configBanc à la main."
+      ) -join "`n")
+  } else {
+    $dossierConfig = Split-Path -Parent $configBanc
+    if (-not (Test-Path -LiteralPath $dossierConfig)) {
+      New-Item -ItemType Directory -Force -Path $dossierConfig | Out-Null
+    }
+    $texteConfig = (@(
+        "# Écrit par bench-boucle.ps1 : la mesure ne porte QUE sur « $Cable »."
+        "# La configuration par défaut du produit (SPEC §1.2) crée deux câbles ; le second"
+        "# tournerait à vide dans le graphe et ses xruns entreraient dans le compteur global"
+        "# que lit le verdict. Ce fichier n'est PAS réécrit s'il existe déjà : le modifier"
+        "# est la façon prévue de faire varier le quantum, le pilote ou le format."
+        ""
+        "[[cable]]"
+        "id = $idConfig"
+      ) -join "`r`n") + "`r`n"
+    [System.IO.File]::WriteAllText($configBanc, $texteConfig, (New-Object System.Text.UTF8Encoding($false)))
+    Write-Host "Isolation : $configBanc écrit, un seul câble (id $idConfig)."
   }
 
   $argumentsDemon = @("--root", $Racine, "--backend", "wasapi", "--no-persist", "--log-level", "info")
