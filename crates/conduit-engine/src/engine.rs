@@ -299,6 +299,9 @@ impl Engine {
             Command::CableSetChannels { id, channels } => self
                 .cable_op(|c| c.set_channels(id, channels))
                 .map(Reply::Cable),
+            Command::CableSetFormat { id, format } => self
+                .cable_op(|c| c.set_format(id, format))
+                .map(Reply::Cable),
             Command::Dump => Ok(Reply::Dump { text: self.dump() }),
             Command::Subscribe { .. } => Err(EngineError::Unsupported("subscribe")),
             Command::Save => Err(EngineError::Unsupported("save")),

@@ -165,12 +165,19 @@ async fn cable_add_remove_rename_list() {
     let out = ctl(s, &["cable", "add", "--name", "Musique"])
         .await
         .unwrap();
-    assert!(out.starts_with("câble 1 « Musique » stéréo"), "{out}");
+    // Le format entier, pas seulement les canaux : c'est ce qu'un câble sert.
+    assert!(
+        out.starts_with("câble 1 « Musique » 48 kHz float 32, 2 canaux"),
+        "{out}"
+    );
     let out = ctl(s, &["cable", "add", "--channels", "1"]).await.unwrap();
-    assert!(out.contains("mono"), "{out}");
+    assert!(out.contains("1 canal"), "{out}");
     let list = ctl(s, &["cable", "list"]).await.unwrap();
     assert_eq!(list.lines().count(), 3, "{list}");
     assert!(list.contains("Musique") && list.contains("Conduit 2"));
+    // La colonne FORMAT : compacte, et son jeton de profondeur est celui qui se retape.
+    assert!(list.contains("FORMAT"), "{list}");
+    assert!(list.contains("48k f32"), "{list}");
     assert!(ctl(s, &["cable", "rename", "1", "Jeu"])
         .await
         .unwrap()
@@ -190,6 +197,59 @@ async fn cable_add_remove_rename_list() {
         .contains("entre 1 et 8"));
     let nodes = ctl(s, &["nodes"]).await.unwrap();
     assert!(nodes.contains("null:cable2:render"), "{nodes}");
+    c.daemon.shutdown().await;
+}
+
+/// `cable set-format` : les champs donnés s'appliquent, les champs omis se conservent, et
+/// chaque refus nomme son domaine.
+///
+/// La conservation est le point : `--channels 6` sur un câble réglé en 96 kHz PCM 24 ne
+/// doit pas le ramener au défaut. C'est le `cable list` préalable de `conduitctl` qui le
+/// garantit, et rien d'autre ne le vérifierait.
+#[tokio::test(flavor = "multi_thread")]
+async fn cable_set_format_keeps_the_fields_left_out() {
+    let c = start(Config::default()).await;
+    let s = &c.daemon.socket;
+    ctl(s, &["cable", "add"]).await.unwrap();
+
+    let out = ctl(
+        s,
+        &[
+            "cable",
+            "set-format",
+            "1",
+            "--rate",
+            "96000",
+            "--depth",
+            "pcm24",
+        ],
+    )
+    .await
+    .unwrap();
+    assert!(out.contains("96 kHz PCM 24, 2 canaux"), "{out}");
+
+    // Les canaux seuls : la fréquence et la profondeur sont conservées.
+    let out = ctl(s, &["cable", "set-format", "1", "--channels", "6"])
+        .await
+        .unwrap();
+    assert!(out.contains("96 kHz PCM 24, 6 canaux"), "{out}");
+    let list = ctl(s, &["cable", "list"]).await.unwrap();
+    assert!(list.contains("96k pcm24"), "{list}");
+
+    // Chaque refus nomme le champ, la valeur reçue et le domaine.
+    let e = ctl(s, &["cable", "set-format", "1", "--depth", "double"])
+        .await
+        .unwrap_err();
+    assert!(e.contains("double") && e.contains("pcm16"), "{e}");
+    let e = ctl(s, &["cable", "set-format", "1", "--channels", "9"])
+        .await
+        .unwrap_err();
+    assert!(e.contains("9") && e.contains("1 à 8"), "{e}");
+    // Un câble que cette machine ne sert pas : le message donne la commande qui liste.
+    let e = ctl(s, &["cable", "set-format", "7", "--channels", "2"])
+        .await
+        .unwrap_err();
+    assert!(e.contains("cable list"), "{e}");
     c.daemon.shutdown().await;
 }
 

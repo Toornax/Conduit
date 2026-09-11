@@ -1,5 +1,6 @@
 //! Mise en forme tabulaire.
 
+use conduit_backend::CableFormat;
 use conduit_protocol::{EngineStatus, Notification, Reply};
 
 fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
@@ -28,6 +29,31 @@ fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Le format d'un câble en **colonne** : « 48k f32 », « 44,1k pcm24 ».
+///
+/// # Ce qu'il dit, et ce qu'il ne redit pas
+///
+/// Deux champs seulement, la fréquence et la profondeur : les canaux ont déjà leur
+/// colonne dans la table des câbles, et les écrire deux fois sur la même ligne ferait
+/// deux endroits à lire pour un seul nombre — et un jour deux nombres différents.
+///
+/// La fréquence est abrégée en kilohertz (« 48k », « 96k », « 44,1k ») parce qu'une
+/// colonne se lit en diagonale ; une fréquence qui ne tombe pas sur une centaine de hertz
+/// est écrite en entier plutôt qu'arrondie, pour qu'aucun chiffre n'y soit perdu. La
+/// profondeur emploie le **jeton** de la ligne de commande — `f32`, `pcm16`, `pcm24` —, ce
+/// qui fait que la valeur lue dans la table est celle qui se retape dans un
+/// `cable set-format --depth`. Le libellé long (« float 32 ») reste pour la phrase de
+/// `Reply::Cable`, où il y a la place.
+fn format_compact(f: &CableFormat) -> String {
+    let hz = f.sample_rate.hz();
+    let frequence = match (hz / 1000, hz % 1000) {
+        (k, 0) => format!("{k}k"),
+        (k, r) if r % 100 == 0 => format!("{k},{}k", r / 100),
+        _ => hz.to_string(),
+    };
+    format!("{frequence} {}", f.depth.jeton())
 }
 
 /// Formate une réponse.
@@ -112,13 +138,14 @@ pub fn reply(r: &Reply) -> String {
                 .collect::<Vec<_>>(),
         ),
         Reply::Cables { cables } => table(
-            &["N°", "NOM", "CANAUX", "ACTIF", "RENDU", "CAPTURE"],
+            &["N°", "NOM", "FORMAT", "CANAUX", "ACTIF", "RENDU", "CAPTURE"],
             &cables
                 .iter()
                 .map(|c| {
                     vec![
                         c.id.0.to_string(),
                         c.name.clone(),
+                        format_compact(&c.format),
                         c.channels.to_string(),
                         if c.active { "oui" } else { "non" }.into(),
                         c.render.to_string(),
@@ -129,7 +156,7 @@ pub fn reply(r: &Reply) -> String {
         ),
         Reply::Cable(c) => format!(
             "câble {} « {} » {} : rendu {}, capture {}\n",
-            c.id.0, c.name, c.channels, c.render, c.capture
+            c.id.0, c.name, c.format, c.render, c.capture
         ),
         Reply::Dump { text } => text.clone(),
     }
@@ -206,8 +233,10 @@ pub fn event(n: &Notification) -> String {
         ),
         Notification::LinkRemoved { id } => format!("lien retiré {id}"),
         Notification::DriverChanged(d) => format!("pilote : {d:?}"),
+        // Le format et non les seuls canaux : un `set-format` qui ne changerait que la
+        // fréquence produirait autrement deux lignes identiques dans `conduitctl monitor`.
         Notification::CableChanged { id, info } => match info {
-            Some(i) => format!("câble {} : « {} » {}", id.0, i.name, i.channels),
+            Some(i) => format!("câble {} : « {} » {}", id.0, i.name, i.format),
             None => format!("câble {} supprimé", id.0),
         },
         Notification::Rt(e) => format!("temps réel : {e:?}"),

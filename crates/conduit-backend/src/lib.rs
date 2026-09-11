@@ -27,7 +27,9 @@ pub mod event;
 pub mod null;
 pub mod rt;
 
-pub use cable::{CableControl, CableError, CableId, CableInfo, CableSpec};
+pub use cable::{
+    CableControl, CableError, CableFormat, CableId, CableInfo, CableSpec, SampleDepth,
+};
 pub use device::{
     AudioCallback, Backend, BackendError, ClockInfo, DeviceDirection, DeviceHandle, DeviceId,
     DeviceInfo, StreamFormat, StreamIo,

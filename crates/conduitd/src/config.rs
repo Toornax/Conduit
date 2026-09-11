@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use conduit_backend::cable::{CableFormat, SampleDepth};
 use conduit_core::types::{ChannelCount, Quantum, SampleRate};
 use conduit_protocol::api::DriverChoice;
 use serde::{Deserialize, Serialize};
@@ -64,10 +65,52 @@ pub struct CableSection {
     /// Canaux (défaut 2).
     #[serde(default = "default_channels")]
     pub channels: u8,
+    /// Fréquence en Hz : 44100, 48000 ou 96000 sous Windows.
+    ///
+    /// Absente, la fréquence du câble n'est **pas touchée** : une configuration qui ne
+    /// parle pas d'un réglage ne doit pas le ramener au défaut à chaque démarrage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate: Option<u32>,
+    /// Profondeur : `pcm16`, `pcm24` ou `f32`. Absente, elle n'est pas touchée non plus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<String>,
 }
 
 fn default_channels() -> u8 {
     2
+}
+
+impl CableSection {
+    /// La fréquence de la section, déjà validée par [`Config::validate`].
+    ///
+    /// Rend `None` aussi quand la valeur est hors bornes : la validation a lieu au
+    /// chargement, et cette lecture n'a pas à échouer une seconde fois.
+    #[must_use]
+    pub fn rate(&self) -> Option<SampleRate> {
+        self.rate.and_then(SampleRate::new)
+    }
+
+    /// La profondeur de la section, déjà validée par [`Config::validate`].
+    #[must_use]
+    pub fn depth(&self) -> Option<SampleDepth> {
+        self.depth.as_deref().and_then(|d| d.parse().ok())
+    }
+
+    /// Le format que cette section demande, sachant celui que le câble sert aujourd'hui.
+    ///
+    /// Les champs absents gardent leur valeur **courante** — c'est la même règle que
+    /// `conduitctl cable set-format`, et pour la même raison : un fichier qui ne mentionne
+    /// pas la fréquence n'a pas demandé à en changer. `channels`, lui, a toujours une
+    /// valeur (2 par défaut) : la section déclare l'état voulu du câble, et c'est ce qui
+    /// permet au démon de dire qu'il diverge.
+    #[must_use]
+    pub fn format(&self, courant: CableFormat) -> CableFormat {
+        CableFormat {
+            sample_rate: self.rate().unwrap_or(courant.sample_rate),
+            depth: self.depth().unwrap_or(courant.depth),
+            channels: ChannelCount::new(self.channels).unwrap_or(courant.channels),
+        }
+    }
 }
 
 /// Section `[log]`.
@@ -109,16 +152,22 @@ impl Config {
     /// Configuration par défaut de SPEC §1.2 : deux câbles stéréo.
     pub fn with_default_cables() -> Self {
         Self {
+            // Ni `rate` ni `depth` : la configuration par défaut ne demande aucun format,
+            // donc aucun démarrage de démon ne redémarre un périphérique pour rien.
             cables: vec![
                 CableSection {
                     id: 1,
                     alias: None,
                     channels: 2,
+                    rate: None,
+                    depth: None,
                 },
                 CableSection {
                     id: 2,
                     alias: None,
                     channels: 2,
+                    rate: None,
+                    depth: None,
                 },
             ],
             ..Default::default()
@@ -213,6 +262,34 @@ impl Config {
                     format!("attendu entre 1 et {}", ChannelCount::MAX),
                 ));
             }
+            // Les deux champs de format sont validés **au chargement**, comme tout le
+            // reste : une faute de frappe dans un TOML doit se voir au démarrage du démon,
+            // avec la ligne fautive, et non quinze secondes plus tard dans le journal.
+            if let Some(hz) = c.rate {
+                if SampleRate::new(hz).is_none() {
+                    return Err(invalid(
+                        "cable",
+                        "rate",
+                        hz.to_string(),
+                        format!(
+                            "attendu un entier de {} à {} Hz (44100, 48000 ou 96000 sous \
+                             Windows, les seules que le pilote Conduit serve)",
+                            SampleRate::MIN,
+                            SampleRate::MAX
+                        ),
+                    ));
+                }
+            }
+            if let Some(depth) = &c.depth {
+                if depth.parse::<SampleDepth>().is_err() {
+                    return Err(invalid(
+                        "cable",
+                        "depth",
+                        depth.clone(),
+                        "attendu pcm16, pcm24 ou f32".into(),
+                    ));
+                }
+            }
             if let Some(a) = &c.alias {
                 conduit_backend::cable::validate_cable_name(a)
                     .map_err(|e| invalid("cable", "alias", a.clone(), e.to_string()))?;
@@ -283,6 +360,8 @@ channels = 2
 id       = 2
 alias    = "Micro traité"
 channels = 1
+rate     = 96000
+depth    = "pcm24"
 
 [[autoconnect]]
 match  = { cable = 1, direction = "capture" }
@@ -305,6 +384,57 @@ level = "info"
         assert_eq!(cfg.quantum().get(), 256);
         let back = Config::parse(&cfg.to_toml()).unwrap();
         assert_eq!(back, cfg);
+    }
+
+    /// Le format d'une section : ce qu'elle dit, et ce qu'elle laisse au câble.
+    ///
+    /// Le second point est celui qui compte : une section muette sur la fréquence ne doit
+    /// pas ramener en 48 kHz un câble réglé en 96 à chaque démarrage du démon.
+    #[test]
+    fn le_format_d_une_section_complete_le_courant() {
+        let cfg = Config::parse(SAMPLE).unwrap();
+        let courant = CableFormat::default();
+
+        // Section muette sur le format : seuls les canaux sont déclarés.
+        let un = &cfg.cables[0];
+        assert_eq!(un.rate(), None);
+        assert_eq!(un.depth(), None);
+        assert_eq!(un.format(courant), courant, "rien n'est demandé");
+
+        // Section qui déclare les trois champs.
+        let deux = &cfg.cables[1];
+        assert_eq!(deux.rate(), SampleRate::new(96_000));
+        assert_eq!(deux.depth(), Some(SampleDepth::Pcm24));
+        let voulu = deux.format(courant);
+        assert_eq!(voulu.sample_rate, SampleRate::HZ_96000);
+        assert_eq!(voulu.depth, SampleDepth::Pcm24);
+        assert_eq!(voulu.channels, ChannelCount::MONO);
+
+        // Un câble déjà en 96 kHz PCM 24 que la première section décrit : elle ne
+        // demande que la stéréo, et ne touche pas au reste.
+        let garde = un.format(voulu);
+        assert_eq!(garde.sample_rate, SampleRate::HZ_96000);
+        assert_eq!(garde.depth, SampleDepth::Pcm24);
+        assert_eq!(garde.channels, ChannelCount::STEREO);
+    }
+
+    /// Un `rate` ou un `depth` seul se désérialise, et l'autre champ reste absent.
+    #[test]
+    fn les_champs_de_format_sont_facultatifs_un_par_un() {
+        let cfg = Config::parse("[[cable]]\nid = 1\nrate = 44100").unwrap();
+        assert_eq!(cfg.cables[0].rate(), SampleRate::new(44_100));
+        assert_eq!(cfg.cables[0].depth(), None);
+        assert_eq!(cfg.cables[0].channels, 2, "le défaut reste le défaut");
+
+        let cfg = Config::parse("[[cable]]\nid = 1\ndepth = \"pcm16\"").unwrap();
+        assert_eq!(cfg.cables[0].rate(), None);
+        assert_eq!(cfg.cables[0].depth(), Some(SampleDepth::Pcm16));
+
+        // Et l'aller-retour TOML n'invente pas les champs absents. (« rate » nu : le
+        // `sample_rate` de la section [engine] en contient les lettres.)
+        let toml = cfg.to_toml();
+        assert!(!toml.contains("\nrate ="), "{toml}");
+        assert_eq!(Config::parse(&toml).unwrap(), cfg);
     }
 
     #[test]
@@ -343,6 +473,18 @@ level = "info"
             .unwrap_err()
             .to_string();
         assert!(e.contains("caractère interdit"), "{e}");
+        // Les deux champs de format : le message nomme le domaine, pas seulement le refus.
+        // Le domaine du champ est celui du dépôt ; les trois fréquences du pilote Windows
+        // sont **nommées** dans le message, mais c'est `conduit_helper::controle` qui les
+        // fait respecter — un câble PipeWire à 22 050 Hz n'a rien d'illégal.
+        let e = Config::parse("[[cable]]\nid = 1\nrate = 12")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("rate") && e.contains("96000"), "{e}");
+        let e = Config::parse("[[cable]]\nid = 1\ndepth = \"double\"")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("depth") && e.contains("pcm24"), "{e}");
         let e = Config::parse("[engine]\ndriver = \"\"")
             .unwrap_err()
             .to_string();

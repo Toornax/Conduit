@@ -257,12 +257,13 @@ pub(crate) mod fixtures {
         }
     }
 
-    /// Câble stéréo actif.
+    /// Câble stéréo actif, au format d'un câble neuf.
     pub(crate) fn cable(id: u32, name: &str) -> CableInfo {
         CableInfo {
             id: CableId(id),
             name: name.into(),
             channels: ChannelCount::STEREO,
+            format: conduit_backend::CableFormat::default(),
             active: true,
             render: conduit_backend::DeviceId::new(format!("cable-{id}-render")),
             capture: conduit_backend::DeviceId::new(format!("cable-{id}-capture")),

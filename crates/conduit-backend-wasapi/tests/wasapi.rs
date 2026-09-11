@@ -163,6 +163,16 @@ fn cable_control_is_installed_by_the_daemon() {
         CableControl::get(&backend, CableId(1)),
         Err(CableError::NotFound(CableId(1)))
     ));
+    // Le format passe par le même câblage que les autres écritures : sans contrôle
+    // installé, il dit le montage manquant ; avec le double, il dit le câble manquant.
+    assert!(matches!(
+        CableControl::set_format(
+            &mut backend,
+            CableId(1),
+            conduit_backend::CableFormat::default()
+        ),
+        Err(CableError::NotFound(CableId(1)))
+    ));
 }
 
 /// Un contrôle des câbles qui ne connaît aucun câble : de quoi vérifier le câblage du
@@ -187,6 +197,15 @@ impl CableControl for SansCable {
         &mut self,
         id: CableId,
         _channels: ChannelCount,
+    ) -> Result<CableInfo, CableError> {
+        Err(CableError::NotFound(id))
+    }
+    /// Aucun câble : aucun format à régler. Le trait n'a pas d'implémentation par défaut
+    /// pour `set_format`, et c'est ce qui oblige ce double à le dire au lieu de le taire.
+    fn set_format(
+        &mut self,
+        id: CableId,
+        _format: conduit_backend::CableFormat,
     ) -> Result<CableInfo, CableError> {
         Err(CableError::NotFound(id))
     }

@@ -432,10 +432,13 @@ impl App {
             }
             Message::AddCable => {
                 // Le câble naît stéréo et sans nom : le démon le nomme, et
-                // l'alias se saisit ensuite dans la ligne.
+                // l'alias se saisit ensuite dans la ligne. Sans format demandé :
+                // en demander un ferait redémarrer le périphérique du pilote, soit
+                // une seconde de silence, pour un clic sur « Ajouter un câble ».
                 let spec = CableSpec {
                     name: None,
                     channels: ChannelCount::STEREO,
+                    format: None,
                 };
                 self.attente = Some(Attente::Creation);
                 self.request(Command::CableAdd { spec });
@@ -1104,6 +1107,7 @@ mod tests {
                 spec: CableSpec {
                     name: None,
                     channels: ChannelCount::STEREO,
+                    format: None,
                 }
             }
         );

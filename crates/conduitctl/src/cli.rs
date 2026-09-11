@@ -158,6 +158,30 @@ pub enum CableCmd {
         /// Canaux.
         channels: u8,
     },
+    /// Change le format d'un câble : fréquence, profondeur, canaux.
+    ///
+    /// Écrit le format dans la clé matérielle du périphérique puis redémarre celui-ci :
+    /// environ UNE SECONDE DE SILENCE sur les seize câbles, flux ouverts compris. Le câble
+    /// visé doit être DÉCONNECTÉ — le format d'un endpoint audio est figé à sa création, et
+    /// régler celui d'un câble connecté est refusé plutôt que fait à moitié. Désactivez-le
+    /// (« cable remove »), réglez son format, puis réactivez-le (« cable add »).
+    ///
+    /// Les champs omis gardent la valeur que le câble sert aujourd'hui.
+    ///
+    /// Exemple : conduitctl cable set-format 3 --rate 96000 --channels 6
+    SetFormat {
+        /// Numéro.
+        id: u32,
+        /// Fréquence en Hz : 44100, 48000 ou 96000.
+        #[arg(long)]
+        rate: Option<u32>,
+        /// Profondeur : pcm16, pcm24 ou f32.
+        #[arg(long)]
+        depth: Option<String>,
+        /// Canaux, 1 à 8.
+        #[arg(long)]
+        channels: Option<u8>,
+    },
 }
 
 /// Types de nœuds internes.

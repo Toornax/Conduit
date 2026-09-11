@@ -20,7 +20,9 @@ use std::time::{Duration, Instant};
 
 use conduit_core::types::{ChannelCount, SampleRate};
 
-use crate::cable::{validate_cable_name, CableControl, CableError, CableId, CableInfo, CableSpec};
+use crate::cable::{
+    validate_cable_name, CableControl, CableError, CableFormat, CableId, CableInfo, CableSpec,
+};
 use crate::device::{
     AudioCallback, Backend, BackendError, ClockInfo, DeviceDirection, DeviceHandle, DeviceId,
     DeviceInfo, StreamFormat,
@@ -477,9 +479,15 @@ impl CableControl for NullBackend {
         let name = spec.name.unwrap_or_else(|| id.to_string());
         validate_cable_name(&name)?;
         inner.next_cable += 1;
+        // `spec.channels` est ignoré dès que `spec.format` est donné : le format porte
+        // déjà ses canaux, et laisser les deux se contredire n'apporterait qu'un piège.
+        let format = spec.format.unwrap_or(CableFormat {
+            channels: spec.channels,
+            ..CableFormat::default()
+        });
         let (render_spec, capture_spec) =
-            Self::cable_devices(id, &name, spec.channels, SampleRate::HZ_48000, 480);
-        let loopback = Arc::new(Loopback::new(spec.channels.as_usize(), 480 * 4));
+            Self::cable_devices(id, &name, format.channels, format.sample_rate, 480);
+        let loopback = Arc::new(Loopback::new(format.channels.as_usize(), 480 * 4));
         let render_id = DeviceId::new(format!("null:cable{}:render", id.0));
         let capture_id = DeviceId::new(format!("null:cable{}:capture", id.0));
         let render = Arc::new(NullDevice::new(
@@ -504,7 +512,10 @@ impl CableControl for NullBackend {
         let info = CableInfo {
             id,
             name,
-            channels: spec.channels,
+            // `channels` est le raccourci documenté sur `format.channels` : il en sort,
+            // il ne s'en écarte pas.
+            channels: format.channels,
+            format,
             active: true,
             render: render_id,
             capture: capture_id,
@@ -532,23 +543,45 @@ impl CableControl for NullBackend {
         Ok(())
     }
 
+    /// Règle les canaux **sans toucher au reste du format** : un câble en 96 kHz PCM 24
+    /// qui passe de 2 à 6 canaux reste en 96 kHz PCM 24.
     fn set_channels(
         &mut self,
         id: CableId,
         channels: ChannelCount,
     ) -> Result<CableInfo, CableError> {
         let old = self.get(id)?;
-        if old.channels == channels {
+        self.set_format(
+            id,
+            CableFormat {
+                channels,
+                ..old.format
+            },
+        )
+    }
+
+    /// Applique le format et rend le câble : le backend simulé n'a **rien de plus à
+    /// simuler**.
+    ///
+    /// Il n'a ni clé matérielle à écrire ni devnode à redémarrer, et surtout pas
+    /// d'endpoint dont le format serait figé à la création — le refus « ce câble est
+    /// connecté » de la vraie plateforme n'a donc ici aucun objet à protéger. La
+    /// recréation reproduit tout de même le **court silence** : les périphériques
+    /// disparaissent puis réapparaissent, et les tests du moteur voient la même séquence
+    /// d'événements que sur une vraie machine.
+    fn set_format(&mut self, id: CableId, format: CableFormat) -> Result<CableInfo, CableError> {
+        let old = self.get(id)?;
+        if old.format == format {
             return Ok(old);
         }
-        // Recréation : les périphériques disparaissent puis réapparaissent (court silence).
         self.remove(id)?;
         let mut inner = self.inner.lock().unwrap();
         inner.next_cable = id.0; // réutilise le numéro
         drop(inner);
         let info = self.create(CableSpec {
             name: Some(old.name),
-            channels,
+            channels: format.channels,
+            format: Some(format),
         })?;
         let mut inner = self.inner.lock().unwrap();
         inner.next_cable = inner.cables.keys().map(|c| c.0).max().unwrap_or(0) + 1;

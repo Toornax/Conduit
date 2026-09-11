@@ -44,10 +44,17 @@ const FENETRE: (f32, f32) = (1120.0, 720.0);
 
 /// Un câble de démonstration : `nom` vide montre l'invite « Sans alias ».
 fn cable(id: u32, nom: &str, canaux: u8, actif: bool) -> CableInfo {
+    let channels = ChannelCount::new(canaux).expect("canaux hors bornes");
     CableInfo {
         id: CableId(id),
         name: nom.into(),
-        channels: ChannelCount::new(canaux).expect("canaux hors bornes"),
+        channels,
+        // Le format d'un câble neuf, aux canaux près : `channels` en est le raccourci,
+        // et un aperçu qui les ferait diverger montrerait une machine impossible.
+        format: conduit_backend::CableFormat {
+            channels,
+            ..conduit_backend::CableFormat::default()
+        },
         active: actif,
         render: DeviceId::new(format!("null:cable{id}:render")),
         capture: DeviceId::new(format!("null:cable{id}:capture")),

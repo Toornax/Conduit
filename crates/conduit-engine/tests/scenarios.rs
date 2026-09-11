@@ -662,6 +662,7 @@ fn cables_create_device_nodes() {
             spec: CableSpec {
                 name: Some("Musique".into()),
                 channels: ChannelCount::STEREO,
+                format: None,
             },
         })
         .unwrap()

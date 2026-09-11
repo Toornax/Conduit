@@ -40,6 +40,7 @@
 //! | `remove` | **désactive** le câble | `Requete::Desactiver` |
 //! | `list` | l'état des seize | `Requete::Lister` |
 //! | `set_channels` | règle les canaux | `Requete::Canaux` |
+//! | `set_format` | écrit `CableFormat<n>` et redémarre le devnode | `Requete::Format` |
 //! | `rename` | écrit le nom d'endpoint dans le registre | `Requete::Renommer` |
 //! | `rename` vers `Conduit N` | **efface** le nom personnalisé | `Requete::NomDefaut` |
 //!
@@ -62,15 +63,20 @@
 //! *quelle* valeur, *comment* on retrouve un câble déjà renommé et *comment* on revient
 //! en arrière est dans l'en-tête de [`crate::registre`].
 //!
-//! # Ce que ce module ne fait pas
+//! # `set_channels` et `set_format` : deux verbes, un seul chemin qui aboutit
 //!
-//! Il ne change pas le nombre de canaux par lui-même. Depuis **M1b-05** le pilote sert 1 à
-//! 8 canaux par câble, mais il ne peut pas en changer à chaud : ses tables KS sont
-//! immuables et PortCls en retient les pointeurs pour toute la vie du filtre. Le changement
-//! demande d'écrire `CableFormat<n>` dans la clé matérielle du périphérique puis de
-//! redémarrer le devnode, et ce chemin n'est pas encore exposé. Le refus du service
-//! ([`Statut::CanauxNonApplicables`]) est propagé tel quel, avec le nombre de canaux
-//! réellement servi dans le message.
+//! Depuis **M1b-05** le pilote sert 1 à 8 canaux par câble, mais il ne peut pas en changer
+//! à chaud : ses tables KS sont immuables et PortCls en retient les pointeurs pour toute
+//! la vie du filtre. [`CableControl::set_channels`] envoie donc `Requete::Canaux`, que le
+//! service refuse ([`Statut::CanauxNonApplicables`]) dès que le compte demandé n'est pas
+//! celui du format configuré — refus propagé tel quel, avec le compte réellement servi
+//! dans le message et le nom de la commande qui aboutit, elle.
+//!
+//! Celle qui aboutit, c'est [`CableControl::set_format`] : écrire `CableFormat<n>` dans la
+//! clé matérielle du périphérique puis redémarrer le devnode, ce que le service sait faire
+//! depuis l'ordre 7 du protocole. Elle coûte **environ une seconde de silence sur les
+//! seize câbles** et exige un câble déconnecté ; les deux sont dits à l'utilisateur avant
+//! qu'il la tape, dans l'aide de `conduitctl cable set-format`.
 //!
 //! # Aucun test de ce module ne touche la machine
 //!
@@ -81,10 +87,12 @@
 //! exercé que par `tests/tube.rs`, `#[ignore]`.
 
 use conduit_backend::cable::validate_cable_name;
-use conduit_backend::{CableError, CableId, CableInfo, DeviceId};
-use conduit_core::types::ChannelCount;
-use conduit_kmd_core::config::CABLE_MAX;
+use conduit_backend::{CableError, CableFormat, CableId, CableInfo, DeviceId, SampleDepth};
+use conduit_core::types::{ChannelCount, SampleRate};
+use conduit_kmd_core::config::{CableFormat as FormatPilote, CABLE_MAX};
+use conduit_kmd_core::format::SAMPLE_RATES;
 use conduit_kmd_core::params::{MAX_CHANNELS, MIN_CHANNELS};
+use conduit_kmd_core::ring::SampleFormat;
 
 use crate::protocole::{Reponse, Requete, Statut, CANAUX_PAR_DEFAUT, PROTOCOLE_VERSION};
 
@@ -237,48 +245,173 @@ pub fn ordre_de_renommage(cable: CableId, voulu: &str) -> Result<Requete, CableE
 }
 
 // ---------------------------------------------------------------------------------
+// Les deux formats : le type portable et l'encodage du pilote.
+// ---------------------------------------------------------------------------------
+//
+// Ce module est le **seul** du dépôt qui voie les deux mondes à la fois, et c'est
+// délibéré. `conduit_backend::CableFormat` est la couche partagée des trois plateformes
+// et ne connaît pas `conduit-kmd-core` ; `conduit_kmd_core::config::CableFormat` est le
+// contrat d'un pilote Windows et ne connaît pas `SampleRate`. Mettre la traduction
+// ailleurs ferait dépendre l'un de l'autre ; la mettre en deux endroits ferait deux
+// règles à tenir d'accord. Elle tient ici, en deux fonctions, testées en table.
+
+/// Le défaut portable, celui sur lequel un mot nul se replie.
+///
+/// Écrit comme une constante pour que l'assertion ci-dessous le compare à celui du
+/// contrat : ce sont deux écritures de la **même** valeur — 48 kHz, float 32, stéréo —
+/// dans deux crates qui ne se voient pas, et rien d'autre que ce test ne les tient
+/// d'accord.
+const FORMAT_DEFAUT: CableFormat = CableFormat {
+    sample_rate: SampleRate::HZ_48000,
+    depth: SampleDepth::F32,
+    channels: ChannelCount::STEREO,
+};
+
+// Le nombre de canaux du contrat tient dans un `ChannelCount`, et c'est celui du défaut
+// portable. Les trois assertions d'origine sont conservées : elles disaient pourquoi le
+// repli sur `CANAUX_PAR_DEFAUT` ne pouvait pas échouer, elles disent maintenant pourquoi
+// les deux défauts coïncident.
+const _: () = assert!(MIN_CHANNELS <= CANAUX_PAR_DEFAUT && CANAUX_PAR_DEFAUT <= MAX_CHANNELS);
+const _: () = assert!(CANAUX_PAR_DEFAUT <= ChannelCount::MAX as u32);
+const _: () = assert!(FORMAT_DEFAUT.channels.get() as u32 == CANAUX_PAR_DEFAUT);
+
+/// La profondeur du pilote qui correspond à la profondeur portable.
+///
+/// Total dans les deux sens, sans repli : les trois profondeurs sont les mêmes trois, et
+/// une variante ajoutée d'un côté doit faire échouer la compilation de l'autre plutôt que
+/// de tomber dans un `_ =>` silencieux.
+const fn profondeur_pilote(depth: SampleDepth) -> SampleFormat {
+    match depth {
+        SampleDepth::Pcm16 => SampleFormat::I16,
+        SampleDepth::Pcm24 => SampleFormat::Pcm24,
+        SampleDepth::F32 => SampleFormat::F32,
+    }
+}
+
+/// L'inverse. `SampleFormat` est `#[non_exhaustive]`, d'où le repli — qui rend `None`
+/// plutôt que d'inventer une profondeur : un format qu'on ne saurait pas nommer ne vaut
+/// pas mieux qu'un format inconnu.
+const fn profondeur_portable(depth: SampleFormat) -> Option<SampleDepth> {
+    match depth {
+        SampleFormat::I16 => Some(SampleDepth::Pcm16),
+        SampleFormat::Pcm24 => Some(SampleDepth::Pcm24),
+        SampleFormat::F32 => Some(SampleDepth::F32),
+        _ => None,
+    }
+}
+
+/// Le format du pilote que décrit `format`, ou le refus qui **nomme les domaines**.
+///
+/// La couche portable accepte tout ce qu'un câble PipeWire pourrait servir — 22 050 Hz,
+/// par exemple. Le pilote Conduit, lui, ne déclare que trois fréquences
+/// ([`SAMPLE_RATES`]) parce que `copy_frames` ne rééchantillonne pas : c'est ici que la
+/// frontière se franchit, et c'est donc ici que le refus doit dire lesquelles.
+///
+/// # Erreurs
+///
+/// [`CableError::Unsupported`], dont le message porte la valeur refusée **et** le domaine
+/// attendu : l'utilisateur corrige sa ligne sans relire la documentation.
+pub fn format_pilote(format: CableFormat) -> Result<FormatPilote, CableError> {
+    let hz = format.sample_rate.hz();
+    if !SAMPLE_RATES.contains(&hz) {
+        return Err(CableError::Unsupported(format!(
+            "fréquence {hz} Hz non servie par le pilote Conduit : attendu {}",
+            SAMPLE_RATES
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    let canaux = u32::from(format.channels.get());
+    if !(MIN_CHANNELS..=MAX_CHANNELS).contains(&canaux) {
+        return Err(CableError::Unsupported(format!(
+            "{canaux} canaux hors des bornes du pilote ({MIN_CHANNELS} à {MAX_CHANNELS})"
+        )));
+    }
+    let candidat = FormatPilote {
+        sample_rate: hz,
+        depth: profondeur_pilote(format.depth),
+        channels: format.channels.get(),
+    };
+    // Ceinture et bretelles : ce qu'on vient de composer doit passer **le** codec du
+    // contrat, celui-là même que le pilote applique au démarrage d'un devnode. Sans ce
+    // contrôle, un champ ajouté au contrat sans être ajouté ici partirait quand même sur
+    // le canal et se ferait refuser côté service, avec un message qui demande un rapport
+    // de bogue au lieu de dire ce qui manque.
+    FormatPilote::decode(candidat.encode()).map_err(|cause| {
+        CableError::Unsupported(format!(
+            "format « {format} » refusé par le contrat du pilote : {cause}"
+        ))
+    })
+}
+
+/// Le format portable que décrit le mot `brut` d'une réponse, ou `None`.
+///
+/// `None` a **deux** causes qui se traitent pareil : le mot est nul — le service ne
+/// connaît pas le format de ce câble, ou l'ordre n'en visait aucun —, ou il est
+/// indécodable. Dans les deux cas l'appelant se replie sur [`CableFormat::default`]
+/// plutôt que d'afficher une valeur inventée.
+///
+/// Le mot nul est traité **avant** le codec plutôt que laissé lui tomber dessus : le
+/// contrat le refuserait de toute façon — le code 0 n'existe pour aucun des trois champs
+/// —, mais dire ici que 0 veut dire « inconnu » écrit l'intention du protocole là où on la
+/// lit, au lieu de la faire dépendre d'une coïncidence d'encodage.
+#[must_use]
+pub fn format_portable(brut: u32) -> Option<CableFormat> {
+    if brut == 0 {
+        return None;
+    }
+    let pilote = FormatPilote::decode(brut).ok()?;
+    Some(CableFormat {
+        sample_rate: SampleRate::new(pilote.sample_rate)?,
+        depth: profondeur_portable(pilote.depth)?,
+        channels: ChannelCount::new(pilote.channels)?,
+    })
+}
+
+// ---------------------------------------------------------------------------------
 // D'une réponse à un CableInfo.
 // ---------------------------------------------------------------------------------
 
-/// Le nombre de canaux que le pilote sert, quand la réponse ne le dit pas.
+/// Le format du câble `cable` d'après `reponse`, ou [`CableFormat::default`].
 ///
-/// [`Reponse::canaux`] vaut 0 pour un ordre qui ne vise aucun câble — un `lister`, par
-/// exemple. On retombe alors sur la valeur du contrat ([`CANAUX_PAR_DEFAUT`]), celle d'un
-/// poste fraîchement installé. Depuis M1b-05 ce n'est plus la seule valeur possible, et
-/// c'est ce qui rend ce repli **approximatif par nature** : un `lister` ne dit pas le
-/// format de chaque câble, faute d'un champ pour les seize. Un `activer` ou un `canaux`,
-/// eux, visent un câble et rendent son compte réel.
-const CANAUX_DEFAUT: ChannelCount = match ChannelCount::new(CANAUX_PAR_DEFAUT as u8) {
-    Some(canaux) => canaux,
-    // Injoignable : le contrat borne `CANAUX_PAR_DEFAUT` à `MIN_CHANNELS..=MAX_CHANNELS`,
-    // et `ChannelCount` accepte 1 à 8. Un repli plutôt qu'un `unwrap` : ce fichier ne
-    // contient aucune panique atteignable.
-    None => ChannelCount::STEREO,
-};
-
-// Le repli ci-dessus n'est jamais pris tant que les deux bornes coïncident.
-const _: () = assert!(MIN_CHANNELS <= CANAUX_PAR_DEFAUT && CANAUX_PAR_DEFAUT <= MAX_CHANNELS);
-const _: () = assert!(CANAUX_PAR_DEFAUT <= ChannelCount::MAX as u32);
-
-/// Le nombre de canaux qu'annonce une réponse, ou `CANAUX_DEFAUT` si elle n'en annonce
-/// pas (0) ou en annonce un que `ChannelCount` refuse.
+/// # Deux champs, jamais en concurrence
+///
+/// Une réponse porte le format à deux endroits, et un seul parle à la fois :
+///
+/// | ordre | [`Reponse::formats`] (la table) | [`Reponse::format`] (l'en-tête) |
+/// |---|---|---|
+/// | `lister` | les seize | **0** — l'ordre ne vise aucun câble |
+/// | les sept autres | **0** — la table ne voyage pas | celui du câble visé |
+///
+/// On lit donc la table d'abord — elle est indexée par câble et ne peut pas se tromper de
+/// cible — puis l'en-tête. Le repli ne peut pas mal attribuer un format : quand l'en-tête
+/// est renseigné, la table est vide et `cable` est le câble que l'ordre visait, puisque
+/// c'est le seul que les appelants passent.
 #[must_use]
-pub fn canaux(brut: u32) -> ChannelCount {
-    u8::try_from(brut)
-        .ok()
-        .and_then(ChannelCount::new)
-        .unwrap_or(CANAUX_DEFAUT)
+pub fn format_de(reponse: &Reponse, cable: CableId) -> CableFormat {
+    format_portable(reponse.format_de(cable))
+        .or_else(|| format_portable(reponse.format))
+        .unwrap_or(FORMAT_DEFAUT)
 }
 
 /// Le [`CableInfo`] du câble `cable`, tel que `reponse` le décrit.
 ///
 /// Les deux endpoints portent l'identifiant de repli : voir [`ENDPOINT_REPLI`].
+///
+/// **Les canaux viennent du format**, plus de [`Reponse::canaux`] : ils en font partie, et
+/// deux sources pour le même nombre finiraient par se contredire. Le champ `canaux` de la
+/// réponse reste ce qu'il a toujours été — un écho du câble visé — et ce sont les
+/// messages de refus ([`Statut::CanauxNonApplicables`]) qui l'emploient.
 #[must_use]
 pub fn info(reponse: &Reponse, cable: CableId) -> CableInfo {
+    let format = format_de(reponse, cable);
     CableInfo {
         id: cable,
         name: nom(cable),
-        channels: canaux(reponse.canaux),
+        channels: format.channels,
+        format,
         active: reponse.est_actif(cable),
         render: endpoint_repli(cable, Cote::Rendu),
         capture: endpoint_repli(cable, Cote::Capture),
@@ -290,16 +423,16 @@ pub fn info(reponse: &Reponse, cable: CableId) -> CableInfo {
 /// Un câble absent du masque [`Reponse::presents`] n'est pas listé : il n'est pas dans
 /// la réserve que ce pilote a enregistrée (paramètre `Reserve` du registre, M1b-01), et
 /// prétendre le contraire ferait espérer une activation qui échouerait.
+///
+/// Chaque câble porte **son** format, lu dans la table des seize que le lot A1 a ajoutée à
+/// la réponse de `lister`. C'est ce qui a fait disparaître l'ancien repli sur les canaux
+/// du contrat : `conduitctl cable list` annonçait deux canaux à un câble qui en servait
+/// six, ce qui n'était pas une approximation mais une erreur.
 #[must_use]
 pub fn liste(reponse: &Reponse) -> Vec<CableInfo> {
     numeros()
         .filter(|cable| reponse.est_present(*cable))
-        // Un `lister` ne vise aucun câble : ses canaux sont ceux du contrat, pas ceux
-        // que la réponse porte pour un autre ordre.
-        .map(|cable| CableInfo {
-            channels: CANAUX_DEFAUT,
-            ..info(reponse, cable)
-        })
+        .map(|cable| info(reponse, cable))
         .collect()
 }
 
@@ -427,13 +560,13 @@ pub fn verifier(reponse: &Reponse, cable: Option<CableId>) -> Result<(), CableEr
 #[cfg(windows)]
 mod windows {
     use super::{
-        cable_nomme, info, liste, nom, ordre_de_renommage, premier_libre, verifier, CableError,
-        CableId, CableInfo, ChannelCount, CABLE_MAX, CANAUX_PAR_DEFAUT,
+        cable_nomme, format_de, format_pilote, info, liste, nom, ordre_de_renommage, premier_libre,
+        verifier, CableError, CableId, CableInfo, ChannelCount, CABLE_MAX, CANAUX_PAR_DEFAUT,
     };
     use crate::protocole::{Reponse, Requete, NOM_TUBE};
     use crate::tube::{demander, ErreurClient};
     use conduit_backend::cable::validate_cable_name;
-    use conduit_backend::{CableControl, CableSpec};
+    use conduit_backend::{CableControl, CableFormat, CableSpec};
 
     /// Le [`CableControl`] du dorsal Windows : chaque appel est un ordre au service.
     ///
@@ -608,30 +741,51 @@ mod windows {
         /// le dit, avec la commande qui termine le travail : le défaire serait détruire
         /// ce que l'appelant a obtenu pour n'avoir pas obtenu le reste.
         ///
-        /// Un nombre de canaux différent de celui que le câble sert est refusé **avant**
-        /// d'activer quoi que ce soit : activer puis échouer sur les canaux laisserait
-        /// derrière un câble que l'appelant n'a pas demandé.
+        /// # `spec.format` : le format **avant** l'activation
         ///
-        /// # Pourquoi le contrôle porte encore sur le défaut
+        /// `Some` demande la seule séquence qui produise un endpoint au bon format —
+        /// écrire `CableFormat<n>`, redémarrer le devnode, **puis** connecter. L'ordre
+        /// n'est pas négociable : le format du moteur d'un endpoint est mis en cache à sa
+        /// création (mesuré en M1b-05), et régler celui d'un câble déjà connecté ne le
+        /// déplacerait pas. D'où le refus, qui nomme la séquence, quand le câble visé est
+        /// **déjà actif dans un autre format** : mieux vaut le dire que redémarrer son
+        /// périphérique pour rien.
         ///
-        /// `create` **choisit** son câble (le premier libre) : il ne peut donc pas relire à
-        /// l'avance le format de celui qu'il prendra, et un `--channels 6` ne réussirait que
-        /// si le câble tiré au sort se trouvait réglé sur six. Refuser tout ce qui n'est pas
-        /// le défaut est le comportement prévisible ; l'alternative — activer, constater, se
-        /// rétracter — laisserait des câbles allumés derrière elle.
+        /// Quand `spec.format` est `Some`, `spec.channels` est **ignoré** : le format porte
+        /// déjà ses canaux.
         ///
-        /// Ce contrôle deviendra une **relecture** le jour où `create` saura demander un
-        /// format : il faudra alors écrire `CableFormat<n>` puis redémarrer le
-        /// périphérique, ce que le service ne sait pas encore faire.
+        /// # Sans format, un nombre de canaux hors du défaut reste refusé
+        ///
+        /// Le refus est prononcé **avant** d'activer quoi que ce soit : activer puis
+        /// échouer sur les canaux laisserait derrière un câble que l'appelant n'a pas
+        /// demandé. `create` **choisit** son câble (le premier libre) et ne peut donc pas
+        /// relire à l'avance le format de celui qu'il prendra ; un `--channels 6` ne
+        /// réussirait que si le câble tiré au sort se trouvait réglé sur six.
+        ///
+        /// Ce qui a changé depuis M1b-05 : le message nomme désormais la sortie, parce
+        /// qu'elle existe — `--format 48000:f32:6`, qui passe par `spec.format` et paie la
+        /// seconde de silence en connaissance de cause.
         fn create(&mut self, spec: CableSpec) -> Result<CableInfo, CableError> {
-            if u32::from(spec.channels.get()) != CANAUX_PAR_DEFAUT {
-                return Err(CableError::Unsupported(format!(
-                    "un câble neuf est en {CANAUX_PAR_DEFAUT} canaux : en demander un autre \
-                     nombre à la création supposerait d'écrire son format dans la clé \
-                     matérielle du périphérique puis de redémarrer celui-ci, ce que \
-                     Conduit ne sait pas encore faire"
-                )));
-            }
+            // Le format demandé est traduit **d'abord** : une fréquence que le pilote ne
+            // sert pas doit être refusée avant qu'un câble soit activé, pas après.
+            let format_voulu = match spec.format {
+                Some(format) => {
+                    format_pilote(format)?;
+                    Some(format)
+                }
+                None => {
+                    if u32::from(spec.channels.get()) != CANAUX_PAR_DEFAUT {
+                        return Err(CableError::Unsupported(format!(
+                            "un câble neuf est en {CANAUX_PAR_DEFAUT} canaux : pour en \
+                             obtenir un autre nombre, demandez le format entier — son \
+                             écriture dans la clé matérielle du périphérique et le \
+                             redémarrage de celui-ci coûtent environ une seconde de \
+                             silence sur les seize câbles"
+                        )));
+                    }
+                    None
+                }
+            };
             // Le nom voulu, et le câble qu'il désigne s'il en désigne un. Un nom libre
             // ne vise aucun câble en particulier : on prendra le premier libre, puis on
             // le renommera.
@@ -669,11 +823,31 @@ mod windows {
 
             // Déjà connecté : la demande est satisfaite, on rend l'état constaté.
             if etat.est_actif(cible) {
+                // Sauf si l'appelant voulait un **autre** format : on ne le lui donnera
+                // pas sans déconnecter, et le taire ferait croire à un succès.
+                if let Some(format) = format_voulu {
+                    let courant = format_de(&etat, cible);
+                    if courant != format {
+                        return Err(CableError::Unsupported(format!(
+                            "le câble {} est connecté et sert « {courant} » : \
+                             désactivez-le, réglez son format, puis réactivez-le — le \
+                             format d'un endpoint audio est figé à sa création, et le \
+                             redémarrage du périphérique ne le déplacerait pas",
+                            cible.0
+                        )));
+                    }
+                }
                 return match a_renommer {
                     // Les endpoints sont publiés depuis longtemps : un seul essai suffit.
                     Some(nouveau) => self.rename(cible, &nouveau),
                     None => Ok(info(&etat, cible)),
                 };
+            }
+            // Le format **avant** l'activation : c'est la seule séquence qui produise un
+            // endpoint au bon format. Son échec sort ici, sur un câble encore déconnecté,
+            // donc sans rien laisser derrière.
+            if let Some(format) = format_voulu {
+                self.set_format(cible, format)?;
             }
             let reponse = self.ordre(Requete::Activer(cible))?;
             match a_renommer {
@@ -723,6 +897,52 @@ mod windows {
             Ok(info(&reponse, id))
         }
 
+        /// Écrit le **format** du câble dans la clé matérielle de son périphérique, puis
+        /// redémarre celui-ci (M1b-05, ordre 7 du protocole).
+        ///
+        /// Environ **une seconde de silence sur les seize câbles** : le redémarrage du
+        /// devnode republie les endpoints du pilote, tous les câbles compris, et les flux
+        /// ouverts s'interrompent. Ce n'est pas une manœuvre qu'on déclenche par surprise,
+        /// et c'est pourquoi ni `ensure_cables` ni aucune convergence silencieuse ne
+        /// l'appellent d'eux-mêmes.
+        ///
+        /// # Le pré-contrôle d'inactivité, et pourquoi le service reste le juge
+        ///
+        /// Un `lister` précède l'ordre pour deux choses : dire « câble inconnu » sur un
+        /// numéro hors réserve — comme `set_channels` et `remove` —, et donner
+        /// **immédiatement** le message « désactivez-le d'abord » sans faire payer un
+        /// aller-retour privilégié pour un refus certain. Ce n'est qu'un raccourci de
+        /// diagnostic : entre notre lecture et l'écriture, le câble peut être connecté par
+        /// quelqu'un d'autre, et c'est le service qui tranche pour de bon
+        /// ([`Statut::CableActif`]). Décider ici **à sa place** ferait deux politiques à
+        /// tenir d'accord, ce que M1b-21 a déjà appris à ne pas faire.
+        fn set_format(
+            &mut self,
+            id: CableId,
+            format: CableFormat,
+        ) -> Result<CableInfo, CableError> {
+            // La traduction d'abord : une fréquence hors des trois du pilote se refuse
+            // sans ouvrir le canal, avec un message qui nomme le domaine.
+            let format_du_pilote = format_pilote(format)?;
+            let etat = self.etat()?;
+            if !etat.est_present(id) {
+                return Err(CableError::NotFound(id));
+            }
+            if etat.est_actif(id) {
+                return Err(CableError::Unsupported(format!(
+                    "le câble {} est connecté : désactivez-le, réglez son format, puis \
+                     réactivez-le — le format d'un endpoint audio est figé à sa création, \
+                     et le redémarrage du périphérique ne le déplacerait pas",
+                    id.0
+                )));
+            }
+            let reponse = self.ordre(Requete::Format {
+                cable: id,
+                format: format_du_pilote,
+            })?;
+            Ok(info(&reponse, id))
+        }
+
         /// **Renomme le câble côté OS** (M1b-21), par le registre et sans toucher au
         /// pilote.
         ///
@@ -748,6 +968,10 @@ mod windows {
         /// d'y mettre est celle-là. Ce que le dorsal WASAPI publiera ensuite dans
         /// `DeviceInfo::name` dépend, lui, du moment où le moteur audio relira la clé :
         /// voir la section « rafraîchissement » de [`crate::registre`].
+        ///
+        /// Le **format**, lui, est celui que la réponse porte : renommer ne touche ni au
+        /// pilote ni à la clé matérielle, et le service relit l'état des câbles après
+        /// chaque écriture. Seul le nom est remplacé dans le [`CableInfo`] rendu.
         fn rename(&mut self, id: CableId, name: &str) -> Result<CableInfo, CableError> {
             let requete = ordre_de_renommage(id, name)?;
             let voulu = requete.nom().unwrap_or(name).trim().to_owned();
@@ -768,7 +992,7 @@ pub use windows::ControleCables;
 mod tests {
     use super::*;
     use crate::protocole::{ORDRE_ACTIVER, ORDRE_LISTER};
-    use conduit_kmd_core::config::ACTIVE_CABLES_MASK;
+    use conduit_kmd_core::config::{ACTIVE_CABLES_MASK, CABLE_FORMAT_DEFAULT};
 
     /// Une réponse de succès à un `lister`, avec les masques donnés.
     fn reponse(presents: u32, actifs: u32) -> Reponse {
@@ -1115,21 +1339,143 @@ mod tests {
         );
     }
 
-    /// Les canaux d'une réponse sont ceux qu'elle porte, et le contrat sert de repli.
+    /// **Le défaut portable est celui du pilote.** Deux crates qui ne se voient pas
+    /// écrivent la même valeur ; rien d'autre que ce test ne les tient d'accord.
     #[test]
-    fn les_canaux_viennent_de_la_reponse_ou_du_contrat() {
-        assert_eq!(canaux(0), CANAUX_DEFAUT);
-        assert_eq!(canaux(2), ChannelCount::STEREO);
-        assert_eq!(canaux(1), ChannelCount::MONO);
-        assert_eq!(canaux(8).get(), 8);
-        // Hors bornes : le repli du contrat, pas une panique.
-        assert_eq!(canaux(9), CANAUX_DEFAUT);
-        assert_eq!(canaux(u32::MAX), CANAUX_DEFAUT);
-        assert_eq!(CANAUX_DEFAUT.get() as u32, CANAUX_PAR_DEFAUT);
-        // Un `lister` ne vise aucun câble : ses canaux sont ceux du contrat.
-        let mut r = reponse(0b1, 0b1);
-        r.canaux = 0;
-        assert_eq!(liste(&r)[0].channels, CANAUX_DEFAUT);
+    fn le_defaut_portable_est_celui_du_pilote() {
+        assert_eq!(
+            format_portable(CABLE_FORMAT_DEFAULT.encode()),
+            Some(CableFormat::default())
+        );
+        assert_eq!(FORMAT_DEFAUT, CableFormat::default());
+        assert_eq!(
+            format_pilote(CableFormat::default()).unwrap(),
+            CABLE_FORMAT_DEFAULT
+        );
+        assert_eq!(
+            CableFormat::default().channels.get() as u32,
+            CANAUX_PAR_DEFAUT
+        );
+    }
+
+    /// **L'aller-retour entre les deux mondes**, sur tout le domaine du contrat : trois
+    /// fréquences, trois profondeurs, huit comptes de canaux — soixante-douze formats.
+    #[test]
+    fn les_deux_mondes_du_format_se_traduisent() {
+        for hz in SAMPLE_RATES {
+            for depth in SampleDepth::ALL {
+                for canaux in 1..=ChannelCount::MAX {
+                    let portable = CableFormat {
+                        sample_rate: SampleRate::new(hz).expect("fréquence du contrat"),
+                        depth,
+                        channels: ChannelCount::new(canaux).expect("canaux du contrat"),
+                    };
+                    let pilote = format_pilote(portable).expect("format du domaine");
+                    assert_eq!(pilote.sample_rate, hz);
+                    assert_eq!(u32::from(pilote.channels), u32::from(canaux));
+                    assert_eq!(
+                        format_portable(pilote.encode()),
+                        Some(portable),
+                        "{portable}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **Le mot nul est « inconnu »**, jamais un format.
+    ///
+    /// Le protocole s'en sert pour dire « je ne sais pas » ; le décoder donnerait un code
+    /// de fréquence 0, que le contrat refuse de toute façon — mais le dire ici plutôt que
+    /// de s'en remettre au codec rend l'intention vérifiable.
+    #[test]
+    fn le_mot_nul_n_est_pas_un_format() {
+        assert_eq!(format_portable(0), None);
+        // Chaque champ aberrant donne « inconnu » lui aussi : un octet de poids fort non
+        // nul, un code de fréquence inexistant, zéro canal.
+        for aberrant in [0xFF00_0302_u32, 0x0002_03FF, 0x0000_0302, 0x0002_0300] {
+            assert_eq!(format_portable(aberrant), None, "{aberrant:#010x}");
+        }
+    }
+
+    /// Ce que la couche portable accepte et que le pilote refuse : la frontière, et le
+    /// message qui la nomme.
+    #[test]
+    fn la_frontiere_du_pilote_nomme_son_domaine() {
+        let hors_domaine = CableFormat {
+            sample_rate: SampleRate::new(22_050).expect("fréquence du dépôt"),
+            ..CableFormat::default()
+        };
+        let erreur = format_pilote(hors_domaine).expect_err("22 050 Hz n'est pas servi");
+        assert!(matches!(erreur, CableError::Unsupported(_)));
+        let texte = erreur.to_string();
+        assert!(texte.contains("22050"), "{texte}");
+        for hz in SAMPLE_RATES {
+            assert!(texte.contains(&hz.to_string()), "{texte} ne dit pas {hz}");
+        }
+    }
+
+    /// **Les canaux viennent du format**, pour les seize câbles d'un `lister`.
+    ///
+    /// C'est ce que la table de la réponse a rendu possible : avant elle, un `lister`
+    /// annonçait le défaut du contrat pour tout le monde, y compris pour un câble qui
+    /// servait six canaux.
+    #[test]
+    fn les_canaux_viennent_du_format() {
+        let mut r = reponse(0b111, 0b001);
+        r.formats[0] = CABLE_FORMAT_DEFAULT.encode();
+        r.formats[1] = FormatPilote {
+            sample_rate: 96_000,
+            depth: SampleFormat::Pcm24,
+            channels: 6,
+        }
+        .encode();
+        // Le troisième reste inconnu : le service n'a pas su lire sa clé matérielle.
+        r.formats[2] = 0;
+
+        let cables = liste(&r);
+        assert_eq!(cables.len(), 3);
+        assert_eq!(cables[0].format, CableFormat::default());
+        assert_eq!(cables[1].format.channels.get(), 6);
+        assert_eq!(cables[1].format.sample_rate, SampleRate::HZ_96000);
+        assert_eq!(cables[1].format.depth, SampleDepth::Pcm24);
+        // Mot nul : le défaut, comme les canaux se repliaient autrefois — mais c'est
+        // désormais le cas exceptionnel.
+        assert_eq!(cables[2].format, CableFormat::default());
+        // Et `channels` est le raccourci, jamais une seconde vérité.
+        for cable in &cables {
+            assert_eq!(cable.channels, cable.format.channels, "{}", cable.name);
+        }
+    }
+
+    /// Les deux champs de format d'une réponse ne se marchent pas dessus : la table pour
+    /// `lister`, l'en-tête pour les sept autres ordres.
+    #[test]
+    fn le_format_se_lit_dans_la_table_ou_dans_l_en_tete() {
+        let six = FormatPilote {
+            sample_rate: 48_000,
+            depth: SampleFormat::F32,
+            channels: 6,
+        }
+        .encode();
+
+        // Un `activer` : la table ne voyage pas, l'en-tête porte le câble visé.
+        let mut active = reponse(ACTIVE_CABLES_MASK, 0b100);
+        active.ordre = ORDRE_ACTIVER;
+        active.format = six;
+        assert_eq!(format_de(&active, CableId(3)).channels.get(), 6);
+        assert_eq!(info(&active, CableId(3)).channels.get(), 6);
+
+        // Un `lister` : la table parle, et l'en-tête vaut 0 — le repli est inerte.
+        let mut listee = reponse(ACTIVE_CABLES_MASK, 0);
+        listee.formats[2] = six;
+        assert_eq!(listee.format, 0);
+        assert_eq!(format_de(&listee, CableId(3)).channels.get(), 6);
+        assert_eq!(
+            format_de(&listee, CableId(1)),
+            CableFormat::default(),
+            "un câble sans format dans la table garde le défaut"
+        );
     }
 
     /// Notre lecture d'un nom `Conduit N` est **celle du dorsal**, pas une seconde.

@@ -80,6 +80,7 @@ async fn mirror_loads_then_follows_the_cable_notifications() {
         spec: CableSpec {
             name: Some("Musique".into()),
             channels: ChannelCount::new(4).unwrap(),
+            format: None,
         },
     });
     let added = wait_cable_changed(&mut rx, &mut mirror, 3).await;

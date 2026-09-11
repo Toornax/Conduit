@@ -5,8 +5,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use conduit_backend::{
-    AudioCallback, Backend, BackendError, CableControl, CableError, CableId, CableInfo, CableSpec,
-    DeviceDirection, DeviceHandle, DeviceId, DeviceInfo, EventReceiver, StreamFormat,
+    AudioCallback, Backend, BackendError, CableControl, CableError, CableFormat, CableId,
+    CableInfo, CableSpec, DeviceDirection, DeviceHandle, DeviceId, DeviceInfo, EventReceiver,
+    StreamFormat,
 };
 use conduit_core::types::ChannelCount;
 
@@ -480,6 +481,25 @@ impl CableControl for WasapiBackend {
                 .as_mut()
                 .ok_or_else(|| CableError::Unavailable(SANS_CONTROLE.to_owned()))?;
             controle.set_channels(id, channels)?
+        };
+        Ok(self.resoudre_un(info))
+    }
+
+    /// Délègue au contrôle injecté, puis **repasse par `resoudre_un`**.
+    ///
+    /// Le service ne connaît pas les endpoints MMDevice : le [`CableInfo`] qu'il rend porte
+    /// les jetons de repli de `conduit_helper::controle`. La résolution est donc faite ici
+    /// comme pour les autres écritures — et elle compte particulièrement après un
+    /// changement de format, puisque le redémarrage du devnode republie les endpoints du
+    /// pilote et que le câble reste déconnecté juste après (ses endpoints n'existent pas
+    /// encore : les jetons de repli sont alors la vérité, et `resoudre_un` les laisse).
+    fn set_format(&mut self, id: CableId, format: CableFormat) -> Result<CableInfo, CableError> {
+        let info = {
+            let controle = self
+                .cables
+                .as_mut()
+                .ok_or_else(|| CableError::Unavailable(SANS_CONTROLE.to_owned()))?;
+            controle.set_format(id, format)?
         };
         Ok(self.resoudre_un(info))
     }

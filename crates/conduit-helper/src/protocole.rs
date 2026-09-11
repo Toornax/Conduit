@@ -199,9 +199,9 @@ pub const TAILLE_REPONSE: usize = 28;
 /// # Pourquoi `lister` et lui seul rend une table
 ///
 /// Sans elle, `conduitctl cable list` garde des canaux **inventés** : [`Reponse::canaux`]
-/// vaut 0 pour un ordre qui ne vise aucun câble, et `crate::controle::liste` retombe alors
-/// sur `CANAUX_DEFAUT`, la valeur d'un poste neuf. Or les canaux font partie du format, et
-/// depuis M1b-05 chaque câble a le sien : afficher deux canaux pour un câble qui en sert
+/// vaut 0 pour un ordre qui ne vise aucun câble, et `crate::controle::liste` retombait
+/// alors sur les canaux du contrat, la valeur d'un poste neuf. Or les canaux font partie
+/// du format, et depuis M1b-05 chaque câble a le sien : afficher deux canaux pour un câble qui en sert
 /// six n'est pas une approximation, c'est une erreur. La table rend les seize vrais d'un
 /// coup, pour le prix de soixante-quatre octets et d'une seule ouverture de la clé
 /// matérielle côté service.

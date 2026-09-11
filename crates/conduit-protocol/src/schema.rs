@@ -77,7 +77,11 @@ mod tests {
         let names = variant_names::<Command>();
         assert!(names.contains(&"status".to_string()));
         assert!(names.contains(&"cable_add".to_string()));
-        assert!(names.len() >= 25, "{names:?}");
+        // Le nom **sérialisé** de la commande de M1b-05 : c'est celui qu'un client tiers
+        // écrit dans sa trame, et le renommer casserait ce client sans rien changer au
+        // type Rust. Le seuil, lui, ne fait que garantir qu'aucune commande n'a disparu.
+        assert!(names.contains(&"cable_set_format".to_string()), "{names:?}");
+        assert!(names.len() >= 26, "{names:?}");
         assert!(variant_names::<Reply>().contains(&"nodes".to_string()));
         assert!(variant_names::<Notification>().contains(&"shutdown".to_string()));
         let md = protocol_markdown();

@@ -385,15 +385,36 @@ premier câble libre de la réserve fixe de seize (SPEC §5.4) et rend l'état e
 le câble visé est déjà actif ; `remove` **désactive** ; `rename` écrit le nom de
 l'endpoint dans le registre (M1b-21, voir ci-dessous) ; `set_channels` propage le refus
 du pilote, qui sert 1 à 8 canaux par câble depuis M1b-05 mais ne peut pas en changer à
-chaud — le changement demande d'écrire `CableFormat<n>` dans la clé matérielle du
-périphérique puis de redémarrer le devnode, chemin que le service n'expose pas encore. Le bout en
+chaud ; `set_format` est le verbe qui aboutit — il écrit `CableFormat<n>` dans la clé
+matérielle du périphérique puis redémarre le devnode. Le bout en
 bout se vérifie en machine virtuelle, service installé et pilote chargé :
 
 ```powershell
-conduitctl cable add          # -> câble 1 « Conduit 1 » 2 : rendu …, capture …
-conduitctl cable list
+conduitctl cable add          # -> câble 1 « Conduit 1 » 48 kHz float 32, 2 canaux : rendu …
+conduitctl cable list         # colonne FORMAT : « 48k f32 », « 96k pcm24 »…
 conduitctl cable remove 1
 ```
+
+### Changer le format d'un câble (M1b-05)
+
+`set-format` écrit le format puis **redémarre le périphérique du pilote** : environ une
+seconde de silence sur les seize câbles, flux ouverts compris. Le câble visé doit être
+**déconnecté** — le format du moteur d'un endpoint est mis en cache à sa création, et le
+redémarrage ne le déplacerait pas. D'où la séquence, et le refus explicite quand on
+l'oublie :
+
+```powershell
+conduitctl cable remove 1                                   # déconnecter d'abord
+conduitctl cable set-format 1 --rate 96000 --depth pcm24    # les canaux sont conservés
+conduitctl cable set-format 1 --channels 6                  # 96 kHz PCM 24 conservés
+conduitctl cable add --name "Conduit 1"                     # reconnecter
+```
+
+Les champs omis gardent la valeur que le câble sert : `conduitctl` lit un `cable list`
+avant de composer la demande. Le fichier de configuration dit la même chose avec la même
+orthographe — `rate` et `depth` dans une section `[[cable]]` —, mais le démon ne
+l'applique **que** sur un câble déconnecté, avant de le connecter ; sur un câble connecté
+dont le format diverge il journalise un avertissement et n'écrit rien.
 
 ### Renommer un endpoint (M1b-21)
 

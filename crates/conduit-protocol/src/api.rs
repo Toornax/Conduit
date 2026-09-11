@@ -3,7 +3,7 @@
 //! Tous les types sont `serde` ; les énumérations sont étiquetées (`cmd`, `reply`,
 //! `event`, `kind`, …) pour rester lisibles en JSON et stables en MessagePack.
 
-use conduit_backend::{CableId, CableInfo, CableSpec, DeviceId, DeviceInfo};
+use conduit_backend::{CableFormat, CableId, CableInfo, CableSpec, DeviceId, DeviceInfo};
 use conduit_core::graph::{LinkId, LinkInfo, NodeId, PortId};
 use conduit_core::node::PortSpec;
 use conduit_core::nodes::{EqBand, MeterReading};
@@ -408,6 +408,23 @@ pub enum Command {
         /// Canaux.
         channels: ChannelCount,
     },
+    /// Change le **format** d'un câble : fréquence, profondeur, canaux.
+    ///
+    /// Sous Windows, la seule commande qui change réellement les canaux d'un câble —
+    /// `cable_set_channels` se fait refuser par le pilote dès que le compte demandé n'est
+    /// pas celui du format configuré. Elle exige un câble **déconnecté** et coûte environ
+    /// une seconde de silence sur les seize câbles : le format d'un endpoint est figé à sa
+    /// création, et l'appliquer demande de redémarrer le périphérique du pilote.
+    ///
+    /// Ajoutée après [`PROTOCOL_VERSION`](crate::wire::PROTOCOL_VERSION) 1 sans
+    /// l'incrémenter : c'est une **variante de plus** dans un énuméré étiqueté par `cmd`,
+    /// qu'un client plus ancien n'émet jamais et dont il n'a donc rien à savoir.
+    CableSetFormat {
+        /// Câble.
+        id: CableId,
+        /// Format voulu.
+        format: CableFormat,
+    },
     /// Remet les compteurs de xruns à zéro.
     ResetXruns,
     /// S'abonne (ou se désabonne) aux notifications.
@@ -676,6 +693,20 @@ mod tests {
                 spec: CableSpec {
                     name: Some("Musique".into()),
                     channels: ChannelCount::MONO,
+                    format: None,
+                },
+            },
+            // Le même, avec un format : `None` et `Some` sont deux chemins de
+            // sérialisation distincts, et le second est celui qui est neuf.
+            Command::CableAdd {
+                spec: CableSpec {
+                    name: None,
+                    channels: ChannelCount::STEREO,
+                    format: Some(CableFormat {
+                        sample_rate: SampleRate::HZ_96000,
+                        depth: conduit_backend::SampleDepth::Pcm24,
+                        channels: ChannelCount::new(6).unwrap(),
+                    }),
                 },
             },
             Command::CableRemove { id: CableId(1) },
@@ -686,6 +717,14 @@ mod tests {
             Command::CableSetChannels {
                 id: CableId(2),
                 channels: ChannelCount::new(6).unwrap(),
+            },
+            Command::CableSetFormat {
+                id: CableId(2),
+                format: CableFormat {
+                    sample_rate: SampleRate::HZ_44100,
+                    depth: conduit_backend::SampleDepth::Pcm16,
+                    channels: ChannelCount::new(4).unwrap(),
+                },
             },
             Command::ResetXruns,
             Command::Subscribe { enabled: true },
@@ -756,6 +795,7 @@ mod tests {
             id: CableId(1),
             name: "Conduit 1".into(),
             channels: ChannelCount::STEREO,
+            format: CableFormat::default(),
             active: true,
             render: "r".into(),
             capture: "c".into(),

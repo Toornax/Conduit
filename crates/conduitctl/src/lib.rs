@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
-use conduit_backend::{CableId, CableSpec};
+use conduit_backend::{CableFormat, CableId, CableSpec};
 use conduit_core::graph::{Direction, LinkId, NodeId, PortId};
 use conduit_core::types::{ChannelCount, Db};
 use conduit_protocol::client::{Client, ClientError};
@@ -133,6 +133,7 @@ async fn execute(args: Args) -> Result<String, CliError> {
                         channels: ChannelCount::new(channels).ok_or_else(|| {
                             CliError::Usage(format!("canaux : entre 1 et {}", ChannelCount::MAX))
                         })?,
+                        format: None,
                     },
                 },
                 CableCmd::Remove { id } => Command::CableRemove { id: CableId(id) },
@@ -146,6 +147,19 @@ async fn execute(args: Args) -> Result<String, CliError> {
                         CliError::Usage(format!("canaux : entre 1 et {}", ChannelCount::MAX))
                     })?,
                 },
+                CableCmd::SetFormat {
+                    id,
+                    rate,
+                    depth,
+                    channels,
+                } => {
+                    let id = CableId(id);
+                    let courant = format_courant(&mut client, id).await?;
+                    Command::CableSetFormat {
+                        id,
+                        format: format_demande(courant, rate, depth.as_deref(), channels)?,
+                    }
+                }
             };
             call(&mut client, cmd).await?
         }
@@ -202,6 +216,69 @@ async fn execute(args: Args) -> Result<String, CliError> {
     } else {
         format::reply(&reply)
     })
+}
+
+/// Le format que sert aujourd'hui le câble `id`, lu par un `cable list` préalable.
+///
+/// # Pourquoi un aller-retour de plus
+///
+/// `set-format` accepte des champs partiels — `--channels 6` seul ne doit pas ramener en
+/// 48 kHz un câble réglé en 96. Il faut donc connaître les valeurs courantes, et deux
+/// endroits seulement peuvent les fournir : ici, par une commande qui existe déjà, ou le
+/// démon, à qui il faudrait apprendre une « demande partielle de format ». Le second
+/// ferait une seconde façon de dire la même chose dans le protocole, pour économiser une
+/// lecture qui ne coûte rien et ne modifie rien.
+///
+/// # Erreurs
+///
+/// [`CliError::Usage`] si le câble n'est pas servi par cette machine — avec la commande
+/// qui donne les numéros valides.
+async fn format_courant(client: &mut Client, id: CableId) -> Result<CableFormat, CliError> {
+    let Reply::Cables { cables } = call(client, Command::CableList).await? else {
+        return Err(CliError::Daemon(
+            "réponse inattendue à « cable list »".into(),
+        ));
+    };
+    cables
+        .into_iter()
+        .find(|c| c.id == id)
+        .map(|c| c.format)
+        .ok_or_else(|| {
+            CliError::Usage(format!(
+                "câble {} inconnu : « conduitctl cable list » donne les numéros servis par \
+                 cette machine",
+                id.0
+            ))
+        })
+}
+
+/// Le format demandé : les champs donnés, complétés par ceux de `courant`.
+///
+/// Pur, donc vérifiable sans démon. Les trois champs sont recomposés en texte
+/// `fréquence:profondeur:canaux` et confiés à **l'analyseur du dépôt**
+/// ([`CableFormat`]) plutôt qu'à trois contrôles écrits ici : c'est la même orthographe
+/// que le TOML du démon, ce sont les mêmes messages, et il n'y a qu'un endroit où les
+/// domaines sont écrits.
+///
+/// # Erreurs
+///
+/// [`CliError::Usage`], dont le message nomme le champ fautif, la valeur reçue et le
+/// domaine attendu.
+pub fn format_demande(
+    courant: CableFormat,
+    rate: Option<u32>,
+    depth: Option<&str>,
+    channels: Option<u8>,
+) -> Result<CableFormat, CliError> {
+    let texte = format!(
+        "{}:{}:{}",
+        rate.unwrap_or_else(|| courant.sample_rate.hz()),
+        depth.unwrap_or_else(|| courant.depth.jeton()),
+        channels.unwrap_or_else(|| courant.channels.get()),
+    );
+    texte
+        .parse::<CableFormat>()
+        .map_err(|e| CliError::Usage(e.to_string()))
 }
 
 async fn call(client: &mut Client, cmd: Command) -> Result<Reply, CliError> {

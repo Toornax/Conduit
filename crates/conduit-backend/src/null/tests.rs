@@ -300,11 +300,16 @@ fn cables_loop_render_to_capture() {
         .create(CableSpec {
             name: Some("Musique".into()),
             channels: ChannelCount::MONO,
+            ..Default::default()
         })
         .unwrap();
     assert_eq!(c2.id, CableId(2));
     assert_eq!(cc.list().unwrap().len(), 2);
     assert_eq!(cc.get(CableId(2)).unwrap().channels, ChannelCount::MONO);
+    // `channels` est un raccourci sur `format.channels`, jamais une seconde vérité.
+    for cable in cc.list().unwrap() {
+        assert_eq!(cable.channels, cable.format.channels, "{}", cable.name);
+    }
     assert!(matches!(
         cc.get(CableId(7)),
         Err(CableError::NotFound(CableId(7)))
@@ -403,6 +408,10 @@ fn cable_remove_rename_channels_and_limit() {
     assert_eq!(changed.id, c1.id, "le numéro est conservé");
     assert_eq!(changed.name, "Jeu");
     assert_eq!(changed.channels.get(), 6);
+    // Régler les canaux ne touche pas au reste du format.
+    assert_eq!(changed.format.sample_rate, c1.format.sample_rate);
+    assert_eq!(changed.format.depth, c1.format.depth);
+    assert_eq!(changed.format.channels, changed.channels);
     assert_eq!(cc.list().unwrap().len(), 2);
     cc.remove(c1.id).unwrap();
     assert!(matches!(cc.remove(c1.id), Err(CableError::NotFound(_))));
@@ -427,6 +436,75 @@ fn cable_remove_rename_channels_and_limit() {
         }
     )));
     assert!(events.iter().any(|e| matches!(e, DeviceEvent::CableChanged { id: CableId(1), info: Some(i) } if i.name == "Jeu")));
+}
+
+/// `set_format` applique les trois champs, conserve le numéro et le nom, et se voit
+/// jusque dans les périphériques publiés.
+///
+/// C'est ce dernier point qui compte : un format que seul le `CableInfo` porterait ne
+/// prouverait rien. Ici la fréquence du câble est celle de ses deux périphériques, et
+/// c'est la propriété que le vrai pilote obtient en redémarrant son devnode.
+#[test]
+fn cable_set_format_applies_and_reports() {
+    let mut b = NullBackend::new();
+    let cc = b.cable_control().unwrap();
+    let c1 = cc.create(CableSpec::default()).unwrap();
+    assert_eq!(c1.format, CableFormat::default());
+
+    // Le même format : rien n'est recréé, l'état est rendu tel quel.
+    assert_eq!(cc.set_format(c1.id, CableFormat::default()).unwrap(), c1);
+
+    let voulu = CableFormat {
+        sample_rate: SampleRate::HZ_96000,
+        depth: crate::cable::SampleDepth::Pcm24,
+        channels: ChannelCount::new(6).unwrap(),
+    };
+    let apres = cc.set_format(c1.id, voulu).unwrap();
+    assert_eq!(apres.id, c1.id, "le numéro est conservé");
+    assert_eq!(apres.name, c1.name);
+    assert_eq!(apres.format, voulu);
+    assert_eq!(
+        apres.channels, voulu.channels,
+        "le raccourci suit le format"
+    );
+    assert_eq!(cc.get(c1.id).unwrap().format, voulu);
+
+    // Un câble inconnu est nommé, jamais confondu avec un succès.
+    assert!(matches!(
+        cc.set_format(CableId(9), voulu),
+        Err(CableError::NotFound(CableId(9)))
+    ));
+
+    // Le format se voit dans les périphériques publiés, pas seulement dans le `CableInfo`.
+    for device in b.devices().unwrap() {
+        if device.cable == Some(c1.id) {
+            assert_eq!(device.sample_rate, SampleRate::HZ_96000, "{}", device.id);
+            assert_eq!(device.channels, 6, "{}", device.id);
+        }
+    }
+}
+
+/// Un `CableSpec` qui porte un format l'applique **à la création**, et `channels` est
+/// alors ignoré — c'est ce que la documentation du champ promet.
+#[test]
+fn cable_spec_format_wins_over_channels() {
+    let mut b = NullBackend::new();
+    let cc = b.cable_control().unwrap();
+    let voulu = CableFormat {
+        sample_rate: SampleRate::HZ_44100,
+        depth: crate::cable::SampleDepth::Pcm16,
+        channels: ChannelCount::new(4).unwrap(),
+    };
+    let info = cc
+        .create(CableSpec {
+            name: None,
+            // Contredit volontairement le format : c'est le format qui gagne.
+            channels: ChannelCount::MONO,
+            format: Some(voulu),
+        })
+        .unwrap();
+    assert_eq!(info.format, voulu);
+    assert_eq!(info.channels, voulu.channels);
 }
 
 #[test]

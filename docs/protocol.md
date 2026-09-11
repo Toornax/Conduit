@@ -32,6 +32,7 @@ Les exemples ci-dessous sont en JSON pour la lisibilité ; l'encodage réel est 
 - `cable_remove`
 - `cable_rename`
 - `cable_set_channels`
+- `cable_set_format`
 - `reset_xruns`
 - `subscribe`
 - `dump`
@@ -155,6 +156,29 @@ Les exemples ci-dessous sont en JSON pour la lisibilité ; l'encodage réel est 
     }
   ],
   "$defs": {
+    "CableFormat": {
+      "description": "Le format d'un câble : fréquence, profondeur, canaux.\n\nC'est **le** type que la chaîne client transporte, du `conduitctl cable set-format` au\ncontrôle de la plateforme. Sous Windows il finit encodé dans le `REG_DWORD`\n`CableFormat<n>` du devnode ; ailleurs, il décrit simplement les endpoints que le\ndorsal publie.\n\nLe texte de [`FromStr`] est `fréquence:profondeur:canaux` — `48000:f32:2` —, le même\npour la ligne de commande et pour le TOML, parce qu'il n'y a aucune raison qu'un\nutilisateur apprenne deux orthographes du même réglage.",
+      "type": "object",
+      "properties": {
+        "channels": {
+          "description": "Nombre de canaux.",
+          "$ref": "#/$defs/ChannelCount"
+        },
+        "depth": {
+          "description": "Profondeur d'échantillon.",
+          "$ref": "#/$defs/SampleDepth"
+        },
+        "sample_rate": {
+          "description": "Fréquence d'échantillonnage.",
+          "$ref": "#/$defs/SampleRate"
+        }
+      },
+      "required": [
+        "sample_rate",
+        "depth",
+        "channels"
+      ]
+    },
     "CableId": {
       "description": "Identifiant d'un câble (numéro stable, 1 = « Conduit 1 »).",
       "type": "integer",
@@ -174,8 +198,12 @@ Les exemples ci-dessous sont en JSON pour la lisibilité ; l'encodage réel est 
           "$ref": "#/$defs/DeviceId"
         },
         "channels": {
-          "description": "Canaux.",
+          "description": "Canaux — **raccourci sur `format.channels`**, jamais une seconde vérité.\n\nLe champ précède [`Self::format`] et lui survit le temps que ses appelants\nmigrent : la GUI, les règles d'auto-connexion et la table de `conduitctl cable\nlist` le lisent encore. Les implémentations du trait doivent le tenir **égal** à\n`format.channels` ; les tests l'assertent, et la dette « supprimer `channels` » est\nouverte.",
           "$ref": "#/$defs/ChannelCount"
+        },
+        "format": {
+          "description": "Format servi par ce câble.\n\nNon optionnel : depuis M1b-05 chaque câble a le sien, et depuis le lot A1 la\nréponse `lister` du service porte la table des seize — le format est donc\n**toujours** connu. Un mot nul (clé matérielle illisible, câble hors réserve) se\nreplie sur [`CableFormat::default`], comme les canaux se repliaient auparavant,\nmais c'est désormais le cas exceptionnel et non l'ordinaire.",
+          "$ref": "#/$defs/CableFormat"
         },
         "id": {
           "description": "Identifiant.",
@@ -194,6 +222,7 @@ Les exemples ci-dessous sont en JSON pour la lisibilité ; l'encodage réel est 
         "id",
         "name",
         "channels",
+        "format",
         "active",
         "render",
         "capture"
@@ -204,8 +233,20 @@ Les exemples ci-dessous sont en JSON pour la lisibilité ; l'encodage réel est 
       "type": "object",
       "properties": {
         "channels": {
-          "description": "Canaux.",
+          "description": "Canaux.\n\n**Ignoré quand [`Self::format`] est `Some`** : le format porte déjà ses canaux, et\nles faire dire par deux champs ferait une contradiction possible. C'est\n`format.channels` qui compte alors.",
           "$ref": "#/$defs/ChannelCount"
+        },
+        "format": {
+          "description": "Format à appliquer **avant** l'activation, ou `None` pour prendre le câble tel\nqu'il est.\n\n`None` est le comportement d'avant M1b-05 : on connecte le câble sans toucher à sa\nclé matérielle. `Some` demande la seule séquence qui produise un endpoint au bon\nformat — écrire `CableFormat<n>`, redémarrer le devnode, **puis** activer — parce\nque le format d'un endpoint audio est figé à sa création et qu'un redémarrage du\npériphérique ne le déplace pas (mesuré en M1b-05).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CableFormat"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "name": {
           "description": "Nom OS souhaité (`None` = `Conduit N`).",
@@ -707,6 +748,29 @@ Les exemples ci-dessous sont en JSON pour la lisibilité ; l'encodage réel est 
             "cmd",
             "id",
             "channels"
+          ]
+        },
+        {
+          "description": "Change le **format** d'un câble : fréquence, profondeur, canaux.\n\nSous Windows, la seule commande qui change réellement les canaux d'un câble —\n`cable_set_channels` se fait refuser par le pilote dès que le compte demandé n'est\npas celui du format configuré. Elle exige un câble **déconnecté** et coûte environ\nune seconde de silence sur les seize câbles : le format d'un endpoint est figé à sa\ncréation, et l'appliquer demande de redémarrer le périphérique du pilote.\n\nAjoutée après [`PROTOCOL_VERSION`](crate::wire::PROTOCOL_VERSION) 1 sans\nl'incrémenter : c'est une **variante de plus** dans un énuméré étiqueté par `cmd`,\nqu'un client plus ancien n'émet jamais et dont il n'a donc rien à savoir.",
+          "type": "object",
+          "properties": {
+            "cmd": {
+              "type": "string",
+              "const": "cable_set_format"
+            },
+            "format": {
+              "description": "Format voulu.",
+              "$ref": "#/$defs/CableFormat"
+            },
+            "id": {
+              "description": "Câble.",
+              "$ref": "#/$defs/CableId"
+            }
+          },
+          "required": [
+            "cmd",
+            "id",
+            "format"
           ]
         },
         {
@@ -2345,6 +2409,26 @@ Les exemples ci-dessous sont en JSON pour la lisibilité ; l'encodage réel est 
           "required": [
             "Err"
           ]
+        }
+      ]
+    },
+    "SampleDepth": {
+      "description": "Profondeur d'échantillon d'un câble.\n\n# Pourquoi un type d'ici et non `conduit_kmd_core::ring::SampleFormat`\n\nCe crate est la **couche partagée** des trois plateformes : il porte le trait\n[`CableControl`] que servent le dorsal WASAPI, le dorsal PipeWire et le dorsal\nCoreAudio, et il ne dépend pas — et ne doit pas dépendre — de `conduit-kmd-core`, qui\nest le contrat d'**un** pilote Windows. Un câble PipeWire a une profondeur sans que\n`CableFormat<n>` existe nulle part sur la machine.\n\nLa traduction vers l'encodage `REG_DWORD` du pilote vit donc là où les deux mondes se\ntouchent, et nulle part ailleurs : `conduit_helper::controle`.",
+      "oneOf": [
+        {
+          "description": "PCM signé 16 bits.",
+          "type": "string",
+          "const": "pcm16"
+        },
+        {
+          "description": "PCM signé 24 bits (conteneur de trois octets).",
+          "type": "string",
+          "const": "pcm24"
+        },
+        {
+          "description": "Flottant 32 bits, plage nominale [−1, 1]. Le défaut du moteur audio de Windows.",
+          "type": "string",
+          "const": "f32"
         }
       ]
     },
