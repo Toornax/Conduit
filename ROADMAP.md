@@ -595,7 +595,32 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   `conduitctl cable set-format` existera.
   *Chaîne client livrée le 2026-09-11* : `conduitctl cable set-format`, `CableFormat`
   portable dans `CableSpec` et `CableInfo`, colonne `FORMAT` de `cable list`, `rate` et
-  `depth` dans les sections `[[cable]]`. La **mesure en machine virtuelle reste à faire**.
+  `depth` dans les sections `[[cable]]`.
+  *Mesuré en VM le 2026-09-11* — commits `051f384` (service, protocole **version 3**,
+  **ordre 7**) et `8cb96d3` (chaîne client). **La moitié espace utilisateur est close** :
+  - *Câble actif* : le changement est **refusé à tous les étages** — CLI locale du service
+    comme `conduitctl` — et le refus porte **la séquence à suivre** dans son message, pas un
+    code à traduire.
+  - *Câble inactif* : écriture puis redémarrage du devnode en **0,12 s**, la seconde annoncée
+    était large ; `CableFormat2 = 0x00020303` **vérifié au registre**.
+  - *Le cache de la création d'endpoint est bien défait* : câble 3 réactivé après passage à
+    96 kHz, son endpoint **naît en 96 kHz**, le moteur audio annonce défaut et maximum à
+    **960 trames** et minimum à **480** (10 et 5 ms à 96 kHz), et la passe de boucle est
+    **parfaite** à 96 kHz. C'est la preuve directe du « piège d'exploitation » ci-dessus : il
+    fallait un endpoint qui n'existait pas encore, et le redémarrage du devnode le fournit.
+  - `cable list` : colonne `FORMAT` et canaux **vrais** pour les seize câbles.
+
+  **Dette ouverte, trouvée par cette mesure : le démon met son propre `set-format` au veto.**
+  Quand `conduitd` tourne, le retrait du devnode est refusé par `PNP_VetoOutstandingOpen`
+  (**code 6**) — et ce ne sont pas les flux du câble visé qui bloquent, mais ceux que le
+  démon tient sur les câbles actifs **voisins**. Le statut **15** « écrit mais pas appliqué »
+  a réagi **comme conçu**, avec un message honnête ; la contre-preuve est faite : **démon
+  arrêté, la même séquence passe sans veto**. Conséquence : `set-format` à travers le démon
+  exige que celui-ci **relâche ses flux** le temps du geste — le moteur doit fermer puis
+  rouvrir ses ports, ce n'est pas trivial et ce n'est pas fait. *Seconde conséquence, mesurée
+  elle aussi* : après un statut 15, `cable list` affiche le format **écrit** alors que
+  l'endpoint sert encore l'**ancien** — divergence à signaler dans l'affichage (dette mineure,
+  à traiter un jour).
 
   « Aucun format » : l'endpoint existe et devient actif, mais `IAudioClient::GetMixFormat`
   échoue. Ce qui est **écarté** : les tables du binaire livré sont exactes entrée par entrée
@@ -922,6 +947,17 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   désormais où le rendu en est par les paquets servis, mais seuls les clients exclusifs les
   empruntent — le partagé, que cette borne concerne, scrute. Reste donc à calculer l'avance
   sur la période effective au lieu d'une constante.
+  *Note du 2026-09-11 — un défaut ouvert, non instruit, qui ne remet pas le lot en cause* :
+  en **exclusif servi**, environ **une passe de 8 s sur trois** échoue par sauts de phase.
+  Deux de ces échecs sont des **premières passes** dont le premier saut tombe quasiment au
+  **même endroit** (~0,8 s : trames **38 144** et **39 552**) et avec une **grosse
+  amplitude**, 1,8 à 2,3 rad. Le contrôle sans paquets (`PacketMode = 0`) échoue **aussi**
+  (9/10 puis 8/10), mais avec des sauts **dix fois plus petits** — ce n'est donc pas le même
+  phénomène que le bruit sub-trame du tableau ci-dessus. *Soupçon* : un **transitoire
+  d'ancrage** du chemin servi en début de flux — résolution du premier numéro de paquet, ou
+  interaction entre la borne et l'avance. **Enquête dédiée à mener, non commencée.**
+  `PacketMode` reste à **1** par défaut : le partagé y est indifférent (**20/20** mesuré le
+  même soir) et l'exclusif reste fonctionnel.
 
 ### M1b.B — Service d'assistance
 
@@ -1001,6 +1037,38 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   réel par flux (rendu direct dans le tampon WASAPI, capture par paquets, sans
   allocation ni verrou — `tests/no_alloc.rs`), déconnexion propre sur
   `AUDCLNT_E_DEVICE_INVALIDATED`, `ClockInfo` par atomiques, `latency()` hors trait.
+  *Banc rejoué le 2026-09-11 (soir) — **le critère n'est PAS atteint**, la case reste
+  décochée.* Cinq passes de **600 s** par `drivers/windows/tools/bench-boucle.ps1`. La boucle
+  **porte le signal** d'un bout à l'autre — VU stable à **−12,04 dBFS**, crête identique au
+  début et à la fin : ce n'est pas une mesure sur du silence, c'est bien la boucle qui rate.
+  *Passe isolée* — un seul câble au monde, Conduit 1 **pilote de son propre graphe**,
+  quantum 256 : **50 underruns, tous du côté CAPTURE**, le premier à **270 s**, puis par
+  **rafales** (11, 18, 12, 9) toutes les **~2 min** ; le remplissage du tampon oscille de
+  **386 à 1 056 trames** et le ratio de la DLL chasse entre **0,990 et 1,0012**.
+  **Ce n'est pas un problème de charge** : temps de cycle **41 µs en moyenne pour un budget
+  de 5 333 µs**, zéro dépassement. La signature est celle d'un **battement lent** entre
+  l'horloge du rendu (le pilote du graphe, période 10 ms) et la cadence de la capture, que la
+  boucle à verrouillage **n'amortit pas**.
+  *Piège de méthode, à ne plus refaire* : en pilote de graphe `auto`, le pilote choisi est
+  l'**endpoint par défaut de Windows** — devenu Conduit 3 à 96 kHz après sa création par la
+  mesure de M1b-05 — et l'écart de cycles montait alors à **6,7 %**. **Toujours nommer le
+  pilote dans une mesure.**
+  *Suspects, dans l'ordre du plan* :
+  1. **MMCSS absent.** Les fils audio n'ont que `SetThreadPriority(TIME_CRITICAL)` : aucun
+     `AvSetMmThreadCharacteristics`, donc aucune classe « Pro Audio » ni aucune part de temps
+     processeur garantie par le planificateur. **Aucune note de dette ne l'écrivait nulle
+     part** — elle est écrite ici.
+  2. **Le quantum 256 contre la période 480** du pilote de graphe : essayer **480**, puis
+     **128**.
+  3. **Le réglage de la boucle à verrouillage** (`crates/conduit-core/src/dsp/dll.rs`) : la
+     chasse du ratio est visible dans la série temporelle.
+  *Prochaine étape écrite* : une **campagne dédiée** sur le banc corrigé, ces trois variables
+  **une à la fois**.
+  *Le banc a été corrigé le jour même* pour que cette campagne mesure ce qu'elle croit
+  mesurer : il écrit désormais `<racine>\config\conduit.toml` avec le **seul** câble mesuré,
+  la configuration par défaut du démon en créant deux et les endpoints à vide du second ayant
+  fourni **32 à 42 xruns** d'une passe ; et le dépôt des binaires arrête le service
+  `ConduitHelper`, qui tenait `conduit-helper.exe` ouvert.
 - [x] **M1b-32** `feat(wasapi): mode exclusif quand disponible`
   *Fait quand* : latence mesurée inférieure au mode partagé, repli automatique documenté.
   *Mesuré* le 2026-09-06 sur les 5 endpoints de rendu du poste (`tests/exclusive.rs`, 48 kHz
