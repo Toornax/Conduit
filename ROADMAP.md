@@ -1073,8 +1073,9 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   (`crates/conduit-core/src/asyncport.rs`) — `max_correction` effectif **5e-4 (500 ppm)** et
   `bandwidth_hz` effectif **0,02**. La saturation au franchissement **a toujours lieu** mais ne
   coûte plus que **24 trames/s** : inoffensive. Test de simulation
-  `dent_de_scie_ne_vide_plus_lanneau` : ancien réglage → creux à **29 trames** (la panne) ;
-  neuf → creux à **225**. Instrumentation ajoutée au passage : **bornes min/max** de
+  `dent_de_scie_ne_vide_plus_lanneau` : ancien réglage → creux relevé à **29 trames** sur
+  une exécution (le test assertit « sous un quantum », la panne) ; neuf → creux à **225**
+  contre 297 sans artefact. Instrumentation ajoutée au passage : **bornes min/max** de
   remplissage et de ratio, publiées par le protocole et affichées par le banc — un relevé
   périodique du seul niveau courant ne peut pas voir la dent de scie, qui est justement ce
   qu'il faut observer.
