@@ -130,6 +130,13 @@ pub struct Analysis {
     pub phase_breaks: Vec<PhaseBreak>,
     /// Seuil de saut de phase effectivement appliqué, en radians.
     pub phase_threshold_rad: f64,
+    /// Glissement total restitué **en trames**, signé, autour du premier saut de
+    /// phase, ou `None` s'il n'y a pas de saut. `delta_rad` ne garde que le résidu
+    /// du décalage modulo 2π ; ce champ cumule les sauts de blocs adjacents de même
+    /// sens et ne convertit qu'une fois en trames, ce qui restitue un glissement
+    /// réparti sur plusieurs blocs là où `delta_rad` le sous-estimerait. Voir
+    /// `phase_slip_frames` pour la limite sur un glissement instantané.
+    pub phase_slip_frames: Option<f64>,
     /// Trous constatés.
     pub gaps: Vec<Gap>,
     /// Trames sous le seuil de silence (les passages par zéro du sinus en font
@@ -259,12 +266,9 @@ pub fn analyze_with(samples: &[f32], spec: &SineSpec, options: &AnalysisOptions)
     };
 
     let phase_threshold_rad = phase_threshold(omega, options.phase_tolerance_rad);
-    let phase_breaks = find_phase_breaks(
-        &mono,
-        omega,
-        options.block_frames.max(8),
-        phase_threshold_rad,
-    );
+    let block = options.block_frames.max(8);
+    let phase_breaks = find_phase_breaks(&mono, omega, block, phase_threshold_rad);
+    let phase_slip_frames = phase_slip_frames(&phase_breaks, omega, block);
 
     Analysis {
         frames,
@@ -273,6 +277,7 @@ pub fn analyze_with(samples: &[f32], spec: &SineSpec, options: &AnalysisOptions)
         thd_estimate,
         phase_breaks,
         phase_threshold_rad,
+        phase_slip_frames,
         gaps,
         silence_frames,
         clipped_frames,
@@ -310,15 +315,24 @@ pub fn verify(analysis: &Analysis, spec: &SineSpec, tol: &Tolerances) -> Verdict
 
     if analysis.phase_breaks.len() > tol.max_phase_breaks {
         let first = analysis.phase_breaks[0];
+        // `delta_rad` est replié modulo 2π : un glissement de plusieurs périodes s'y
+        // sous-estime. On ajoute la restitution en trames quand elle est disponible.
+        // On affiche la magnitude : le sens (trames perdues ou dupliquées) est déjà
+        // porté par le signe de `delta_rad` ci-dessus.
+        let glissement = match analysis.phase_slip_frames {
+            Some(f) => format!(" (glissement cumulé ≈ {} trames)", fr(f.abs(), 0)),
+            None => String::new(),
+        };
         reasons.push(format!(
             "continuité : {} saut(s) de phase au-delà de {} rad ({} accepté(s)), le premier \
-             à la trame {} de {} rad — trames perdues ou dupliquées dans la boucle \
+             à la trame {} de {} rad{} — trames perdues ou dupliquées dans la boucle \
              (position du tampon cyclique du pilote)",
             analysis.phase_breaks.len(),
             fr(analysis.phase_threshold_rad, 4),
             tol.max_phase_breaks,
             first.frame,
-            fr(first.delta_rad, 4)
+            fr(first.delta_rad, 4),
+            glissement
         ));
     }
 
@@ -601,6 +615,47 @@ fn find_phase_breaks(mono: &[f64], omega: f64, block: usize, threshold: f64) -> 
         .collect()
 }
 
+/// Restitution du glissement total, **en trames** et signé, à partir des sauts de
+/// phase, ou `None` s'il n'y a pas de saut (ou si `omega` est nul).
+///
+/// [`PhaseBreak::delta_rad`] ne garde que le résidu du décalage modulo 2π : un
+/// glissement de plus d'une période s'y replie et se sous-estime (un tour de tampon
+/// de 480 trames peut n'y laisser qu'un résidu de ~1,85 rad, soit ~32 trames une fois
+/// divisé par `omega`). Quand le pilote glisse **progressivement**, le décalage
+/// s'étale sur des blocs adjacents qui sautent tous dans le même sens, chacun sous π
+/// donc non replié : on cumule leurs `delta_rad` depuis le premier saut, tant que les
+/// blocs restent adjacents (frontières distantes d'un `block`) et de même signe, puis
+/// on ne convertit **qu'une seule fois** le total en trames (`total_rad / omega`). La
+/// conversion trame par trame tronquerait à chaque bloc ; le cumul restitue le
+/// glissement complet.
+///
+/// # Limite
+///
+/// Sur un sinus rigoureusement pur, un glissement **instantané** de plus d'une période
+/// se présente comme un unique saut dont le `delta_rad` est déjà replié : il est alors
+/// indistinguable d'un glissement modulo la période, et aucune mesure sur les seuls
+/// échantillons ne peut lever l'ambiguïté (la corrélation croisée de deux sinus purs
+/// est exactement périodique de la période du signal, ses maxima se répètent tous les
+/// `2π/omega`). Le cumul ne restitue le glissement complet que lorsqu'il est réparti
+/// sur plusieurs blocs, chaque pas restant sous une période.
+fn phase_slip_frames(breaks: &[PhaseBreak], omega: f64, block: usize) -> Option<f64> {
+    if breaks.is_empty() || omega.abs() < 1e-12 {
+        return None;
+    }
+    let mut total = breaks[0].delta_rad;
+    for pair in breaks.windows(2) {
+        let (prev, cur) = (pair[0], pair[1]);
+        let adjacent = cur.frame.saturating_sub(prev.frame) == block;
+        let meme_sens = cur.delta_rad.signum() == prev.delta_rad.signum();
+        if adjacent && meme_sens {
+            total += cur.delta_rad;
+        } else {
+            break;
+        }
+    }
+    Some(total / omega)
+}
+
 /// Ramène un angle dans `]-π, π]`.
 fn wrap_pi(angle: f64) -> f64 {
     let mut a = angle % TAU;
@@ -640,6 +695,86 @@ mod tests {
     /// pour que les tests restent rapides en mode debug.
     fn frames(rate: u32) -> usize {
         rate as usize / 2
+    }
+
+    /// Signal stéréo synthétique où la phase gagne `pas_trames · ω` radians à chaque
+    /// frontière de bloc dans `bloc_debut+1 ..= bloc_debut+n_pas`, soit un glissement
+    /// **connu** de `n_pas · pas_trames` trames réparti sur des blocs adjacents (chaque
+    /// pas restant sous une période, donc non replié). Hors de cette plage la phase
+    /// avance normalement : la majorité des blocs sont propres, la dérive médiane est
+    /// nulle et seuls les blocs de la rampe donnent des sauts.
+    fn signal_avec_glissement(
+        s: &SineSpec,
+        total_frames: usize,
+        block: usize,
+        bloc_debut: usize,
+        n_pas: usize,
+        pas_trames: f64,
+    ) -> Vec<f32> {
+        let omega = s.omega();
+        let channels = s.channels.max(1);
+        let mut out = Vec::with_capacity(total_frames * channels);
+        let mut extra = 0.0_f64;
+        for n in 0..total_frames {
+            if n % block == 0 {
+                let bloc = n / block;
+                if bloc > bloc_debut && bloc <= bloc_debut + n_pas {
+                    extra += pas_trames * omega;
+                }
+            }
+            let value = (s.amplitude * (omega * n as f64 + extra).sin()) as f32;
+            for _ in 0..channels {
+                out.push(value);
+            }
+        }
+        out
+    }
+
+    /// Un glissement progressif de 240 puis 480 trames doit être **restitué en
+    /// trames** (à quelques trames près), là où `delta_rad` seul, replié modulo 2π,
+    /// le sous-estimerait. 441 Hz à 48 kHz : période ≈ 108,8 trames, donc 240 et 480
+    /// ne sont pas des multiples entiers de la période.
+    #[test]
+    fn glissement_progressif_restitue_en_trames() {
+        let s = spec(441.0, 48_000);
+        let block = AnalysisOptions::default().block_frames;
+        for (n_pas, pas_trames, attendu) in [(12usize, 20.0f64, 240.0f64), (12, 40.0, 480.0)] {
+            let samples = signal_avec_glissement(&s, 24_000, block, 50, n_pas, pas_trames);
+            let a = analyze(&samples, &s);
+            let slip = a
+                .phase_slip_frames
+                .expect("un glissement doit être restitué");
+            // Le signe encode le sens (le fit rend une phase en π/2 − φ) ; c'est la
+            // magnitude qui doit approcher le glissement injecté, à quelques trames près.
+            assert!(
+                (slip.abs() - attendu).abs() <= 4.0,
+                "glissement de {attendu} trames : restitué {slip} (sauts {:?})",
+                a.phase_breaks
+            );
+            // Le verdict échoue toujours sur le NOMBRE de sauts (critère inchangé) ;
+            // le message de continuité porte désormais la restitution en trames.
+            let v = verify(&a, &s, &Tolerances::default());
+            assert!(!v.ok);
+            let continuite = v
+                .reasons
+                .iter()
+                .find(|r| r.starts_with("continuité"))
+                .expect("une raison de continuité");
+            assert!(
+                continuite.contains("glissement cumulé"),
+                "message sans restitution en trames : {continuite}"
+            );
+        }
+    }
+
+    /// Sans saut de phase, pas de restitution ; un sinus propre laisse le champ à `None`.
+    #[test]
+    fn pas_de_glissement_sur_sinus_propre() {
+        let s = spec(441.0, 48_000);
+        let samples = generate(&s, frames(48_000), 0.0);
+        let a = analyze(&samples, &s);
+        assert!(a.phase_breaks.is_empty());
+        assert_eq!(a.phase_slip_frames, None);
     }
 
     #[test]

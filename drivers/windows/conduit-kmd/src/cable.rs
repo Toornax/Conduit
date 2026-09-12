@@ -268,6 +268,26 @@ pub struct StreamState {
 // durable : les envoyer d'un fil à l'autre est sûr.
 unsafe impl Send for StreamState {}
 
+/// Ce qu'un appel à [`StreamState::packets_transferred`] a calculé, pour le relevé de
+/// paquets ([`config::StreamPackets`]).
+///
+/// Le pilote ne s'en sert pas pour décider — seul [`Self::count`] part au moteur audio — ;
+/// les deux autres champs datent et prouvent le plafonnement du correctif du 2026-09-12
+/// (voir [`StreamState::packets_transferred`]) sans débogueur, par `conduit-looptest`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PacketCountReport {
+    /// Le compte **rendu** par `GetPacketCount` : plafonné à ce que le client a fourni,
+    /// monotone, base 1.
+    pub count: u64,
+    /// Le nombre de paquets que la seule **position** désignait comme complets
+    /// (`floor(position / taille_paquet)`, **non plafonné**) à cet instant. L'écart avec
+    /// [`Self::count`] est le nombre de paquets que le client aurait sautés **sans** le
+    /// plafond.
+    pub reached: u64,
+    /// Le dernier numéro de paquet **accepté** à cet instant, `None` si aucun.
+    pub last_write: Option<u64>,
+}
+
 impl StreamState {
     /// Flux à l'arrêt, position 0, sans tampon ni événement, exposant les interfaces de
     /// paquets `packet_exposure` (voir le champ).
@@ -382,16 +402,39 @@ impl StreamState {
     /// Fait avancer le compte de paquets transférés et le rend, ou `None` sans géométrie de
     /// paquets.
     ///
+    /// # `GetPacketCount` est le point de resynchronisation, et ne doit jamais mentir
+    ///
+    /// Le client interroge cette méthode **après un refus** de `SetWritePacket` pour savoir où
+    /// il en est, puis reprend son flux à `last_write_packet + 1` — le **seul** numéro que
+    /// `conduit_kmd_core::packetnum::validate_write` accepte pour une position non alignée.
+    /// Le compte rendu ne doit donc **jamais prétendre transféré un paquet que le client n'a
+    /// pas fourni** : sinon le client se recale devant ce qu'il a écrit, la suite de son flux
+    /// glisse d'un tour de tampon, et le décalage est permanent (glissement de 480 trames
+    /// mesuré le 2026-09-12, absent à `PacketMode = 0`, déclenché par la gigue de réveil qui
+    /// atteint une période entière).
+    ///
+    /// D'où le **plafond** `last_write_packet + 1` (le nombre de paquets réellement fournis,
+    /// `last_write_packet` étant le numéro base 0 du dernier accepté) : le candidat est le
+    /// minimum entre ce que la position désigne et ce plafond. Sans dernier paquet accepté, le
+    /// plafond est 0 — aucun paquet fourni, c'est la vérité, et le compte reste 0.
+    ///
     /// Le compte suit la position — pour un pont logiciel la latence matérielle est nulle,
     /// donc « transféré vers le matériel » et « joué » sont le même instant — mais il ne
-    /// **recule jamais** : voir [`StreamState::packet_count`].
+    /// **recule jamais** (`max`), et le plafond ne le fait pas reculer non plus puisque
+    /// `last_write_packet` ne fait que croître jusqu'au `KSSTATE_STOP` qui remet tout à zéro :
+    /// voir [`StreamState::packet_count`].
     ///
     /// IRQL : `<= DISPATCH_LEVEL` (sous le verrou du flux).
-    pub fn packets_transferred(&mut self, qpc_now: u64) -> Option<u64> {
+    pub fn packets_transferred(&mut self, qpc_now: u64) -> Option<PacketCountReport> {
         let geo = self.packet_geometry()?;
-        let complets = geo.complete_at(self.frames_at(qpc_now));
-        self.packet_count = self.packet_count.max(complets);
-        Some(self.packet_count)
+        let reached = geo.complete_at(self.frames_at(qpc_now));
+        let plafond = self.last_write_packet.map_or(0, |w| w.saturating_add(1));
+        self.packet_count = self.packet_count.max(reached.min(plafond));
+        Some(PacketCountReport {
+            count: self.packet_count,
+            reached,
+            last_write: self.last_write_packet,
+        })
     }
 
     /// Le prochain paquet de capture à rendre par `GetReadPacket` : son numéro **absolu** et
@@ -1002,6 +1045,21 @@ struct SidePackets {
     irql_last: AtomicU32,
     /// IRQL maximal vu, qui ne redescend jamais.
     irql_max: AtomicU32,
+    /// Refus de `SetWritePacket` pour cause de retard (`STATUS_DATA_LATE_ERROR`) : c'est le
+    /// refus qui déclenche la resynchronisation par `GetPacketCount`, donc celui que le
+    /// glissement de 480 trames guettait. Le compter le date et le quantifie.
+    set_write_late: AtomicU64,
+    /// Refus de `SetWritePacket` pour cause de débordement (`STATUS_DATA_OVERRUN`).
+    set_write_overrun: AtomicU64,
+    /// Dernière valeur rendue par `GetPacketCount` (plafonnée), écrite à chaque appel servi.
+    last_packet_count_returned: AtomicU64,
+    /// Paquets que la seule position désignait comme complets au dernier `GetPacketCount`
+    /// (non plafonné) : l'écart avec [`Self::last_packet_count_returned`] est le glissement
+    /// que le correctif évite.
+    packets_reached_at_last_count: AtomicU64,
+    /// Dernier paquet accepté au dernier `GetPacketCount`, [`u64::MAX`] si aucun (l'`Option`
+    /// du flux n'a pas de représentation dans un atomique).
+    last_write_at_last_count: AtomicU64,
 }
 
 impl SidePackets {
@@ -1017,10 +1075,15 @@ impl SidePackets {
             last_qpc: AtomicU64::new(0),
             irql_last: AtomicU32::new(0),
             irql_max: AtomicU32::new(0),
+            set_write_late: AtomicU64::new(0),
+            set_write_overrun: AtomicU64::new(0),
+            last_packet_count_returned: AtomicU64::new(0),
+            packets_reached_at_last_count: AtomicU64::new(0),
+            last_write_at_last_count: AtomicU64::new(0),
         }
     }
 
-    /// Remet les dix compteurs à zéro (nouveau cycle de périphérique).
+    /// Remet les quinze compteurs à zéro (nouveau cycle de périphérique).
     ///
     /// IRQL : `PASSIVE_LEVEL`, aucune broche ouverte : `Relaxed` suffit.
     fn reset(&self) {
@@ -1034,6 +1097,38 @@ impl SidePackets {
         self.last_qpc.store(0, Ordering::Relaxed);
         self.irql_last.store(0, Ordering::Relaxed);
         self.irql_max.store(0, Ordering::Relaxed);
+        self.set_write_late.store(0, Ordering::Relaxed);
+        self.set_write_overrun.store(0, Ordering::Relaxed);
+        self.last_packet_count_returned.store(0, Ordering::Relaxed);
+        self.packets_reached_at_last_count
+            .store(0, Ordering::Relaxed);
+        self.last_write_at_last_count.store(0, Ordering::Relaxed);
+    }
+
+    /// Compte un **refus** de `SetWritePacket` : `late` distingue le retard
+    /// (`STATUS_DATA_LATE_ERROR`) du débordement (`STATUS_DATA_OVERRUN`).
+    ///
+    /// IRQL : quelconque — un seul `fetch_add`.
+    fn note_write_refusal(&self, late: bool) {
+        let compteur = if late {
+            &self.set_write_late
+        } else {
+            &self.set_write_overrun
+        };
+        compteur.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Mémorise les trois valeurs du dernier `GetPacketCount` servi (voir les champs de
+    /// [`SidePackets`] et [`PacketCountReport`]).
+    ///
+    /// IRQL : quelconque — trois `store`.
+    fn note_packet_count(&self, report: &PacketCountReport) {
+        self.last_packet_count_returned
+            .store(report.count, Ordering::Relaxed);
+        self.packets_reached_at_last_count
+            .store(report.reached, Ordering::Relaxed);
+        self.last_write_at_last_count
+            .store(report.last_write.unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
     /// Le compteur de la méthode `methode`.
@@ -1092,7 +1187,7 @@ impl SidePackets {
     /// Un instantané du bloc, **sans l'exposition** : c'est [`Cable::packets_snapshot`] qui
     /// la pose, en la lisant sous le verrou du flux courant.
     ///
-    /// IRQL : quelconque — dix chargements atomiques, aucun verrou pris.
+    /// IRQL : quelconque — quinze chargements atomiques, aucun verrou pris.
     fn snapshot(&self) -> StreamPackets {
         StreamPackets {
             exposure: PacketExposure::NoStream.code(),
@@ -1107,6 +1202,13 @@ impl SidePackets {
             queries_granted: self.queries_granted.load(Ordering::Relaxed),
             first_qpc: self.first_qpc.load(Ordering::Relaxed),
             last_qpc: self.last_qpc.load(Ordering::Relaxed),
+            set_write_late: self.set_write_late.load(Ordering::Relaxed),
+            set_write_overrun: self.set_write_overrun.load(Ordering::Relaxed),
+            last_packet_count_returned: self.last_packet_count_returned.load(Ordering::Relaxed),
+            packets_reached_at_last_count: self
+                .packets_reached_at_last_count
+                .load(Ordering::Relaxed),
+            last_write_at_last_count: self.last_write_at_last_count.load(Ordering::Relaxed),
         }
     }
 }
@@ -1797,6 +1899,13 @@ impl Cable {
             }),
         );
         let status = tour.write;
+        // Un refus est ce qui pousse le client à se recaler par `GetPacketCount` : on le
+        // compte par cause, pour dater et quantifier le déclencheur du glissement corrigé.
+        if status == STATUS_DATA_LATE_ERROR {
+            self.packets.slot(direction).note_write_refusal(true);
+        } else if status == STATUS_DATA_OVERRUN {
+            self.packets.slot(direction).note_write_refusal(false);
+        }
         self.compter(tour);
         status
     }
@@ -2147,6 +2256,18 @@ impl Cable {
         self.packets
             .slot(direction)
             .note_call(methode, irql, clock::now());
+    }
+
+    /// Mémorise les trois valeurs de diagnostic du dernier `GetPacketCount` **servi** dans le
+    /// sens `direction` (voir [`PacketCountReport`] et [`SidePackets`]).
+    ///
+    /// Séparé de [`Cable::note_packet_call`] parce que ces valeurs ne se calculent que sous le
+    /// verrou du flux, dans `stream::WaveStream::packet_count`, et n'existent que pour un appel
+    /// **honoré** — un refus (`STATUS_DEVICE_NOT_READY`, sans géométrie) n'a rien à en dire.
+    ///
+    /// IRQL : quelconque — trois `store` sur le câble, aucun verrou pris.
+    pub fn note_packet_count(&self, direction: Direction, report: &PacketCountReport) {
+        self.packets.slot(direction).note_packet_count(report);
     }
 
     /// Compte un `QueryInterface` reçu sur un IID du mode paquets par le flux du sens

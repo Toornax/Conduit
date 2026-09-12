@@ -871,13 +871,18 @@ impl MiniportWaveRTOutputStream for WaveStream {
     fn packet_count(&self) -> Result<u32, NtStatus> {
         let _ = self.noter_paquet(PacketMethod::PacketCount);
         let now = clock::now();
-        let compte = {
+        let rapport = {
             let mut state = self.shared.lock();
             state.packets_transferred(now)
         };
-        compte
-            .map(packetnum::truncate)
-            .ok_or(STATUS_DEVICE_NOT_READY)
+        let Some(rapport) = rapport else {
+            return Err(STATUS_DEVICE_NOT_READY);
+        };
+        // Hors du verrou du flux : dater et prouver le plafonnement du correctif (l'écart
+        // entre `reached` et `count` est le glissement évité), lu ensuite par
+        // `conduit-looptest`.
+        self.cable.note_packet_count(self.direction, &rapport);
+        Ok(packetnum::truncate(rapport.count))
     }
 
     // IRQL: <= DISPATCH_LEVEL (celui de `QueryInterface`) — deux `fetch_add`.

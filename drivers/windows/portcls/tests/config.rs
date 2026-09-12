@@ -50,10 +50,11 @@ use conduit_kmd_core::config::{
     OC_OVERRUNS, OC_RESERVED, OC_SILENCED_BEFORE_RENDER, OC_SILENCED_NO_RENDER, OC_TICKS,
     OCP_CABLE, OCP_CAPTURE, OCP_MODE, OCP_RENDER, OS_BUFFER_BYTES, OS_BUFFER_FRAMES, OS_KS_STATE,
     OS_MODE, OS_NOTIFICATION_COUNT, OS_NOTIFICATION_EVENTS, OS_REFUSED_ALLOCATIONS, OSP_EXPOSURE,
-    OSP_FIRST_QPC, OSP_GET_READ_PACKET, OSP_IRQL_LAST, OSP_IRQL_MAX, OSP_LAST_QPC,
-    OSP_PACKET_COUNT, OSP_PRESENTATION_POSITION, OSP_QUERIES, OSP_QUERIES_GRANTED, OSP_RESERVED,
-    OSP_SET_WRITE_PACKET, OT_CABLE, OT_CAPTURE, OT_RENDER, OT_RESERVED, PacketExposure,
-    StreamPackets, StreamSide, StreamTransport,
+    OSP_FIRST_QPC, OSP_GET_READ_PACKET, OSP_IRQL_LAST, OSP_IRQL_MAX,
+    OSP_LAST_PACKET_COUNT_RETURNED, OSP_LAST_QPC, OSP_LAST_WRITE_AT_LAST_COUNT, OSP_PACKET_COUNT,
+    OSP_PACKETS_REACHED_AT_LAST_COUNT, OSP_PRESENTATION_POSITION, OSP_QUERIES, OSP_QUERIES_GRANTED,
+    OSP_RESERVED, OSP_SET_WRITE_LATE, OSP_SET_WRITE_OVERRUN, OSP_SET_WRITE_PACKET, OT_CABLE,
+    OT_CAPTURE, OT_RENDER, OT_RESERVED, PacketExposure, StreamPackets, StreamSide, StreamTransport,
 };
 use portcls::portcls_sys::{
     GUID, GUID_NULL, IMiniportTopologyVtbl, IUnknown, KSPROPERTY_TYPE_BASICSUPPORT,
@@ -162,7 +163,7 @@ const TAILLE_PAQUETS: usize = CABLE_PACKETS_BYTES;
 /// Le relevé de paquets que le faux miniport rapporte.
 ///
 /// **Les deux sens exposent des interfaces différentes et n'ont aucune valeur en commun**,
-/// pour la raison de [`TRANSPORT`] : deux blocs de quatre-vingts octets écrits l'un à la place
+/// pour la raison de [`TRANSPORT`] : deux blocs de cent vingt octets écrits l'un à la place
 /// de l'autre feraient lire « le rendu expose l'interface d'entrée », c'est-à-dire l'exact
 /// contraire de la sémantique que le lot 2 doit mesurer.
 const PAQUETS: CablePackets = CablePackets {
@@ -181,6 +182,11 @@ const PAQUETS: CablePackets = CablePackets {
         queries_granted: 31,
         first_qpc: 37,
         last_qpc: 41,
+        set_write_late: 79,
+        set_write_overrun: 83,
+        last_packet_count_returned: 89,
+        packets_reached_at_last_count: 97,
+        last_write_at_last_count: 101,
     },
     capture: StreamPackets {
         exposure: PacketExposure::Input.code(),
@@ -195,6 +201,11 @@ const PAQUETS: CablePackets = CablePackets {
         queries_granted: 67,
         first_qpc: 71,
         last_qpc: 73,
+        set_write_late: 103,
+        set_write_overrun: 107,
+        last_packet_count_returned: 109,
+        packets_reached_at_last_count: 113,
+        last_write_at_last_count: 127,
     },
 };
 
@@ -1235,7 +1246,7 @@ fn un_major_target_etranger_est_refuse_sur_le_transport() {
 // Le relevé de paquets (lot 2 du mode paquets WaveRT).
 // ---------------------------------------------------------------------------------
 
-/// La lecture rend les vingt-six champs, chacun à son décalage nommé — et surtout **le bon
+/// La lecture rend les trente-six champs, chacun à son décalage nommé — et surtout **le bon
 /// bloc au bon sens**.
 ///
 /// Les deux sens du faux miniport exposent des interfaces différentes : c'est ce qui fait que
@@ -1305,6 +1316,31 @@ fn la_lecture_des_paquets_rend_les_vingt_six_champs_a_leurs_decalages() {
             "{nom}"
         );
         assert_eq!(u64_a(&octets, base + OSP_LAST_QPC), bloc.last_qpc, "{nom}");
+        assert_eq!(
+            u64_a(&octets, base + OSP_SET_WRITE_LATE),
+            bloc.set_write_late,
+            "{nom}"
+        );
+        assert_eq!(
+            u64_a(&octets, base + OSP_SET_WRITE_OVERRUN),
+            bloc.set_write_overrun,
+            "{nom}"
+        );
+        assert_eq!(
+            u64_a(&octets, base + OSP_LAST_PACKET_COUNT_RETURNED),
+            bloc.last_packet_count_returned,
+            "{nom}"
+        );
+        assert_eq!(
+            u64_a(&octets, base + OSP_PACKETS_REACHED_AT_LAST_COUNT),
+            bloc.packets_reached_at_last_count,
+            "{nom}"
+        );
+        assert_eq!(
+            u64_a(&octets, base + OSP_LAST_WRITE_AT_LAST_COUNT),
+            bloc.last_write_at_last_count,
+            "{nom}"
+        );
     }
 
     // Et l'aller-retour complet par le parseur du contrat, celui-là même que le client
@@ -1349,7 +1385,7 @@ fn la_negociation_de_taille_des_paquets() {
         );
     }
 
-    // Exact, puis plus grand : succès, et rien n'est écrit au-delà des cent soixante-huit
+    // Exact, puis plus grand : succès, et rien n'est écrit au-delà des deux cent quarante-huit
     // octets.
     let (status, taille, _) = lire_paquets(this, TAILLE_PAQUETS);
     assert_eq!(status, STATUS_SUCCESS);
@@ -1463,7 +1499,7 @@ fn basic_support_repond_en_paliers() {
             GUID_NULL,
             0_u32,
         ),
-        // Le relevé de paquets : cent soixante-huit octets, même raisonnement.
+        // Le relevé de paquets : deux cent quarante-huit octets, même raisonnement.
         (
             "paquets",
             &ITEM_PAQUETS,

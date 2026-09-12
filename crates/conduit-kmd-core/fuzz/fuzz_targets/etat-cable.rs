@@ -19,7 +19,7 @@
 //! # Trois parseurs, la même entrée
 //!
 //! Depuis le lot 2 du mode paquets, les mêmes octets partent aussi dans
-//! `CablePackets::from_bytes` (`KSPROPERTY_CONDUIT_PACKETS`, 168 octets), et depuis la
+//! `CablePackets::from_bytes` (`KSPROPERTY_CONDUIT_PACKETS`, 248 octets), et depuis la
 //! déclaration des contraintes de taille de paquet dans `CableTransport::from_bytes`
 //! (`KSPROPERTY_CONDUIT_TRANSPORT`, 80 octets). Les trois longueurs exigées étant
 //! différentes, une entrée donnée n'en intéresse qu'un seul à la fois — c'est voulu : le

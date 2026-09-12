@@ -381,7 +381,23 @@ pub const PID_MARQUE_CABLE: u32 = 1;
 /// il n'est **pas** compatible en longueur. Le message d'inadéquation de `conduit-looptest`
 /// est déjà rédigé pour ce cas : il rapporte deux millésimes sans prétendre savoir ce qui
 /// diffère, et c'est exactement ce qu'il faut dire ici.
-pub const CONFIG_VERSION: u32 = 6;
+///
+/// # Pourquoi 7 : cinq champs de diagnostic de plus sur [`StreamPackets`]
+///
+/// L'instrumentation du correctif de `GetPacketCount` (2026-09-12) ajoute **cinq
+/// `ULONGLONG`** à chaque bloc de sens de [`StreamPackets`] — [`StreamPackets::set_write_late`],
+/// [`StreamPackets::set_write_overrun`], [`StreamPackets::last_packet_count_returned`],
+/// [`StreamPackets::packets_reached_at_last_count`] et
+/// [`StreamPackets::last_write_at_last_count`]. Un bloc passe de 80 à 120 octets, et la valeur
+/// de [`KSPROPERTY_CONDUIT_PACKETS`] de 168 à 248. Comme le passage à 6, c'est un changement de
+/// **longueur** : tout client v6 se verra refuser sa lecture par le contrôle de longueur
+/// exacte, la panne que ce numéro existe pour nommer.
+///
+/// Le passage de 6 à 7 est **additif** au sens sémantique — les champs existants gardent leur
+/// décalage et leur sens, seul le relevé de paquets s'allonge —, mais non compatible en
+/// longueur. La règle sur les messages ne change pas : `conduit-looptest` rapporte deux
+/// millésimes sans prétendre savoir ce qui diffère.
+pub const CONFIG_VERSION: u32 = 7;
 
 /// Nombre de câbles que le contrat sait adresser : le plafond de la réserve
 /// ([`crate::params::MAX_RESERVE`], SPEC F-06).
@@ -2055,9 +2071,19 @@ pub const OSP_QUERIES_GRANTED: usize = 56;
 pub const OSP_FIRST_QPC: usize = 64;
 /// `StreamPackets::last_qpc` (`ULONGLONG`) : décalage 72.
 pub const OSP_LAST_QPC: usize = 72;
+/// `StreamPackets::set_write_late` (`ULONGLONG`) : décalage 80.
+pub const OSP_SET_WRITE_LATE: usize = 80;
+/// `StreamPackets::set_write_overrun` (`ULONGLONG`) : décalage 88.
+pub const OSP_SET_WRITE_OVERRUN: usize = 88;
+/// `StreamPackets::last_packet_count_returned` (`ULONGLONG`) : décalage 96.
+pub const OSP_LAST_PACKET_COUNT_RETURNED: usize = 96;
+/// `StreamPackets::packets_reached_at_last_count` (`ULONGLONG`) : décalage 104.
+pub const OSP_PACKETS_REACHED_AT_LAST_COUNT: usize = 104;
+/// `StreamPackets::last_write_at_last_count` (`ULONGLONG`) : décalage 112.
+pub const OSP_LAST_WRITE_AT_LAST_COUNT: usize = 112;
 
-/// Taille du bloc de paquets d'un sens, en octets : **80**.
-pub const STREAM_PACKETS_BYTES: usize = 80;
+/// Taille du bloc de paquets d'un sens, en octets : **120**.
+pub const STREAM_PACKETS_BYTES: usize = 120;
 
 /// Ce que le mode paquets a produit dans **un sens** d'un câble, depuis le dernier
 /// `StartDevice`.
@@ -2151,6 +2177,36 @@ pub struct StreamPackets {
     /// deux appels à une seconde d'intervalle et deux appels collés ne racontent pas la même
     /// histoire, et le nombre d'appels seul ne les distingue pas.
     pub last_qpc: u64,
+    /// Refus de `SetWritePacket` pour cause de **retard** (`STATUS_DATA_LATE_ERROR`) sur ce
+    /// sens, cumulés depuis le dernier `StartDevice`.
+    ///
+    /// C'est le refus qui déclenche la resynchronisation du client par `GetPacketCount` — le
+    /// point exact où le glissement de 480 trames du 2026-09-12 naissait. Compter les deux
+    /// causes séparément **date et quantifie** les refus, là où le seul `set_write_packet`
+    /// (appels reçus) ne dit pas combien ont abouti.
+    pub set_write_late: u64,
+    /// Refus de `SetWritePacket` pour cause de **débordement** (`STATUS_DATA_OVERRUN`) sur ce
+    /// sens, cumulés depuis le dernier `StartDevice`. Voir [`Self::set_write_late`].
+    pub set_write_overrun: u64,
+    /// Dernière valeur **rendue** par `GetPacketCount` (plafonnée, monotone) sur ce sens, 0 si
+    /// aucun appel. C'est ce que le client a réellement reçu pour se recaler.
+    pub last_packet_count_returned: u64,
+    /// Nombre de paquets que la **position** désignait comme complets (`floor(position /
+    /// taille_paquet)`, **non plafonné**) au dernier `GetPacketCount`, 0 si aucun appel.
+    ///
+    /// L'écart avec [`Self::last_packet_count_returned`] est **le nombre de paquets que le
+    /// client aurait sautés sans le correctif du 2026-09-12** : le compte rendu est plafonné à
+    /// ce que le client a fourni, ce champ est ce que la seule position aurait annoncé. Un
+    /// écart non nul mesuré ici, un `set_write_late` non nul et l'absence de glissement à la
+    /// mesure : c'est la démonstration du correctif.
+    pub packets_reached_at_last_count: u64,
+    /// Dernier numéro de paquet **accepté** au moment du dernier `GetPacketCount`, ou
+    /// [`u64::MAX`] si le client n'avait encore rien fait accepter (l'`Option` du pilote
+    /// n'ayant pas de représentation dans une structure `#[repr(C)]`).
+    ///
+    /// Le plafond appliqué au compte rendu est `last_write + 1` ; ce champ le donne pour
+    /// vérifier, avec [`Self::packets_reached_at_last_count`], que le plafonnement a bien joué.
+    pub last_write_at_last_count: u64,
 }
 
 /// `CablePackets::cable` (`ULONG`) : décalage 0.
@@ -2159,14 +2215,14 @@ pub const OCP_CABLE: usize = 0;
 pub const OCP_MODE: usize = 4;
 /// `CablePackets::render` ([`StreamPackets`]) : décalage 8.
 pub const OCP_RENDER: usize = 8;
-/// `CablePackets::capture` ([`StreamPackets`]) : décalage 88.
-pub const OCP_CAPTURE: usize = 88;
+/// `CablePackets::capture` ([`StreamPackets`]) : décalage 128.
+pub const OCP_CAPTURE: usize = 128;
 
-/// Taille de la valeur de [`KSPROPERTY_CONDUIT_PACKETS`], en octets : **168**.
+/// Taille de la valeur de [`KSPROPERTY_CONDUIT_PACKETS`], en octets : **248**.
 ///
 /// Fixe et vérifiée par assertion `const` contre `size_of::<CablePackets>()`, comme les trois
 /// autres structures d'échange.
-pub const CABLE_PACKETS_BYTES: usize = 168;
+pub const CABLE_PACKETS_BYTES: usize = 248;
 
 /// Ce que le mode paquets a produit sur les **deux** sens d'un câble, tel qu'il traverse
 /// `IOCTL_KS_PROPERTY`.
@@ -2231,11 +2287,27 @@ const _: () = assert!(core::mem::offset_of!(StreamPackets, queries) == OSP_QUERI
 const _: () = assert!(core::mem::offset_of!(StreamPackets, queries_granted) == OSP_QUERIES_GRANTED);
 const _: () = assert!(core::mem::offset_of!(StreamPackets, first_qpc) == OSP_FIRST_QPC);
 const _: () = assert!(core::mem::offset_of!(StreamPackets, last_qpc) == OSP_LAST_QPC);
-// Quatre `ULONG` contigus, puis huit `ULONGLONG` alignés sur huit : aucun trou, donc aucun
+const _: () = assert!(core::mem::offset_of!(StreamPackets, set_write_late) == OSP_SET_WRITE_LATE);
+const _: () =
+    assert!(core::mem::offset_of!(StreamPackets, set_write_overrun) == OSP_SET_WRITE_OVERRUN);
+const _: () = assert!(
+    core::mem::offset_of!(StreamPackets, last_packet_count_returned)
+        == OSP_LAST_PACKET_COUNT_RETURNED
+);
+const _: () = assert!(
+    core::mem::offset_of!(StreamPackets, packets_reached_at_last_count)
+        == OSP_PACKETS_REACHED_AT_LAST_COUNT
+);
+const _: () = assert!(
+    core::mem::offset_of!(StreamPackets, last_write_at_last_count) == OSP_LAST_WRITE_AT_LAST_COUNT
+);
+// Quatre `ULONG` contigus, puis treize `ULONGLONG` alignés sur huit : aucun trou, donc aucun
 // octet de rembourrage implicite à recopier vers l'espace utilisateur.
 const _: () = assert!(OSP_RESERVED.saturating_add(TAILLE_MOT) == OSP_SET_WRITE_PACKET);
 const _: () = assert!(OSP_SET_WRITE_PACKET == TAILLE_MOT_LONG.saturating_mul(2));
-const _: () = assert!(OSP_LAST_QPC.saturating_add(TAILLE_MOT_LONG) == STREAM_PACKETS_BYTES);
+const _: () = assert!(OSP_LAST_QPC.saturating_add(TAILLE_MOT_LONG) == OSP_SET_WRITE_LATE);
+const _: () =
+    assert!(OSP_LAST_WRITE_AT_LAST_COUNT.saturating_add(TAILLE_MOT_LONG) == STREAM_PACKETS_BYTES);
 
 const _: () = assert!(size_of::<CablePackets>() == CABLE_PACKETS_BYTES);
 const _: () = assert!(align_of::<CablePackets>() == 8);
@@ -2259,7 +2331,7 @@ const _: () = assert!(CABLE_PACKETS_BYTES != CABLE_TRANSPORT_BYTES);
 ///
 /// Distinct des trois autres pour la même raison qu'elles le sont entre elles : les longueurs
 /// attendues diffèrent, et un message qui annoncerait « 72 attendus » pour une structure de
-/// 168 octets serait un diagnostic faux.
+/// 248 octets serait un diagnostic faux.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PacketsError {
     /// Longueur du tampon différente de [`CABLE_PACKETS_BYTES`] — plus courte **ou** plus
@@ -2371,6 +2443,11 @@ impl StreamPackets {
             queries_granted: 0,
             first_qpc: 0,
             last_qpc: 0,
+            set_write_late: 0,
+            set_write_overrun: 0,
+            last_packet_count_returned: 0,
+            packets_reached_at_last_count: 0,
+            last_write_at_last_count: 0,
         }
     }
 
@@ -2439,6 +2516,20 @@ impl StreamPackets {
             queries_granted: mot_long(data, base.checked_add(OSP_QUERIES_GRANTED)?)?,
             first_qpc: mot_long(data, base.checked_add(OSP_FIRST_QPC)?)?,
             last_qpc: mot_long(data, base.checked_add(OSP_LAST_QPC)?)?,
+            set_write_late: mot_long(data, base.checked_add(OSP_SET_WRITE_LATE)?)?,
+            set_write_overrun: mot_long(data, base.checked_add(OSP_SET_WRITE_OVERRUN)?)?,
+            last_packet_count_returned: mot_long(
+                data,
+                base.checked_add(OSP_LAST_PACKET_COUNT_RETURNED)?,
+            )?,
+            packets_reached_at_last_count: mot_long(
+                data,
+                base.checked_add(OSP_PACKETS_REACHED_AT_LAST_COUNT)?,
+            )?,
+            last_write_at_last_count: mot_long(
+                data,
+                base.checked_add(OSP_LAST_WRITE_AT_LAST_COUNT)?,
+            )?,
         })
     }
 
@@ -2455,7 +2546,7 @@ impl StreamPackets {
                 poser_mot(dest, absolu, valeur);
             }
         }
-        let longs: [(usize, u64); 8] = [
+        let longs: [(usize, u64); 13] = [
             (OSP_SET_WRITE_PACKET, self.set_write_packet),
             (OSP_GET_READ_PACKET, self.get_read_packet),
             (OSP_PACKET_COUNT, self.packet_count),
@@ -2464,6 +2555,17 @@ impl StreamPackets {
             (OSP_QUERIES_GRANTED, self.queries_granted),
             (OSP_FIRST_QPC, self.first_qpc),
             (OSP_LAST_QPC, self.last_qpc),
+            (OSP_SET_WRITE_LATE, self.set_write_late),
+            (OSP_SET_WRITE_OVERRUN, self.set_write_overrun),
+            (
+                OSP_LAST_PACKET_COUNT_RETURNED,
+                self.last_packet_count_returned,
+            ),
+            (
+                OSP_PACKETS_REACHED_AT_LAST_COUNT,
+                self.packets_reached_at_last_count,
+            ),
+            (OSP_LAST_WRITE_AT_LAST_COUNT, self.last_write_at_last_count),
         ];
         for (offset, valeur) in longs {
             if let Some(absolu) = base.checked_add(offset) {
@@ -3194,8 +3296,9 @@ mod tests {
         // Une propriété qui apparaît est un changement observable du jeu, et ce numéro en
         // est la seule voie (voir sa documentation) : 3 avec les compteurs, 4 avec le
         // transport, 5 avec le relevé de paquets, 6 avec les deux `NTSTATUS` de pose des
-        // contraintes de taille de paquet — le premier changement qui allonge une valeur.
-        assert_eq!(CONFIG_VERSION, 6);
+        // contraintes de taille de paquet, 7 avec les cinq champs de diagnostic du correctif
+        // de GetPacketCount — deux allongements de valeur (6, puis 7).
+        assert_eq!(CONFIG_VERSION, 7);
     }
 
     /// Le `pid` de la marque : celui qu'écrit le service et celui que lit le dorsal.
@@ -3348,6 +3451,11 @@ mod tests {
                 queries_granted: 31,
                 first_qpc: 37,
                 last_qpc: 41,
+                set_write_late: 79,
+                set_write_overrun: 83,
+                last_packet_count_returned: 89,
+                packets_reached_at_last_count: 97,
+                last_write_at_last_count: 101,
             },
             capture: StreamPackets {
                 exposure: PacketExposure::Input.code(),
@@ -3362,16 +3470,21 @@ mod tests {
                 queries_granted: 67,
                 first_qpc: 71,
                 last_qpc: 73,
+                set_write_late: 103,
+                set_write_overrun: 107,
+                last_packet_count_returned: 109,
+                packets_reached_at_last_count: 113,
+                last_write_at_last_count: 127,
             },
         }
     }
 
-    /// La disposition du relevé de paquets : 168 octets, deux `ULONG` puis deux blocs de 80,
+    /// La disposition du relevé de paquets : 248 octets, deux `ULONG` puis deux blocs de 120,
     /// aucun trou — et chaque champ se relit **à son décalage nommé**.
     #[test]
     fn la_disposition_des_paquets_est_celle_des_decalages_nommes() {
-        assert_eq!(CABLE_PACKETS_BYTES, 168);
-        assert_eq!(STREAM_PACKETS_BYTES, 80);
+        assert_eq!(CABLE_PACKETS_BYTES, 248);
+        assert_eq!(STREAM_PACKETS_BYTES, 120);
         assert_eq!(size_of::<CablePackets>(), CABLE_PACKETS_BYTES);
         assert_eq!(size_of::<StreamPackets>(), STREAM_PACKETS_BYTES);
         assert_eq!(align_of::<CablePackets>(), 8);
@@ -3423,6 +3536,26 @@ mod tests {
             );
             assert_eq!(mot_long(&brut, base + OSP_FIRST_QPC), Some(bloc.first_qpc));
             assert_eq!(mot_long(&brut, base + OSP_LAST_QPC), Some(bloc.last_qpc));
+            assert_eq!(
+                mot_long(&brut, base + OSP_SET_WRITE_LATE),
+                Some(bloc.set_write_late)
+            );
+            assert_eq!(
+                mot_long(&brut, base + OSP_SET_WRITE_OVERRUN),
+                Some(bloc.set_write_overrun)
+            );
+            assert_eq!(
+                mot_long(&brut, base + OSP_LAST_PACKET_COUNT_RETURNED),
+                Some(bloc.last_packet_count_returned)
+            );
+            assert_eq!(
+                mot_long(&brut, base + OSP_PACKETS_REACHED_AT_LAST_COUNT),
+                Some(bloc.packets_reached_at_last_count)
+            );
+            assert_eq!(
+                mot_long(&brut, base + OSP_LAST_WRITE_AT_LAST_COUNT),
+                Some(bloc.last_write_at_last_count)
+            );
         }
         assert_eq!(CablePackets::from_bytes(&brut), Ok(paquets));
     }
@@ -4740,6 +4873,7 @@ mod tests {
                     queries_granted: appels,
                     first_qpc: qpc,
                     last_qpc: 0,
+                    ..StreamPackets::new()
                 },
                 capture: StreamPackets {
                     exposure: exposition_capture,

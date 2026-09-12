@@ -21,7 +21,7 @@
 //! | [`KSPROPERTY_CONDUIT_VERSION`] | GET, BASICSUPPORT | un `ULONG` |
 //! | [`KSPROPERTY_CONDUIT_COUNTERS`] | GET, BASICSUPPORT | [`CableCounters`], 56 octets |
 //! | [`KSPROPERTY_CONDUIT_TRANSPORT`] | GET, BASICSUPPORT | [`CableTransport`], 80 octets |
-//! | [`KSPROPERTY_CONDUIT_PACKETS`] | GET, BASICSUPPORT | [`CablePackets`], 168 octets |
+//! | [`KSPROPERTY_CONDUIT_PACKETS`] | GET, BASICSUPPORT | [`CablePackets`], 248 octets |
 //!
 //! Une seule est modifiable, et c'est la première : la version est celle du binaire chargé,
 //! les compteurs sont ce que la boucle locale a fait, le transport est ce que le moteur audio
@@ -150,11 +150,12 @@ use conduit_kmd_core::config::{
     OC_DISCARDED_TICKS, OC_OVERRUNS, OC_RESERVED, OC_SILENCED_BEFORE_RENDER, OC_SILENCED_NO_RENDER,
     OC_TICKS, OCP_CABLE, OCP_CAPTURE, OCP_MODE, OCP_RENDER, OS_BUFFER_BYTES, OS_BUFFER_FRAMES,
     OS_KS_STATE, OS_MODE, OS_NOTIFICATION_COUNT, OS_NOTIFICATION_EVENTS, OS_REFUSED_ALLOCATIONS,
-    OSP_EXPOSURE, OSP_FIRST_QPC, OSP_GET_READ_PACKET, OSP_IRQL_LAST, OSP_IRQL_MAX, OSP_LAST_QPC,
-    OSP_PACKET_COUNT, OSP_PRESENTATION_POSITION, OSP_QUERIES, OSP_QUERIES_GRANTED, OSP_RESERVED,
-    OSP_SET_WRITE_PACKET, OT_CABLE, OT_CAPTURE, OT_CONSTRAINTS_CAPTURE, OT_CONSTRAINTS_RENDER,
-    OT_RENDER, OT_RESERVED, STREAM_PACKETS_BYTES, STREAM_TRANSPORT_BYTES, StreamPackets,
-    StreamTransport,
+    OSP_EXPOSURE, OSP_FIRST_QPC, OSP_GET_READ_PACKET, OSP_IRQL_LAST, OSP_IRQL_MAX,
+    OSP_LAST_PACKET_COUNT_RETURNED, OSP_LAST_QPC, OSP_LAST_WRITE_AT_LAST_COUNT, OSP_PACKET_COUNT,
+    OSP_PACKETS_REACHED_AT_LAST_COUNT, OSP_PRESENTATION_POSITION, OSP_QUERIES, OSP_QUERIES_GRANTED,
+    OSP_RESERVED, OSP_SET_WRITE_LATE, OSP_SET_WRITE_OVERRUN, OSP_SET_WRITE_PACKET, OT_CABLE,
+    OT_CAPTURE, OT_CONSTRAINTS_CAPTURE, OT_CONSTRAINTS_RENDER, OT_RENDER, OT_RESERVED,
+    STREAM_PACKETS_BYTES, STREAM_TRANSPORT_BYTES, StreamPackets, StreamTransport,
 };
 use portcls_sys::{
     GUID, GUID_NULL, KSPROPERTY_TYPE_BASICSUPPORT, KSPROPERTY_TYPE_GET, KSPROPERTY_TYPE_SET,
@@ -288,18 +289,22 @@ const _: () = assert!(OS_KS_STATE == 20 && OS_REFUSED_ALLOCATIONS == 24);
 const _: () = assert!(OS_REFUSED_ALLOCATIONS + 8 == STREAM_TRANSPORT_BYTES);
 const _: () = assert!(PACKETS_ACCESS_FLAGS == 513);
 const _: () = assert!(PACKETS_ACCESS_FLAGS & KSPROPERTY_TYPE_SET == 0);
-// Idem pour le relevé de paquets : deux `ULONG` puis deux blocs de sens de 80 octets, chacun
-// aligné sur huit ; dans un bloc, quatre `ULONG` puis huit `ULONGLONG`.
-const _: () = assert!(CABLE_PACKETS_BYTES == 168 && STREAM_PACKETS_BYTES == 80);
+// Idem pour le relevé de paquets : deux `ULONG` puis deux blocs de sens de 120 octets, chacun
+// aligné sur huit ; dans un bloc, quatre `ULONG` puis treize `ULONGLONG`.
+const _: () = assert!(CABLE_PACKETS_BYTES == 248 && STREAM_PACKETS_BYTES == 120);
 const _: () = assert!(OCP_CABLE == 0 && OCP_MODE == 4);
-const _: () = assert!(OCP_RENDER == 8 && OCP_CAPTURE == 88);
+const _: () = assert!(OCP_RENDER == 8 && OCP_CAPTURE == 128);
 const _: () = assert!(OCP_CAPTURE + STREAM_PACKETS_BYTES == CABLE_PACKETS_BYTES);
 const _: () = assert!(OSP_EXPOSURE == 0 && OSP_IRQL_LAST == 4 && OSP_IRQL_MAX == 8);
 const _: () = assert!(OSP_RESERVED == 12 && OSP_SET_WRITE_PACKET == 16);
 const _: () = assert!(OSP_GET_READ_PACKET == 24 && OSP_PACKET_COUNT == 32);
 const _: () = assert!(OSP_PRESENTATION_POSITION == 40 && OSP_QUERIES == 48);
 const _: () = assert!(OSP_QUERIES_GRANTED == 56 && OSP_FIRST_QPC == 64 && OSP_LAST_QPC == 72);
-const _: () = assert!(OSP_LAST_QPC + 8 == STREAM_PACKETS_BYTES);
+const _: () = assert!(OSP_SET_WRITE_LATE == 80 && OSP_SET_WRITE_OVERRUN == 88);
+const _: () =
+    assert!(OSP_LAST_PACKET_COUNT_RETURNED == 96 && OSP_PACKETS_REACHED_AT_LAST_COUNT == 104);
+const _: () = assert!(OSP_LAST_WRITE_AT_LAST_COUNT == 112);
+const _: () = assert!(OSP_LAST_WRITE_AT_LAST_COUNT + 8 == STREAM_PACKETS_BYTES);
 
 // ---------------------------------------------------------------------------------
 // Trace.
@@ -624,6 +629,21 @@ fn ecrire_sens_paquets(champs: &mut Champs<'_>, base: usize, sens: &StreamPacket
     }
     if let Some(o) = a(OSP_LAST_QPC) {
         champs.u64(o, sens.last_qpc);
+    }
+    if let Some(o) = a(OSP_SET_WRITE_LATE) {
+        champs.u64(o, sens.set_write_late);
+    }
+    if let Some(o) = a(OSP_SET_WRITE_OVERRUN) {
+        champs.u64(o, sens.set_write_overrun);
+    }
+    if let Some(o) = a(OSP_LAST_PACKET_COUNT_RETURNED) {
+        champs.u64(o, sens.last_packet_count_returned);
+    }
+    if let Some(o) = a(OSP_PACKETS_REACHED_AT_LAST_COUNT) {
+        champs.u64(o, sens.packets_reached_at_last_count);
+    }
+    if let Some(o) = a(OSP_LAST_WRITE_AT_LAST_COUNT) {
+        champs.u64(o, sens.last_write_at_last_count);
     }
 }
 
@@ -996,7 +1016,7 @@ impl<T: CableConfig> PropertyHandler<T> for ConduitTransport {
 /// [`KSPROPERTY_CONDUIT_PACKETS`] : ce que le moteur audio a fait des interfaces du **mode
 /// paquets** (lot 2).
 ///
-/// Une [`CablePackets`] de 168 octets, en **lecture seule** et **sans contrôle de privilège**,
+/// Une [`CablePackets`] de 248 octets, en **lecture seule** et **sans contrôle de privilège**,
 /// comme les compteurs et le transport, pour les mêmes raisons. Elle répond à la question que
 /// le lot 0 a laissée ouverte : le moteur audio scrute-t-il par politique, ou parce qu'il ne
 /// trouve pas les interfaces de paquets ? Le paramètre de registre `PacketMode` les expose sur
@@ -1036,7 +1056,7 @@ impl<T: CableConfig> PropertyHandler<T> for ConduitPackets {
     }
 
     fn basic_support(req: &Request<'_, T>, value: &mut [u8]) -> Result<u32, NtStatus> {
-        // Structure de cent soixante-huit octets : aucune `VARENUM` ne la nomme, d'où un
+        // Structure de deux cent quarante-huit octets : aucune `VARENUM` ne la nomme, d'où un
         // `PropTypeSet` nul, exactement comme pour l'état, les compteurs et le transport.
         let ecrits = basic_support_ks(value, PACKETS_ACCESS_FLAGS, &GUID_NULL, 0);
         req.target.trace(&ConfigTrace {
@@ -1218,7 +1238,7 @@ mod tests {
         assert_eq!(TAILLE_VERSION, 4);
         assert_eq!(CABLE_COUNTERS_BYTES, 56);
         assert_eq!(CABLE_TRANSPORT_BYTES, 80);
-        assert_eq!(CABLE_PACKETS_BYTES, 168);
+        assert_eq!(CABLE_PACKETS_BYTES, 248);
         // Les cinq longueurs sont distinctes : un client qui allouerait la mauvaise se
         // fait refuser au lieu de lire une structure pour une autre.
         let tailles = [
@@ -1238,13 +1258,13 @@ mod tests {
     /// La sérialisation du relevé de paquets écrit chaque champ à son décalage, ou rien du
     /// tout.
     ///
-    /// Les vingt-six valeurs diffèrent d'un sens à l'autre, pour la raison de
+    /// Les trente-six valeurs diffèrent d'un sens à l'autre, pour la raison de
     /// [`la_serialisation_du_transport_est_tout_ou_rien`].
     #[test]
     fn la_serialisation_des_paquets_est_tout_ou_rien() {
         let paquets = paquets_temoin();
 
-        // Place suffisante : les vingt-six champs, à leurs décalages.
+        // Place suffisante : les trente-six champs, à leurs décalages.
         let mut tampon = [0xAAu8; CABLE_PACKETS_BYTES];
         ecrire_paquets(&mut tampon, &paquets);
         assert_eq!(tampon, paquets.to_bytes());
@@ -1258,7 +1278,7 @@ mod tests {
         // Tampon vide (interrogation de taille) : rien non plus, et aucune panique.
         ecrire_paquets(&mut [], &paquets);
 
-        // Plus grand que nécessaire : les cent soixante-huit premiers octets, et rien au-delà.
+        // Plus grand que nécessaire : les deux cent quarante-huit premiers octets, et rien au-delà.
         let mut grand = [0xAAu8; CABLE_PACKETS_BYTES + 8];
         ecrire_paquets(&mut grand, &paquets);
         assert_eq!(&grand[..CABLE_PACKETS_BYTES], &paquets.to_bytes()[..]);
@@ -1573,6 +1593,11 @@ mod tests {
                 queries_granted: 31,
                 first_qpc: 37,
                 last_qpc: 41,
+                set_write_late: 79,
+                set_write_overrun: 83,
+                last_packet_count_returned: 89,
+                packets_reached_at_last_count: 97,
+                last_write_at_last_count: 101,
             },
             capture: StreamPackets {
                 exposure: PacketExposure::Input.code(),
@@ -1587,6 +1612,11 @@ mod tests {
                 queries_granted: 67,
                 first_qpc: 71,
                 last_qpc: 73,
+                set_write_late: 103,
+                set_write_overrun: 107,
+                last_packet_count_returned: 109,
+                packets_reached_at_last_count: 113,
+                last_write_at_last_count: 127,
             },
         }
     }

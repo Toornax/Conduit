@@ -614,6 +614,36 @@ fn lignes_sens_paquets(sens: StreamSide, bloc: &StreamPackets) -> String {
             bloc.irql_last, bloc.irql_max, bloc.first_qpc, bloc.last_qpc
         );
     }
+    // Combien des SetWritePacket ont été refusés, par cause : c'est le refus qui pousse le
+    // client à se recaler par GetPacketCount, donc le déclencheur du glissement corrigé le
+    // 2026-09-12. On ne l'imprime que si le client a réellement écrit des paquets.
+    if bloc.set_write_packet > 0 {
+        let _ = writeln!(
+            out,
+            "                refus SetWritePacket : {} en retard (DATA_LATE_ERROR), {} \
+             débordement (DATA_OVERRUN)",
+            bloc.set_write_late, bloc.set_write_overrun
+        );
+    }
+    // Le dernier GetPacketCount servi, et la démonstration du correctif : le compte rendu est
+    // plafonné à ce que le client a fourni ; `packets_reached_at_last_count` est ce que la
+    // seule position aurait annoncé, et l'écart est le glissement que le plafond évite.
+    if bloc.packets_reached_at_last_count > 0 || bloc.last_packet_count_returned > 0 {
+        let ecart = bloc
+            .packets_reached_at_last_count
+            .saturating_sub(bloc.last_packet_count_returned);
+        let dernier_ecrit = if bloc.last_write_at_last_count == u64::MAX {
+            "aucun".to_owned()
+        } else {
+            bloc.last_write_at_last_count.to_string()
+        };
+        let _ = writeln!(
+            out,
+            "                dernier GetPacketCount : rendu {}, position atteignait {} \
+             paquet(s), dernier écrit {dernier_ecrit} — écart évité {ecart} paquet(s)",
+            bloc.last_packet_count_returned, bloc.packets_reached_at_last_count
+        );
+    }
     out
 }
 
@@ -1610,6 +1640,13 @@ mod tests {
                 queries_granted: 29,
                 first_qpc: 1_000,
                 last_qpc: 2_000,
+                set_write_late: 3,
+                set_write_overrun: 1,
+                // Le client a écrit jusqu'au paquet 4 (cinq paquets fournis) ; la position
+                // avait atteint sept paquets complets : le plafond a évité un saut de deux.
+                last_packet_count_returned: 5,
+                packets_reached_at_last_count: 7,
+                last_write_at_last_count: 4,
             },
             capture: StreamPackets {
                 exposure: PacketExposure::Input.code(),
@@ -1629,6 +1666,10 @@ mod tests {
             "GetOutputStreamPresentationPosition 7",
             "IRQL dernier 0, max 0",
             "QPC premier 1000, dernier 2000",
+            "refus SetWritePacket : 3 en retard",
+            "1 débordement",
+            "dernier GetPacketCount : rendu 5, position atteignait 7",
+            "dernier écrit 4 — écart évité 2 paquet(s)",
         ] {
             assert!(
                 texte.contains(attendu),
