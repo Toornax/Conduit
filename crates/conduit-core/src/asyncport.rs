@@ -20,6 +20,35 @@ use crate::dsp::resampler::{ResampleQuality, Resampler};
 use crate::ring::{RingBuffer, RingConsumer, RingProducer};
 use crate::types::SampleRate;
 
+/// Écrêtage maximal de la correction de ratio d'un port, quelle que soit la
+/// configuration demandée : 5e-4, soit ± 500 ppm.
+///
+/// Couvre toute dérive réelle entre deux horloges de matériel grand public (les
+/// quartz usuels sont à ± 100 ppm au pire). Le rôle de ce plafond est de rendre
+/// *inoffensive* une saturation provoquée par l'artefact de mesure décrit sur
+/// [`AsyncPortConfig::effective_dll`] : à 500 ppm, la réserve ne se vide plus qu'à
+/// 24 trames/s, donc une consigne de 768 trames tient 32 s, là où un artefact dure
+/// moins d'une seconde. À 1 % (l'ancien défaut), elle se vidait à 485 trames/s et
+/// l'anneau était à sec avant la fin de l'artefact.
+pub const MAX_CORRECTION: f64 = 5e-4;
+
+/// Bande passante maximale de la DLL d'un port : 0,02 Hz.
+///
+/// Dix fois moins que le défaut générique, donc `kp` dix fois plus petit
+/// (5,24e-6 contre 5,24e-5). À écrêtage inchangé (1 %), il aurait fallu 1910 trames
+/// d'erreur filtrée pour saturer, contre 191 auparavant — l'artefact de 480 trames
+/// serait passé sous la butée. Mais l'écrêtage descend en même temps à
+/// [`MAX_CORRECTION`], si bien que la butée est encore atteinte dès **96 trames**
+/// d'erreur filtrée : un saut de 480 sature toujours la boucle. Ce que ce gain
+/// réduit, c'est la vitesse à laquelle la boucle rejoint la butée et le temps qu'elle
+/// y passe ; l'innocuité, elle, vient de [`MAX_CORRECTION`] — c'est ce que mesure
+/// le test `dent_de_scie_ne_vide_plus_lanneau`.
+///
+/// Coût assumé : la boucle converge en une dizaine de secondes au démarrage au lieu
+/// d'environ une. Les deux bouts partageant le même minuteur, il n'y a rien à
+/// rattraper vite.
+pub const MAX_BANDWIDTH_HZ: f64 = 0.02;
+
 /// Configuration d'un port asynchrone.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AsyncPortConfig {
@@ -73,12 +102,36 @@ impl AsyncPortConfig {
             .unwrap_or_else(|| self.device_block + self.quantum_in_device_frames() + 32)
     }
 
-    /// Paramètres DLL effectifs : le seuil de verrouillage est au moins la moitié du
-    /// bruit de mesure (un bloc périphérique + un quantum).
+    /// Paramètres DLL effectifs. Trois garde-fous, tous imposés par le fait que le
+    /// remplissage passé à la DLL est un **niveau instantané** (`GraphReader::read`,
+    /// `GraphWriter::write`) et non une moyenne :
+    ///
+    /// - le seuil de verrouillage est au moins la moitié du bruit de mesure (un bloc
+    ///   périphérique + un quantum) ;
+    /// - l'écrêtage est plafonné à [`MAX_CORRECTION`] ;
+    /// - la bande passante est plafonnée à [`MAX_BANDWIDTH_HZ`].
+    ///
+    /// Mesures du 2026-09-11 (boucle par câble, ROADMAP M1b-31) : rafales de
+    /// sous-alimentations en capture toutes les ~2 min. Le producteur (capture
+    /// WASAPI) verse 480 trames d'un coup par période de 10 ms et le consommateur les
+    /// tire dos à dos dans le même réveil : le remplissage échantillonné une fois par
+    /// cycle est une **dent de scie d'amplitude 480**, lue à sa propre fréquence
+    /// (stroboscope). La phase des deux réveils dérive (~83 ppm mesurés) ; quand elle
+    /// franchit la frontière du paquet, le remplissage mesuré saute de ±480 d'un cycle
+    /// à l'autre. Avec les défauts génériques (`bandwidth_hz` 0,2 → `kp` ≈ 5,2e-5), ce
+    /// saut donne `kp·480 = 0,025 > max_correction = 0,01` : la DLL saturait à
+    /// **ratio 0,99000** (la butée, relevée telle quelle dans la série), la
+    /// consommation accélérait de 1 % (−485 trames/s) et vidait l'anneau en moins
+    /// d'une seconde — rafale, reset, et rebelote tant que la phase reste sur la
+    /// frontière. Zéro débordement, zéro xrun au rendu : le signe colle. Les deux
+    /// bouts partagent le minuteur du pilote, il n'existe aucune dérive réelle de
+    /// cette taille ; 1 % d'écrêtage est absurde pour ce système.
     fn effective_dll(&self) -> DllConfig {
         let noise = (self.device_block + self.quantum_in_device_frames()) as f64 / 2.0;
         DllConfig {
             lock_threshold: self.dll.lock_threshold.max(noise),
+            max_correction: self.dll.max_correction.min(MAX_CORRECTION),
+            bandwidth_hz: self.dll.bandwidth_hz.min(MAX_BANDWIDTH_HZ),
             ..self.dll
         }
     }
@@ -91,15 +144,42 @@ impl AsyncPortConfig {
 }
 
 /// Statistiques partagées d'un port, lisibles hors temps réel.
-#[derive(Debug, Default)]
+///
+/// Les extrêmes (`fill_min`/`fill_max`, `ratio_min`/`ratio_max`) sont cumulés depuis
+/// la dernière remise à zéro : un relevé périodique du seul niveau courant ne peut
+/// pas voir la dent de scie de la mesure de remplissage (cf.
+/// [`AsyncPortConfig::effective_dll`]), qui est justement ce qu'il faut observer.
+#[derive(Debug)]
 pub struct AsyncStats {
     underruns: AtomicU64,
     overruns: AtomicU64,
     fill: AtomicU32,
+    fill_min: AtomicU32,
+    fill_max: AtomicU32,
     ratio_bits: AtomicU64,
+    ratio_min_millionths: AtomicU64,
+    ratio_max_millionths: AtomicU64,
     locked: AtomicBool,
     running: AtomicBool,
     cycles: AtomicU64,
+}
+
+impl Default for AsyncStats {
+    fn default() -> Self {
+        Self {
+            underruns: AtomicU64::new(0),
+            overruns: AtomicU64::new(0),
+            fill: AtomicU32::new(0),
+            fill_min: AtomicU32::new(u32::MAX),
+            fill_max: AtomicU32::new(0),
+            ratio_bits: AtomicU64::new(0),
+            ratio_min_millionths: AtomicU64::new(u64::MAX),
+            ratio_max_millionths: AtomicU64::new(0),
+            locked: AtomicBool::new(false),
+            running: AtomicBool::new(false),
+            cycles: AtomicU64::new(0),
+        }
+    }
 }
 
 impl AsyncStats {
@@ -119,9 +199,32 @@ impl AsyncStats {
     pub fn fill(&self) -> u32 {
         self.fill.load(Ordering::Relaxed)
     }
+    /// Remplissage minimal depuis la dernière remise à zéro (0 si aucune mesure).
+    pub fn fill_min(&self) -> u32 {
+        match self.fill_min.load(Ordering::Relaxed) {
+            u32::MAX => 0,
+            v => v,
+        }
+    }
+    /// Remplissage maximal depuis la dernière remise à zéro.
+    pub fn fill_max(&self) -> u32 {
+        self.fill_max.load(Ordering::Relaxed)
+    }
     /// Ratio de rééchantillonnage courant.
     pub fn ratio(&self) -> f64 {
         f64::from_bits(self.ratio_bits.load(Ordering::Relaxed))
+    }
+    /// Ratio minimal depuis la dernière remise à zéro, en millionièmes (0 si aucune
+    /// mesure). Entier pour rester atomique sans verrou : 1_000_000 = ratio 1,0.
+    pub fn ratio_min_millionths(&self) -> u64 {
+        match self.ratio_min_millionths.load(Ordering::Relaxed) {
+            u64::MAX => 0,
+            v => v,
+        }
+    }
+    /// Ratio maximal depuis la dernière remise à zéro, en millionièmes.
+    pub fn ratio_max_millionths(&self) -> u64 {
+        self.ratio_max_millionths.load(Ordering::Relaxed)
     }
     /// Vrai si la DLL est verrouillée.
     pub fn is_locked(&self) -> bool {
@@ -139,6 +242,32 @@ impl AsyncStats {
     pub fn reset_xruns(&self) {
         self.underruns.store(0, Ordering::Relaxed);
         self.overruns.store(0, Ordering::Relaxed);
+    }
+
+    /// Remet les extrêmes à zéro. À appeler après relevé, et une fois le flux en
+    /// régime : le préremplissage passe par un remplissage nul, qui écraserait
+    /// `fill_min` pour toute la vie du port.
+    pub fn reset_extremes(&self) {
+        self.fill_min.store(u32::MAX, Ordering::Relaxed);
+        self.fill_max.store(0, Ordering::Relaxed);
+        self.ratio_min_millionths.store(u64::MAX, Ordering::Relaxed);
+        self.ratio_max_millionths.store(0, Ordering::Relaxed);
+    }
+
+    /// Publie l'état d'un cycle : niveau courant, ratio, verrouillage, et mise à jour
+    /// des extrêmes. Temps réel : oui (atomiques relâchées, aucun verrou).
+    fn record(&self, fill: usize, ratio: f64, locked: bool) {
+        let fill = fill as u32;
+        self.fill.store(fill, Ordering::Relaxed);
+        self.fill_min.fetch_min(fill, Ordering::Relaxed);
+        self.fill_max.fetch_max(fill, Ordering::Relaxed);
+        self.ratio_bits.store(ratio.to_bits(), Ordering::Relaxed);
+        let millionths = (ratio * 1e6).round().clamp(0.0, u64::MAX as f64) as u64;
+        self.ratio_min_millionths
+            .fetch_min(millionths, Ordering::Relaxed);
+        self.ratio_max_millionths
+            .fetch_max(millionths, Ordering::Relaxed);
+        self.locked.store(locked, Ordering::Relaxed);
     }
 }
 
@@ -238,13 +367,8 @@ impl GraphReader {
     }
 
     fn publish(&self, fill: usize) {
-        self.stats.fill.store(fill as u32, Ordering::Relaxed);
         self.stats
-            .ratio_bits
-            .store(self.resampler.ratio().to_bits(), Ordering::Relaxed);
-        self.stats
-            .locked
-            .store(self.dll.is_locked(), Ordering::Relaxed);
+            .record(fill, self.resampler.ratio(), self.dll.is_locked());
     }
 
     /// Statistiques.
@@ -330,13 +454,11 @@ impl GraphWriter {
                 break;
             }
         }
-        self.stats.fill.store(fill as u32, Ordering::Relaxed);
-        self.stats
-            .ratio_bits
-            .store(self.resampler.ratio().to_bits(), Ordering::Relaxed);
-        self.stats
-            .locked
-            .store(self.dll.is_locked(), Ordering::Relaxed);
+        self.stats.record(
+            fill.max(0.0) as usize,
+            self.resampler.ratio(),
+            self.dll.is_locked(),
+        );
         ok
     }
 
@@ -501,13 +623,17 @@ mod tests {
         (out, stats, reader)
     }
 
-    fn check_output(out: &[f32], drift_ppm: f64, seconds: f64, stats: &AsyncStats) {
+    /// Vérifie la sortie après `settle` secondes d'établissement. `settle` n'est plus
+    /// une poignée de secondes depuis que [`MAX_BANDWIDTH_HZ`] ramène la bande passante
+    /// de la boucle à 0,02 Hz : la convergence prend une dizaine de secondes, et c'est
+    /// le prix assumé de l'insensibilité à la dent de scie de la mesure.
+    fn check_output(out: &[f32], drift_ppm: f64, seconds: f64, settle: f64, stats: &AsyncStats) {
         assert_eq!(stats.underruns(), 0, "sous-alimentations");
         assert_eq!(stats.overruns(), 0, "débordements");
         assert!(stats.is_running());
         assert!(stats.is_locked(), "DLL non verrouillée");
-        // Après 3 s : continuité de phase (dérivée bornée par ω·A à 1 kHz + marge).
-        let start = (3.0 * GRAPH_RATE) as usize;
+        // Après `settle` : continuité de phase (dérivée bornée par ω·A à 1 kHz + marge).
+        let start = (settle * GRAPH_RATE) as usize;
         let tail = &out[start..];
         let expected_freq = 1000.0 * (1.0 + drift_ppm * 1e-6);
         let max_step = 2.0 * core::f64::consts::PI * expected_freq / GRAPH_RATE * 1.05;
@@ -521,49 +647,66 @@ mod tests {
         // Fréquence : le sinus du périphérique arrive à sa vitesse réelle.
         let zc = zero_crossings(tail) as f64;
         let measured = zc / 2.0 / (tail.len() as f64 / GRAPH_RATE);
-        let tol = expected_freq * 2e-4 + 2.0 / (seconds - 3.0);
+        let tol = expected_freq * 2e-4 + 2.0 / (seconds - settle);
         assert!(
             (measured - expected_freq).abs() < tol,
             "fréquence {measured} vs {expected_freq} (± {tol})"
         );
     }
 
+    // Les dérives simulées ici tiennent dans l'enveloppe de [`MAX_CORRECTION`]
+    // (± 500 ppm), qui est désormais tout ce que le port prétend rattraper : au-delà,
+    // la boucle sature — par construction, et c'est ce qui rend la saturation
+    // inoffensive (cf. `effective_dll`). Les quartz du matériel grand public tiennent
+    // dans ± 100 ppm.
+
     #[test]
     fn input_port_absorbs_positive_drift_with_jitter() {
-        let (out, stats, reader) = simulate_input(1000.0, 0.3, 256, 48_000.0, 12.0);
-        check_output(&out, 1000.0, 12.0, &stats);
+        let (out, stats, reader) = simulate_input(300.0, 0.3, 256, 48_000.0, 30.0);
+        check_output(&out, 300.0, 30.0, 15.0, &stats);
         // L'estimation intégrale converge lentement (quelques constantes de temps) :
         // on vérifie le signe et l'ordre de grandeur ; la fréquence mesurée ci-dessus
         // prouve que le ratio effectif est juste.
         let est = reader.dll().drift_ppm();
-        assert!(est > 500.0 && est < 2000.0, "dérive estimée {est}");
+        assert!(est > 150.0 && est < 450.0, "dérive estimée {est}");
         assert!(
             stats.ratio() < 1.0,
             "ratio {} : le périphérique va plus vite, on consomme plus",
             stats.ratio()
         );
         assert!(stats.cycles() > 0);
+        // Les extrêmes ont bien été relevés, et le ratio n'a jamais quitté l'enveloppe.
+        assert!(stats.fill_max() >= stats.fill_min());
+        assert!(stats.fill_min() > 0, "remplissage minimal nul sans xrun");
+        let (lo, hi) = (
+            stats.ratio_min_millionths() as f64 / 1e6,
+            stats.ratio_max_millionths() as f64 / 1e6,
+        );
+        assert!(
+            lo >= 1.0 - MAX_CORRECTION && hi <= 1.0 + MAX_CORRECTION,
+            "ratio hors de ± 500 ppm : {lo} … {hi}"
+        );
     }
 
     #[test]
     fn input_port_absorbs_negative_drift_with_odd_block_size() {
-        let (out, stats, _) = simulate_input(-1000.0, 0.5, 240, 48_000.0, 12.0);
-        check_output(&out, -1000.0, 12.0, &stats);
+        let (out, stats, _) = simulate_input(-300.0, 0.5, 240, 48_000.0, 30.0);
+        check_output(&out, -300.0, 30.0, 15.0, &stats);
         assert!(stats.ratio() > 1.0);
     }
 
     #[test]
     fn input_port_resamples_44k1_device() {
-        let (out, stats, _) = simulate_input(200.0, 0.2, 441, 44_100.0, 10.0);
-        check_output(&out, 200.0, 10.0, &stats);
+        let (out, stats, _) = simulate_input(200.0, 0.2, 441, 44_100.0, 30.0);
+        check_output(&out, 200.0, 30.0, 15.0, &stats);
         assert!((stats.ratio() - 48_000.0 / 44_100.0).abs() < 0.002);
     }
 
     #[test]
     #[ignore = "long : 1 h simulée, lancer en release"]
     fn input_port_one_hour_without_xrun() {
-        let (out, stats, _) = simulate_input(800.0, 0.4, 256, 48_000.0, 3600.0);
-        check_output(&out, 800.0, 3600.0, &stats);
+        let (out, stats, _) = simulate_input(400.0, 0.4, 256, 48_000.0, 3600.0);
+        check_output(&out, 400.0, 3600.0, 15.0, &stats);
     }
 
     #[test]
@@ -675,15 +818,15 @@ mod tests {
     #[test]
     fn output_port_absorbs_drift_both_ways() {
         for (drift, block, rate) in [
-            (1000.0, 256, 48_000.0),
-            (-1000.0, 200, 48_000.0),
+            (400.0, 256, 48_000.0),
+            (-400.0, 200, 48_000.0),
             (300.0, 441, 44_100.0),
         ] {
-            let (out, stats) = simulate_output(drift, 0.3, block, rate, 12.0);
+            let (out, stats) = simulate_output(drift, 0.3, block, rate, 30.0);
             assert_eq!(stats.underruns(), 0, "dérive {drift}");
             assert_eq!(stats.overruns(), 0, "dérive {drift}");
             assert!(stats.is_locked(), "dérive {drift} : DLL non verrouillée");
-            let start = (3.0 * rate) as usize;
+            let start = (15.0 * rate) as usize;
             let tail = &out[start..];
             // Dans l'horloge du périphérique, le sinus du graphe apparaît à 1000 / (1 + dérive).
             // En temps réel, le sinus du graphe reste à 1000 Hz : le rééchantillonneur
@@ -741,6 +884,107 @@ mod tests {
         }
         assert!(!ok);
         assert!(writer.stats().overruns() > 0);
+    }
+
+    /// Configuration du câble mesuré le 2026-09-11 : capture WASAPI par paquets de
+    /// 480 trames (10 ms), graphe à 256 trames de quantum, consigne 768 trames.
+    fn cfg_cable_mesure() -> AsyncPortConfig {
+        AsyncPortConfig {
+            channels: 2,
+            graph_rate: SampleRate::HZ_48000,
+            device_rate: SampleRate::HZ_48000,
+            quantum: 256,
+            device_block: 480,
+            target_fill: None,
+            quality: ResampleQuality::Normal,
+            dll: DllConfig::default(),
+        }
+    }
+
+    /// Rejoue le défaut mesuré : le remplissage lu par le port est le **niveau
+    /// instantané** de l'anneau, donc une dent de scie d'amplitude 480 (un paquet de
+    /// capture) échantillonnée une fois par cycle ; la phase des deux réveils dérive
+    /// (~83 ppm) et franchit la frontière du paquet à `t = 1 s`, ce qui fait sauter la
+    /// mesure de +480 **sans qu'une seule trame n'ait été produite en plus**.
+    ///
+    /// Retourne `(ratio min, ratio max, creux minimal de l'anneau en trames)`. Le
+    /// creux est le niveau vrai juste avant l'arrivée d'un paquet : c'est lui qui
+    /// s'annule en sous-alimentation.
+    fn rejoue_dent_de_scie(cfg: DllConfig, seconds: f64, saut: bool) -> (f64, f64, f64) {
+        const FREQUENCE: f64 = 48_000.0;
+        const PAQUET: f64 = 480.0;
+        const QUANTUM_TEST: f64 = 256.0;
+        let tic = PAQUET / FREQUENCE;
+        let periode = QUANTUM_TEST / FREQUENCE;
+        let consigne = cfg_cable_mesure().effective_target_fill() as f64;
+        let mut dll = Dll::new(cfg, FREQUENCE, periode);
+        let mut consomme = 0.0;
+        let mut mult = 1.0;
+        let (mut rmin, mut rmax) = (f64::INFINITY, f64::NEG_INFINITY);
+        let mut creux_min = f64::INFINITY;
+        let cycles = (seconds / periode) as usize;
+        for cycle in 0..cycles {
+            let t = cycle as f64 * periode;
+            let tics = (t / tic).floor();
+            // Le creux : l'anneau tel qu'il est juste avant le paquet du tic courant.
+            let creux = consigne + tics * PAQUET - consomme;
+            // Le stroboscope : avant la frontière, la salve du graphe précède le
+            // paquet du tic et voit le creux ; après, elle le suit et voit la crête.
+            let strobe = if saut && t >= 1.0 { PAQUET } else { 0.0 };
+            let mesure = creux + strobe;
+            creux_min = creux_min.min(creux);
+            consomme += QUANTUM_TEST / mult;
+            mult = dll.update(mesure - consigne);
+            rmin = rmin.min(mult);
+            rmax = rmax.max(mult);
+        }
+        (rmin, rmax, creux_min)
+    }
+
+    #[test]
+    fn dent_de_scie_ne_vide_plus_lanneau() {
+        // Ancien réglage : les défauts génériques de la DLL, avec le seul garde-fou
+        // d'alors (le seuil de verrouillage). C'est la panne mesurée.
+        let ancien = DllConfig {
+            lock_threshold: (480.0 + 256.0) / 2.0,
+            ..DllConfig::default()
+        };
+        let (rmin, _, creux) = rejoue_dent_de_scie(ancien, 5.0, true);
+        assert!(
+            rmin <= 0.990_001,
+            "ancien réglage : la DLL devrait saturer à la butée 0,99 ({rmin})"
+        );
+        // Une lecture qui tombe sur le creux réclame un quantum (256 trames) : sous ce
+        // seuil elle repart à vide — c'est la rafale de sous-alimentations mesurée.
+        assert!(
+            creux < 256.0,
+            "ancien réglage : l'anneau devrait se vider sous un quantum (creux {creux} trames)"
+        );
+
+        // Nouveau réglage : celui que le port applique réellement. Référence : la même
+        // simulation sans le saut de phase, c'est-à-dire le creux structurel de la dent
+        // de scie (consigne − un paquet). L'écart entre les deux est le coût de
+        // l'artefact, et lui seul.
+        let neuve = cfg_cable_mesure().effective_dll();
+        let (_, _, creux_sans_saut) = rejoue_dent_de_scie(neuve, 5.0, false);
+        let (rmin, rmax, creux) = rejoue_dent_de_scie(neuve, 5.0, true);
+        assert!(
+            rmin >= 1.0 - MAX_CORRECTION && rmax <= 1.0 + MAX_CORRECTION,
+            "ratio hors de ± 500 ppm : {rmin} … {rmax}"
+        );
+        assert!(creux > 0.0, "l'anneau se vide : creux {creux} trames");
+        // 4 s d'écrêtage à 500 ppm ne peuvent retirer que 4 × 24 = 96 trames ; on
+        // tolère 130 pour le régime transitoire. L'ancien réglage en retirait 260.
+        // Relevé de cette simulation : creux 225 trames contre 297 sans artefact, soit
+        // 72 trames de réserve dépensées — et le ratio colle à la butée 0,999500. La
+        // DLL sature donc toujours sur un saut de 480 trames (l'écrêtage cède dès
+        // 96 trames d'erreur filtrée, kp = 5,24e-6) : ce que le réglage achète, ce
+        // n'est pas l'absence de saturation, c'est son innocuité.
+        let cout = creux_sans_saut - creux;
+        assert!(
+            cout < 130.0,
+            "l'artefact coûte {cout} trames de réserve (creux {creux} contre {creux_sans_saut})"
+        );
     }
 
     #[test]

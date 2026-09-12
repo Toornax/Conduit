@@ -136,6 +136,10 @@ fn etat_de_peripherique(
         fill,
         ratio,
         locked: etat != NodeState::Suspended,
+        fill_min: fill.saturating_sub(240),
+        fill_max: fill + 240,
+        ratio_min_millionths: (ratio * 1e6) as u64 - 50,
+        ratio_max_millionths: (ratio * 1e6) as u64 + 50,
     }
 }
 

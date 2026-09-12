@@ -254,6 +254,10 @@ pub(crate) mod fixtures {
             fill: 960,
             ratio: 1.0,
             locked: true,
+            fill_min: 928,
+            fill_max: 992,
+            ratio_min_millionths: 999_950,
+            ratio_max_millionths: 1_000_050,
         }
     }
 

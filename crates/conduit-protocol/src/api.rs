@@ -155,6 +155,19 @@ pub struct DeviceStatus {
     pub ratio: f64,
     /// DLL verrouillée.
     pub locked: bool,
+    /// Remplissage minimal depuis la dernière remise à zéro des xruns.
+    #[serde(default)]
+    pub fill_min: u32,
+    /// Remplissage maximal depuis la dernière remise à zéro des xruns.
+    #[serde(default)]
+    pub fill_max: u32,
+    /// Ratio minimal depuis la dernière remise à zéro des xruns, en millionièmes
+    /// (1_000_000 = 1,0).
+    #[serde(default)]
+    pub ratio_min_millionths: u64,
+    /// Ratio maximal depuis la dernière remise à zéro des xruns, en millionièmes.
+    #[serde(default)]
+    pub ratio_max_millionths: u64,
 }
 
 /// Pilote courant.
@@ -778,6 +791,10 @@ mod tests {
                 fill: 512,
                 ratio: 1.0,
                 locked: true,
+                fill_min: 32,
+                fill_max: 992,
+                ratio_min_millionths: 999_500,
+                ratio_max_millionths: 1_000_500,
             }],
             position: 4096,
             cycles: 16,

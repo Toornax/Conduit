@@ -48,6 +48,17 @@
   premier xrun n'interrompt PAS la mesure : la suite de la série est ce qui distingue un
   accident isolé d'une dérive.
 
+  Bornes de remplissage et de ratio. Chaque relevé et le récapitulatif affichent, pour les
+  deux bouts du câble, « remplissage min–max » et « ratio min–max » (status.devices[] :
+  fill_min, fill_max, ratio_min_millionths, ratio_max_millionths). Le champ « fill » seul
+  ne sert à rien ici : le remplissage mesuré par un port asynchrone est le niveau
+  INSTANTANÉ de son anneau, donc une dent de scie d'amplitude un paquet (480 trames à
+  10 ms), et un relevé périodique l'échantillonne au lieu de la mesurer. Les bornes, tenues
+  à jour à chaque cycle du graphe, montrent la hauteur de la dent de scie, le creux
+  réellement atteint — celui qui s'annule en sous-alimentation — et tout écrêtage de la
+  DLL. Elles sont cumulées depuis la remise à zéro des xruns que le banc fait juste avant
+  la mesure : elles couvrent la campagne, pas l'intervalle.
+
   Effets de bord et restauration. Le banc arrête les conduitd déjà lancés (deux démons se
   disputeraient les périphériques) et supprime la tâche d'autodémarrage le temps de la
   mesure. Le bloc finally réenregistre la tâche si elle existait et relance les démons
@@ -252,6 +263,49 @@ function Format-Pilote {
   $genre = [string](Get-Champ -Objet $Driver -Nom "kind" -Source "status --json (driver)")
   if ($genre -ne "device") { return $genre }
   return "device " + [string](Get-Champ -Objet $Driver -Nom "id" -Source "status --json (driver)")
+}
+
+function Find-Peripherique {
+  <#
+  .SYNOPSIS
+    L'entrée de status.devices dont l'id vaut $Id, ou $null s'il n'y en a pas
+    exactement une.
+  #>
+  param([Parameter(Mandatory)][AllowNull()]$Etat, [Parameter(Mandatory)][string]$Id)
+  $peripheriques = @(Get-Champ -Objet $Etat -Nom "devices" -Source "status --json")
+  $trouves = @($peripheriques | Where-Object {
+      [string](Get-Champ -Objet $_ -Nom "id" -Source "status --json (devices)") -eq $Id
+    })
+  if ($trouves.Count -ne 1) { return $null }
+  return $trouves[0]
+}
+
+function Format-Extremes {
+  <#
+  .SYNOPSIS
+    « remplissage 736–1248 trames, ratio 0,999500–1,000500 » pour une entrée de
+    status.devices.
+  .DESCRIPTION
+    Pourquoi des extrêmes et pas le seul « fill » courant : le remplissage qu'un port
+    asynchrone mesure est le NIVEAU INSTANTANÉ de son anneau, donc une dent de scie
+    dont l'amplitude vaut un paquet du périphérique (480 trames à 10 ms). Un relevé
+    périodique de « fill » échantillonne cette dent de scie au lieu de la mesurer : il
+    ne dit ni sa hauteur, ni le creux réellement atteint, qui est pourtant ce qui
+    s'annule en sous-alimentation. Les bornes, elles, sont tenues à jour à CHAQUE
+    cycle du graphe, côté moteur.
+
+    Elles sont CUMULÉES depuis la dernière remise à zéro des xruns, que le banc ne
+    fait qu'une fois, juste avant la mesure (« conduitctl xruns --reset ») : ces
+    bornes couvrent donc toute la campagne écoulée, et non l'intervalle. Un
+    élargissement entre deux relevés date l'événement à l'intervalle près.
+  #>
+  param([Parameter(Mandatory)][AllowNull()]$Peripherique)
+  $remplissageMin = [long](Get-Champ -Objet $Peripherique -Nom "fill_min" -Source "status --json (devices)")
+  $remplissageMax = [long](Get-Champ -Objet $Peripherique -Nom "fill_max" -Source "status --json (devices)")
+  $ratioMin = [double](Get-Champ -Objet $Peripherique -Nom "ratio_min_millionths" -Source "status --json (devices)") / 1e6
+  $ratioMax = [double](Get-Champ -Objet $Peripherique -Nom "ratio_max_millionths" -Source "status --json (devices)") / 1e6
+  return ("remplissage {0:n0}–{1:n0} trames, ratio {2:n6}–{3:n6}" -f `
+      $remplissageMin, $remplissageMax, $ratioMin, $ratioMax)
 }
 
 function Split-LigneDeCommande {
@@ -640,6 +694,13 @@ try {
     $cyclesCourants = Get-Champ -Objet $etat -Nom "cycles" -Source "status --json"
     Write-Host ("  {0,6:n0} s / {1} s — xruns {2}, cycles {3}, crête {4} dBFS" -f `
         $chrono.Elapsed.TotalSeconds, $Duree, $xruns, $cyclesCourants, $crete)
+    # Les bornes de remplissage et de ratio des deux bouts du câble : c'est là que la
+    # dent de scie du remplissage et un éventuel écrêtage de la DLL se voient.
+    foreach ($paire in @(, @("rendu", $idRendu)) + @(, @("capture", $idCapture))) {
+      $peripheriqueReleve = Find-Peripherique -Etat $etat -Id ([string]$paire[1])
+      if ($null -eq $peripheriqueReleve) { continue }
+      Write-Host ("         {0,-8} {1}" -f $paire[0], (Format-Extremes -Peripherique $peripheriqueReleve))
+    }
   }
   $chrono.Stop()
 
@@ -669,15 +730,13 @@ try {
   foreach ($paire in @(, @("rendu", $idRendu)) + @(, @("capture", $idCapture))) {
     $sens = [string]$paire[0]
     $identifiant = [string]$paire[1]
-    $trouves = @($peripheriquesEtat | Where-Object {
-        [string](Get-Champ -Objet $_ -Nom "id" -Source "status --json (devices)") -eq $identifiant
-      })
-    if ($trouves.Count -ne 1) {
+    $peripherique = Find-Peripherique -Etat $final -Id $identifiant
+    if ($null -eq $peripherique) {
       $peripheriquesSains = $false
-      $lignesPeripheriques += ("  {0,-8} ABSENT de status.devices ({1} entrée(s)) — id {2}" -f $sens, $trouves.Count, $identifiant)
+      $lignesPeripheriques += ("  {0,-8} ABSENT de status.devices (ou en double) — {1} périphérique(s) au moteur, id {2}" -f `
+          $sens, $peripheriquesEtat.Count, $identifiant)
       continue
     }
-    $peripherique = $trouves[0]
     $sous = [long](Get-Champ -Objet $peripherique -Nom "underruns" -Source "status --json (devices)")
     $sur = [long](Get-Champ -Objet $peripherique -Nom "overruns" -Source "status --json (devices)")
     $ratio = [double](Get-Champ -Objet $peripherique -Nom "ratio" -Source "status --json (devices)")
@@ -697,6 +756,7 @@ try {
     if ($verrou) { $verrouTexte = "verrouillée" }
     $lignesPeripheriques += ("  {0,-8} « {1} » état {2} — underruns {3}, overruns {4}, ratio {5:n6}, DLL {6}" -f `
         $sens, $libelle, $etatNoeud, $sous, $sur, $ratio, $verrouTexte)
+    $lignesPeripheriques += ("           {0}" -f (Format-Extremes -Peripherique $peripherique))
     $lignesPeripheriques += ("           id {0}" -f $identifiant)
   }
 
@@ -723,7 +783,7 @@ try {
   Add-Ligne -Libelle "Crête du VU" -Valeur ("initiale {0} dBFS, finale {1} dBFS (écart {2:n2} dB, toléré {3:n0} dB)" -f `
       $creteInitiale, $creteFinale, $ecartCrete, $ecartCreteMaxDb)
   if ($null -ne $premierXrun) { Add-Ligne -Libelle "Premier xrun" -Valeur ("à {0} s" -f $premierXrun) }
-  Add-Recapitulatif "  Périphériques du câble :"
+  Add-Recapitulatif "  Périphériques du câble (bornes cumulées depuis « xruns --reset ») :"
   foreach ($ligne in $lignesPeripheriques) { Add-Recapitulatif $ligne }
   Add-Recapitulatif ""
   if ($verdict) {

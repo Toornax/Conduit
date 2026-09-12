@@ -311,6 +311,10 @@ impl Engine {
                 for d in self.devices.values() {
                     if let Some(s) = &d.stats {
                         s.reset_xruns();
+                        // Les extrêmes de remplissage et de ratio repartent avec les
+                        // xruns : c'est le même repère de campagne, et cela les purge
+                        // du remplissage nul traversé au préremplissage.
+                        s.reset_extremes();
                     }
                     d.set_last_xruns((0, 0));
                 }
@@ -397,25 +401,20 @@ impl Engine {
             .devices
             .values()
             .map(|d| {
-                let (underruns, overruns, fill, ratio, locked) = match &d.stats {
-                    Some(s) => (
-                        s.underruns(),
-                        s.overruns(),
-                        s.fill(),
-                        s.ratio(),
-                        s.is_locked(),
-                    ),
-                    None => (0, 0, 0, 1.0, false),
-                };
+                let s = d.stats.as_deref();
                 DeviceStatus {
                     id: d.info.id.clone(),
                     node: d.node,
                     state: d.state,
-                    underruns,
-                    overruns,
-                    fill,
-                    ratio,
-                    locked,
+                    underruns: s.map_or(0, AsyncStats::underruns),
+                    overruns: s.map_or(0, AsyncStats::overruns),
+                    fill: s.map_or(0, AsyncStats::fill),
+                    ratio: s.map_or(1.0, AsyncStats::ratio),
+                    locked: s.is_some_and(AsyncStats::is_locked),
+                    fill_min: s.map_or(0, AsyncStats::fill_min),
+                    fill_max: s.map_or(0, AsyncStats::fill_max),
+                    ratio_min_millionths: s.map_or(0, AsyncStats::ratio_min_millionths),
+                    ratio_max_millionths: s.map_or(0, AsyncStats::ratio_max_millionths),
                 }
             })
             .collect();

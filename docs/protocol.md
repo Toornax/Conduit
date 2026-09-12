@@ -956,6 +956,20 @@ Les exemples ci-dessous sont en JSON pour la lisibilité ; l'encodage réel est 
           "format": "uint32",
           "minimum": 0
         },
+        "fill_max": {
+          "description": "Remplissage maximal depuis la dernière remise à zéro des xruns.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
+        "fill_min": {
+          "description": "Remplissage minimal depuis la dernière remise à zéro des xruns.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 0,
+          "minimum": 0
+        },
         "id": {
           "description": "Périphérique.",
           "$ref": "#/$defs/DeviceId"
@@ -978,6 +992,20 @@ Les exemples ci-dessous sont en JSON pour la lisibilité ; l'encodage réel est 
           "description": "Ratio de rééchantillonnage.",
           "type": "number",
           "format": "double"
+        },
+        "ratio_max_millionths": {
+          "description": "Ratio maximal depuis la dernière remise à zéro des xruns, en millionièmes.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
+        "ratio_min_millionths": {
+          "description": "Ratio minimal depuis la dernière remise à zéro des xruns, en millionièmes\n(1_000_000 = 1,0).",
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
         },
         "state": {
           "description": "État.",
