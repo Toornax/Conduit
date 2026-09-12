@@ -946,17 +946,44 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   désormais où le rendu en est par les paquets servis, mais seuls les clients exclusifs les
   empruntent — le partagé, que cette borne concerne, scrute. Reste donc à calculer l'avance
   sur la période effective au lieu d'une constante.
-  *Note du 2026-09-11 — un défaut ouvert, non instruit, qui ne remet pas le lot en cause* :
-  en **exclusif servi**, environ **une passe de 8 s sur trois** échoue par sauts de phase.
-  Deux de ces échecs sont des **premières passes** dont le premier saut tombe quasiment au
-  **même endroit** (~0,8 s : trames **38 144** et **39 552**) et avec une **grosse
-  amplitude**, 1,8 à 2,3 rad. Le contrôle sans paquets (`PacketMode = 0`) échoue **aussi**
-  (9/10 puis 8/10), mais avec des sauts **dix fois plus petits** — ce n'est donc pas le même
-  phénomène que le bruit sub-trame du tableau ci-dessus. *Soupçon* : un **transitoire
-  d'ancrage** du chemin servi en début de flux — résolution du premier numéro de paquet, ou
-  interaction entre la borne et l'avance. **Enquête dédiée à mener, non commencée.**
+  *Résolu le 2026-09-12 — le défaut ouvert le 2026-09-11 est instruit et corrigé, le lot
+  n'est pas remis en cause* (analyse sur pièces, mesures VM, session console, débogueur
+  détaché) :
+  - **Le « glissement de 32-40 trames » du 11 était un artefact de lecture.** Le détecteur
+    de `conduit-looptest` ajuste la phase par blocs de **128 trames** et la replie dans
+    ]−π, π]. Le vrai glissement était de **480 trames — deux paquets, un tour complet de
+    tampon** ; les lectures **1,85** et **2,33 rad** étaient la même cause vue à des positions
+    de coupure différentes dans le bloc, non deux amplitudes distinctes.
+  - **Cause.** `StreamState::packets_transferred`
+    (`drivers/windows/conduit-kmd/src/cable.rs`) rendait `floor(position / taille_paquet)`
+    sans se borner à `last_write_packet`. `GetPacketCount` n'est appelé qu'**après un refus
+    de `SetWritePacket`** (client en retard de plus d'une période) et lui annonçait alors
+    **1-2 paquets « transférés » jamais écrits** ; le client se recalait **devant** → un
+    glissement **permanent de 480 trames**, amplitude entamée, **zéro trou**, et **absent à
+    `PacketMode = 0`**. Le refus survient quand la gigue de réveil atteint une période
+    entière : environ **1 par passe de 8 s**, plus fréquent sous charge — d'où le « 1 sur 3 »
+    observé le 11.
+  - **Correctif** (commit `5103a36`) : `packets_transferred` plafonne à
+    `min(floor(position / taille), last_write_packet + 1)`, **monotonie préservée** — le
+    client se recale sur `last_write_packet + 1`, seul numéro que `validate_write` accepte.
+    Instrumentation ajoutée (`CONFIG_VERSION` **6 → 7**) : compteurs `set_write_late` /
+    `set_write_overrun` et le triplet du dernier `GetPacketCount` (rendu / atteint / dernier
+    écrit → « écart évité »), lisibles par `--cable-transport` ; l'outil restitue désormais
+    le **glissement cumulé en trames** au lieu d'un angle replié.
+  - *Mesuré le 2026-09-12* : deux séries de **20 passes exclusives servies** (une au repos,
+    une sous charge CPU de 3 tâches), **40 refus `DATA_LATE_ERROR` cumulés, zéro
+    `DATA_OVERRUN`, zéro glissement de 480 trames**. Les deux seules passes ratées (**19/20**
+    chacune) ne portaient que du bruit **sub-trame** (**2** et **0** trames de glissement
+    cumulé), identique au plancher du chemin notifications (`PacketMode = 0`) et de la boucle
+    partagée. Avant le correctif : **~1 passe sur 3** avec le glissement de 480 trames. **Le
+    chemin exclusif servi se comporte désormais comme le chemin sans paquets.**
+  - *Reste, non bloquant* : le plancher de bruit **sub-trame** (~1 passe/20, quelques trames)
+    est **commun à tous les chemins** et n'est pas propre au mode paquets ; le correctif (b)
+    de la troncature de `committed` (grappes dispersées, curseur qui n'avance pas au-delà du
+    copié) reste à faire et à **mesurer séparément** — il touche la dissymétrie du commit
+    `7603b7b`, donc prudence.
   `PacketMode` reste à **1** par défaut : le partagé y est indifférent (**20/20** mesuré le
-  même soir) et l'exclusif reste fonctionnel.
+  même soir) et l'exclusif servi est désormais au plancher commun.
 
 ### M1b.B — Service d'assistance
 
