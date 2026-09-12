@@ -32,9 +32,8 @@ M1a et la partie Windows de M1b ont avancé en parallèle.
   Verifier sans le moindre vidage. Les douze tâches sont cochées et
   [ADR-015](docs/adr/015-resultat-du-spike-pilote-rust.md) tranche : on reste en Rust, le
   repli C++ n'est pas exercé, en deux jours contre trois semaines proposées.
-- **M1b.C** : M1b-30, 32, 33 et 35 cochées ; le démon charge WASAPI par défaut sous
-  Windows et tourne sans xrun (1 h, deux cartes, 720 006 cycles). M1b-31 attend la boucle
-  par câble, donc le pilote.
+- **M1b.C** : M1b-30, 31, 32, 33 et 35 cochées ; le démon charge WASAPI par défaut sous
+  Windows et tourne sans xrun (1 h, deux cartes, 720 006 cycles).
 - **M1b.A, M1b.B, M1b.D** : débloquées par la VM, qui valide désormais la propriété de
   configuration du pilote supposée par le helper et le MSI ; pas encore reprises.
 - **M2** : ouvert et mené en parallèle, puisqu'il ne dépend pas de la VM — la GUI se
@@ -1029,46 +1028,75 @@ interroge la broche de jack en boucle. Consigné dans `vm-debug.ps1`.
   30 s), non exécuté par l'agent. Tranché en M1b-31 : `DeviceInfo` = format de
   mixage (`GetMixFormat`, repli `PKEY_AudioEngine_DeviceFormat`) et `sample_rates` =
   44,1/48/96 kHz, toutes acceptées en partagé par conversion automatique.
-- [ ] **M1b-31** `feat(wasapi): lecture et capture en mode partagé, événementiel`
+- [x] **M1b-31** `feat(wasapi): lecture et capture en mode partagé, événementiel`
   *Fait quand* : test de boucle à travers Conduit 1 via l'engine, xruns = 0 sur 10 min.
-  *État* : flux partagés livrés et testés sur cartes réelles ; la boucle via Conduit 1
-  attend le pilote (M1a). Fait : format demandé honoré (`IAudioClient3` au format de
-  mixage avec période choisie, sinon `Initialize` + `AUTOCONVERTPCM`), un fil temps
-  réel par flux (rendu direct dans le tampon WASAPI, capture par paquets, sans
-  allocation ni verrou — `tests/no_alloc.rs`), déconnexion propre sur
-  `AUDCLNT_E_DEVICE_INVALIDATED`, `ClockInfo` par atomiques, `latency()` hors trait.
-  *Banc rejoué le 2026-09-11 (soir) — **le critère n'est PAS atteint**, la case reste
-  décochée.* Cinq passes de **600 s** par `drivers/windows/tools/bench-boucle.ps1`. La boucle
-  **porte le signal** d'un bout à l'autre — VU stable à **−12,04 dBFS**, crête identique au
-  début et à la fin : ce n'est pas une mesure sur du silence, c'est bien la boucle qui rate.
-  *Passe isolée* — un seul câble au monde, Conduit 1 **pilote de son propre graphe**,
-  quantum 256 : **50 underruns, tous du côté CAPTURE**, le premier à **270 s**, puis par
-  **rafales** (11, 18, 12, 9) toutes les **~2 min** ; le remplissage du tampon oscille de
-  **386 à 1 056 trames** et le ratio de la DLL chasse entre **0,990 et 1,0012**.
-  **Ce n'est pas un problème de charge** : temps de cycle **41 µs en moyenne pour un budget
-  de 5 333 µs**, zéro dépassement. La signature est celle d'un **battement lent** entre
-  l'horloge du rendu (le pilote du graphe, période 10 ms) et la cadence de la capture, que la
-  boucle à verrouillage **n'amortit pas**.
+  *Critère tenu le 2026-09-12* : **600 s, 0 xrun**. Fait : format demandé honoré
+  (`IAudioClient3` au format de mixage avec période choisie, sinon `Initialize` +
+  `AUTOCONVERTPCM`), un fil temps réel par flux (rendu direct dans le tampon WASAPI,
+  capture par paquets, sans allocation ni verrou — `tests/no_alloc.rs`), déconnexion
+  propre sur `AUDCLNT_E_DEVICE_INVALIDATED`, `ClockInfo` par atomiques, `latency()`
+  hors trait.
+  *Banc du 2026-09-11 (soir) — le critère n'était PAS atteint.* Cinq passes de **600 s**
+  par `drivers/windows/tools/bench-boucle.ps1`. La boucle **portait le signal** d'un bout à
+  l'autre — VU stable à **−12,04 dBFS**, crête identique au début et à la fin : ce n'était
+  pas une mesure sur du silence, c'était bien la boucle qui ratait. *Passe isolée* — un seul
+  câble au monde, Conduit 1 **pilote de son propre graphe**, quantum 256 : **50 underruns,
+  tous du côté CAPTURE**, le premier à **270 s**, puis par **rafales** (11, 18, 12, 9) toutes
+  les **~2 min** ; le remplissage du tampon oscillait de **386 à 1 056 trames** et le ratio de
+  la DLL chassait entre **0,990 et 1,0012**. Pas un problème de charge : **41 µs de cycle
+  moyen pour un budget de 5 333 µs**, zéro dépassement.
   *Piège de méthode, à ne plus refaire* : en pilote de graphe `auto`, le pilote choisi est
   l'**endpoint par défaut de Windows** — devenu Conduit 3 à 96 kHz après sa création par la
   mesure de M1b-05 — et l'écart de cycles montait alors à **6,7 %**. **Toujours nommer le
   pilote dans une mesure.**
-  *Suspects, dans l'ordre du plan* :
-  1. **MMCSS absent.** Les fils audio n'ont que `SetThreadPriority(TIME_CRITICAL)` : aucun
-     `AvSetMmThreadCharacteristics`, donc aucune classe « Pro Audio » ni aucune part de temps
-     processeur garantie par le planificateur. **Aucune note de dette ne l'écrivait nulle
-     part** — elle est écrite ici.
-  2. **Le quantum 256 contre la période 480** du pilote de graphe : essayer **480**, puis
-     **128**.
-  3. **Le réglage de la boucle à verrouillage** (`crates/conduit-core/src/dsp/dll.rs`) : la
-     chasse du ratio est visible dans la série temporelle.
-  *Prochaine étape écrite* : une **campagne dédiée** sur le banc corrigé, ces trois variables
-  **une à la fois**.
-  *Le banc a été corrigé le jour même* pour que cette campagne mesure ce qu'elle croit
-  mesurer : il écrit désormais `<racine>\config\conduit.toml` avec le **seul** câble mesuré,
-  la configuration par défaut du démon en créant deux et les endpoints à vide du second ayant
+  *Le banc a été corrigé le jour même* pour que la campagne mesure ce qu'elle croit mesurer :
+  il écrit désormais `<racine>\config\conduit.toml` avec le **seul** câble mesuré, la
+  configuration par défaut du démon en créant deux et les endpoints à vide du second ayant
   fourni **32 à 42 xruns** d'une passe ; et le dépôt des binaires arrête le service
   `ConduitHelper`, qui tenait `conduit-helper.exe` ouvert.
+  **Diagnostic du 2026-09-12, sur pièces, sans instrumentation nouvelle : la boucle
+  s'asservissait sur un artefact de mesure.** Le remplissage n'est pas échantillonné n'importe
+  comment — c'est un **stroboscope**. Le producteur (capture WASAPI) verse **480 trames d'un
+  coup** par période de 10 ms, le consommateur les tire **dos à dos dans le même réveil**, et
+  `GraphReader::read` relève le **niveau instantané une fois par cycle** : une dent de scie
+  d'amplitude 480, lue **à sa propre fréquence**. La phase entre les deux réveils dérive
+  (**~83 ppm**, banal en VM) ; à chaque **franchissement de frontière de paquet** — période de
+  battement **≈ 2 min**, exactement la cadence des rafales — le remplissage mesuré saute de
+  **±480 trames** d'un cycle à l'autre. Avec les défauts génériques (`bandwidth_hz` 0,2 →
+  `kp` ≈ 5,2e-5), `kp·480 = 0,025 > max_correction = 0,01` : la DLL **saturait à
+  ratio 0,99000**, la butée, relevée telle quelle dans la série ; la consommation accélérait
+  de **485 trames/s** et vidait l'anneau **en moins d'une seconde**. Les deux endpoints
+  partagent le **minuteur unique du pilote** : il n'existe aucune dérive réelle de cette
+  taille. **MMCSS est hors de cause** — le signe des erreurs serait inverse, et la mesure
+  donnait zéro overrun et zéro dépassement de budget.
+  *Correctif* (commit `5590b56`) : deux plafonds dans `AsyncPortConfig::effective_dll`
+  (`crates/conduit-core/src/asyncport.rs`) — `max_correction` effectif **5e-4 (500 ppm)** et
+  `bandwidth_hz` effectif **0,02**. La saturation au franchissement **a toujours lieu** mais ne
+  coûte plus que **24 trames/s** : inoffensive. Test de simulation
+  `dent_de_scie_ne_vide_plus_lanneau` : ancien réglage → creux à **29 trames** (la panne) ;
+  neuf → creux à **225**. Instrumentation ajoutée au passage : **bornes min/max** de
+  remplissage et de ratio, publiées par le protocole et affichées par le banc — un relevé
+  périodique du seul niveau courant ne peut pas voir la dent de scie, qui est justement ce
+  qu'il faut observer.
+  *Validation du 2026-09-12, 600 s : **RÉUSSITE, 0 xrun**.* Même banc, en VM, session console,
+  un seul câble actif, Conduit 1 pilote de son propre graphe, quantum 256. **112 496 cycles**
+  (écart **0,010 %**), **zéro underrun et zéro overrun des deux côtés**, zéro dépassement de
+  budget (**46 µs** de cycle moyen pour 5 333), crête VU **−12,04 dBFS** identique au début et
+  à la fin. **Ratio confiné à [0,999500 ; 1,000500]** — les bornes sont *touchées* : la
+  saturation existe bel et bien et reste inoffensive, ce que le correctif promettait.
+  **Remplissage 157 à 1 672 trames**, jamais vide, pour une consigne de 768.
+  *Une passe intermédiaire*, avec Conduit 2 actif mais **hors du graphe**, a montré
+  **1 underrun sur ce câble oisif** : l'isolation du banc l'écarte de la mesure, mais un port
+  oisif qui **frôle le vide (31 trames)** reste une observation à garder.
+  *Pistes restantes, non bloquantes* :
+  1. La **refonte propre** est d'asservir la DLL sur les **horodatages** plutôt que sur le
+     niveau d'anneau — `ClockInfo` est déjà fourni au rappel de capture **et jeté**
+     (`crates/conduit-engine/src/engine.rs:877`). Le stroboscope disparaîtrait à la racine.
+  2. Les cycles de **224 trames** produits par `chunks_mut` faussent le `period_s` de la DLL.
+  3. **MMCSS reste souhaitable** : les fils audio n'ont que
+     `SetThreadPriority(TIME_CRITICAL)`, aucun `AvSetMmThreadCharacteristics`, donc aucune
+     classe « Pro Audio » ni part de temps processeur garantie. Hors de cause ici, mais aucune
+     note de dette ne l'écrivait nulle part — elle est écrite ici.
 - [x] **M1b-32** `feat(wasapi): mode exclusif quand disponible`
   *Fait quand* : latence mesurée inférieure au mode partagé, repli automatique documenté.
   *Mesuré* le 2026-09-06 sur les 5 endpoints de rendu du poste (`tests/exclusive.rs`, 48 kHz
